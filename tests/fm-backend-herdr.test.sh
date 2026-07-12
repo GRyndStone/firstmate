@@ -69,12 +69,16 @@ SH
 # (`.result.tab.tab_id` / `.result.root_pane.pane_id`, verified empirically
 # against the real binary); `pane close` removes the pane's single-pane tab
 # (closing a tab's only pane closes the tab); `workspace list` / `tab list` /
-# `pane list` reflect live state; `agent get <pane>` reports the pane's preset
-# agent_status (set via fake_herdr_set_agent_status, never through a CLI
-# call - mirrors an out-of-band agent registering itself) or an
-# agent_not_found error when none was preset (verified real-herdr behavior for
-# a pane with no registered agent). Every call is logged to $FM_HERDR_LOG in
-# the same unit-separated form as make_herdr_fakebin.
+# `pane list` reflect live state; `pane get <pane>` succeeds for a pane still
+# present in state and answers pane_not_found for one that is gone; `agent get
+# <pane>` reports the pane's preset agent_status (set via
+# fake_herdr_set_agent_status, never through a CLI call - mirrors an
+# out-of-band agent registering itself) or an agent_not_found error when none
+# was preset (verified real-herdr behavior for a pane with no registered
+# agent). Setting FM_FAKE_HERDR_AGENT_ERROR=<pane> forces that pane's `agent
+# get` to return a generic (non-agent_not_found) error body, modeling a
+# stressed/confused liveness read under fd-limit pressure. Every call is logged
+# to $FM_HERDR_LOG in the same unit-separated form as make_herdr_fakebin.
 make_herdr_statefake() {  # <dir> -> echoes fakebin dir; seeds an empty state file
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -141,8 +145,28 @@ case "$cmd $sub" in
     tab=${3:-}
     jq_state --arg t "$tab" '.tabs |= [.[]|select(.tab_id != $t)]' | save
     ;;
+  "pane get")
+    pane=${3:-}
+    exists=$(jq_state -r --arg p "$pane" 'any(.tabs[]; .pane_id == $p)')
+    if [ "$exists" = true ]; then
+      printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$pane"
+    else
+      # A structurally-gone pane (its shell died and herdr reaped it): real
+      # herdr answers `pane get` with a pane_not_found error body.
+      printf '{"error":{"code":"pane_not_found","message":"pane %s not found"}}\n' "$pane"
+    fi
+    ;;
   "agent get")
     pane=${3:-}
+    if [ -n "${FM_FAKE_HERDR_AGENT_ERROR:-}" ] && [ "$pane" = "${FM_FAKE_HERDR_AGENT_ERROR}" ]; then
+      # Model a stressed, non-agent_not_found error on the liveness read
+      # (fd-limit pressure / "PaneDied for unknown pane" confused bookkeeping):
+      # herdr returns a generic error body, NOT the definite "no agent here"
+      # agent_not_found. The adapter must classify this as an ambiguous
+      # (unknown) read and fail closed, never as "no agent -> safe to close".
+      printf '{"error":{"code":"internal_error","message":"fd limit reached"}}\n'
+      exit 0
+    fi
     status=$(jq_state -r --arg p "$pane" '.agent_status[$p] // empty')
     if [ -n "$status" ]; then
       printf '{"result":{"agent":{"agent_status":"%s"}}}\n' "$status"
@@ -1645,6 +1669,86 @@ EOF
   pass "fm_backend_herdr_workspace_prune_seeded_default_tab: refuses to close the seeded default tab when its pane reports a working agent (defense in depth)"
 }
 
+# --- 2026-07-11 data-loss incident: the prune must FAIL CLOSED ---------------
+#
+# Root cause (docs/herdr-backend.md "Incident (2026-07-11)"): the prune's
+# liveness gate used to refuse ONLY on agent_status == "working" and close on
+# everything else. That fails OPEN two ways - a live-but-idle/blocked/done
+# agent, and an errored/empty read under fd-limit stress, both read as
+# "!= working" and got a destructive `pane close`. The live incident closed two
+# unrelated LIVE crewmate panes. The fix routes the prune through the same
+# fail-CLOSED classifier the husk path already uses (live AND unknown both
+# refuse). These two tests pin both halves: a live idle agent and an
+# ambiguous/errored liveness read must each leave the pane untouched.
+
+test_prune_refuses_a_live_idle_agent_pane() {
+  # A LIVE crewmate agent between turns reads idle, not working. The old
+  # fail-open ==working gate closed it; the fix must refuse for ANY registered
+  # agent state (working/idle/blocked/done).
+  local dir log state fb raw container seeded seeded_pane ids pane
+  dir="$TMP_ROOT/prune-idle-live"; mkdir -p "$dir"; log="$dir/log"; state="$dir/state.json"; : > "$log"
+  fb=$(make_herdr_statefake "$dir")
+  raw=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /proj' "$ROOT" ) \
+    || fail "container_ensure failed against the stateful fake"
+  container=${raw%%$'\t'*}
+  seeded=${raw#*$'\t'}
+  [ -n "$seeded" ] || fail "expected a freshly created workspace to report a seeded default tab id"
+  seeded_pane=$(jq -r --arg t "$seeded" '.tabs[] | select(.tab_id == $t) | .pane_id' "$state")
+  [ -n "$seeded_pane" ] || fail "could not resolve the seeded default tab's pane id from state"
+  # A live, registered agent sitting IDLE (not working) on the resolved pane.
+  fake_herdr_set_agent_status "$state" "$seeded_pane" idle
+
+  ids=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task "$1" "$2" /proj "$3"' "$ROOT" "$container" "fm-idletest" "$seeded" ) \
+    || fail "create_task failed against the stateful fake"
+  read -r _ pane <<EOF
+$ids
+EOF
+  [ -n "$pane" ] || fail "create_task returned no pane id"
+
+  jq -e --arg t "$seeded" '.tabs[] | select(.tab_id == $t)' "$state" >/dev/null \
+    || fail "REGRESSION: the prune closed a pane hosting a LIVE (idle) registered agent - the fail-open ==working gate"
+  assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f'"$seeded_pane" \
+    "the prune must never close a pane whose agent is live in any registered state (working/idle/blocked/done)"
+  pass "fm_backend_herdr_workspace_prune_seeded_default_tab: refuses to close a pane hosting a LIVE idle agent (fail-open ==working gate fix)"
+}
+
+test_prune_refuses_an_ambiguous_liveness_read() {
+  # Under fd-limit pressure ("PaneDied for unknown pane") the liveness read on
+  # the resolved pane comes back a non-agent_not_found error. The old gate saw
+  # an empty status and, because "" != "working", proceeded to CLOSE. The
+  # fail-closed classifier must map any ambiguous/errored read to `unknown` and
+  # refuse - uncertainty must never resolve to a destructive close.
+  local dir log state fb raw container seeded seeded_pane ids pane
+  dir="$TMP_ROOT/prune-ambiguous"; mkdir -p "$dir"; log="$dir/log"; state="$dir/state.json"; : > "$log"
+  fb=$(make_herdr_statefake "$dir")
+  raw=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" HERDR_SESSION=fmtest \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /proj' "$ROOT" ) \
+    || fail "container_ensure failed against the stateful fake"
+  container=${raw%%$'\t'*}
+  seeded=${raw#*$'\t'}
+  [ -n "$seeded" ] || fail "expected a freshly created workspace to report a seeded default tab id"
+  seeded_pane=$(jq -r --arg t "$seeded" '.tabs[] | select(.tab_id == $t) | .pane_id' "$state")
+  [ -n "$seeded_pane" ] || fail "could not resolve the seeded default tab's pane id from state"
+
+  # Force the seeded pane's `agent get` to error under (modeled) fd-limit stress.
+  ids=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" \
+    FM_FAKE_HERDR_AGENT_ERROR="$seeded_pane" HERDR_SESSION=fmtest \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task "$1" "$2" /proj "$3"' "$ROOT" "$container" "fm-ambigtest" "$seeded" ) \
+    || fail "create_task failed against the stateful fake"
+  read -r _ pane <<EOF
+$ids
+EOF
+  [ -n "$pane" ] || fail "create_task returned no pane id"
+
+  jq -e --arg t "$seeded" '.tabs[] | select(.tab_id == $t)' "$state" >/dev/null \
+    || fail "REGRESSION: the prune closed a pane whose liveness read errored under stress - a fail-open gate turned an ambiguous read into a destructive close"
+  assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f'"$seeded_pane" \
+    "the prune must fail CLOSED on an ambiguous/errored liveness read (fd-limit pressure), never close the pane"
+  pass "fm_backend_herdr_workspace_prune_seeded_default_tab: fails closed (refuses) on an ambiguous/errored liveness read under server stress"
+}
+
 # test_no_jq_reserved_keyword_arg_names: regression guard for the
 # workspace-leak root cause (a jq `--arg`/`--argjson` named after a jq
 # reserved keyword, e.g. `label`, is a compile error on jq <= 1.6; this
@@ -1989,6 +2093,8 @@ test_repeated_cycles_reuse_one_workspace_no_orphans
 test_adopted_workspace_never_prunes_default_tab
 test_label_collision_startup_workspace_leaves_live_tab_alone
 test_prune_refuses_a_working_agent_pane_defense_in_depth
+test_prune_refuses_a_live_idle_agent_pane
+test_prune_refuses_an_ambiguous_liveness_read
 test_no_jq_reserved_keyword_arg_names
 test_create_task_refuses_duplicate_label
 test_create_task_refuses_duplicate_label_when_agent_live
