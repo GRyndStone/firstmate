@@ -119,6 +119,23 @@ rc=1
 
 A recognized pane-qualified target stays on strict inventory matching in both directions, and an unrecognized explicit shape resolves leniently instead of false-reading as gone; `tests/fm-backend-tmux-smoke.test.sh` keeps these shapes covered against a real server too.
 
+Unlike `display-message`, `tmux capture-pane` does NOT resolve a gone target leniently: it fails outright on a killed window whose session survives, so the watcher's capture-failure trigger for `handle_gone_endpoint` (`bin/fm-watch.sh`) genuinely fires for ordinary tmux ship/scout crews and the strict probe then corroborates the death.
+Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
+
+```sh
+$ tmux new-session -d -s probe -n keepwin
+$ tmux new-window -t probe -n taskwin
+$ tmux kill-window -t probe:taskwin                                  # session survives
+$ tmux capture-pane -p -t probe:taskwin -S -40; echo rc=$?
+can't find window: taskwin
+rc=1
+$ tmux display-message -p -t probe:taskwin '#{pane_id} #{window_name}'; echo rc=$?   # lenient, for contrast
+%0 keepwin
+rc=0
+```
+
+`tests/fm-backend-tmux-smoke.test.sh` pins this against a real server: after the kill-window step it asserts `fm_backend_tmux_capture` fails on the killed window, so a future tmux release quietly making capture-pane resolution lenient would surface as a smoke failure instead of silently re-opening the endpoint-gone blind spot.
+
 ## Agent liveness probe
 
 `fm_backend_target_exists` (`bin/fm-backend.sh`) only checks that a window's pane still exists, strictly per the section above.

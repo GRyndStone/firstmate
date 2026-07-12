@@ -1213,7 +1213,7 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last
+  local reason=$1 state=$2 decision action distilled task last verdict
   local kind="" arg=""
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
@@ -1223,7 +1223,22 @@ handle_wake() {  # <reason> <state>
     signal:*) kind=signal; arg="${reason#signal: }"
               decision=$(classify_signal "$arg" "$state") ;;
     stale:*)  kind=stale; arg="${reason#stale: }"
-              decision=$(classify_stale "$arg" "$state") ;;
+              # A stale reason is "<window>" or "<window> <verdict...>": the
+              # watcher decorates wedge, pause-recheck, and death wakes past the
+              # window token, so only the FIRST token names the window - never
+              # feed the decorated remainder to the classifier as a target.
+              verdict="${arg#* }"
+              arg="${arg%% *}"
+              case "$verdict" in
+                endpoint-gone\ \(*|agent-dead\ \(*)
+                  # A confirmed death verdict (fm-watch.sh handle_gone_endpoint
+                  # / handle_dead_agent): the crew is dead, not idle, whatever
+                  # its status log says - escalate directly, never re-absorb it
+                  # as a declared pause or age it as a transient wedge.
+                  decision="escalate|${reason#stale: }" ;;
+                *)
+                  decision=$(classify_stale "$arg" "$state") ;;
+              esac ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;

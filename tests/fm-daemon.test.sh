@@ -226,6 +226,66 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   pass "a terminal signal clears pause and stale tracking across both supervisors"
 }
 
+# The watcher's death verdicts arrive DECORATED past the window token
+# ("stale: <window> endpoint-gone (...)" / "stale: <window> agent-dead (...)").
+# handle_wake must resolve the real window from the FIRST token and escalate the
+# confirmed death directly - never feed the decorated remainder to classify_stale
+# as a garbled window that reads no status and self-handles as a transient, and
+# never re-absorb the death as the crew's declared pause. Combined with the
+# watcher's once-per-death dedupe markers, either failure would silence a crew
+# death for the whole afk stretch.
+test_handle_wake_escalates_decorated_endpoint_gone() {
+  local dir state key win reason
+  dir=$(make_supercase handle-endpoint-gone)
+  state="$dir/state"
+  win="sess:fm-dead-w11"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/dead-w11.meta"
+  printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/dead-w11.status"
+  key=$(printf '%s' "dead-w11" | tr ':/.' '___')
+  reason="stale: $win endpoint-gone (recorded backend endpoint no longer exists - the crew is dead, not quiet, whatever its last status says; recover it instead of resuming routine supervision)"
+  FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  [ -s "$state/.subsuper-escalations" ] || fail "endpoint-gone death verdict did not escalate"
+  grep -qF "$win endpoint-gone" "$state/.subsuper-escalations" || fail "endpoint-gone escalation lost the window or verdict: $(cat "$state/.subsuper-escalations")"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "endpoint-gone was re-absorbed as the crew's declared pause"
+  set -- "$state"/.subsuper-stale-*
+  [ ! -e "$1" ] || fail "endpoint-gone left a stale persistence marker behind: $1"
+  pass "handle_wake escalates a decorated endpoint-gone verdict against the real window"
+}
+
+test_handle_wake_escalates_decorated_agent_dead() {
+  local dir state key win reason
+  dir=$(make_supercase handle-agent-dead)
+  state="$dir/state"
+  win="sess:fm-dead-w12"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/dead-w12.meta"
+  printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/dead-w12.status"
+  key=$(printf '%s' "dead-w12" | tr ':/.' '___')
+  date +%s > "$state/.subsuper-stale-$key"
+  reason="stale: $win agent-dead (endpoint exists but the agent process is confidently dead - the crew died in its declared wait; recover it instead of resuming routine supervision)"
+  FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  [ -s "$state/.subsuper-escalations" ] || fail "agent-dead death verdict did not escalate"
+  grep -qF "$win agent-dead" "$state/.subsuper-escalations" || fail "agent-dead escalation lost the window or verdict: $(cat "$state/.subsuper-escalations")"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "agent-dead was re-absorbed as the crew's declared pause"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "agent-dead escalation left the real window's stale persistence marker to re-escalate as a false wedge"
+  pass "handle_wake escalates a decorated agent-dead verdict against the real window"
+}
+
+# Decorated NON-death stale reasons (the watcher's wedge and pause-recheck wakes)
+# must also resolve the window from the first token, so the wedge marker ages
+# under the real task's key instead of a garbled one that housekeeping drops.
+test_handle_wake_decorated_wedge_resolves_window() {
+  local dir state key win
+  dir=$(make_supercase handle-decorated-wedge)
+  state="$dir/state"
+  win="sess:fm-wedge-w13"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/wedge-w13.meta"
+  key=$(printf '%s' "wedge-w13" | tr ':/.' '___')
+  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win (idle 300s, possible wedge, escalation 1)" "$state"
+  [ -e "$state/.subsuper-stale-$key" ] || fail "decorated wedge reason did not record the real window's stale marker"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "a transient wedge reason escalated on the wake itself"
+  pass "handle_wake resolves the window from the first token of a decorated wedge reason"
+}
+
 test_housekeeping_migrates_watcher_pause_marker() {
   local dir state key win
   dir=$(make_supercase migrate-watcher-pause)
@@ -1662,6 +1722,9 @@ test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
+test_handle_wake_escalates_decorated_endpoint_gone
+test_handle_wake_escalates_decorated_agent_dead
+test_handle_wake_decorated_wedge_resolves_window
 test_housekeeping_migrates_watcher_pause_marker
 test_housekeeping_migrates_watcher_unpaused_marker_to_clear
 test_housekeeping_seeds_pause_marker_from_status

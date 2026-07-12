@@ -213,6 +213,16 @@ if fm_backend_target_exists tmux "$SESSION:$PANE_ID"; then
 fi
 pass "real tmux: fm_backend_target_exists reads a killed window as gone while its session survives"
 
+# The watcher's endpoint-gone trigger for ordinary crews is a FAILED capture
+# (bin/fm-watch.sh), so capture-pane must not share display-message's lenient
+# resolution and quietly read another window's pane instead. Pin the verified
+# behavior (docs/tmux-backend.md "Strict window-existence probe", 2026-07-12):
+# capture-pane fails outright on a killed window whose session survives.
+if fm_backend_tmux_capture "$TARGET" 40 >/dev/null 2>&1; then
+  fail "fm_backend_tmux_capture leniently resolved a killed window (session surviving) instead of failing - the watcher's endpoint-gone trigger would never fire"
+fi
+pass "real tmux: fm_backend_tmux_capture fails on a killed window while its session survives"
+
 # --- strict existence probe, whole server down ---------------------------------
 
 tmux kill-server >/dev/null 2>&1 || true
