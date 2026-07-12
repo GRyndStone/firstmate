@@ -236,11 +236,29 @@ fm_backend_herdr_workspace_find() {  # <session>
 #
 # Defense in depth on top of that gate (not the primary safety mechanism):
 # re-verify <seeded_tab_id> is still present, still carries label "1" (a
-# human could have renamed or repurposed it in the interim), and refuse to
-# close it if its pane hosts an actively working agent per herdr's own
-# agent-state detection (`agent get`) - belt-and-suspenders against any other
-# unforeseen path landing a live agent in a tab this function was about to
-# close.
+# human could have renamed or repurposed it in the interim), and - the final
+# gate before the close - route the pane through the SAME fail-closed
+# classifier the create_task husk path uses (fm_backend_herdr_tab_is_husk ->
+# fm_backend_herdr_pane_agent_state): close ONLY on a positively-confirmed
+# husk (dead pane, or the agent-less seeded shell); refuse for a `live` agent
+# in any registered state AND for any ambiguous/errored/timed-out `unknown`
+# read.
+#
+# Second live-fire incident fix (2026-07-11, docs/herdr-backend.md "Incident
+# (2026-07-11)"): the earlier version of this defense-in-depth gate was
+# fail-OPEN - it refused ONLY when `agent get` reported exactly "working" and
+# closed on everything else. That closed a pane two ways it must not: a LIVE
+# crewmate agent sitting idle/blocked/done between turns (any non-"working"
+# registered state), and - the case that actually fired - an errored/empty
+# read under herdr fd-limit pressure ("PaneDied for unknown pane" confused
+# pane<->tab bookkeeping), where `agent get` returned no parseable status,
+# `"" != working` held, and the pane was closed. The created-vs-adopted gate
+# above still means an ADOPTED workspace never reaches here at all; but when
+# herdr's own stressed bookkeeping let fm_backend_herdr_pane_for_tab resolve a
+# LIVE, unrelated crewmate pane for this seeded tab, the fail-open gate turned
+# that ambiguity into a destructive `pane close` on two live crewmate panes.
+# The fix makes the gate fail CLOSED via the shared classifier, so no
+# ambiguous or live read can ever license a close, whatever pane was resolved.
 #
 # Verified real-herdr behavior (not modeled by the canned-response fake-CLI
 # unit tests; modeled by make_herdr_statefake): closing a workspace's LAST
@@ -250,7 +268,7 @@ fm_backend_herdr_workspace_find() {  # <session>
 # exists alongside it, never right after workspace creation - and this
 # function independently re-checks the tab count as a second layer.
 fm_backend_herdr_workspace_prune_seeded_default_tab() {  # <session> <workspace_id> <seeded_tab_id>
-  local session=$1 wsid=$2 tab_id=$3 tabs tab_count current_label pane_id agent_out agent_status
+  local session=$1 wsid=$2 tab_id=$3 tabs tab_count current_label pane_id
   [ -n "$tab_id" ] || return 0
   tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 0
   tab_count=$(printf '%s' "$tabs" | jq -r '.result.tabs? // [] | length' 2>/dev/null)
@@ -259,9 +277,15 @@ fm_backend_herdr_workspace_prune_seeded_default_tab() {  # <session> <workspace_
   [ "$current_label" = "1" ] || return 0
   pane_id=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$tab_id") || return 0
   [ -n "$pane_id" ] || return 0
-  agent_out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>/dev/null)
-  agent_status=$(printf '%s' "$agent_out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
-  [ "$agent_status" = working ] && return 0
+  # Fail-CLOSED liveness gate: close ONLY when the shared husk classifier
+  # POSITIVELY confirms a husk (dead pane, or the agent-less seeded shell).
+  # A registered agent in ANY state (working/idle/blocked/done) reads `live`
+  # and REFUSES; any ambiguous, errored, timed-out, or unparseable read reads
+  # `unknown` and REFUSES - uncertainty never resolves to "close it". This is
+  # the exact fail-safe-toward-refusal contract the create_task husk path
+  # already depends on (fm_backend_herdr_pane_agent_state), reused here so the
+  # two reclamation paths cannot drift. See the header incident note.
+  fm_backend_herdr_tab_is_husk "$session" "$pane_id" || return 0
   fm_backend_herdr_cli "$session" pane close "$pane_id" >/dev/null 2>&1 || true
 }
 

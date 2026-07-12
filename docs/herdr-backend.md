@@ -141,7 +141,10 @@ Use a distinct name such as `$want` instead; `tests/fm-backend-herdr.test.sh` gr
 `fm_backend_herdr_create_task` accepts that value as an explicit 4th argument and is the ONLY place allowed to act on it; it never re-derives "prunable" from a tab's label or the workspace's tab count.
 An adopted workspace's caller always passes an empty 4th argument, so create_task never even looks for a prune candidate in that case - it is structurally impossible for an adopted workspace's tabs to be pruned, regardless of how they are labeled.
 
-Defense in depth on top of that gate (not the primary safety mechanism): before closing the seeded tab, `fm_backend_herdr_workspace_prune_seeded_default_tab` re-verifies the tab is still present, re-checks it is still labeled `1`, and refuses if its pane's `agent get` reports `agent_status: working` (herdr's own native agent-state detection) - belt-and-suspenders against a live agent having landed there through some other path.
+Defense in depth on top of that gate (not the primary safety mechanism): before closing the seeded tab, `fm_backend_herdr_workspace_prune_seeded_default_tab` re-verifies the tab is still present, re-checks it is still labeled `1`, and then routes the pane through the SAME fail-closed liveness classifier the restored-husk path uses (`fm_backend_herdr_tab_is_husk` -> `fm_backend_herdr_pane_agent_state`).
+It closes ONLY on a positively-confirmed husk (a `dead` pane, or the `no-agent` agent-less seeded shell); it refuses for a `live` agent in ANY registered state (`working`/`idle`/`blocked`/`done`) and for any ambiguous, errored, timed-out, or unparseable `unknown` read.
+This is a hard fail-closed contract: uncertainty never resolves to a close.
+Before the 2026-07-11 fix below, this gate was fail-OPEN (it refused only on `agent_status: working` and closed on everything else), which is exactly what let a stressed, non-`working` read become a destructive close.
 
 #### Incident: the 2026-07-02 self-kill
 
@@ -157,6 +160,49 @@ The fix is structural, not another heuristic, and is unit- and E2E-tested: see `
 Because closing a workspace's last tab deletes it, a home's workspace does not outlive a fully idle fleet (zero live tasks for that home) - the next spawn's `workspace_find` simply finds nothing and recreates it. Reuse holds across concurrent and sequential tasks; it is not a guarantee that the workspace itself survives the whole session unconditionally.
 
 A workspace whose label this adapter did not derive (see "Label derivation" above) is never adopted, reused, or torn down by firstmate - `fm_backend_herdr_workspace_find` and `fm_backend_herdr_list_live` only ever match a home's own derived label.
+
+#### Incident: the 2026-07-11 fail-open prune close under fd-limit pressure
+
+A second live-fire close-a-live-pane incident, with a different root cause from the 2026-07-02 self-kill above: not the created-vs-adopted gate (which held), but the defense-in-depth liveness gate inside `fm_backend_herdr_workspace_prune_seeded_default_tab` failing OPEN.
+
+Environment: herdr 0.7.3 (server 0.7.x, the running default session), macOS aarch64.
+The server was under sustained resource stress - heavy concurrent load (a ~349MB mirror clone plus 16 concurrent `gh repo delete`) ran alongside repeated FAILED `fm-spawn` attempts on the herdr backend.
+
+What the prune did wrong: the gate refused to close the seeded tab ONLY when `agent get` reported `agent_status: working`, and closed on everything else.
+"Everything else" fails open two ways: a LIVE crewmate agent sitting `idle`/`blocked`/`done` between turns (any non-`working` registered state), and - the case that actually fired - an errored or empty read, where `agent get` returned no parseable status under stress, `"" != working` held, and the pane was closed.
+The gate also passed `2>/dev/null` to `agent get`, discarding the error body real herdr writes to stderr, so a stressed error read was guaranteed to collapse to an empty status and then to a close.
+
+Log evidence, `~/.config/herdr/herdr-server.log`, 2026-07-11 (exact lines):
+
+```
+2026-07-11T21:07:01..21:08:21  INFO herdr::platform::macos: raised server file descriptor soft limit previous=256 target=8192   (every ~10s, continuous)
+2026-07-11T21:08:09.659506Z  INFO herdr::pane: agent changed pane=10 previous_agent=Some(Claude) agent=None pgid=Some(87972)
+2026-07-11T21:08:11.662742Z  INFO ... request_id="cli:pane:close" method="pane.close" changes_ui=true
+2026-07-11T21:08:11.664048Z  INFO ... pane.exit pane_id=7 status="ExitStatus { code: 1, signal: None }"
+2026-07-11T21:08:11.688236Z  WARN herdr::app::actions: PaneDied for unknown pane pane=7
+2026-07-11T21:08:14.291552Z  INFO ... request_id="cli:pane:close" method="pane.close" changes_ui=true
+2026-07-11T21:08:14.292609Z  INFO ... pane.exit pane_id=8 status="ExitStatus { code: 1, signal: None }"
+2026-07-11T21:08:14.316943Z  WARN herdr::app::actions: PaneDied for unknown pane pane=8
+```
+
+Reading of the evidence: the fd soft limit was being re-raised every ~10 seconds (fd exhaustion pressure); an agent registration was flapping to `None` on a live Claude pane seconds before the closes (`agent changed ... agent=None`); and each `pane.close` was immediately followed by `PaneDied for unknown pane`, i.e. herdr could not even map the pane it had just been told to close.
+The two `cli:pane:close` calls closed live panes 7 and 8 (`w6:p7`, `w6:p8`), unrelated to the spawn in flight.
+Spawn issues only ONE kind of `pane close`: the seeded-default-tab prune (the only other `pane close` in the adapter is `fm_backend_herdr_kill`, on teardown, not spawn), so these closes came from the prune.
+
+Root cause, stated with its proven and inferred parts kept distinct:
+
+- Proven (deterministically, by regression test): given ANY pane the prune resolves, a non-`working` live read (`idle`/`blocked`/`done`) OR an errored/empty read closed the pane, because the gate was fail-open.
+  See `tests/fm-backend-herdr.test.sh`'s `test_prune_refuses_a_live_idle_agent_pane` and `test_prune_refuses_an_ambiguous_liveness_read`, both of which fail against the old gate and pass against the fix.
+- Inferred (from the log, not reproduced in isolation): under the fd-limit pressure and the `PaneDied for unknown pane` confusion, herdr's own pane<->tab bookkeeping was scrambled enough that `fm_backend_herdr_pane_for_tab`, filtering `pane list` by the seeded tab's id, resolved a LIVE, unrelated crewmate pane instead of the seeded shell.
+  The exact internal misattribution cannot be reproduced without inducing real fd exhaustion on a live server, so this half is not claimed as proven - but it is the only path consistent with the log, and it does not need to be reproduced for the fix to be correct.
+
+Why the fix closes the incident regardless of the inferred half: the destructive `pane close` had exactly one deciding gate, and that gate failed open.
+Whatever pane the stressed server resolved, the gate is now the shared fail-CLOSED classifier (`fm_backend_herdr_tab_is_husk` -> `fm_backend_herdr_pane_agent_state`): a `live` agent in any registered state refuses, and any ambiguous/errored/timed-out `unknown` read refuses.
+A live crewmate pane reads `live` and is spared; a stressed unparseable read reads `unknown` and is spared; only the genuine agent-less seeded shell (`no-agent`) or a structurally-dead pane (`dead`) is still pruned, so the intended cleanup is unchanged.
+This also unifies the two reclamation paths on one liveness owner, so the prune gate and the restored-husk gate can no longer drift.
+
+The residual, documented honestly: the prune still targets ONLY the seeded tab (gated on `current_label == "1"`), and the classifier still treats a crisp `agent_not_found` as `no-agent` (close-eligible), because that is the seeded shell's normal state.
+For a close to still reach a live crewmate pane, herdr would have to BOTH mis-resolve that pane for the seeded tab AND answer `agent get` on a genuinely-registered agent with a definite `agent_not_found` - a compound herdr-correctness failure, not the fd-pressure ambiguity this fix eliminates (which now always classifies `unknown` and refuses).
 
 ## Target string and meta fields
 
@@ -188,7 +234,7 @@ Herdr tasks additionally record:
 | ANSI capture | `herdr pane read <pane> --source recent --lines N --format ansi` | Herdr 0.7.3 preserves composer de-emphasis styling, letting the shared `fm_composer_strip_ghost` extractor treat dim/faint and dark-TRUECOLOR ghost/placeholder text as empty while retaining real typed input. The same small-`--lines` workaround applies. |
 | Busy state | `herdr agent get <pane>` -> `.result.agent.agent_status` | Verified live against an interactive `claude` session: reports `working` while generating, `done` once idle. Mapped: `working` -> busy; `idle`/`done` -> idle; `blocked` -> idle (surfaced like a stale pane, not suppressed as busy - a blocked agent is stuck waiting on the human, not grinding); anything else -> unknown (the cue for the shared tail-regex fallback). |
 | Kill | `herdr pane close <pane>` | Closing a tab's only (root) pane also closes the tab - no separate tab-close call needed for this adapter's one-pane-per-tab shape. Best-effort: closing an already-closed pane exits non-zero, matching tmux's `kill-window \|\| true` contract. Teardown itself only ever closes the task's own pane/tab, never the workspace - but closing a workspace's LAST tab (verified real-herdr behavior) deletes the workspace as a side effect, so a home's own workspace persists only while at least one task tab remains; see "Workspace lifecycle" above. |
-| Default-tab prune (create_task, first task in a fresh workspace only) | `herdr workspace create`'s own response (`.result.tab.tab_id`) identifies the seeded tab; `herdr tab list` + `herdr agent get <pane>` re-verify it; `herdr pane close <pane>` closes exactly that tab id | `herdr workspace create` seeds the new workspace with one auto-created default tab (label `1`, id captured straight from the create response) firstmate never uses. `fm_backend_herdr_create_task` closes EXACTLY that captured tab id right after creating the first real task tab in a freshly created workspace - never right after `workspace create` itself (see Kill row), and never re-derived from a tab's label or the workspace's tab count at create_task time (see "Default-tab prune" above for the created-vs-adopted safety gate and the 2026-07-02 incident it fixes). Best-effort; an ADOPTED workspace (not freshly created by this same call) is never a prune candidate at all. |
+| Default-tab prune (create_task, first task in a fresh workspace only) | `herdr workspace create`'s own response (`.result.tab.tab_id`) identifies the seeded tab; `herdr tab list` re-verifies it is still present and labeled `1`; `herdr pane get` + `herdr agent get <pane>`, via the shared fail-closed classifier, gate the close; `herdr pane close <pane>` closes exactly that tab id | `herdr workspace create` seeds the new workspace with one auto-created default tab (label `1`, id captured straight from the create response) firstmate never uses. `fm_backend_herdr_create_task` closes EXACTLY that captured tab id right after creating the first real task tab in a freshly created workspace - never right after `workspace create` itself (see Kill row), and never re-derived from a tab's label or the workspace's tab count at create_task time (see "Default-tab prune" above for the created-vs-adopted safety gate and the 2026-07-02 incident it fixes). The final liveness gate is FAIL-CLOSED (`fm_backend_herdr_tab_is_husk`): a `live` agent in any state and any ambiguous/errored `unknown` read both refuse the close - see the 2026-07-11 incident above. Best-effort; an ADOPTED workspace (not freshly created by this same call) is never a prune candidate at all. |
 | Recovery / list-live | `herdr tab list --workspace <id>`, filter labels starting with `fm-` | Label-based, never trusts a stored id blindly - see "ID stability" below. `<id>` is always THIS home's own workspace (`fm_backend_herdr_workspace_find`), so recovery never sees a sibling home's tabs. |
 | Workspace create / tab create (focus) | `herdr workspace create --no-focus`, `herdr tab create --no-focus` | Verified: neither focuses by default once a workspace already exists in the session, matching pre-P3 (flagless) behavior; `--no-focus` is passed anyway for defense in depth, since the very first workspace ever created in a brand-new session focuses regardless of the flag. `--focus` was separately verified to reliably focus, confirming the flag has real effect. |
 | Session targeting for DESTRUCTIVE calls | `herdr session stop <name> --session <name> --json`, then `herdr session delete <name> --session <name> --json`; never `herdr server stop` | Owned by `bin/fm-herdr-lab.sh` (which `tests/herdr-test-safety.sh` sources), re-querying `herdr session list --json` before every destructive call. See "Session targeting" below - `HERDR_SESSION` alone is not reliably honored once another herdr server is already running on the machine. |
