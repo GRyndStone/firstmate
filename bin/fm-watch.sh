@@ -407,9 +407,11 @@ paused_agent_is_dead() {  # <window>
 }
 
 # Surface a paused crew whose endpoint exists but whose agent process is
-# confidently dead - once per death (.agent-dead-<key> dedupes; cleared when the
-# pane goes busy or changes, the agent reads alive again, or pause tracking
-# clears). Keeps the pause bookkeeping (paused flag plus a fresh recheck stamp)
+# confidently dead - once per death (.agent-dead-<key> dedupes; cleared only on
+# positive liveness - a busy pane or an alive probe read - or when pause
+# tracking clears, never on pane-hash churn alone, and surfaced regardless of
+# afk so the away-mode daemon receives the death verdict rather than a plain
+# stale). Keeps the pause bookkeeping (paused flag plus a fresh recheck stamp)
 # so subsequent polls absorb through the normal bounded pause cadence instead of
 # re-probing every poll. Enqueue precedes the suppressor writes, matching the
 # enqueue-before-suppress ordering everywhere else.
@@ -860,10 +862,29 @@ EOF
           esac
         elif afk_present; then
           # Daemon owns triage: one-shot per distinct stale hash, as before.
+          # A paused crew's confidently-dead agent is the exception: the same
+          # bounded probe cadence as normal mode (first sight of a paused
+          # stale hash, then the paused-recheck window) surfaces the explicit
+          # agent-dead verdict, deduped once per death, so the daemon receives
+          # the death instead of a plain stale it may re-absorb as a declared
+          # pause. Ambiguous or errored liveness reads stay fail-closed and
+          # hand off only the plain stale.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
+            if status_is_paused "$last"; then
+              date +%s > "$STATE/.paused-rechecked-$key"
+              if paused_agent_is_dead "$w"; then
+                handle_dead_agent "$w" "$h"
+                continue
+              fi
+            fi
             fm_wake_append stale "$w" "stale: $w" || exit 1
             printf '%s' "$h" > "$sf"
             wake "stale: $w"
+          elif status_is_paused "$last" && [ "$(age_of "$STATE/.paused-rechecked-$key")" -ge "$STALE_ESCALATE_SECS" ]; then
+            date +%s > "$STATE/.paused-rechecked-$key"
+            if paused_agent_is_dead "$w"; then
+              handle_dead_agent "$w" "$h"
+            fi
           fi
         elif stale_is_terminal "$w" "$STATE"; then
           # The log's last line is captain-relevant - but that alone is not
@@ -958,10 +979,16 @@ EOF
           fi
         fi
       else
-        # Pane busy or not yet stably stale: reset pending escalation bookkeeping
-        # (a busy pane is also positive agent-liveness, so a surfaced agent-dead
-        # marker resets and a later death re-surfaces).
-        rm -f "$ssf" "$ewf" "$STATE/.agent-dead-$key"
+        # Pane busy or not yet stably stale: reset pending escalation bookkeeping.
+        # A surfaced agent-dead marker resets only on genuine positive
+        # agent-liveness (an actually-busy pane) - never on the n<2
+        # bookkeeping window alone, which a dead pane re-enters after any
+        # cosmetic redraw and which would re-surface the same death once per
+        # recheck window.
+        rm -f "$ssf" "$ewf"
+        if [ -e "$STATE/.agent-dead-$key" ] && window_is_busy "$w" "$tail40"; then
+          rm -f "$STATE/.agent-dead-$key"
+        fi
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
         fi
@@ -975,14 +1002,26 @@ EOF
       # liveness (busy pane, an alive probe read) or a pause-tracking clear.
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
-      if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
+      if ! status_is_paused "$(last_status_line "$STATE/$task.status")" || window_is_busy "$w" "$tail40"; then
+        [ -e "$pf" ] && clear_pause_tracking "$w"
+      elif afk_present; then
+        # Afk keeps the same bounded paused-recheck death probe on a churning
+        # idle pane, and preserves the pause bookkeeping (including the
+        # agent-dead marker) instead of wiping it, so one death cannot
+        # re-surface per recheck window; pause re-surfacing itself stays
+        # daemon-owned.
+        if [ "$kind" != secondmate ] && [ "$(age_of "$STATE/.paused-rechecked-$key")" -ge "$STALE_ESCALATE_SECS" ]; then
+          date +%s > "$STATE/.paused-rechecked-$key"
+          if paused_agent_is_dead "$w"; then
+            handle_dead_agent "$w" "$h"
+          fi
+        fi
+      else
         case "$(pause_state_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
           dead)   handle_dead_agent "$w" "$h" ;;
           *)      clear_pause_tracking "$w" ;;
         esac
-      else
-        [ -e "$pf" ] && clear_pause_tracking "$w"
       fi
     fi
   done < <(recorded_windows)
