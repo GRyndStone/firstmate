@@ -4,6 +4,10 @@
 # clear volatile state, refresh/prune the project's clone for PR-based ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
+# Touches a state/<task-id>.tearing-down tombstone before the endpoint-affecting
+# cleanup and removes it with the task's other state files, so the watcher absorbs
+# the teardown's own gone endpoint while the tombstone is fresh
+# (FM_TEARDOWN_TOMBSTONE_SECS) instead of waking on it as a crew death.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so

@@ -7,9 +7,11 @@
 # captain-relevant events plus bounded declared-pause rechecks. This is the
 # token-efficient replacement for the prior always-inject daemon: routine
 # signal/stale/heartbeat wakes cost zero firstmate context; only done/
-# needs-decision/blocked/failed/persistent-wedge/check-output events and a
-# declared-pause recheck reach the LLM, and even then as one pre-read digest per
-# batch window.
+# needs-decision/blocked/failed/persistent-wedge/check-output events, confirmed
+# crew deaths (a stale reason carrying the watcher's endpoint-gone/agent-dead
+# verdict, escalated directly rather than re-absorbed as a pause or aged as a
+# wedge), and a declared-pause recheck reach the LLM, and even then as one
+# pre-read digest per batch window.
 #
 # PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
 # injects ONLY when the durable away-mode flag state/.afk is present. Invoking
