@@ -94,6 +94,18 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
   printf '%s\n' "$wid"
 }
 
+# fm_backend_tmux_probe_lenient: tmux's own target resolution as an existence
+# read - `display-message` exits 0 whenever the target resolves and fails only
+# when it cannot (no server on the socket being the common case). Kept ONLY as
+# the fail-open fallback for explicit user-supplied target shapes the strict
+# parser below does not recognize (an fm-send.sh explicit target, an
+# FM_SUPERVISOR_TARGET daemon override), so an exotic-but-valid tmux target can
+# never false-read as gone. Recognized task-shaped targets never reach it,
+# because resolution is lenient enough to read a killed window as alive.
+fm_backend_tmux_probe_lenient() {  # <target>
+  tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1
+}
+
 # fm_backend_tmux_target_exists: strict existence probe backing
 # fm_backend_target_exists's tmux arm. tmux's own target resolution is
 # LENIENT: `tmux display-message -p -t <target>` exits 0 for a killed window
@@ -103,31 +115,58 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
 # window-existence probe"). So existence is an exact match against the
 # server's own inventory - the same list-then-match shape as
 # fm_backend_tmux_create_task's duplicate check - never a target-resolution
-# probe. Target shapes callers record: a pane id (%N - the away-mode daemon's
-# TMUX_PANE supervisor target), a window id (@N - fm-spawn's stable window
-# handle), and session:name or session:index (fm-spawn's recorded window=
-# meta, the daemon's firstmate:0 default). A window-id match also requires
-# <expected-label> as the window name when given, so a recycled id after a
-# server restart never reads as the recorded task. A downed server fails the
-# listing and reads gone, exactly as before.
+# probe. Recognized shapes, matched strictly: a pane id (%N - the away-mode
+# daemon's TMUX_PANE supervisor target), a window id (@N - fm-spawn's stable
+# window handle), session:name or session:index (fm-spawn's recorded window=
+# meta, the daemon's firstmate:0 default), a bare window name, a
+# session-qualified pane id (session:%N), and a pane-qualified window
+# (session:window.pane, the window by exact name or index and the pane by
+# index or %id, matched as one composite line against the pane inventory so a
+# window name containing dots still matches whole). A window-id match also
+# requires <expected-label> as the window name when given, so a recycled id
+# after a server restart never reads as the recorded task. Any OTHER shape
+# (session ids, =exact prefixes, {marker} pane specifiers, offset tokens) is
+# not modeled here and falls back to fm_backend_tmux_probe_lenient rather
+# than reading gone. A downed server fails the listing - and the fallback
+# probe - and reads gone, exactly as before.
 fm_backend_tmux_target_exists() {  # <target> [expected-label]
-  local target=$1 expected=${2:-} ses='' win=''
+  local target=$1 expected=${2:-} ses='' win='' pane='' pane_fmt=''
   case "$target" in
     %*)
+      case "${target#%}" in
+        ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
+      esac
       tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF -- "$target"
       return
       ;;
-    *:*) ses=${target%%:*}; win=${target#*:} ;;
+    *:*)
+      ses=${target%%:*}; win=${target#*:}
+      if [ -z "$ses" ] || [ -z "$win" ]; then
+        fm_backend_tmux_probe_lenient "$target"; return
+      fi
+      case "$ses" in
+        '$'*|'='*) fm_backend_tmux_probe_lenient "$target"; return ;;
+      esac
+      ;;
     *) win=$target ;;
   esac
-  [ -n "$win" ] || return 1
   case "$win" in
     @*)
+      case "${win#@}" in
+        ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
+      esac
       if [ -n "$expected" ]; then
         tmux list-windows -a -F '#{window_id} #{window_name}' 2>/dev/null | grep -qxF -- "$win $expected"
       else
         tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$win"
       fi
+      return
+      ;;
+    %*)
+      case "${win#%}" in
+        ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
+      esac
+      tmux list-panes -a -F '#{session_name}:#{pane_id}' 2>/dev/null | grep -qxF -- "$ses:$win"
       return
       ;;
   esac
@@ -137,11 +176,44 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
     # An index-based window part (the daemon's firstmate:0 default) is not a
     # window NAME; retry against the index inventory before reading gone.
     case "$win" in
+      *[!0-9]*) ;;
+      *)
+        tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win"
+        return
+        ;;
+    esac
+    case "$win" in
+      *.*) ;;
+      *) return 1 ;;
+    esac
+    # Pane-qualified window part (session:window.pane): recognize a pane index
+    # or a %id after the LAST dot; anything else after it is an unmodeled pane
+    # specifier and falls back to the lenient probe.
+    pane=${win##*.}
+    case "$pane" in
+      %*)
+        case "${pane#%}" in
+          ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
+        esac
+        pane_fmt='#{pane_id}'
+        ;;
+      ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
+      *) pane_fmt='#{pane_index}' ;;
+    esac
+    tmux list-panes -a -F "#{session_name}:#{window_name}.$pane_fmt" 2>/dev/null | grep -qxF -- "$ses:$win" \
+      && return 0
+    case "${win%.*}" in
       *[!0-9]*) return 1 ;;
-      *) tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win" ;;
+      *) tmux list-panes -a -F "#{session_name}:#{window_index}.$pane_fmt" 2>/dev/null | grep -qxF -- "$ses:$win" ;;
     esac
   else
-    tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qxF -- "$win"
+    tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qxF -- "$win" && return 0
+    # A dotted bare name could equally be tmux's window.pane shorthand with no
+    # session part; that shape is not modeled strictly, so fail open.
+    case "$win" in
+      *.*) fm_backend_tmux_probe_lenient "$target" ;;
+      *) return 1 ;;
+    esac
   fi
 }
 

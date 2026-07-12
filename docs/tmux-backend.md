@@ -71,7 +71,10 @@ You should see a `fm-<id>` window for the task, live and updating as the crewmat
 `fm_backend_target_exists`'s tmux arm (`fm_backend_tmux_target_exists`, `bin/backends/tmux.sh`) answers "does the recorded endpoint still exist" by exact match against the server's own window/pane inventory, never by probing tmux's target resolution.
 That distinction matters because tmux's target resolution is lenient: `tmux display-message -p -t <target>` exits 0 for a killed window whose session survives (it silently resolves the target to another window) and even for a nonexistent session - it only fails when no server is running on the socket.
 The old probe used exactly that command, so the watcher's endpoint-gone corroboration read a dead task window as alive and silently absorbed the most common tmux death mode; only whole-server death was detected.
-The strict probe handles every target shape callers record - a pane id (`%N`, the away-mode daemon's `TMUX_PANE` supervisor target), a window id (`@N`, fm-spawn's stable window handle, with the expected `fm-<id>` label also required as the window name when given), and `session:name` or `session:index` - and a downed server still fails the listing and reads gone.
+The strict probe recognizes these target shapes and matches each exactly against the inventory: a pane id (`%N`, the away-mode daemon's `TMUX_PANE` supervisor target), a window id (`@N`, fm-spawn's stable window handle, with the expected `fm-<id>` label also required as the window name when given), `session:name` or `session:index` (fm-spawn's recorded `window=` meta, the daemon's `firstmate:0` default), a bare window name, a session-qualified pane id (`session:%N`), and a pane-qualified window (`session:window.pane`, the window by exact name or index and the pane by index or `%id`, matched as one composite inventory line so a window name containing dots still matches whole).
+A downed server still fails the listing and reads gone.
+Any target shape the strict parser does not recognize - session ids (`$N`), `=exact` prefixes, `{marker}` pane specifiers, an empty session or window part, a dotted bare name that could be tmux's sessionless `window.pane` shorthand - falls back to the old lenient resolution probe (`fm_backend_tmux_probe_lenient`, `tmux display-message -p -t <target> '#{pane_id}'`) instead of reading gone.
+That fallback is deliberately fail-open for the two entry points that pass arbitrary explicit user-supplied targets, `bin/fm-send.sh` explicit backend targets and the away-mode daemon's `FM_SUPERVISOR_TARGET` override, so an exotic-but-valid tmux target can never false-read as a dead endpoint, while task-shaped endpoints keep the strict death detection above.
 
 Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
 
@@ -97,6 +100,24 @@ rc=1
 
 The raw `display-message` probe still reports the killed window alive (`rc=0`), while the strict probe reads it gone in every target shape, keeps a live window alive in every shape, and reads a gone session and a downed server as gone.
 With this, the watcher's endpoint-gone wake fires within one poll for a killed tmux task window whose session survives, not just for whole-server death; `tests/fm-backend-tmux-smoke.test.sh` keeps both directions covered against a real server.
+
+Pane-qualified shapes and the lenient fallback verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on the same pristine private-socket layout (`probeses:fm-victim` window `@1`, pane `%1` at pane index 0, window index 1):
+
+```sh
+$ fm_backend_target_exists tmux probeses:fm-victim.0; echo rc=$?   # and probeses:fm-victim.%1, probeses:1.0, probeses:%1
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim.99; echo rc=$?  # recognized shape, strictly absent pane
+rc=1
+$ fm_backend_target_exists tmux '=probeses:fm-victim'; echo rc=$?  # unrecognized shape -> lenient resolution
+rc=0
+$ fm_backend_target_exists tmux 'probeses:fm-victim.{top-left}'; echo rc=$?   # unrecognized pane specifier -> lenient resolution
+rc=0
+$ tmux kill-window -t @1                                           # session survives
+$ fm_backend_target_exists tmux probeses:fm-victim.0; echo rc=$?   # and probeses:%1
+rc=1
+```
+
+A recognized pane-qualified target stays on strict inventory matching in both directions, and an unrecognized explicit shape resolves leniently instead of false-reading as gone; `tests/fm-backend-tmux-smoke.test.sh` keeps these shapes covered against a real server too.
 
 ## Agent liveness probe
 

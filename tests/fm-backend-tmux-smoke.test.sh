@@ -146,6 +146,35 @@ if fm_backend_target_exists tmux "$WID" "fm-some-other-label"; then
 fi
 pass "real tmux: fm_backend_target_exists reads a live window alive in every recorded target shape"
 
+# --- strict existence probe, pane-qualified and session-qualified shapes -------
+# Regression for the option-C shape extension (docs/tmux-backend.md "Strict
+# window-existence probe"): explicit user-supplied targets like
+# `session:window.pane` (fm-send explicit targets, FM_SUPERVISOR_TARGET
+# overrides) must read alive strictly while present, and a shape the strict
+# parser does not model must fall back to the lenient resolution probe rather
+# than reading gone.
+
+PANE_IDX=$(tmux display-message -p -t "$WID" '#{pane_index}') || fail "could not read the task window's pane index"
+WIN_IDX=$(tmux display-message -p -t "$WID" '#{window_index}') || fail "could not read the task window's index"
+fm_backend_target_exists tmux "$SESSION:$WINDOW.$PANE_IDX" \
+  || fail "strict probe: live session:window.pane-index target read as gone"
+fm_backend_target_exists tmux "$SESSION:$WINDOW.$PANE_ID" \
+  || fail "strict probe: live session:window.pane-id target read as gone"
+fm_backend_target_exists tmux "$SESSION:$WIN_IDX.$PANE_IDX" \
+  || fail "strict probe: live session:window-index.pane-index target read as gone"
+fm_backend_target_exists tmux "$SESSION:$PANE_ID" \
+  || fail "strict probe: live session-qualified pane-id target read as gone"
+if fm_backend_target_exists tmux "$SESSION:$WINDOW.99"; then
+  fail "strict probe: a nonexistent pane index on a live window must read gone"
+fi
+pass "real tmux: fm_backend_target_exists reads pane-qualified and session-qualified pane targets alive strictly"
+
+fm_backend_target_exists tmux "=$SESSION:$WINDOW" \
+  || fail "lenient fallback: an unrecognized =exact-prefixed target read as gone while resolvable"
+fm_backend_target_exists tmux "$SESSION:$WINDOW.{top-left}" \
+  || fail "lenient fallback: an unrecognized {marker} pane specifier read as gone while resolvable"
+pass "real tmux: unrecognized explicit target shapes fall back to the lenient resolution probe instead of reading gone"
+
 # --- kill ---------------------------------------------------------------------
 
 fm_backend_tmux_kill "$TARGET"
@@ -175,6 +204,12 @@ if fm_backend_target_exists tmux "$PANE_ID"; then
 fi
 if fm_backend_target_exists tmux "no-such-session:$WINDOW" "$WINDOW"; then
   fail "strict probe: a nonexistent session read as alive"
+fi
+if fm_backend_target_exists tmux "$SESSION:$WINDOW.$PANE_IDX"; then
+  fail "strict probe: killed window (session surviving) read as alive via session:window.pane"
+fi
+if fm_backend_target_exists tmux "$SESSION:$PANE_ID"; then
+  fail "strict probe: killed window (session surviving) read as alive via session-qualified pane id"
 fi
 pass "real tmux: fm_backend_target_exists reads a killed window as gone while its session survives"
 
