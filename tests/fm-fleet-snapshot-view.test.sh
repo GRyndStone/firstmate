@@ -29,6 +29,16 @@ for arg in "$@"; do
   prev=$arg
 done
 case "${1:-}" in
+  list-windows)
+    # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
+    # probe"): every recorded window is live in this suite; deadness is
+    # expressed through agent_alive (a zsh pane_current_command), not a gone
+    # endpoint.
+    for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
+      [ -e "$m" ] || continue
+      sed -n 's/^window=//p' "$m"
+    done
+    ;;
   display-message)
     case "$*" in
       *pane_current_command*)

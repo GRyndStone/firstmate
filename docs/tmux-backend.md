@@ -66,9 +66,41 @@ tmux list-windows -t <session-name>
 Use the current tmux session name for the run-inside-tmux path, or `firstmate` for the detached outside-tmux path.
 You should see a `fm-<id>` window for the task, live and updating as the crewmate works.
 
+## Strict window-existence probe
+
+`fm_backend_target_exists`'s tmux arm (`fm_backend_tmux_target_exists`, `bin/backends/tmux.sh`) answers "does the recorded endpoint still exist" by exact match against the server's own window/pane inventory, never by probing tmux's target resolution.
+That distinction matters because tmux's target resolution is lenient: `tmux display-message -p -t <target>` exits 0 for a killed window whose session survives (it silently resolves the target to another window) and even for a nonexistent session - it only fails when no server is running on the socket.
+The old probe used exactly that command, so the watcher's endpoint-gone corroboration read a dead task window as alive and silently absorbed the most common tmux death mode; only whole-server death was detected.
+The strict probe handles every target shape callers record - a pane id (`%N`, the away-mode daemon's `TMUX_PANE` supervisor target), a window id (`@N`, fm-spawn's stable window handle, with the expected `fm-<id>` label also required as the window name when given), and `session:name` or `session:index` - and a downed server still fails the listing and reads gone.
+
+Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
+
+```sh
+$ tmux new-session -d -s probeses
+$ tmux new-window -dP -F '#{window_id}' -t probeses: -n fm-victim   # -> @1, pane %1
+$ tmux display-message -p -t probeses:fm-victim '#{pane_id}'; echo rc=$?
+%1
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?   # and @1, %1, probeses:1
+rc=0
+$ tmux kill-window -t @1                                            # session survives
+$ tmux display-message -p -t probeses:fm-victim '#{pane_id}' >/dev/null 2>&1; echo rc=$?
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?   # likewise @1 and %1
+rc=1
+$ fm_backend_target_exists tmux noses:fm-victim; echo rc=$?
+rc=1
+$ tmux kill-server
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?
+rc=1
+```
+
+The raw `display-message` probe still reports the killed window alive (`rc=0`), while the strict probe reads it gone in every target shape, keeps a live window alive in every shape, and reads a gone session and a downed server as gone.
+With this, the watcher's endpoint-gone wake fires within one poll for a killed tmux task window whose session survives, not just for whole-server death; `tests/fm-backend-tmux-smoke.test.sh` keeps both directions covered against a real server.
+
 ## Agent liveness probe
 
-`fm_backend_target_exists` (`bin/fm-backend.sh`) only checks that a window's pane still exists.
+`fm_backend_target_exists` (`bin/fm-backend.sh`) only checks that a window's pane still exists, strictly per the section above.
 A secondmate agent that exits leaves its pane alive as a bare idle shell, which passes that check as "alive" - the gap `bin/fm-bootstrap.sh`'s session-start secondmate-liveness sweep exists to close (evidence 2026-07-07: every secondmate in one fleet was found sitting at a dead `zsh` shell, invisible to that check).
 
 `fm_backend_tmux_agent_alive` (`bin/backends/tmux.sh`) answers a deeper question: is a real harness-agent *process* running in the pane right now, not just whether the pane exists?

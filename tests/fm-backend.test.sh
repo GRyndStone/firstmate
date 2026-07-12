@@ -613,7 +613,7 @@ case "${1:-}" in
     for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  list-windows) printf 'sess:win\n'; exit 0 ;;
 esac
 exit 0
 SH
@@ -630,10 +630,16 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
     "$bin/bin/fm-send.sh" "$@" >/dev/null 2>&1
 }
 
+# The explicit-target liveness preflight differs by design between old and
+# new: the old bin probed tmux's lenient target resolution (display-message),
+# the new one matches the strict window inventory (docs/tmux-backend.md
+# "Strict window-existence probe"). Strip both shapes so the remaining send
+# command logs still diff byte-for-byte.
 strip_send_preflight() {  # <log>
-  local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
-  awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
+  local preflight_old preflight_new
+  preflight_old=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
+  preflight_new=$'tmux\x1flist-windows\x1f-a\x1f-F\x1f#{session_name}:#{window_name}'
+  awk -v a="$preflight_old" -v b="$preflight_new" '$0 != a && $0 != b { print }' "$1"
 }
 
 test_send_conformance_old_vs_new() {
@@ -650,7 +656,7 @@ test_send_conformance_old_vs_new() {
   run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" --key Escape
   rc_new=$?
   expect_code "$rc_old" "$rc_new" "fm-send --key: old vs new exit code"
-  assert_contains "$(cat "$log_new")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
+  assert_contains "$(cat "$log_new")" $'\x1f''list-windows'$'\x1f''-a'$'\x1f''-F'$'\x1f''#{session_name}:#{window_name}' \
     "fm-send --key did not verify the explicit tmux target before sending"
   strip_send_preflight "$log_old" > "$filtered_old"
   strip_send_preflight "$log_new" > "$filtered_new"

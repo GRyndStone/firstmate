@@ -659,7 +659,9 @@ test_secondmate_unpause_clears_pause_tracking() {
   : > "$state/.stale-$key"
   : > "$state/.stale-since-$key"
   : > "$state/.wedge-escalations-$key"
-  watch_bg "$state" "$fakebin" "$out"
+  # The resumed secondmate is alive: its window must be in the strict-probe
+  # inventory, or the per-poll endpoint-gone check rightfully surfaces it.
+  watch_bg "$state" "$fakebin" "$out" env FM_FAKE_TMUX_WINDOW="$window"
   pid=$!
   wait_live "$pid" 20 || fail "watcher exited while reconciling a resumed secondmate: $(cat "$out")"
   [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "resumed secondmate retained the pause marker"; }

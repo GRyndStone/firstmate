@@ -48,7 +48,7 @@ TARGET="$SESSION:$WINDOW"
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \
   || fail "real tmux: new-session failed"
-fm_backend_tmux_create_task "$SESSION" "$WINDOW" "$HOME" \
+WID=$(fm_backend_tmux_create_task "$SESSION" "$WINDOW" "$HOME") \
   || fail "fm_backend_tmux_create_task failed to create the task window"
 tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -qx "$WINDOW" \
   || fail "created window is not visible in the real session"
@@ -127,6 +127,25 @@ if fm_backend_tmux_resolve_bare_selector "no-such-window-xyz" 2>/dev/null; then
 fi
 pass "real tmux: fm_backend_tmux_resolve_bare_selector fails for a window that does not exist"
 
+# --- strict existence probe, live window --------------------------------------
+# Regression for the endpoint-gone corroboration (docs/tmux-backend.md "Strict
+# window-existence probe"): a legitimately-alive window must read alive in every
+# target shape callers record, so recovery digests never misread live crews.
+
+PANE_ID=$(tmux list-panes -t "$WID" -F '#{pane_id}') || fail "could not read the task window's pane id"
+fm_backend_target_exists tmux "$TARGET" "$WINDOW" \
+  || fail "strict probe: live session:name target with label read as gone"
+fm_backend_target_exists tmux "$TARGET" \
+  || fail "strict probe: live session:name target without label read as gone"
+fm_backend_target_exists tmux "$WID" "$WINDOW" \
+  || fail "strict probe: live window-id target with label read as gone"
+fm_backend_target_exists tmux "$PANE_ID" \
+  || fail "strict probe: live pane-id target read as gone"
+if fm_backend_target_exists tmux "$WID" "fm-some-other-label"; then
+  fail "strict probe: a live window id must not satisfy a mismatched expected label"
+fi
+pass "real tmux: fm_backend_target_exists reads a live window alive in every recorded target shape"
+
 # --- kill ---------------------------------------------------------------------
 
 fm_backend_tmux_kill "$TARGET"
@@ -136,6 +155,36 @@ fi
 # Best-effort contract: killing an already-gone window must not error.
 fm_backend_tmux_kill "$TARGET" || fail "fm_backend_tmux_kill on an already-dead target must stay best-effort (never fail)"
 pass "real tmux: fm_backend_tmux_kill removes the window and is idempotent/best-effort"
+
+# --- strict existence probe, killed window with a SURVIVING session ------------
+# THE incident-class regression: `tmux display-message -p -t <gone>` exits 0 by
+# silently resolving to another window (tmux 3.7b), so a resolution-based probe
+# reads the dead task window as alive and the watcher's endpoint-gone wake never
+# fires. The strict inventory match must read it gone while the session lives.
+
+tmux has-session -t "$SESSION" 2>/dev/null \
+  || fail "precondition: the session must survive the window kill for this regression"
+if fm_backend_target_exists tmux "$TARGET" "$WINDOW"; then
+  fail "strict probe: killed window (session surviving) read as alive via session:name"
+fi
+if fm_backend_target_exists tmux "$WID" "$WINDOW"; then
+  fail "strict probe: killed window (session surviving) read as alive via window id"
+fi
+if fm_backend_target_exists tmux "$PANE_ID"; then
+  fail "strict probe: killed window (session surviving) read as alive via pane id"
+fi
+if fm_backend_target_exists tmux "no-such-session:$WINDOW" "$WINDOW"; then
+  fail "strict probe: a nonexistent session read as alive"
+fi
+pass "real tmux: fm_backend_target_exists reads a killed window as gone while its session survives"
+
+# --- strict existence probe, whole server down ---------------------------------
+
+tmux kill-server >/dev/null 2>&1 || true
+if fm_backend_target_exists tmux "$TARGET" "$WINDOW"; then
+  fail "strict probe: a downed server read as alive"
+fi
+pass "real tmux: fm_backend_target_exists reads a downed server as gone"
 
 cleanup_all
 trap - EXIT

@@ -94,6 +94,57 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
   printf '%s\n' "$wid"
 }
 
+# fm_backend_tmux_target_exists: strict existence probe backing
+# fm_backend_target_exists's tmux arm. tmux's own target resolution is
+# LENIENT: `tmux display-message -p -t <target>` exits 0 for a killed window
+# whose session survives (it silently resolves the target to another window)
+# and even for a nonexistent session - it only fails when no server is
+# running on the socket (verified on tmux 3.7b; docs/tmux-backend.md "Strict
+# window-existence probe"). So existence is an exact match against the
+# server's own inventory - the same list-then-match shape as
+# fm_backend_tmux_create_task's duplicate check - never a target-resolution
+# probe. Target shapes callers record: a pane id (%N - the away-mode daemon's
+# TMUX_PANE supervisor target), a window id (@N - fm-spawn's stable window
+# handle), and session:name or session:index (fm-spawn's recorded window=
+# meta, the daemon's firstmate:0 default). A window-id match also requires
+# <expected-label> as the window name when given, so a recycled id after a
+# server restart never reads as the recorded task. A downed server fails the
+# listing and reads gone, exactly as before.
+fm_backend_tmux_target_exists() {  # <target> [expected-label]
+  local target=$1 expected=${2:-} ses='' win=''
+  case "$target" in
+    %*)
+      tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF -- "$target"
+      return
+      ;;
+    *:*) ses=${target%%:*}; win=${target#*:} ;;
+    *) win=$target ;;
+  esac
+  [ -n "$win" ] || return 1
+  case "$win" in
+    @*)
+      if [ -n "$expected" ]; then
+        tmux list-windows -a -F '#{window_id} #{window_name}' 2>/dev/null | grep -qxF -- "$win $expected"
+      else
+        tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$win"
+      fi
+      return
+      ;;
+  esac
+  if [ -n "$ses" ]; then
+    tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep -qxF -- "$ses:$win" \
+      && return 0
+    # An index-based window part (the daemon's firstmate:0 default) is not a
+    # window NAME; retry against the index inventory before reading gone.
+    case "$win" in
+      *[!0-9]*) return 1 ;;
+      *) tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win" ;;
+    esac
+  else
+    tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qxF -- "$win"
+  fi
+}
+
 # fm_backend_tmux_current_path: the live pane's current working directory, or
 # empty on any tmux error. Mirrors fm-spawn.sh's worktree-discovery poll:
 # `tmux display-message -p -t "$T" '#{pane_current_path}'`.
