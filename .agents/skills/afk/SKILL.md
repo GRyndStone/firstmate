@@ -129,6 +129,8 @@ Classify each wake this way:
   -> self-handle. Captain-relevant verb -> escalate.
 - `signal` or `stale` for a declared `paused:` external wait -> self-handle and track the pause rather than a wedge.
   If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one awaiting-external recheck and resets the pause window.
+- `stale` whose reason carries an `endpoint-gone` or `agent-dead` death verdict -> escalate directly.
+  The watcher confirmed the crew is dead, not idle (`docs/architecture.md` "Event-driven supervision"), so the verdict is never re-absorbed as a declared pause or aged as a transient wedge, whatever the status log says.
 - `check` -> always escalate. Check scripts print only when firstmate should wake.
 - `stale` with a terminal status -> escalate. Non-terminal stale is transient:
   record a marker and self-handle. If the pane is still idle past

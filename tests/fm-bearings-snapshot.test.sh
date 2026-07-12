@@ -28,6 +28,15 @@ SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
+  # probe"): recorded windows are live except dead-marked ones, which the
+  # inventory omits exactly like a killed real window.
+  list-windows)
+    for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
+      [ -e "$m" ] || continue
+      sed -n 's/^window=//p' "$m"
+    done | grep -v 'dead-'
+    ;;
   display-message) case "$*" in *dead-*) exit 1 ;; *) printf '%%1\n' ;; esac ;;
   capture-pane) printf 'all quiet\n> \n' ;;
 esac

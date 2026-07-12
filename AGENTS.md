@@ -97,6 +97,7 @@ state/               volatile runtime signals; gitignored
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
+  <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -104,7 +105,7 @@ state/               volatile runtime signals; gitignored
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
-  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
+  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .endpoint-gone-* .agent-dead-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
@@ -586,6 +587,7 @@ On wake, in order of cheapness:
    A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
 3. `stale:` the crewmate stopped without reporting; peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
+   If the stale reason includes `endpoint-gone` or `agent-dead`, the crew's endpoint or agent process is confirmed dead, not merely quiet - load `stuck-crewmate-recovery` directly instead of treating it as a routine stall (`docs/architecture.md` "Event-driven supervision" owns the detection rules).
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
 5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
@@ -599,6 +601,7 @@ Each task's backend live-task inventory is the ground truth: tmux when `backend=
 For `kind=secondmate`, an idle pane is healthy.
 A secondmate may be sitting on its own watcher with no visible pane changes, so parent supervision uses status writes plus heartbeat review, not pane-staleness.
 `fm-watch.sh` therefore skips stale-pane wakes for windows whose meta records `kind=secondmate`.
+A secondmate endpoint that no longer exists is death, not idleness, and still surfaces an `endpoint-gone` stale wake (`docs/architecture.md` "Event-driven supervision").
 This exception is narrow: ordinary crewmates still trip stale detection when their pane stops changing without a busy signature.
 
 **Watcher liveness is guarded, not just disciplined.**

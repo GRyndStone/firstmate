@@ -4,6 +4,10 @@
 # clear volatile state, refresh/prune the project's clone for PR-based ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
+# Touches a state/<task-id>.tearing-down tombstone before the endpoint-affecting
+# cleanup and removes it with the task's other state files, so the watcher absorbs
+# the teardown's own gone endpoint while the tombstone is fresh
+# (FM_TEARDOWN_TOMBSTONE_SECS) instead of waking on it as a crew death.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
@@ -877,6 +881,9 @@ cleanup_firstmate_home_children() {
       fi
     fi
     if [ -n "$child_t" ]; then
+      # Tombstone for the child home's own watcher, same contract as the main
+      # task path: a mid-teardown gone endpoint is teardown, not a crew death.
+      touch "$sub_state/$child_id.tearing-down"
       if [ "$child_backend" = zellij ]; then
         # Zellij titles are scoped by the owning home tag, so forced secondmate
         # cleanup must verify child tabs as that child home, not the parent.
@@ -916,7 +923,7 @@ cleanup_firstmate_home_children() {
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
-    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
+    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down"
   done
 }
 
@@ -985,6 +992,15 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# Tombstone for the watcher: everything from here to the state-file removal can
+# take the task's endpoint down (the treehouse return kills the crew's
+# processes, then fm_backend_kill closes the window), and a gone endpoint whose
+# meta still exists must read as teardown-in-progress, not a crew death
+# (fm-watch.sh handle_gone_endpoint). Removed with the other state files below;
+# the watcher's absorb is age-bounded, so a crashed teardown cannot suppress a
+# real death past the bound.
+touch "$STATE/$ID.tearing-down"
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -1038,7 +1054,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

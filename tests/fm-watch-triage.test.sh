@@ -659,7 +659,9 @@ test_secondmate_unpause_clears_pause_tracking() {
   : > "$state/.stale-$key"
   : > "$state/.stale-since-$key"
   : > "$state/.wedge-escalations-$key"
-  watch_bg "$state" "$fakebin" "$out"
+  # The resumed secondmate is alive: its window must be in the strict-probe
+  # inventory, or the per-poll endpoint-gone check rightfully surfaces it.
+  watch_bg "$state" "$fakebin" "$out" env FM_FAKE_TMUX_WINDOW="$window"
   pid=$!
   wait_live "$pid" 20 || fail "watcher exited while reconciling a resumed secondmate: $(cat "$out")"
   [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "resumed secondmate retained the pause marker"; }
@@ -1096,6 +1098,386 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+# --- dead crews are never absorbed into a declared pause ----------------------
+# Regression for the 2026-07-12 gsd-ideal-state incident: a crewmate died
+# silently while its status log's last line was a legitimate `paused:` declared
+# wait. Its pane ceased to exist, so fm_backend_capture failed and the stale
+# loop silently `continue`d past every classification - including the pause
+# re-surface - for ~5 hours. A missing endpoint is death, not quiet: it must
+# surface within one poll with an unmistakable endpoint-gone reason, and a
+# paused crew whose endpoint survives but whose agent process is confidently
+# dead must surface on the bounded recheck cadence. docs/architecture.md
+# ("Event-driven supervision") owns the classification rules.
+
+test_paused_crew_gone_endpoint_surfaced_immediately() {
+  local dir state fakebin out drain_out window key sig pid
+  dir=$(make_case paused-gone-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  window="test:fm-gone"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/gone.meta"
+  # The incident shape: the last status line is a legitimate declared pause.
+  printf 'paused: supervising - monitor armed\n' > "$state/gone.status"
+  sig=$(seen_sig "$state/gone.status"); printf '%s' "$sig" > "$state/.seen-gone_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # Even with every absorb cadence effectively infinite, death surfaces at once.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a paused crew whose endpoint is gone"
+  grep -F "stale: $window endpoint-gone" "$out" >/dev/null || fail "gone endpoint did not carry the endpoint-gone reason: $(cat "$out")"
+  [ -e "$state/.endpoint-gone-$key" ] || fail "endpoint-gone surfaced marker was not recorded"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the endpoint-gone wake failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "endpoint-gone" >/dev/null || fail "endpoint-gone wake was not queued"
+
+  # A second watcher over the same still-gone endpoint absorbs via the marker:
+  # one wake per disappearance, not one per poll.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 \
+    FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "an already-surfaced gone endpoint re-woke the supervisor: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an already-surfaced gone endpoint re-enqueued a wake"; }
+  reap "$pid"
+  pass "a paused crew whose endpoint is gone surfaces an endpoint-gone wake within one poll, once per disappearance"
+}
+
+test_paused_crew_alive_quiet_endpoint_absorbed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case paused-alive-quiet); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-held-alive"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/held-alive.meta"
+  printf 'paused: holding for the upstream release\n' > "$state/held-alive.status"
+  sig=$(seen_sig "$state/held-alive.status"); printf '%s' "$sig" > "$state/.seen-held-alive_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, holding for upstream")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · holding for the upstream release'
+  # Endpoint alive (capture works), agent alive (verified harness binary in the
+  # pane): the declared pause absorbs exactly as before this change.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced a quiet-but-alive declared pause: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "quiet-but-alive pause enqueued a wake"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "quiet-but-alive pause did not record its pause flag"; }
+  [ ! -e "$state/.agent-dead-$key" ] || { reap "$pid"; fail "an alive agent was marked agent-dead"; }
+  [ ! -e "$state/.endpoint-gone-$key" ] || { reap "$pid"; fail "an alive endpoint was marked endpoint-gone"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a quiet-but-alive declared pause keeps absorbing exactly as before (no new wake noise)"
+}
+
+test_paused_crew_confident_dead_agent_surfaced() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case paused-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-dead-agent"
+  printf 'bare shell prompt after the agent exited' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-agent.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/dead-agent.status"
+  sig=$(seen_sig "$state/dead-agent.status"); printf '%s' "$sig" > "$state/.seen-dead-agent_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "bare shell prompt after the agent exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
+
+  # Phase A: the endpoint exists but its foreground command is a bare shell -
+  # fm_backend_agent_alive's CONFIDENT dead verdict. Surfaces despite the pause.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a paused crew whose agent process is confidently dead"
+  grep -F "stale: $window agent-dead" "$out" >/dev/null || fail "dead agent did not carry the agent-dead reason: $(cat "$out")"
+  [ -e "$state/.agent-dead-$key" ] || fail "agent-dead surfaced marker was not recorded"
+  [ -e "$state/.paused-rechecked-$key" ] || fail "agent-dead surface did not stamp the bounded recheck gate"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the agent-dead wake failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "agent-dead" >/dev/null || fail "agent-dead wake was not queued"
+
+  # Phase B: the same still-dead agent absorbs (marker + fresh recheck stamp):
+  # one wake per death, and no per-poll re-probing.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "an already-surfaced dead agent re-woke the supervisor: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an already-surfaced dead agent re-enqueued a wake"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a paused crew whose agent process is confidently dead surfaces an agent-dead wake, once per death"
+}
+
+test_paused_crew_ambiguous_agent_liveness_absorbed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case paused-ambiguous-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-ambiguous"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/ambiguous.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/ambiguous.status"
+  sig=$(seen_sig "$state/ambiguous.status"); printf '%s' "$sig" > "$state/.seen-ambiguous_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, holding for upstream")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
+  # A bare "node" foreground command is fm_backend_agent_alive's documented
+  # AMBIGUOUS case (pi execs into a generic node process): unknown must never
+  # count as dead, so the declared pause keeps absorbing.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=node \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced a paused crew on an ambiguous liveness read: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an ambiguous liveness read enqueued a wake"; }
+  [ ! -e "$state/.agent-dead-$key" ] || { reap "$pid"; fail "an ambiguous liveness read was marked agent-dead"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "the ambiguous-read pause was not absorbed as paused"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "an ambiguous or errored agent-liveness read never counts as dead (fail-closed, pause keeps absorbing)"
+}
+
+test_secondmate_gone_endpoint_surfaced() {
+  local dir state fakebin out drain_out window key sig pid
+  dir=$(make_case secondmate-gone-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  window="test:fm-2nd-gone"
+  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/2nd-gone.meta"
+  printf 'working: routine domain supervision\n' > "$state/2nd-gone.status"
+  sig=$(seen_sig "$state/2nd-gone.status"); printf '%s' "$sig" > "$state/.seen-2nd-gone_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # The idle-pane stale exemption protects a healthy secondmate; a MISSING
+  # endpoint is death and wakes the primary between session starts
+  # (docs/architecture.md "Event-driven supervision").
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 \
+    FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a secondmate whose endpoint is gone"
+  grep -F "stale: $window endpoint-gone" "$out" >/dev/null || fail "gone secondmate endpoint did not carry the endpoint-gone reason: $(cat "$out")"
+  [ -e "$state/.endpoint-gone-$key" ] || fail "secondmate endpoint-gone surfaced marker was not recorded"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the secondmate endpoint-gone wake failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "endpoint-gone" >/dev/null || fail "secondmate endpoint-gone wake was not queued"
+  pass "a gone secondmate endpoint wakes the primary between session starts (death, not the healthy idle pane)"
+}
+
+test_secondmate_dead_agent_not_probed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case secondmate-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-2nd-shell"
+  printf 'idle awaiting external' > "$capture_file"
+  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/2nd-shell.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/2nd-shell.status"
+  sig=$(seen_sig "$state/2nd-shell.status"); printf '%s' "$sig" > "$state/.seen-2nd-shell_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle awaiting external")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
+  # A bare-shell foreground command would read confidently dead for a crew, but
+  # secondmate agent-process liveness is owned by the session-start sweep: the
+  # watcher must not probe it, and the pause absorbs as before.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced a paused secondmate on the agent-process probe: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a paused secondmate's bare shell enqueued a wake"; }
+  [ ! -e "$state/.agent-dead-$key" ] || { reap "$pid"; fail "a secondmate was marked agent-dead (sweep owns that call)"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "the paused secondmate was not absorbed as paused"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "secondmate agent-process liveness stays owned by the session-start sweep (no watcher probe, no wake)"
+}
+
+test_gone_endpoint_without_meta_absorbed() {
+  local dir state fakebin
+  dir=$(make_case gone-no-meta); state="$dir/state"; fakebin="$dir/fakebin"
+  # The teardown race: the endpoint is killed moments before the task's meta is
+  # removed (bin/fm-teardown.sh). A window whose meta is already gone mid-cycle
+  # was torn down, not lost, so handle_gone_endpoint absorbs instead of waking.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1" && handle_gone_endpoint "test:fm-raced"' _ "$WATCH" \
+    || fail "handle_gone_endpoint errored for a torn-down window"
+  [ ! -s "$state/.wake-queue" ] || fail "a torn-down window's gone endpoint enqueued a wake"
+  pass "a gone endpoint whose meta is already removed (teardown race) is absorbed, not surfaced"
+}
+
+test_gone_endpoint_with_fresh_tombstone_absorbed() {
+  local dir state fakebin window key
+  dir=$(make_case gone-fresh-tombstone); state="$dir/state"; fakebin="$dir/fakebin"
+  # The other half of the teardown race: the endpoint is already killed but the
+  # meta is not yet removed. fm-teardown stamps state/<id>.tearing-down before
+  # its endpoint-affecting cleanup, so a fresh tombstone absorbs instead of
+  # firing a false death wake.
+  window="test:fm-tearing"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/tearing.meta"
+  touch "$state/tearing.tearing-down"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1" && handle_gone_endpoint "test:fm-tearing"' _ "$WATCH" \
+    || fail "handle_gone_endpoint errored for a tearing-down window"
+  [ ! -s "$state/.wake-queue" ] || fail "a tearing-down window's gone endpoint enqueued a wake"
+  [ ! -e "$state/.endpoint-gone-$key" ] || fail "a tearing-down window was marked endpoint-gone"
+  pass "a gone endpoint with a fresh teardown tombstone (meta still present) is absorbed, not surfaced"
+}
+
+test_gone_endpoint_with_stale_tombstone_surfaced() {
+  local dir state fakebin out window key
+  dir=$(make_case gone-stale-tombstone); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/handle.out"
+  # A tombstone past the freshness bound means a crashed teardown, and the
+  # suppression must lapse fail-closed: the marker-deduped endpoint-gone wake
+  # still fires so the original blind spot cannot re-open.
+  window="test:fm-crashed-teardown"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/crashed.meta"
+  touch "$state/crashed.tearing-down"
+  sleep 2
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_TEARDOWN_TOMBSTONE_SECS=1 FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1" && handle_gone_endpoint "test:fm-crashed-teardown"' _ "$WATCH" > "$out" \
+    || fail "handle_gone_endpoint errored for a stale tombstone"
+  grep -F "stale: $window endpoint-gone" "$out" >/dev/null \
+    || fail "a stale tombstone's gone endpoint did not wake with the endpoint-gone reason: $(cat "$out")"
+  grep "$(printf '\tstale\t')" "$state/.wake-queue" | grep -F "endpoint-gone" >/dev/null \
+    || fail "a stale tombstone's gone endpoint was not queued as endpoint-gone"
+  [ -e "$state/.endpoint-gone-$key" ] || fail "a stale tombstone's surfaced marker was not recorded"
+  pass "a gone endpoint with a stale (past-bound) teardown tombstone surfaces the endpoint-gone wake"
+}
+
+test_dead_agent_marker_survives_pane_redraw() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case dead-agent-redraw); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-dead-redraw"
+  printf 'bare shell prompt after the agent exited' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-redraw.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/dead-redraw.status"
+  sig=$(seen_sig "$state/dead-redraw.status"); printf '%s' "$sig" > "$state/.seen-dead-redraw_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "bare shell prompt after the agent exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
+
+  # Surface the death once, then drain the queue.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface the initial agent-dead wake"
+  grep -F "stale: $window agent-dead" "$out" >/dev/null || fail "initial death did not carry the agent-dead reason: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || fail "drain after the initial agent-dead wake failed"
+
+  # The common death shape: the dead pane redraws cosmetically (a fresh prompt
+  # line changes the hash), then stabilizes. The n<2 bookkeeping window this
+  # re-enters must not wipe the once-per-death marker, so the SAME death stays
+  # absorbed instead of re-surfacing once per recheck window.
+  printf 'bare shell prompt after the agent exited\n$ ' > "$capture_file"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 50; then
+    reap "$pid"; fail "a cosmetic redraw of a dead pane re-woke the supervisor for the same death: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a cosmetic redraw re-enqueued the same death"; }
+  [ -e "$state/.agent-dead-$key" ] || { reap "$pid"; fail "the agent-dead marker was wiped by pane-hash bookkeeping alone"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "the once-per-death agent-dead marker survives a dead pane's cosmetic redraw (no duplicate wake)"
+}
+
+test_afk_paused_dead_agent_surfaced_once() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case afk-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-afk-dead"
+  printf 'bare shell prompt after the agent exited' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-dead.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/afk-dead.status"
+  sig=$(seen_sig "$state/afk-dead.status"); printf '%s' "$sig" > "$state/.seen-afk-dead_status"
+  date '+%s' > "$state/.afk"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "bare shell prompt after the agent exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Away mode must receive the explicit death verdict, not a plain stale the
+  # daemon may re-absorb as a declared pause.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "afk watcher did not surface a paused crew whose agent process is confidently dead"
+  grep -F "stale: $window agent-dead" "$out" >/dev/null || fail "afk death did not carry the agent-dead reason: $(cat "$out")"
+  [ -e "$state/.agent-dead-$key" ] || fail "afk agent-dead surfaced marker was not recorded"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the afk agent-dead wake failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "agent-dead" >/dev/null || fail "afk agent-dead wake was not queued"
+
+  # Marker-deduped: a second afk watcher over the same death stays quiet.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "an already-surfaced afk death re-woke the supervisor: $(cat "$out")"
+  fi
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an already-surfaced afk death re-enqueued a wake"; }
+  reap "$pid"
+  pass "away mode surfaces a paused crew's confident agent death once, with the explicit agent-dead verdict"
+}
+
+test_afk_paused_ambiguous_agent_hands_off_plain_stale() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case afk-ambiguous-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-afk-ambiguous"
+  printf 'idle, holding for upstream' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-ambiguous.meta"
+  printf 'paused: awaiting the upstream release\n' > "$state/afk-ambiguous.status"
+  sig=$(seen_sig "$state/afk-ambiguous.status"); printf '%s' "$sig" > "$state/.seen-afk-ambiguous_status"
+  date '+%s' > "$state/.afk"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, holding for upstream")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # An ambiguous liveness read stays fail-closed during away mode too: the
+  # daemon gets only the plain stale identity, never a death verdict.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=node \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "afk watcher did not hand off the paused stale for the daemon"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "afk ambiguous read did not hand off the plain stale identity: $(cat "$out")"
+  grep -F "agent-dead" "$out" >/dev/null && fail "an afk ambiguous liveness read was surfaced as a death"
+  [ ! -e "$state/.agent-dead-$key" ] || fail "an afk ambiguous liveness read was marked agent-dead"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the afk plain stale failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -Fv "agent-dead" | grep -F "stale: $window" >/dev/null \
+    || fail "afk ambiguous read was not queued as a plain stale"
+  pass "an afk ambiguous or errored agent-liveness read never counts as dead (plain stale handoff only)"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1116,6 +1498,18 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_paused_crew_gone_endpoint_surfaced_immediately
+test_paused_crew_alive_quiet_endpoint_absorbed
+test_paused_crew_confident_dead_agent_surfaced
+test_paused_crew_ambiguous_agent_liveness_absorbed
+test_secondmate_gone_endpoint_surfaced
+test_secondmate_dead_agent_not_probed
+test_gone_endpoint_without_meta_absorbed
+test_gone_endpoint_with_fresh_tombstone_absorbed
+test_gone_endpoint_with_stale_tombstone_surfaced
+test_dead_agent_marker_survives_pane_redraw
+test_afk_paused_dead_agent_surfaced_once
+test_afk_paused_ambiguous_agent_hands_off_plain_stale
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking

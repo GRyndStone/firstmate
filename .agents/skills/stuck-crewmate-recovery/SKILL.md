@@ -10,6 +10,9 @@ metadata:
 
 Use this playbook when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
+A stale wake whose reason carries `endpoint-gone` or `agent-dead` means the crew is confirmed dead, not merely quiet (`docs/architecture.md` "Event-driven supervision" owns the detection rules).
+For `endpoint-gone` there is no pane left to peek or steer, and for `agent-dead` the pane holds no live agent process, so skip the peek/steer/interrupt steps and go straight to step 4's relaunch, peeking an `agent-dead` pane first only to salvage a progress note.
+
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 

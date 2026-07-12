@@ -7,9 +7,11 @@
 # captain-relevant events plus bounded declared-pause rechecks. This is the
 # token-efficient replacement for the prior always-inject daemon: routine
 # signal/stale/heartbeat wakes cost zero firstmate context; only done/
-# needs-decision/blocked/failed/persistent-wedge/check-output events and a
-# declared-pause recheck reach the LLM, and even then as one pre-read digest per
-# batch window.
+# needs-decision/blocked/failed/persistent-wedge/check-output events, confirmed
+# crew deaths (a stale reason carrying the watcher's endpoint-gone/agent-dead
+# verdict, escalated directly rather than re-absorbed as a pause or aged as a
+# wedge), and a declared-pause recheck reach the LLM, and even then as one
+# pre-read digest per batch window.
 #
 # PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
 # injects ONLY when the durable away-mode flag state/.afk is present. Invoking
@@ -1213,7 +1215,7 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last
+  local reason=$1 state=$2 decision action distilled task last verdict
   local kind="" arg=""
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
@@ -1223,7 +1225,22 @@ handle_wake() {  # <reason> <state>
     signal:*) kind=signal; arg="${reason#signal: }"
               decision=$(classify_signal "$arg" "$state") ;;
     stale:*)  kind=stale; arg="${reason#stale: }"
-              decision=$(classify_stale "$arg" "$state") ;;
+              # A stale reason is "<window>" or "<window> <verdict...>": the
+              # watcher decorates wedge, pause-recheck, and death wakes past the
+              # window token, so only the FIRST token names the window - never
+              # feed the decorated remainder to the classifier as a target.
+              verdict="${arg#* }"
+              arg="${arg%% *}"
+              case "$verdict" in
+                endpoint-gone\ \(*|agent-dead\ \(*)
+                  # A confirmed death verdict (fm-watch.sh handle_gone_endpoint
+                  # / handle_dead_agent): the crew is dead, not idle, whatever
+                  # its status log says - escalate directly, never re-absorb it
+                  # as a declared pause or age it as a transient wedge.
+                  decision="escalate|${reason#stale: }" ;;
+                *)
+                  decision=$(classify_stale "$arg" "$state") ;;
+              esac ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
@@ -1390,8 +1407,11 @@ fm_super_main() {
   # --- validate supervisor target at startup (a missing target is a typo) ---
   # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
   # probe, so a herdr supervisor pane is checked via the herdr adapter; for
-  # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
-  # '#{pane_id}'` call as before.
+  # backend=tmux this is the strict inventory match against the server's own
+  # window/pane listing for recognized target shapes, with unrecognized
+  # explicit FM_SUPERVISOR_TARGET shapes falling back to the old lenient
+  # `tmux display-message` resolution probe so they can never false-read as
+  # gone (docs/tmux-backend.md "Strict window-existence probe").
   if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
     echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
     log "startup failed: target '$TARGET' not found (backend=$BACKEND)"

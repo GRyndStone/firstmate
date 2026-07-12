@@ -67,16 +67,35 @@ make_case() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+# FM_FAKE_TMUX_GONE=1 simulates a killed task window whose session survives:
+# capture-pane fails and list-windows omits the window, but display-message
+# still SUCCEEDS by silently resolving the target to another window - real
+# tmux 3.7b behavior (docs/tmux-backend.md "Strict window-existence probe"),
+# so an existence read that trusts display-message would misread the dead
+# window as alive.
 if [ "${1:-}" = "list-windows" ]; then
-  if [ -n "${FM_FAKE_TMUX_WINDOW:-}" ]; then
+  if [ "${FM_FAKE_TMUX_GONE:-}" != 1 ] && [ -n "${FM_FAKE_TMUX_WINDOW:-}" ]; then
     printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
   fi
   exit 0
 fi
 if [ "${1:-}" = "capture-pane" ]; then
+  [ "${FM_FAKE_TMUX_GONE:-}" = 1 ] && exit 1
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
   fi
+  exit 0
+fi
+if [ "${1:-}" = "display-message" ]; then
+  # pane_current_command feeds fm_backend_tmux_agent_alive; default to a
+  # verified harness binary (alive) so tests must opt in to a dead/ambiguous
+  # verdict via FM_FAKE_TMUX_CURRENT_COMMAND.
+  for _a in "$@"; do
+    case "$_a" in
+      *pane_current_command*) printf '%s\n' "${FM_FAKE_TMUX_CURRENT_COMMAND:-claude}"; exit 0 ;;
+    esac
+  done
+  printf 'fakepane\n'
   exit 0
 fi
 exit 1
@@ -131,7 +150,13 @@ case "${1:-}" in
     [ "$_print" = 1 ] && printf 'fakepane\n'
     exit 0 ;;
   list-windows)
-    [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+    # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
+    # probe"): list the daemon's default supervisor target and the case's
+    # window while the pane is alive; a dead pane vanishes from the listing.
+    if [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ]; then
+      printf 'firstmate:0\n'
+      [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+    fi
     exit 0 ;;
   capture-pane)
     # Honor a single-line band capture (-S N -E M, both non-negative) the way the
@@ -208,7 +233,9 @@ case "${1:-}" in
     [ "$print" = 1 ] && printf 'fakepane\n'
     exit 0 ;;
   capture-pane) cat "$COMPOSER" 2>/dev/null; exit 0 ;;
-  list-windows) exit 0 ;;
+  # Strict-probe inventory: the daemon's default supervisor target plus the
+  # explicit sess:win target the fm-send cases steer.
+  list-windows) printf 'firstmate:0\nsess:win\n'; exit 0 ;;
   send-keys)
     shift
     text=""; is_enter=0; lit=0

@@ -66,12 +66,109 @@ tmux list-windows -t <session-name>
 Use the current tmux session name for the run-inside-tmux path, or `firstmate` for the detached outside-tmux path.
 You should see a `fm-<id>` window for the task, live and updating as the crewmate works.
 
+## Strict window-existence probe
+
+`fm_backend_target_exists`'s tmux arm (`fm_backend_tmux_target_exists`, `bin/backends/tmux.sh`) answers "does the recorded endpoint still exist" by exact match against the server's own window/pane inventory, never by probing tmux's target resolution.
+That distinction matters because tmux's target resolution is lenient: `tmux display-message -p -t <target>` exits 0 for a killed window whose session survives (it silently resolves the target to another window) and even for a nonexistent session - it only fails when no server is running on the socket.
+The old probe used exactly that command, so the watcher's endpoint-gone corroboration read a dead task window as alive and silently absorbed the most common tmux death mode; only whole-server death was detected.
+The strict probe recognizes these target shapes and matches each exactly against the inventory: a pane id (`%N`, the away-mode daemon's `TMUX_PANE` supervisor target), a window id (`@N`, fm-spawn's stable window handle, with the expected `fm-<id>` label also required as the window name when given), `session:name` or `session:index` (fm-spawn's recorded `window=` meta, the daemon's `firstmate:0` default), a bare window name, a session-qualified pane id (`session:%N`), and a pane-qualified window (`session:window.pane`, the window by exact name or index and the pane by index or `%id`, matched as one composite inventory line so a window name containing dots still matches whole).
+A downed server still fails the listing and reads gone.
+Any target shape the strict parser does not recognize - session ids (`$N`), `=exact` prefixes, `{marker}` pane specifiers, an empty session or window part, a dotted bare name that could be tmux's sessionless `window.pane` shorthand - falls back to the old lenient resolution probe (`fm_backend_tmux_probe_lenient`, `tmux display-message -p -t <target> '#{pane_id}'`) instead of reading gone.
+That fallback is deliberately fail-open for the two entry points that pass arbitrary explicit user-supplied targets, `bin/fm-send.sh` explicit backend targets and the away-mode daemon's `FM_SUPERVISOR_TARGET` override, so an exotic-but-valid tmux target can never false-read as a dead endpoint, while task-shaped endpoints keep the strict death detection above.
+Two further rules close the same fail-open contract for shapes that parse as `session:name` but are not literal names.
+A window part containing a glob metacharacter (`*`, `?`, `[`) is fnmatch pattern syntax tmux resolves itself, never a literal `fm-<id>` task window name, so it routes straight to the lenient probe instead of inventory-matching the pattern text.
+And strictness on a literal `session:name` or `session:index` miss is label-aware: only the task-shaped call sites (the watcher's `handle_gone_endpoint`, the session-start and recovery digests, the fleet snapshot) pass the recorded `fm-<id>` as the probe's expected-label argument, and recorded `window=` metas are always literal, so a labeled miss reads gone while a label-less miss (an fm-send explicit target, an `FM_SUPERVISOR_TARGET` override) retries the lenient probe, because tmux also resolves unique name prefixes the inventory match cannot model.
+Pane-id (`%N`) and window-id (`@N`) shapes stay strict regardless of label - they are exact identifiers, never patterns or prefixes.
+The label-aware retry means a label-less `session:name` probe of a killed window whose session survives reads alive through the lenient resolution - the same deliberate fail-open direction the explicit-target entry points already chose, and the labeled task-shaped path is unaffected.
+
+Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
+
+```sh
+$ tmux new-session -d -s probeses
+$ tmux new-window -dP -F '#{window_id}' -t probeses: -n fm-victim   # -> @1, pane %1
+$ tmux display-message -p -t probeses:fm-victim '#{pane_id}'; echo rc=$?
+%1
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?   # and @1, %1, probeses:1
+rc=0
+$ tmux kill-window -t @1                                            # session survives
+$ tmux display-message -p -t probeses:fm-victim '#{pane_id}' >/dev/null 2>&1; echo rc=$?
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?   # likewise @1 and %1
+rc=1
+$ fm_backend_target_exists tmux noses:fm-victim; echo rc=$?
+rc=1
+$ tmux kill-server
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?
+rc=1
+```
+
+The raw `display-message` probe still reports the killed window alive (`rc=0`), while the strict probe reads it gone in every target shape, keeps a live window alive in every shape, and reads a gone session and a downed server as gone.
+With this, the watcher's endpoint-gone wake fires within one poll for a killed tmux task window whose session survives, not just for whole-server death; `tests/fm-backend-tmux-smoke.test.sh` keeps both directions covered against a real server.
+
+Pane-qualified shapes and the lenient fallback verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on the same pristine private-socket layout (`probeses:fm-victim` window `@1`, pane `%1` at pane index 0, window index 1):
+
+```sh
+$ fm_backend_target_exists tmux probeses:fm-victim.0; echo rc=$?   # and probeses:fm-victim.%1, probeses:1.0, probeses:%1
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victim.99; echo rc=$?  # recognized shape, strictly absent pane
+rc=1
+$ fm_backend_target_exists tmux '=probeses:fm-victim'; echo rc=$?  # unrecognized shape -> lenient resolution
+rc=0
+$ fm_backend_target_exists tmux 'probeses:fm-victim.{top-left}'; echo rc=$?   # unrecognized pane specifier -> lenient resolution
+rc=0
+$ tmux kill-window -t @1                                           # session survives
+$ fm_backend_target_exists tmux probeses:fm-victim.0; echo rc=$?   # and probeses:%1
+rc=1
+```
+
+A recognized pane-qualified target stays on strict inventory matching in both directions, and an unrecognized explicit shape resolves leniently instead of false-reading as gone; `tests/fm-backend-tmux-smoke.test.sh` keeps these shapes covered against a real server too.
+
+Glob routing and label-aware strictness verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on the same pristine private-socket layout (`probeses:fm-victim`, window `@1`):
+
+```sh
+$ fm_backend_target_exists tmux 'probeses:fm-victi*'; echo rc=$?          # glob window part -> lenient resolution
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victi; echo rc=$?             # label-less unique name prefix -> lenient retry
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victi fm-victim; echo rc=$?   # labeled strict miss -> confident gone
+rc=1
+$ tmux kill-window -t probeses:fm-victim                                  # session survives
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?  # labeled task shape: strict death detection intact
+rc=1
+$ fm_backend_target_exists tmux probeses:fm-victim; echo rc=$?            # label-less: deliberate fail-open via lenient resolution
+rc=0
+$ tmux kill-server
+$ fm_backend_target_exists tmux probeses:fm-victim; echo rc=$?            # downed server also fails the lenient fallback
+rc=1
+```
+
+A resolvable glob or prefix target never false-reads as gone from the explicit-target entry points, the labeled task-shaped miss stays a confident gone, and a downed server reads gone on both paths; `tests/fm-backend-tmux-smoke.test.sh` keeps all three rules covered against a real server.
+
+Unlike `display-message`, `tmux capture-pane` does NOT resolve a gone target leniently: it fails outright on a killed window whose session survives, so the watcher's capture-failure trigger for `handle_gone_endpoint` (`bin/fm-watch.sh`) genuinely fires for ordinary tmux ship/scout crews and the strict probe then corroborates the death.
+Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
+
+```sh
+$ tmux new-session -d -s probe -n keepwin
+$ tmux new-window -t probe -n taskwin
+$ tmux kill-window -t probe:taskwin                                  # session survives
+$ tmux capture-pane -p -t probe:taskwin -S -40; echo rc=$?
+can't find window: taskwin
+rc=1
+$ tmux display-message -p -t probe:taskwin '#{pane_id} #{window_name}'; echo rc=$?   # lenient, for contrast
+%0 keepwin
+rc=0
+```
+
+`tests/fm-backend-tmux-smoke.test.sh` pins this against a real server: after the kill-window step it asserts `fm_backend_tmux_capture` fails on the killed window, so a future tmux release quietly making capture-pane resolution lenient would surface as a smoke failure instead of silently re-opening the endpoint-gone blind spot.
+
 ## Agent liveness probe
 
-`fm_backend_target_exists` (`bin/fm-backend.sh`) only checks that a window's pane still exists.
+`fm_backend_target_exists` (`bin/fm-backend.sh`) only checks that a window's pane still exists, strictly per the section above.
 A secondmate agent that exits leaves its pane alive as a bare idle shell, which passes that check as "alive" - the gap `bin/fm-bootstrap.sh`'s session-start secondmate-liveness sweep exists to close (evidence 2026-07-07: every secondmate in one fleet was found sitting at a dead `zsh` shell, invisible to that check).
 
 `fm_backend_tmux_agent_alive` (`bin/backends/tmux.sh`) answers a deeper question: is a real harness-agent *process* running in the pane right now, not just whether the pane exists?
+The watcher's bounded paused-recheck death probe reuses the same classifier for paused crew endpoints, surfacing a confident `dead` verdict as an `agent-dead` stale wake (`docs/architecture.md` "Event-driven supervision" owns those rules).
 It reads tmux's own `#{pane_current_command}`, which reports the pane's live foreground process name - already resolved by tmux from the pty's controlling process group, not something this adapter derives itself.
 
 Agent liveness and composer safety are separate checks.
