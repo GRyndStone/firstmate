@@ -104,6 +104,7 @@ With this, the watcher's endpoint-gone wake fires within one poll for a killed t
 A secondmate agent that exits leaves its pane alive as a bare idle shell, which passes that check as "alive" - the gap `bin/fm-bootstrap.sh`'s session-start secondmate-liveness sweep exists to close (evidence 2026-07-07: every secondmate in one fleet was found sitting at a dead `zsh` shell, invisible to that check).
 
 `fm_backend_tmux_agent_alive` (`bin/backends/tmux.sh`) answers a deeper question: is a real harness-agent *process* running in the pane right now, not just whether the pane exists?
+The watcher's bounded paused-recheck death probe reuses the same classifier for paused crew endpoints, surfacing a confident `dead` verdict as an `agent-dead` stale wake (`docs/architecture.md` "Event-driven supervision" owns those rules).
 It reads tmux's own `#{pane_current_command}`, which reports the pane's live foreground process name - already resolved by tmux from the pty's controlling process group, not something this adapter derives itself.
 
 Agent liveness and composer safety are separate checks.

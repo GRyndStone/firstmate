@@ -617,9 +617,11 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # against the server's own window/pane inventory instead of probing tmux's
 # lenient target resolution, which reads a killed window as alive while its
 # session survives (fm_backend_tmux_target_exists, bin/backends/tmux.sh).
-# Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
-# primitive so callers that only need a fast alive/dead read (recovery
-# digests, the session-start fleet digest) do not re-derive it inline.
+# Same role as fm-crew-state.sh's pane_readable check (whose tmux arm keeps
+# the lenient read - its authoritative run-step path does not ride on it);
+# exists here as one shared primitive so callers that only need a fast
+# alive/dead read (recovery digests, the session-start fleet digest) do not
+# re-derive it inline.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
