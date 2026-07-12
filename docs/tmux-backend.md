@@ -75,6 +75,11 @@ The strict probe recognizes these target shapes and matches each exactly against
 A downed server still fails the listing and reads gone.
 Any target shape the strict parser does not recognize - session ids (`$N`), `=exact` prefixes, `{marker}` pane specifiers, an empty session or window part, a dotted bare name that could be tmux's sessionless `window.pane` shorthand - falls back to the old lenient resolution probe (`fm_backend_tmux_probe_lenient`, `tmux display-message -p -t <target> '#{pane_id}'`) instead of reading gone.
 That fallback is deliberately fail-open for the two entry points that pass arbitrary explicit user-supplied targets, `bin/fm-send.sh` explicit backend targets and the away-mode daemon's `FM_SUPERVISOR_TARGET` override, so an exotic-but-valid tmux target can never false-read as a dead endpoint, while task-shaped endpoints keep the strict death detection above.
+Two further rules close the same fail-open contract for shapes that parse as `session:name` but are not literal names.
+A window part containing a glob metacharacter (`*`, `?`, `[`) is fnmatch pattern syntax tmux resolves itself, never a literal `fm-<id>` task window name, so it routes straight to the lenient probe instead of inventory-matching the pattern text.
+And strictness on a literal `session:name` or `session:index` miss is label-aware: only the task-shaped call sites (the watcher's `handle_gone_endpoint`, the session-start and recovery digests, the fleet snapshot) pass the recorded `fm-<id>` as the probe's expected-label argument, and recorded `window=` metas are always literal, so a labeled miss reads gone while a label-less miss (an fm-send explicit target, an `FM_SUPERVISOR_TARGET` override) retries the lenient probe, because tmux also resolves unique name prefixes the inventory match cannot model.
+Pane-id (`%N`) and window-id (`@N`) shapes stay strict regardless of label - they are exact identifiers, never patterns or prefixes.
+The label-aware retry means a label-less `session:name` probe of a killed window whose session survives reads alive through the lenient resolution - the same deliberate fail-open direction the explicit-target entry points already chose, and the labeled task-shaped path is unaffected.
 
 Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:
 
@@ -118,6 +123,27 @@ rc=1
 ```
 
 A recognized pane-qualified target stays on strict inventory matching in both directions, and an unrecognized explicit shape resolves leniently instead of false-reading as gone; `tests/fm-backend-tmux-smoke.test.sh` keeps these shapes covered against a real server too.
+
+Glob routing and label-aware strictness verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on the same pristine private-socket layout (`probeses:fm-victim`, window `@1`):
+
+```sh
+$ fm_backend_target_exists tmux 'probeses:fm-victi*'; echo rc=$?          # glob window part -> lenient resolution
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victi; echo rc=$?             # label-less unique name prefix -> lenient retry
+rc=0
+$ fm_backend_target_exists tmux probeses:fm-victi fm-victim; echo rc=$?   # labeled strict miss -> confident gone
+rc=1
+$ tmux kill-window -t probeses:fm-victim                                  # session survives
+$ fm_backend_target_exists tmux probeses:fm-victim fm-victim; echo rc=$?  # labeled task shape: strict death detection intact
+rc=1
+$ fm_backend_target_exists tmux probeses:fm-victim; echo rc=$?            # label-less: deliberate fail-open via lenient resolution
+rc=0
+$ tmux kill-server
+$ fm_backend_target_exists tmux probeses:fm-victim; echo rc=$?            # downed server also fails the lenient fallback
+rc=1
+```
+
+A resolvable glob or prefix target never false-reads as gone from the explicit-target entry points, the labeled task-shaped miss stays a confident gone, and a downed server reads gone on both paths; `tests/fm-backend-tmux-smoke.test.sh` keeps all three rules covered against a real server.
 
 Unlike `display-message`, `tmux capture-pane` does NOT resolve a gone target leniently: it fails outright on a killed window whose session survives, so the watcher's capture-failure trigger for `handle_gone_endpoint` (`bin/fm-watch.sh`) genuinely fires for ordinary tmux ship/scout crews and the strict probe then corroborates the death.
 Verified empirically with real tmux 3.7b on macOS (Darwin 27.0.0), 2026-07-12, on a pristine private-socket server:

@@ -175,6 +175,24 @@ fm_backend_target_exists tmux "$SESSION:$WINDOW.{top-left}" \
   || fail "lenient fallback: an unrecognized {marker} pane specifier read as gone while resolvable"
 pass "real tmux: unrecognized explicit target shapes fall back to the lenient resolution probe instead of reading gone"
 
+# --- strict existence probe, glob shapes and label-aware strictness -----------
+# Regression for the option-B label-aware rule (docs/tmux-backend.md "Strict
+# window-existence probe"): a glob window part is pattern syntax, never a
+# literal fm-<id> task name, so it resolves leniently even though it parses as
+# session:name; a label-less literal session:name that strict-misses (tmux
+# also resolves unique name prefixes) retries leniently instead of
+# false-reading gone; a labeled strict miss stays a confident gone.
+
+WINDOW_PREFIX=${WINDOW%?}
+fm_backend_target_exists tmux "$SESSION:${WINDOW_PREFIX}*" \
+  || fail "glob routing: a resolvable session:name glob target read as gone instead of resolving leniently"
+fm_backend_target_exists tmux "$SESSION:$WINDOW_PREFIX" \
+  || fail "label-aware fallback: a label-less unique-name-prefix target read as gone while tmux resolves it"
+if fm_backend_target_exists tmux "$SESSION:$WINDOW_PREFIX" "$WINDOW"; then
+  fail "label-aware strictness: a labeled strict miss must stay gone, not retry leniently"
+fi
+pass "real tmux: glob window parts resolve leniently and label-less literal misses retry leniently while labeled misses stay gone"
+
 # --- kill ---------------------------------------------------------------------
 
 fm_backend_tmux_kill "$TARGET"
@@ -211,6 +229,8 @@ fi
 if fm_backend_target_exists tmux "$SESSION:$PANE_ID"; then
   fail "strict probe: killed window (session surviving) read as alive via session-qualified pane id"
 fi
+fm_backend_target_exists tmux "$TARGET" \
+  || fail "label-aware fallback: a label-less session:name miss must retry leniently (deliberate fail-open for explicit targets), not read gone"
 pass "real tmux: fm_backend_target_exists reads a killed window as gone while its session survives"
 
 # The watcher's endpoint-gone trigger for ordinary crews is a FAILED capture
@@ -228,6 +248,9 @@ pass "real tmux: fm_backend_tmux_capture fails on a killed window while its sess
 tmux kill-server >/dev/null 2>&1 || true
 if fm_backend_target_exists tmux "$TARGET" "$WINDOW"; then
   fail "strict probe: a downed server read as alive"
+fi
+if fm_backend_target_exists tmux "$TARGET"; then
+  fail "strict probe: a downed server read as alive via the label-less lenient fallback"
 fi
 pass "real tmux: fm_backend_target_exists reads a downed server as gone"
 

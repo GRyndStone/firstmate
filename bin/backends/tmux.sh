@@ -106,6 +106,21 @@ fm_backend_tmux_probe_lenient() {  # <target>
   tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1
 }
 
+# fm_backend_tmux_strict_miss: verdict for a literal-name window target the
+# strict inventory match missed. Task-shaped call sites (the watcher's
+# handle_gone_endpoint, the session-start and recovery digests, the fleet
+# snapshot) pass the recorded fm-<id> as <expected-label>, and recorded
+# window= metas are always literal, so a labeled miss is a confident gone. A
+# label-less miss comes from the explicit user-supplied entry points (an
+# fm-send explicit backend target, an FM_SUPERVISOR_TARGET daemon override),
+# where tmux also resolves unique name prefixes the inventory match cannot
+# model, so it falls back to the lenient resolution probe rather than
+# false-reading a resolvable target as gone.
+fm_backend_tmux_strict_miss() {  # <target> <expected-label>
+  [ -n "$2" ] && return 1
+  fm_backend_tmux_probe_lenient "$1"
+}
+
 # fm_backend_tmux_target_exists: strict existence probe backing
 # fm_backend_target_exists's tmux arm. tmux's own target resolution is
 # LENIENT: `tmux display-message -p -t <target>` exits 0 for a killed window
@@ -127,8 +142,17 @@ fm_backend_tmux_probe_lenient() {  # <target>
 # after a server restart never reads as the recorded task. Any OTHER shape
 # (session ids, =exact prefixes, {marker} pane specifiers, offset tokens) is
 # not modeled here and falls back to fm_backend_tmux_probe_lenient rather
-# than reading gone. A downed server fails the listing - and the fallback
-# probe - and reads gone, exactly as before.
+# than reading gone. Two further fail-open rules protect explicitly
+# user-supplied targets: a window part containing a glob metacharacter
+# (* ? [) is fnmatch pattern syntax, never a literal fm-<id> task window
+# name, and routes straight to the lenient probe; and a literal session:name
+# or session:index miss reads gone only when <expected-label> was passed
+# (the task-shaped call sites), while a label-less miss retries leniently so
+# a unique-name-prefix target never false-reads as gone
+# (fm_backend_tmux_strict_miss above). Pane-id and window-id shapes stay
+# strict regardless - they are exact identifiers, never patterns or
+# prefixes. A downed server fails the listing - and the fallback probe - and
+# reads gone, exactly as before.
 fm_backend_tmux_target_exists() {  # <target> [expected-label]
   local target=$1 expected=${2:-} ses='' win='' pane='' pane_fmt=''
   case "$target" in
@@ -169,6 +193,7 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
       tmux list-panes -a -F '#{session_name}:#{pane_id}' 2>/dev/null | grep -qxF -- "$ses:$win"
       return
       ;;
+    *[*?[]*) fm_backend_tmux_probe_lenient "$target"; return ;;
   esac
   if [ -n "$ses" ]; then
     tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep -qxF -- "$ses:$win" \
@@ -178,13 +203,15 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
     case "$win" in
       *[!0-9]*) ;;
       *)
-        tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win"
+        tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win" \
+          && return 0
+        fm_backend_tmux_strict_miss "$target" "$expected"
         return
         ;;
     esac
     case "$win" in
       *.*) ;;
-      *) return 1 ;;
+      *) fm_backend_tmux_strict_miss "$target" "$expected"; return ;;
     esac
     # Pane-qualified window part (session:window.pane): recognize a pane index
     # or a %id after the LAST dot; anything else after it is an unmodeled pane
