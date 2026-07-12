@@ -1320,6 +1320,48 @@ test_gone_endpoint_without_meta_absorbed() {
   pass "a gone endpoint whose meta is already removed (teardown race) is absorbed, not surfaced"
 }
 
+test_gone_endpoint_with_fresh_tombstone_absorbed() {
+  local dir state fakebin window key
+  dir=$(make_case gone-fresh-tombstone); state="$dir/state"; fakebin="$dir/fakebin"
+  # The other half of the teardown race: the endpoint is already killed but the
+  # meta is not yet removed. fm-teardown stamps state/<id>.tearing-down before
+  # its endpoint-affecting cleanup, so a fresh tombstone absorbs instead of
+  # firing a false death wake.
+  window="test:fm-tearing"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/tearing.meta"
+  touch "$state/tearing.tearing-down"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1" && handle_gone_endpoint "test:fm-tearing"' _ "$WATCH" \
+    || fail "handle_gone_endpoint errored for a tearing-down window"
+  [ ! -s "$state/.wake-queue" ] || fail "a tearing-down window's gone endpoint enqueued a wake"
+  [ ! -e "$state/.endpoint-gone-$key" ] || fail "a tearing-down window was marked endpoint-gone"
+  pass "a gone endpoint with a fresh teardown tombstone (meta still present) is absorbed, not surfaced"
+}
+
+test_gone_endpoint_with_stale_tombstone_surfaced() {
+  local dir state fakebin out window key
+  dir=$(make_case gone-stale-tombstone); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/handle.out"
+  # A tombstone past the freshness bound means a crashed teardown, and the
+  # suppression must lapse fail-closed: the marker-deduped endpoint-gone wake
+  # still fires so the original blind spot cannot re-open.
+  window="test:fm-crashed-teardown"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/crashed.meta"
+  touch "$state/crashed.tearing-down"
+  sleep 2
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_TEARDOWN_TOMBSTONE_SECS=1 FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1" && handle_gone_endpoint "test:fm-crashed-teardown"' _ "$WATCH" > "$out" \
+    || fail "handle_gone_endpoint errored for a stale tombstone"
+  grep -F "stale: $window endpoint-gone" "$out" >/dev/null \
+    || fail "a stale tombstone's gone endpoint did not wake with the endpoint-gone reason: $(cat "$out")"
+  grep "$(printf '\tstale\t')" "$state/.wake-queue" | grep -F "endpoint-gone" >/dev/null \
+    || fail "a stale tombstone's gone endpoint was not queued as endpoint-gone"
+  [ -e "$state/.endpoint-gone-$key" ] || fail "a stale tombstone's surfaced marker was not recorded"
+  pass "a gone endpoint with a stale (past-bound) teardown tombstone surfaces the endpoint-gone wake"
+}
+
 test_dead_agent_marker_survives_pane_redraw() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case dead-agent-redraw); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1463,6 +1505,8 @@ test_paused_crew_ambiguous_agent_liveness_absorbed
 test_secondmate_gone_endpoint_surfaced
 test_secondmate_dead_agent_not_probed
 test_gone_endpoint_without_meta_absorbed
+test_gone_endpoint_with_fresh_tombstone_absorbed
+test_gone_endpoint_with_stale_tombstone_surfaced
 test_dead_agent_marker_survives_pane_redraw
 test_afk_paused_dead_agent_surfaced_once
 test_afk_paused_ambiguous_agent_hands_off_plain_stale

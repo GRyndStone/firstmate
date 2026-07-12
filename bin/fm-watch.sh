@@ -139,6 +139,13 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
 # wedge threshold, but finite so a forgotten pause cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+# bin/fm-teardown.sh touches state/<id>.tearing-down just before killing a
+# task's endpoint and removes it with the task's other state files, so the
+# kill-to-meta-removal gap of a normal teardown reads as teardown, not death.
+# The absorb is age-bounded: past this many seconds the tombstone is stale (a
+# crashed teardown) and the gone endpoint surfaces normally - fail-closed back
+# to waking, never a permanent suppressor.
+TEARDOWN_TOMBSTONE_SECS=${FM_TEARDOWN_TOMBSTONE_SECS:-120}
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
@@ -363,7 +370,7 @@ clear_pause_tracking() {  # <window>
 # pause and regardless of afk. docs/architecture.md ("Event-driven supervision")
 # owns the classification rule.
 handle_gone_endpoint() {  # <window>
-  local w=$1 key marker reason
+  local w=$1 key marker reason meta tomb tomb_mtime tomb_age
   key=$(printf '%s' "$w" | tr ':/.' '___')
   marker="$STATE/.endpoint-gone-$key"
   if fm_backend_target_exists "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null; then
@@ -373,9 +380,24 @@ handle_gone_endpoint() {  # <window>
   # Teardown kills the endpoint moments before removing the task's meta
   # (bin/fm-teardown.sh); a window whose meta is already gone mid-cycle was
   # torn down, not lost.
-  if ! fm_backend_meta_for_window "$w" "$STATE" >/dev/null 2>&1; then
+  if ! meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null); then
     triage_log "absorbed endpoint-gone (no meta - torn down mid-cycle): $w"
     return 0
+  fi
+  # The other half of that race: the meta still exists, but teardown stamped
+  # its state/<id>.tearing-down tombstone just before the kill. Absorb only
+  # while the tombstone is fresh (TEARDOWN_TOMBSTONE_SECS); a stale or
+  # unreadable stamp means a crashed teardown, and the death surfaces normally.
+  tomb="${meta%.meta}.tearing-down"
+  if [ -e "$tomb" ]; then
+    tomb_mtime=$(stat_mtime "$tomb")
+    case "$tomb_mtime" in ''|*[!0-9]*) tomb_mtime=0 ;; esac
+    tomb_age=$(( $(date +%s) - tomb_mtime ))
+    if [ "$tomb_mtime" -gt 0 ] && [ "$tomb_age" -lt "$TEARDOWN_TOMBSTONE_SECS" ]; then
+      triage_log "absorbed endpoint-gone (teardown in progress, tombstone ${tomb_age}s old): $w"
+      return 0
+    fi
+    triage_log "ignoring stale teardown tombstone (${tomb_age}s old, bound ${TEARDOWN_TOMBSTONE_SECS}s): $w"
   fi
   if [ -e "$marker" ]; then
     triage_log "absorbed endpoint-gone (already surfaced): $w"
