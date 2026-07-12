@@ -30,7 +30,14 @@
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
-#                          resume. Unless afk is active.
+#                          resume. Unless afk is active. A stale reason carrying
+#                          "endpoint-gone" (the recorded endpoint no longer
+#                          exists) or "agent-dead" (the endpoint exists but the
+#                          agent process is confidently dead) means the crew
+#                          DIED: it is immediately actionable, never absorbed
+#                          into a declared pause, and surfaced once per death
+#                          even while afk is active. docs/architecture.md
+#                          ("Event-driven supervision") owns those rules.
 #   check: <script>: <out> per-task check output, always actionable
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
@@ -340,7 +347,90 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.agent-dead-$key"
+}
+
+# A recorded endpoint that no longer exists is DEATH, not quiet (the 2026-07-12
+# gsd-ideal-state incident: a crew died in a declared pause, its gone pane made
+# fm_backend_capture fail, and the old loop silently `continue`d past every
+# classification - including the pause re-surface - for hours). Called when a
+# crew capture fails, and per poll for non-paused secondmates (whose stale
+# detection is skipped). Corroborates the failure with the read-only existence
+# probe (fm_backend_target_exists, which never starts a server), so a transient
+# capture hiccup on a live endpoint is not misread as death. A confirmed-gone
+# endpoint surfaces ONCE per disappearance - the .endpoint-gone-<key> marker
+# dedupes until the endpoint reads alive again - regardless of any declared
+# pause and regardless of afk. docs/architecture.md ("Event-driven supervision")
+# owns the classification rule.
+handle_gone_endpoint() {  # <window>
+  local w=$1 key marker reason
+  key=$(printf '%s' "$w" | tr ':/.' '___')
+  marker="$STATE/.endpoint-gone-$key"
+  if fm_backend_target_exists "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null; then
+    rm -f "$marker"
+    return 0
+  fi
+  # Teardown kills the endpoint moments before removing the task's meta
+  # (bin/fm-teardown.sh); a window whose meta is already gone mid-cycle was
+  # torn down, not lost.
+  if ! fm_backend_meta_for_window "$w" "$STATE" >/dev/null 2>&1; then
+    triage_log "absorbed endpoint-gone (no meta - torn down mid-cycle): $w"
+    return 0
+  fi
+  if [ -e "$marker" ]; then
+    triage_log "absorbed endpoint-gone (already surfaced): $w"
+    return 0
+  fi
+  reason="stale: $w endpoint-gone (recorded backend endpoint no longer exists - the crew is dead, not quiet, whatever its last status says; recover it instead of resuming routine supervision)"
+  fm_wake_append stale "$w" "$reason" || exit 1
+  : > "$marker"
+  clear_pause_tracking "$w"
+  wake "$reason"
+}
+
+# Bounded CONFIDENT-dead probe of a paused crew's agent process
+# (fm_backend_agent_alive). dead -> 0. alive clears any stale .agent-dead-<key>
+# surfaced marker so a respawned crew's NEXT death re-surfaces; ambiguous or
+# errored reads (unknown) NEVER count as dead - the same fail-closed principle
+# as the secondmate liveness sweep. Callers keep this off the per-poll path: it
+# runs only on first sight of a paused stale hash and on the bounded
+# paused-recheck cadence (pause_state_class), never every cheap poll.
+paused_agent_is_dead() {  # <window>
+  local w=$1 key verdict
+  key=$(printf '%s' "$w" | tr ':/.' '___')
+  verdict=$(fm_backend_agent_alive "$(window_backend "$w")" "$w" 2>/dev/null)
+  case "$verdict" in
+    dead) return 0 ;;
+    alive) rm -f "$STATE/.agent-dead-$key"; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Surface a paused crew whose endpoint exists but whose agent process is
+# confidently dead - once per death (.agent-dead-<key> dedupes; cleared when the
+# pane goes busy or changes, the agent reads alive again, or pause tracking
+# clears). Keeps the pause bookkeeping (paused flag plus a fresh recheck stamp)
+# so subsequent polls absorb through the normal bounded pause cadence instead of
+# re-probing every poll. Enqueue precedes the suppressor writes, matching the
+# enqueue-before-suppress ordering everywhere else.
+handle_dead_agent() {  # <window> <hash>
+  local win=$1 h=$2 key reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  if [ -e "$STATE/.agent-dead-$key" ]; then
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    : > "$STATE/.paused-$key"
+    date +%s > "$STATE/.paused-rechecked-$key"
+    triage_log "absorbed agent-dead (already surfaced): $win"
+    return 0
+  fi
+  reason="stale: $win agent-dead (endpoint exists but the agent process is confidently dead - the crew died in its declared wait; recover it instead of resuming routine supervision)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$h" > "$STATE/.stale-$key"
+  : > "$STATE/.paused-$key"
+  date +%s > "$STATE/.paused-rechecked-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  : > "$STATE/.agent-dead-$key"
+  wake "$reason"
 }
 
 pause_state_class() {  # <window> <task>
@@ -357,6 +447,16 @@ pause_state_class() {  # <window> <task>
   fi
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
     printf 'paused'
+    return
+  fi
+  # Bounded deeper liveness probe, riding the same recheck cadence as the
+  # authoritative crew-state read below (never every poll): a paused crew whose
+  # endpoint exists but whose agent process is confidently dead is dead, not
+  # waiting. Secondmate agent-process liveness stays owned by the session-start
+  # sweep (docs/architecture.md "Event-driven supervision").
+  if [ "$(window_kind "$win")" != secondmate ] && paused_agent_is_dead "$win"; then
+    date +%s > "$recheck_file"
+    printf 'dead'
     return
   fi
   class=$(crew_absorb_class "$task")
@@ -719,9 +819,21 @@ EOF
       clear_pause_tracking "$w"
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
+      # A secondmate's idle pane is healthy and skips stale detection, but a
+      # GONE endpoint is death, not idleness: the cheap read-only existence
+      # probe keeps a vanished persistent supervisor from rotting invisibly
+      # until the next session start.
+      handle_gone_endpoint "$w"
       continue
     fi
-    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    if ! tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+      # An unreadable endpoint is either gone (death - immediately actionable,
+      # never absorbed into a declared pause) or a transient backend hiccup;
+      # handle_gone_endpoint corroborates with the existence probe and decides.
+      handle_gone_endpoint "$w"
+      continue
+    fi
+    rm -f "$STATE/.endpoint-gone-$key"
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
@@ -815,7 +927,14 @@ EOF
                 triage_log "absorbed non-terminal stale (provably working): $w"
                 ;;
               paused)
-                handle_paused_stale "$w" "$task" "$h"
+                # First sight of a paused stale hash is the once-per-hash spot
+                # for the deeper agent-process probe: a crew that DIED in its
+                # declared wait surfaces instead of being absorbed for hours.
+                if paused_agent_is_dead "$w"; then
+                  handle_dead_agent "$w" "$h"
+                else
+                  handle_paused_stale "$w" "$task" "$h"
+                fi
                 ;;
               *)
                 surface_nonterminal_stale "$w" "$h"
@@ -826,6 +945,7 @@ EOF
             if [ -e "$pf" ] || status_is_paused "$(last_status_line "$STATE/$task.status")"; then
               case "$(pause_state_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
+                dead)    handle_dead_agent "$w" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
@@ -838,8 +958,10 @@ EOF
           fi
         fi
       else
-        # Pane busy or not yet stably stale: reset pending escalation bookkeeping.
-        rm -f "$ssf" "$ewf"
+        # Pane busy or not yet stably stale: reset pending escalation bookkeeping
+        # (a busy pane is also positive agent-liveness, so a surfaced agent-dead
+        # marker resets and a later death re-surfaces).
+        rm -f "$ssf" "$ewf" "$STATE/.agent-dead-$key"
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
         fi
@@ -847,11 +969,16 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
+      # A changed hash alone does not clear .agent-dead-<key>: a dead pane can
+      # still churn cosmetically, and clearing here would re-surface the same
+      # death once per recheck window. The marker resets only on positive
+      # liveness (busy pane, an alive probe read) or a pause-tracking clear.
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
         case "$(pause_state_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
+          dead)   handle_dead_agent "$w" "$h" ;;
           *)      clear_pause_tracking "$w" ;;
         esac
       else

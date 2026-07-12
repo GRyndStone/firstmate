@@ -67,6 +67,8 @@ make_case() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+# FM_FAKE_TMUX_GONE=1 simulates a torn-away endpoint: capture and
+# display-message both fail, exactly like real tmux on a killed window.
 if [ "${1:-}" = "list-windows" ]; then
   if [ -n "${FM_FAKE_TMUX_WINDOW:-}" ]; then
     printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
@@ -74,9 +76,23 @@ if [ "${1:-}" = "list-windows" ]; then
   exit 0
 fi
 if [ "${1:-}" = "capture-pane" ]; then
+  [ "${FM_FAKE_TMUX_GONE:-}" = 1 ] && exit 1
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
   fi
+  exit 0
+fi
+if [ "${1:-}" = "display-message" ]; then
+  [ "${FM_FAKE_TMUX_GONE:-}" = 1 ] && exit 1
+  # pane_current_command feeds fm_backend_tmux_agent_alive; default to a
+  # verified harness binary (alive) so tests must opt in to a dead/ambiguous
+  # verdict via FM_FAKE_TMUX_CURRENT_COMMAND.
+  for _a in "$@"; do
+    case "$_a" in
+      *pane_current_command*) printf '%s\n' "${FM_FAKE_TMUX_CURRENT_COMMAND:-claude}"; exit 0 ;;
+    esac
+  done
+  printf 'fakepane\n'
   exit 0
 fi
 exit 1
