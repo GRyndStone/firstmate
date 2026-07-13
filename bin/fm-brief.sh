@@ -6,10 +6,20 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout|--gsd] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --gsd writes the GSD-driving contract instead: the crewmate is a standing
+#   manager that stands up or resumes the external GSD.Pi project named in {TASK}
+#   and drives it via `gsd headless` (new-project / new-milestone --context, auto
+#   with an explicit --timeout, status, query), never hand-editing the project's
+#   SQLite-authoritative .gsd/ state. The worktree is scratch like a scout's, so
+#   spawn with --scout; the deliverable is the driven external project plus a
+#   report at data/<task-id>/report.md, and done means the {TASK}-named
+#   milestone(s) are complete with evidence. Mutually exclusive with --scout and
+#   --secondmate. Load the drive-gsd skill before scaffolding, spawning,
+#   steering, or recovering a GSD-driving crewmate.
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -72,12 +82,14 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 KIND=ship
 HERDR_LAB=0
+GSD=0
 NO_PROJECTS=0
 POS=()
 for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --gsd) GSD=1 ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     *) POS+=("$a") ;;
@@ -92,6 +104,11 @@ fi
 
 if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
+  exit 1
+fi
+
+if [ "$GSD" -eq 1 ] && [ "$KIND" != ship ]; then
+  echo "error: --gsd is a standalone crewmate contract; it cannot be combined with --scout or --secondmate" >&2
   exit 1
 fi
 
@@ -259,6 +276,75 @@ When the report is complete, append \`done: {one-line conclusion}\` to the statu
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
 echo "scaffolded: $BRIEF (scout; replace {TASK})"
+exit 0
+fi
+
+if [ "$GSD" -eq 1 ]; then
+cat > "$BRIEF" <<EOF
+You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+
+# Task
+{TASK}
+
+$HERDR_SECTION
+
+# Role: standing manager of an external GSD project
+This is a GSD-DRIVING task: you DRIVE the external GSD.Pi project named in the task above, headless.
+You do not do the project's work yourself - GSD's units do the work.
+Your job is to stand the project up or resume it, hand GSD the captain's intent faithfully, drive its process, and route substantive questions back to firstmate.
+You are a STANDING manager: completing one milestone is not the end of the task unless the task names it as the last.
+
+# Setup
+You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
+This worktree is scratch, exactly like a scout's: the deliverables are the driven external GSD project and your report, never a PR from this worktree.
+The GSD project lives OUTSIDE this worktree at the path the task names; run every \`gsd\` command from that project directory.
+Do not carve your own worktree of the GSD project; GSD manages its own internal worktrees.
+If the task names a machine profile or operating guide for \`gsd\`, read it before the first \`gsd\` call and follow it (PATH setup, model policy, acceptance profile).
+
+# Driving GSD headless
+1. Reconcile GSD's view before acting: \`gsd headless status\` and \`gsd headless query\`; \`gsd sessions\` lists resumable sessions.
+2. Stand up or resume per the task: a new project needs a committed git repo first; hand GSD the specification with \`gsd headless new-project\` or \`gsd headless new-milestone --context <spec-file>\`.
+3. Run units with \`gsd headless auto\` and an explicit sane \`--timeout\`; track progress with \`gsd headless status\` / \`gsd headless query\`.
+4. The project's \`.gsd/\` is SQLite-authoritative GSD state: never hand-edit anything under it.
+   Repair a crash-stale unit or lock through GSD's own tooling, never by deleting or rewriting GSD state.
+5. Known GSD 1.9.0 bug - headless shutdown process leak: a headless invocation can print a valid result yet leave a \`gsd\` process alive.
+   After every headless invocation completes, check for leftover \`gsd\` processes from it and kill them, so leaked processes never accumulate or hold locks.
+   For pure inspection whose headless form is known to leak (e.g. \`gsd headless extensions list\`), prefer the interactive form.
+6. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
+
+# Decision routing
+Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision: {concise question + the options GSD surfaced}\` to the status file and pause until firstmate replies.
+Never answer these yourself and never let GSD auto-decide them.
+Procedural or mechanical questions the task text already answers, answer yourself.
+When firstmate replies, feed the decision to GSD, append \`resolved: {how it was decided}\`, and continue.
+
+# Rules
+1. Never push to any remote and never open a PR from this worktree.
+2. The only writable areas are this worktree, the GSD project the task names, the status file below, and your report.
+3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+4. Report status by appending one line:
+   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+   Each append wakes firstmate, so report sparingly: only supervisor-actionable phase changes and the
+   needs-decision/blocked/paused/done/failed states.
+   Milestone completions ARE supervisor-actionable status events: report each completed milestone with a
+   \`working: milestone {name} complete, {where its outputs land}\` line as it happens.
+   GSD auto runs are long: while idle-waiting on a run between events, ALWAYS leave
+   \`$PAUSED_VERB: driving GSD {milestone}, next check {when}\` as the LAST status line, re-appended each
+   time you return to waiting, so firstmate treats your quiet pane as a declared external wait, not a
+   wedge. Use \`blocked: {why}\` when you are stuck and need firstmate to act.
+5. Keep your own context lean: do not read large project artifacts into context - sample heads only;
+   GSD's units hold the detail. If your context passes ~85% used, finish the current supervision step,
+   write a handoff note to \`$DATA/$ID/handoff.md\` (GSD state, running units, next action, any open
+   needs-decision), and append \`$PAUSED_VERB: context handoff written, requesting relaunch\` so firstmate
+   can rotate you cleanly instead of losing you mid-flight.
+
+# Definition of done
+The task is complete only when the milestone(s) the task names are driven to completion, evidenced by \`gsd headless status\` / \`gsd headless query\` output.
+At a milestone boundary the task does not name as final, report the completion and await firstmate's direction instead of exiting; an empty or waiting queue is a resting state, not a reason to terminate.
+When the named milestone(s) are complete, write \`$DATA/$ID/report.md\` - what was driven, each milestone's outcome with the evidence, where the outputs land in the project, and how the captain can open the project themselves - then append \`done: {one-line outcome}\` and stop.
+EOF
+echo "scaffolded: $BRIEF (gsd; replace {TASK})"
 exit 0
 fi
 
