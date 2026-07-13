@@ -229,7 +229,7 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   home="$TMP_ROOT/pause-verb-home"
   mkdir -p "$home/data"
 
-  for kind in ship scout secondmate; do
+  for kind in ship scout secondmate gsd; do
     id="brief-pause-verb-$kind"
     case "$kind" in
       ship)
@@ -244,20 +244,111 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
         FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
           "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
         ;;
+      gsd)
+        FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
+          "$ROOT/bin/fm-brief.sh" "$id" firstmate --gsd >/dev/null 2>&1
+        ;;
     esac
     brief="$home/data/$id/brief.md"
     assert_grep "States: working, needs-decision, blocked, awaiting, done, failed." "$brief" \
       "$kind brief did not render the configured pause verb in its states list"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_grep 'Use `awaiting: {why}`' "$brief" \
-      "$kind brief did not instruct the configured pause status"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_no_grep '`paused: {why}`' "$brief" \
-      "$kind brief still instructs the default paused status"
+    if [ "$kind" = gsd ]; then
+      # The gsd scaffold uses the pause verb in its idle-wait and handoff lines
+      # instead of the generic pause-usage sentence the other scaffolds carry.
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_grep 'awaiting: driving GSD {milestone}, next check {when}' "$brief" \
+        "$kind brief did not render the configured pause verb in its idle-wait line"
+      assert_grep 'awaiting: context handoff written, requesting relaunch' "$brief" \
+        "$kind brief did not render the configured pause verb in its handoff line"
+      assert_no_grep 'paused: driving GSD' "$brief" \
+        "$kind brief still renders the default paused verb in its idle-wait line"
+    else
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_grep 'Use `awaiting: {why}`' "$brief" \
+        "$kind brief did not instruct the configured pause status"
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_no_grep '`paused: {why}`' "$brief" \
+        "$kind brief still instructs the default paused status"
+    fi
     assert_grep 'or a blocker clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
   done
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
+}
+
+# --gsd scaffolds the standing GSD-manager contract: drive an external GSD.Pi
+# project headless, never hand-edit its .gsd/ state, route NEEDS-HUMAN gates as
+# needs-decision, work around the 1.9.0 headless process leak, and finish only
+# when the {TASK}-named milestone(s) are driven to completion with evidence.
+test_gsd_brief_contract() {
+  local home id brief status
+  home="$TMP_ROOT/gsd-home"
+  mkdir -p "$home/data"
+  id="brief-gsd-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someproject --gsd >/dev/null 2>&1; status=$?
+  expect_code 0 "$status" "fm-brief.sh $id someproject --gsd should exit 0"
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "gsd brief was not scaffolded"
+  assert_grep "{TASK}" "$brief" "gsd brief missing the {TASK} placeholder"
+  assert_grep "standing manager of an external GSD project" "$brief" \
+    "gsd brief missing the standing-manager role"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'hand GSD the specification with `gsd headless new-project` or `gsd headless new-milestone --context <spec-file>`' "$brief" \
+    "gsd brief missing the headless stand-up contract"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'Run units with `gsd headless auto` and an explicit sane `--timeout`; track progress with `gsd headless status` / `gsd headless query`' "$brief" \
+    "gsd brief missing the headless auto/status/query drive loop"
+  assert_grep "SQLite-authoritative GSD state: never hand-edit anything under it" "$brief" \
+    "gsd brief missing the never-hand-edit .gsd/ rule"
+  assert_grep "Route every NEEDS-HUMAN gate, every milestone-boundary decision" "$brief" \
+    "gsd brief missing the needs-decision routing contract"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'needs-decision [key=gsd-gate-{slug}]:' "$brief" \
+    "gsd brief missing the keyed NEEDS-HUMAN gate needs-decision line"
+  assert_grep "Slugify every interpolated id or name" "$brief" \
+    "gsd brief missing the key-slug grammar hint"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'check for leftover `gsd` processes from it and kill them' "$brief" \
+    "gsd brief missing the 1.9.0 headless shutdown leak workaround"
+  assert_grep "This worktree is scratch, exactly like a scout's" "$brief" \
+    "gsd brief missing the scratch-worktree declaration"
+  assert_grep "report each completed milestone" "$brief" \
+    "gsd brief missing the milestone-completion status events"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'needs-decision [key=milestone-{id}]: milestone {id} complete' "$brief" \
+    "gsd brief missing the keyed milestone-boundary needs-decision line"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_no_grep '`working: milestone' "$brief" \
+    "gsd brief still routes milestone completions through working: lines"
+  assert_grep 'handoff note at' "$brief" \
+    "gsd brief writable areas missing the handoff note"
+  assert_grep 'or a blocker clears' "$brief" \
+    "gsd brief missing the keyed durable-resolution contract"
+  assert_grep "# Definition of done" "$brief" "gsd brief missing Definition of done section"
+  assert_grep "the milestone(s) the task names are driven to completion" "$brief" \
+    "gsd brief missing the milestones-with-evidence definition of done"
+  assert_grep "# Herdr lifecycle declaration - NOT ENABLED" "$brief" \
+    "gsd brief silently omitted the Herdr declaration"
+  assert_no_grep "EOF" "$brief" "gsd brief leaked a heredoc EOF marker (unterminated heredoc)"
+  pass "fm-brief.sh: --gsd emits the standing GSD-manager contract"
+}
+
+# --gsd is a standalone crewmate contract: combining it with --secondmate or
+# --scout must fail loudly and write nothing.
+test_gsd_rejects_secondmate_and_scout() {
+  local home status
+  home="$TMP_ROOT/gsd-guard-home"
+  mkdir -p "$home/data"
+  status=0
+  FM_HOME="$home" FM_SECONDMATE_CHARTER=x \
+    "$ROOT/bin/fm-brief.sh" gsd-sm --secondmate alpha --gsd >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "--gsd --secondmate must be rejected"
+  assert_absent "$home/data/gsd-sm/brief.md" "rejected --gsd --secondmate still wrote a brief"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" gsd-scout someproject --scout --gsd >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "--gsd --scout must be rejected"
+  assert_absent "$home/data/gsd-scout/brief.md" "rejected --gsd --scout still wrote a brief"
+  pass "fm-brief.sh: --gsd rejects --secondmate and --scout combinations"
 }
 
 test_script_parses
@@ -271,3 +362,5 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
+test_gsd_brief_contract
+test_gsd_rejects_secondmate_and_scout
