@@ -106,6 +106,7 @@ Ship briefs also tell the crewmate to verify `pwd -P` and `git rev-parse --show-
 ## Two task shapes
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
+A GSD-driving brief variant (`fm-brief.sh --gsd`) rides the scout shape at runtime: the crewmate is a standing manager that drives an external GSD.Pi project headless from a scratch worktree, spawned with `--scout` so teardown's scout carve-out applies once its report exists; the agent-only `drive-gsd` skill owns the contract.
 
 ## Dispatch profiles
 
