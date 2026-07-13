@@ -302,6 +302,11 @@ test_gsd_brief_contract() {
     "gsd brief missing the never-hand-edit .gsd/ rule"
   assert_grep "Route every NEEDS-HUMAN gate, every milestone-boundary decision" "$brief" \
     "gsd brief missing the needs-decision routing contract"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'needs-decision [key=gsd-gate-{slug}]:' "$brief" \
+    "gsd brief missing the keyed NEEDS-HUMAN gate needs-decision line"
+  assert_grep "Slugify every interpolated id or name" "$brief" \
+    "gsd brief missing the key-slug grammar hint"
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
   assert_grep 'check for leftover `gsd` processes from it and kill them' "$brief" \
     "gsd brief missing the 1.9.0 headless shutdown leak workaround"

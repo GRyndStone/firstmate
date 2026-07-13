@@ -31,7 +31,7 @@ Everything project-specific - the GSD project path, the objective or specificati
 
 GSD auto runs are long: treat long quiet as normal, not a wedge.
 The brief requires the crewmate to keep a `paused: driving GSD ...` line as the LAST status line while idle-waiting with no open decision or blocker, so the watcher already classifies the quiet pane as a declared external wait.
-While a keyed `needs-decision:` or `blocked:` line is open, the brief forbids any further status append, so the open line stays the last line and keeps surfacing until the crewmate closes it with the keyed `resolved:`.
+While any `needs-decision:` or `blocked:` line is open - keyed or not - the brief forbids any further status append, so the open line stays the last line and keeps surfacing until the crewmate closes it with the matching `resolved:`.
 When you need current GSD progress, steer the crewmate to run `gsd headless status` and report back; never run `gsd` against the external project yourself and never peek the project's files for state - the crewmate is the single driver of that project.
 Milestone completions arrive as keyed `needs-decision [key=milestone-<id>]: milestone <id> complete - <question>` boundary events, so they surface immediately instead of being absorbed behind the `paused:` last line; `working:` lines are only rare mid-milestone progress.
 Relay each completed milestone to the captain as an outcome together with its proceed/UAT question.
@@ -39,7 +39,7 @@ The brief's context self-preservation rule can surface `paused: context handoff 
 
 ## Decision routing
 
-The brief routes every NEEDS-HUMAN gate, milestone-boundary decision, and substantive GSD question to you as `needs-decision:`, with milestone boundaries carrying a `[key=milestone-<id>]` key.
+The brief routes every NEEDS-HUMAN gate, milestone-boundary decision, and substantive GSD question to you as a keyed `needs-decision:` line - gates as `[key=gsd-gate-<slug>]`, milestone boundaries as `[key=milestone-<id>]` - with interpolated ids slugified to the key grammar.
 Relay anything about the captain's intent, scope, or dispositions to the captain; answer purely procedural questions yourself from the brief's task text.
 Send the answer back with `fm-send`, and expect the crewmate's `resolved:` line - carrying the same `[key=...]` when one opened the decision - once it feeds the decision to GSD and resumes.
 At a milestone boundary the task did not name as final, the crewmate reports and waits; decide with the captain whether to continue, extend the task, or stand the manager down.

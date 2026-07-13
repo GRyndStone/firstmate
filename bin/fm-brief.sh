@@ -313,10 +313,11 @@ If the task names a machine profile or operating guide for \`gsd\`, read it befo
 6. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
 
 # Decision routing
-Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision: {concise question + the options GSD surfaced}\` to the status file and wait silently until firstmate replies.
-While a keyed \`needs-decision:\` or \`blocked:\` line is OPEN, append NO further status line - no \`$PAUSED_VERB:\`, no \`working:\` - so the open line stays the LAST status line and keeps surfacing; resume Rule 4's \`$PAUSED_VERB:\` discipline only AFTER appending the keyed \`resolved:\` close below.
+Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision [key=gsd-gate-{slug}]: {concise question + the options GSD surfaced}\` to the status file, with {slug} derived from the gate or check name, and wait silently until firstmate replies.
+While ANY \`needs-decision:\` or \`blocked:\` line is OPEN - keyed or not - append NO further status line - no \`$PAUSED_VERB:\`, no \`working:\` - so the open line stays the LAST status line and keeps surfacing; resume Rule 4's \`$PAUSED_VERB:\` discipline only AFTER appending the matching \`resolved:\` close below.
 A milestone boundary always carries a proceed/UAT decision: report each completed milestone as
 \`needs-decision [key=milestone-{id}]: milestone {id} complete - {UAT/next-milestone question}\`.
+Slugify every interpolated id or name before building a \`[key=...]\` value: lowercase it and turn every character outside \`[a-z0-9._-]\` into \`-\`, because a key with other characters is silently dropped from firstmate's open-decision tracking.
 Never answer these yourself and never let GSD auto-decide them.
 Procedural or mechanical questions the task text already answers, answer yourself.
 When firstmate replies, feed the decision to GSD; when it replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
