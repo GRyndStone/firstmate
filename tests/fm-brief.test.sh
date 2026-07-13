@@ -229,7 +229,7 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   home="$TMP_ROOT/pause-verb-home"
   mkdir -p "$home/data"
 
-  for kind in ship scout secondmate; do
+  for kind in ship scout secondmate gsd; do
     id="brief-pause-verb-$kind"
     case "$kind" in
       ship)
@@ -244,16 +244,32 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
         FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
           "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
         ;;
+      gsd)
+        FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
+          "$ROOT/bin/fm-brief.sh" "$id" firstmate --gsd >/dev/null 2>&1
+        ;;
     esac
     brief="$home/data/$id/brief.md"
     assert_grep "States: working, needs-decision, blocked, awaiting, done, failed." "$brief" \
       "$kind brief did not render the configured pause verb in its states list"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_grep 'Use `awaiting: {why}`' "$brief" \
-      "$kind brief did not instruct the configured pause status"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_no_grep '`paused: {why}`' "$brief" \
-      "$kind brief still instructs the default paused status"
+    if [ "$kind" = gsd ]; then
+      # The gsd scaffold uses the pause verb in its idle-wait and handoff lines
+      # instead of the generic pause-usage sentence the other scaffolds carry.
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_grep 'awaiting: driving GSD {milestone}, next check {when}' "$brief" \
+        "$kind brief did not render the configured pause verb in its idle-wait line"
+      assert_grep 'awaiting: context handoff written, requesting relaunch' "$brief" \
+        "$kind brief did not render the configured pause verb in its handoff line"
+      assert_no_grep 'paused: driving GSD' "$brief" \
+        "$kind brief still renders the default paused verb in its idle-wait line"
+    else
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_grep 'Use `awaiting: {why}`' "$brief" \
+        "$kind brief did not instruct the configured pause status"
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_no_grep '`paused: {why}`' "$brief" \
+        "$kind brief still instructs the default paused status"
+    fi
     assert_grep 'or a blocker clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
   done
@@ -293,6 +309,16 @@ test_gsd_brief_contract() {
     "gsd brief missing the scratch-worktree declaration"
   assert_grep "report each completed milestone" "$brief" \
     "gsd brief missing the milestone-completion status events"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'needs-decision [key=milestone-{id}]: milestone {id} complete' "$brief" \
+    "gsd brief missing the keyed milestone-boundary needs-decision line"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_no_grep '`working: milestone' "$brief" \
+    "gsd brief still routes milestone completions through working: lines"
+  assert_grep 'handoff note at' "$brief" \
+    "gsd brief writable areas missing the handoff note"
+  assert_grep 'or a blocker clears' "$brief" \
+    "gsd brief missing the keyed durable-resolution contract"
   assert_grep "# Definition of done" "$brief" "gsd brief missing Definition of done section"
   assert_grep "the milestone(s) the task names are driven to completion" "$brief" \
     "gsd brief missing the milestones-with-evidence definition of done"

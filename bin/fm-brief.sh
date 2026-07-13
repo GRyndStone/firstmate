@@ -314,21 +314,23 @@ If the task names a machine profile or operating guide for \`gsd\`, read it befo
 
 # Decision routing
 Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision: {concise question + the options GSD surfaced}\` to the status file and pause until firstmate replies.
+A milestone boundary always carries a proceed/UAT decision: report each completed milestone as
+\`needs-decision [key=milestone-{id}]: milestone {id} complete - {UAT/next-milestone question}\`.
 Never answer these yourself and never let GSD auto-decide them.
 Procedural or mechanical questions the task text already answers, answer yourself.
-When firstmate replies, feed the decision to GSD, append \`resolved: {how it was decided}\`, and continue.
+When firstmate replies, feed the decision to GSD; when it replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 
 # Rules
 1. Never push to any remote and never open a PR from this worktree.
-2. The only writable areas are this worktree, the GSD project the task names, the status file below, and your report.
+2. The only writable areas are this worktree, the GSD project the task names, the status file below, your handoff note at \`$DATA/$ID/handoff.md\`, and your report.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
-   Each append wakes firstmate, so report sparingly: only supervisor-actionable phase changes and the
-   needs-decision/blocked/paused/done/failed states.
-   Milestone completions ARE supervisor-actionable status events: report each completed milestone with a
-   \`working: milestone {name} complete, {where its outputs land}\` line as it happens.
+   Each append wakes firstmate, so report sparingly: only the needs-decision/blocked/paused/done/failed
+   states and the rare mid-milestone \`working:\` phase change a supervisor would act on.
+   A milestone boundary is a captain-relevant phase change, not \`working:\` progress: report each
+   completed milestone with the keyed \`needs-decision:\` line from Decision routing above.
    GSD auto runs are long: while idle-waiting on a run between events, ALWAYS leave
    \`$PAUSED_VERB: driving GSD {milestone}, next check {when}\` as the LAST status line, re-appended each
    time you return to waiting, so firstmate treats your quiet pane as a declared external wait, not a
@@ -341,7 +343,7 @@ When firstmate replies, feed the decision to GSD, append \`resolved: {how it was
 
 # Definition of done
 The task is complete only when the milestone(s) the task names are driven to completion, evidenced by \`gsd headless status\` / \`gsd headless query\` output.
-At a milestone boundary the task does not name as final, report the completion and await firstmate's direction instead of exiting; an empty or waiting queue is a resting state, not a reason to terminate.
+At a milestone boundary the task does not name as final, report the completion with the keyed \`needs-decision:\` line from Decision routing and await firstmate's direction instead of exiting; an empty or waiting queue is a resting state, not a reason to terminate.
 When the named milestone(s) are complete, write \`$DATA/$ID/report.md\` - what was driven, each milestone's outcome with the evidence, where the outputs land in the project, and how the captain can open the project themselves - then append \`done: {one-line outcome}\` and stop.
 EOF
 echo "scaffolded: $BRIEF (gsd; replace {TASK})"
