@@ -313,7 +313,8 @@ If the task names a machine profile or operating guide for \`gsd\`, read it befo
 6. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
 
 # Decision routing
-Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision: {concise question + the options GSD surfaced}\` to the status file and pause until firstmate replies.
+Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision: {concise question + the options GSD surfaced}\` to the status file and wait silently until firstmate replies.
+While a keyed \`needs-decision:\` or \`blocked:\` line is OPEN, append NO further status line - no \`$PAUSED_VERB:\`, no \`working:\` - so the open line stays the LAST status line and keeps surfacing; resume Rule 4's \`$PAUSED_VERB:\` discipline only AFTER appending the keyed \`resolved:\` close below.
 A milestone boundary always carries a proceed/UAT decision: report each completed milestone as
 \`needs-decision [key=milestone-{id}]: milestone {id} complete - {UAT/next-milestone question}\`.
 Never answer these yourself and never let GSD auto-decide them.
@@ -331,7 +332,8 @@ When firstmate replies, feed the decision to GSD; when it replies or a blocker c
    states and the rare mid-milestone \`working:\` phase change a supervisor would act on.
    A milestone boundary is a captain-relevant phase change, not \`working:\` progress: report each
    completed milestone with the keyed \`needs-decision:\` line from Decision routing above.
-   GSD auto runs are long: while idle-waiting on a run between events, ALWAYS leave
+   GSD auto runs are long: while idle-waiting on a run between events with NO open needs-decision or
+   blocked line (Decision routing above wins while one is open), ALWAYS leave
    \`$PAUSED_VERB: driving GSD {milestone}, next check {when}\` as the LAST status line, re-appended each
    time you return to waiting, so firstmate treats your quiet pane as a declared external wait, not a
    wedge. Use \`blocked: {why}\` when you are stuck and need firstmate to act.

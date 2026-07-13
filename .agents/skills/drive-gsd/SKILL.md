@@ -30,7 +30,8 @@ Everything project-specific - the GSD project path, the objective or specificati
 ## Supervision specifics
 
 GSD auto runs are long: treat long quiet as normal, not a wedge.
-The brief requires the crewmate to keep a `paused: driving GSD ...` line as the LAST status line while idle-waiting, so the watcher already classifies the quiet pane as a declared external wait.
+The brief requires the crewmate to keep a `paused: driving GSD ...` line as the LAST status line while idle-waiting with no open decision or blocker, so the watcher already classifies the quiet pane as a declared external wait.
+While a keyed `needs-decision:` or `blocked:` line is open, the brief forbids any further status append, so the open line stays the last line and keeps surfacing until the crewmate closes it with the keyed `resolved:`.
 When you need current GSD progress, steer the crewmate to run `gsd headless status` and report back; never run `gsd` against the external project yourself and never peek the project's files for state - the crewmate is the single driver of that project.
 Milestone completions arrive as keyed `needs-decision [key=milestone-<id>]: milestone <id> complete - <question>` boundary events, so they surface immediately instead of being absorbed behind the `paused:` last line; `working:` lines are only rare mid-milestone progress.
 Relay each completed milestone to the captain as an outcome together with its proceed/UAT question.
