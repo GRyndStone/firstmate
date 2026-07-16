@@ -6,9 +6,12 @@
 # fakebin/command-log convention) plus real jq, never a real herdr server.
 # Covers: argument validation (not-a-gsd-command refusal, bad flag, bad id),
 # fail-closed behavior when herdr is missing, the --no-wait launch path (tab
-# labeled gsd-<id>-r<epoch>, never fm-*; pane command cd's into the project,
-# runs via env, records the exit code), exit-code propagation through the
-# default wait, and the dead-pane abort during a wait.
+# labeled gsd-<id>-r<stamp>, never fm-*; pane command cd's into the project,
+# runs via env, records the exit code), per-invocation label/exit-file
+# uniqueness for same-second runs, exit-code propagation through the default
+# wait, the dead-pane abort during a wait (including honoring an exit code
+# recorded in the instant the tab closed), and the loud wait-abandon after
+# consecutive unreadable pane states.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -24,8 +27,13 @@ mkdir -p "$TMP_ROOT"
 # "firstmate" workspace, so the adopted-workspace path runs and no seeded tab
 # is ever pruned), tab list (empty), tab create (fixed ids), pane run
 # (silent), pane get / agent get (a live shell pane with no agent, i.e. a
-# running non-agent command - or pane_not_found when FM_FAKE_PANE_GONE=1).
-# Every invocation logs one unit-separated line to $FM_HERDR_LOG.
+# running non-agent command - or pane_not_found when FM_FAKE_PANE_GONE=1, or
+# an unparseable-state error when FM_FAKE_PANE_UNKNOWN=1). When both
+# FM_FAKE_PANE_GONE=1 and FM_FAKE_DEAD_EXIT are set, the gone answer first
+# records that exit code to the run's exit file (label read back from the
+# tab-create line it already logged), reproducing a run that finished in the
+# same instant its tab closed. Responses stay canned JSON; every invocation
+# logs one unit-separated line to $FM_HERDR_LOG.
 make_gsd_fake_herdr() {  # <dir> -> echoes fakebin dir
   local fb="$1/fakebin"
   mkdir -p "$fb"
@@ -45,7 +53,13 @@ case "${1:-} ${2:-}" in
   "tab create") printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' ;;
   "pane get")
     if [ "${FM_FAKE_PANE_GONE:-0}" = 1 ]; then
+      if [ -n "${FM_FAKE_DEAD_EXIT:-}" ]; then
+        label=$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)
+        [ -n "$label" ] && printf '%s\n' "$FM_FAKE_DEAD_EXIT" > "${FM_GSD_RUN_STATE_DIR:?}/$label.exit"
+      fi
       printf '{"error":{"code":"pane_not_found"}}\n'
+    elif [ "${FM_FAKE_PANE_UNKNOWN:-0}" = 1 ]; then
+      printf '{"error":{"code":"internal_error"}}\n'
     else
       printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}"
     fi
@@ -140,6 +154,26 @@ test_no_wait_launches_visible_tab() {
   pass "fm-gsd-run.sh: --no-wait opens the visible run tab and returns"
 }
 
+# Two runs for the same task id launched within the same second must not
+# share a tab label or exit file - a collision would let create_task classify
+# the first run's pane as a husk and close it under the live run.
+test_same_second_runs_get_unique_labels() {
+  local dir fb log proj out1 out2 file1 file2
+  dir="$TMP_ROOT/unique"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out1=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-u1 "$proj" gsd headless auto 2>&1 ) || fail "first same-second launch failed"
+  out2=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-u1 "$proj" gsd headless auto 2>&1 ) || fail "second same-second launch failed"
+  file1=$(printf '%s\n' "$out1" | sed -n 's/.*exit_file=//p' | head -1)
+  file2=$(printf '%s\n' "$out2" | sed -n 's/.*exit_file=//p' | head -1)
+  [ -n "$file1" ] && [ -n "$file2" ] || fail "same-second launches lost their exit_file lines"
+  [ "$file1" != "$file2" ] || fail "same-second runs for one task id shared an exit file: $file1"
+  pass "fm-gsd-run.sh: same-second runs get unique labels and exit files"
+}
+
 # Default mode waits for the run's exit file and exits with the run's own
 # exit code - a drop-in replacement for running the command directly.
 test_wait_propagates_exit_code() {
@@ -181,10 +215,53 @@ test_wait_aborts_on_dead_pane() {
   pass "fm-gsd-run.sh: a dead run pane aborts the wait loudly"
 }
 
+# A run that records its exit code in the same instant its tab closes (exit
+# file written between the loop's file check and the dead pane read) must
+# have that code honored, not be misreported as closed-without-exit-code.
+test_dead_pane_honors_just_recorded_exit_code() {
+  local dir fb log proj out status
+  dir="$TMP_ROOT/dead-race"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  mkdir -p "$dir/state"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    FM_GSD_RUN_POLL=1 FM_FAKE_PANE_GONE=1 FM_FAKE_DEAD_EXIT=5 \
+    "$ROOT/bin/fm-gsd-run.sh" task-d2 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  expect_code 5 "$status" "a dead pane with a just-recorded exit code must propagate that code"
+  assert_contains "$out" "run finished: exit=5" "dead-race path lost the completion line"
+  assert_not_contains "$out" "closed before the run recorded an exit code" \
+    "dead-race path must not report a missing exit code"
+  pass "fm-gsd-run.sh: a dead pane still honors a just-recorded exit code"
+}
+
+# When the pane state is unreadable poll after poll (e.g. the herdr server
+# died under the wait), the helper abandons the WAIT loudly after the
+# configured streak instead of polling forever - without touching the run.
+test_wait_abandons_after_unknown_streak() {
+  local dir fb log proj out status
+  dir="$TMP_ROOT/unknown"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    FM_GSD_RUN_POLL=0 FM_FAKE_PANE_UNKNOWN=1 FM_GSD_RUN_UNKNOWN_LIMIT=3 \
+    "$ROOT/bin/fm-gsd-run.sh" task-k1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  expect_code 1 "$status" "an unknown-state streak must abandon the wait with exit 1"
+  assert_contains "$out" "abandoning the WAIT after 3 consecutive unreadable pane states" \
+    "unknown-streak abort lost its message"
+  assert_contains "$out" "may still be live" "unknown-streak abort must say the run was not touched"
+  ! grep -q "pane.close" "$log" || fail "abandoning the wait must never close the pane"
+  pass "fm-gsd-run.sh: an unreadable-state streak abandons only the wait, loudly"
+}
+
 test_script_parses_and_help
 test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
 test_no_wait_launches_visible_tab
+test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code
 test_wait_aborts_on_dead_pane
+test_dead_pane_honors_just_recorded_exit_code
+test_wait_abandons_after_unknown_streak

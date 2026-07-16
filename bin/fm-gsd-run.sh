@@ -5,11 +5,13 @@
 # and firstmate can always inspect a live run instead of trusting a subprocess
 # buried in the driving crewmate's own shell.
 # Usage: fm-gsd-run.sh [--no-wait] <task-id> <gsd-project-dir> gsd <args...>
-#   Opens a fresh tab labeled gsd-<task-id>-r<epoch> in this home's herdr
+#   Opens a fresh tab labeled gsd-<task-id>-r<stamp> in this home's herdr
 #   workspace (bin/backends/herdr.sh conventions; the gsd- prefix keeps run
 #   tabs out of the fm-<id> task-tab namespace that recovery's label matching
-#   adopts), cd's into <gsd-project-dir>, runs the command there via `env`,
-#   and records the command's exit code to a per-run exit file when it ends.
+#   adopts, and the epoch-pid-random stamp keeps same-second runs for one
+#   task id from sharing a label or exit file), cd's into <gsd-project-dir>,
+#   runs the command there via `env`, and records the command's exit code to
+#   a per-run exit file when it ends.
 #   Leading NAME=value assignments before `gsd` are allowed (an operating
 #   guide's PATH or model setup); any other leading word is refused so this
 #   stays a GSD launcher, not a general remote shell.
@@ -24,7 +26,10 @@
 #   watcher never adopts it because the label does not start with fm-.
 #   FM_GSD_RUN_POLL overrides the wait poll interval in seconds (default 5);
 #   FM_GSD_RUN_STATE_DIR overrides the exit-file directory (default: a fresh
-#   mktemp dir per run).
+#   mktemp dir per run); FM_GSD_RUN_UNKNOWN_LIMIT overrides how many
+#   consecutive unreadable pane-state polls the wait tolerates before
+#   abandoning the WAIT (default 6) - that abort never touches the pane or
+#   the run, which may still be live with its exit file still to come.
 # Requires the herdr CLI: the visibility contract names herdr as the surface,
 # so when herdr is missing or refuses, this fails loudly instead of falling
 # back to an invisible run - the caller reports blocked rather than driving
@@ -91,7 +96,7 @@ shell_quote() {
 . "$SCRIPT_DIR/fm-backend.sh"
 fm_backend_source herdr || exit 1
 
-RUN_STAMP=$(date +%s)
+RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
 if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
   RUN_DIR=$FM_GSD_RUN_STATE_DIR
@@ -139,11 +144,24 @@ if [ "$NO_WAIT" -eq 1 ]; then
 fi
 
 POLL=${FM_GSD_RUN_POLL:-5}
+UNKNOWN_LIMIT=${FM_GSD_RUN_UNKNOWN_LIMIT:-6}
+case "$UNKNOWN_LIMIT" in ''|*[!0-9]*|0) UNKNOWN_LIMIT=6 ;; esac
+UNKNOWN_STREAK=0
 while [ ! -s "$EXIT_FILE" ]; do
   STATE=$(fm_backend_herdr_pane_agent_state "$SES" "$PANE_ID")
   if [ "$STATE" = dead ]; then
+    [ -s "$EXIT_FILE" ] && break
     echo "error: run tab $LABEL closed before the run recorded an exit code" >&2
     exit 1
+  fi
+  if [ "$STATE" = unknown ]; then
+    UNKNOWN_STREAK=$((UNKNOWN_STREAK + 1))
+    if [ "$UNKNOWN_STREAK" -ge "$UNKNOWN_LIMIT" ]; then
+      echo "error: abandoning the WAIT after $UNKNOWN_STREAK consecutive unreadable pane states for run tab $LABEL (herdr may be down); the run was NOT touched - it may still be live in the tab, and $EXIT_FILE may still appear when it ends" >&2
+      exit 1
+    fi
+  else
+    UNKNOWN_STREAK=0
   fi
   sleep "$POLL"
 done
