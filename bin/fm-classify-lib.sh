@@ -247,36 +247,54 @@ task_has_park_anchor() {  # <id> [<state-dir>]
 #             pane; the crew is legitimately mid-work on a static-looking pane
 #             (e.g. waiting on CI);
 #   paused  - the crew's authoritative current state is a declared external-wait
-#             pause (paused:), which is EXPECTED to idle; OR the crew's own run
-#             FINISHED green (done from the authoritative run-step - outcome
+#             pause (paused:), which is EXPECTED to idle; OR an actively-running
+#             run-step behind the crew's declared paused: last status line -
+#             both signals are positive not-wedged evidence, and the run-step
+#             (which supersedes the log line in fm-crew-state.sh) would
+#             otherwise put a crew that declared "paused: no-mistakes run in
+#             progress" on the wedge timer, treadmilling escalations once per
+#             threshold window (the 2026-07-16 residual incident) instead of
+#             parking it on the pause cadence; OR the crew's own run FINISHED
+#             green (done from the authoritative run-step - outcome
 #             passed/checks-passed, or the ci monitor's checks-green read) with
-#             positive park-anchor evidence (task_has_park_anchor). The run-step
-#             supersedes a paused: log line in fm-crew-state.sh, so a crew that
-#             declared its merge wait AFTER its run went green would otherwise
-#             read done -> none and treadmill stale wakes until the captain
-#             merges (the 2026-07-16 forex-implementability-fold incident); a
-#             finished green run behind a declared pause or an armed check owes
-#             nothing until the PR merges or closes, so it absorbs on the same
+#             positive park-anchor evidence (task_has_park_anchor) - a finished
+#             green run behind a declared pause or an armed check owes nothing
+#             until the PR merges or closes (the 2026-07-16
+#             forex-implementability-fold incident), so it absorbs on the same
 #             bounded pause cadence;
 #   none    - neither, so the wake must surface (a stopped/failed/gate-parked/
 #             torn-down/unknown crew, an unreadable verdict, or a finished crew
 #             with NO park anchor - fail-closed).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
-# authoritatively (not the status log) is what keeps run-step precedence: a crew
-# that appended paused: but then STARTED a run reports working, never paused.
+# One fm-crew-state.sh read serves BOTH absorb reasons at once. Run-step
+# precedence still holds for every NON-absorbable verdict: a crew whose run
+# failed or gate-parked behind a stale paused: line reads none and surfaces.
+# Only a working pane-busy verdict keeps outranking a declared pause (a busy
+# pane contradicts "expected to idle"), and an armed check alone never
+# reclassifies an active run - the composition needs the declared pause itself.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id>
-  local id=$1 line state src
+  local id=$1 line state src statedir
   [ -n "$id" ] || { printf 'none'; return; }
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
   src=${line#*source: }; src=${src%% *}
+  statedir=${STATE:-${FM_STATE_OVERRIDE:-}}
   if [ "$state" = paused ]; then printf 'paused'; return; fi
   if [ "$state" = working ]; then
-    case "$src" in run-step|pane) printf 'working'; return ;; esac
+    case "$src" in
+      run-step)
+        if [ -n "$statedir" ] && status_is_paused "$(last_status_line "$statedir/$id.status")"; then
+          printf 'paused'
+          return
+        fi
+        printf 'working'
+        return
+        ;;
+      pane) printf 'working'; return ;;
+    esac
   fi
   if [ "$state" = "done" ] && [ "$src" = run-step ] && task_has_park_anchor "$id"; then
     printf 'paused'

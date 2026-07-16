@@ -20,7 +20,8 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge; a finished-green
+#                          re-surface cadence, never as a wedge - and it holds even
+#                          while the crew's own run-step is still active; a finished-green
 #                          crew (done run-step) parked on positive anchor evidence -
 #                          its declared pause or an armed per-task check - absorbs
 #                          the same way (crew_absorb_class, fm-classify-lib.sh, owns
