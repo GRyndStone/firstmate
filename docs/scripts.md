@@ -15,6 +15,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
 | `fm-brief.sh`            | Scaffold ship, scout, GSD-manager, secondmate-charter, and Herdr-lab briefs          |
+| `fm-gsd-run.sh`          | Launch a GSD driving run in a visible herdr tab, capturing its exit code and waiting unless `--no-wait` |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-ensure-agents-md.sh` | Ensure a project's real `AGENTS.md`, its `CLAUDE.md` symlink, and the canonical self-governance section |
 | `fm-guard.sh`            | Warn on primary-checkout tangles, pending queued wakes, and stale watcher liveness   |
