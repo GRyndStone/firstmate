@@ -230,8 +230,9 @@ signal_reason_is_actionable() {  # <file> ...
 # merged-PR poll). Anchor evidence alone NEVER absorbs a wake - it only decides
 # which crews the bounded pause-recheck bookkeeping may track; crew_absorb_class
 # still requires the authoritative crew state to corroborate (a declared pause,
-# or a finished green run parked on that anchor), so a wedged crew with a stray
-# check script still surfaces. Pure file read, cheap enough for per-poll gates.
+# an actively-running run-step behind one, or a finished green run parked on
+# that anchor), so a wedged crew with a stray check script still surfaces.
+# Pure file read, cheap enough for per-poll gates.
 task_has_park_anchor() {  # <id> [<state-dir>]
   local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}}
   [ -n "$id" ] || return 1
@@ -314,10 +315,10 @@ crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }
 
-# 0 if crew <id>'s authoritative current state is an absorbable park: a declared
-# external-wait pause, or a finished green run behind park-anchor evidence (see
-# crew_absorb_class). The stale path absorbs such a crew (on a long re-surface
-# cadence) instead of escalating a possible wedge.
+# 0 if crew <id> is in an absorbable park: a declared external-wait pause (even
+# behind a still-active run-step), or a finished green run behind park-anchor
+# evidence (see crew_absorb_class). The stale path absorbs such a crew (on a
+# long re-surface cadence) instead of escalating a possible wedge.
 crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
