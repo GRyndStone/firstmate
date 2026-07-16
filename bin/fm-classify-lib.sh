@@ -224,6 +224,22 @@ signal_reason_is_actionable() {  # <file> ...
   return 1
 }
 
+# 0 if task <id> carries cheap park-ANCHOR evidence that its idle pane may be a
+# deliberate wait rather than a wedge: a declared paused: last status line, or
+# an armed per-task check script (state/<id>.check.sh, e.g. fm-pr-check.sh's
+# merged-PR poll). Anchor evidence alone NEVER absorbs a wake - it only decides
+# which crews the bounded pause-recheck bookkeeping may track; crew_absorb_class
+# still requires the authoritative crew state to corroborate (a declared pause,
+# or a finished green run parked on that anchor), so a wedged crew with a stray
+# check script still surfaces. Pure file read, cheap enough for per-poll gates.
+task_has_park_anchor() {  # <id> [<state-dir>]
+  local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}}
+  [ -n "$id" ] || return 1
+  [ -n "$state" ] || return 1
+  status_is_paused "$(last_status_line "$state/$id.status")" && return 0
+  [ -e "$state/$id.check.sh" ]
+}
+
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,
 # from bin/fm-crew-state.sh's one authoritative current-state line
 # ("state: <s> · source: <src> · <detail>"). Prints exactly one token:
@@ -231,9 +247,20 @@ signal_reason_is_actionable() {  # <file> ...
 #             pane; the crew is legitimately mid-work on a static-looking pane
 #             (e.g. waiting on CI);
 #   paused  - the crew's authoritative current state is a declared external-wait
-#             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
-#             torn-down/unknown crew, or an unreadable verdict).
+#             pause (paused:), which is EXPECTED to idle; OR the crew's own run
+#             FINISHED green (done from the authoritative run-step - outcome
+#             passed/checks-passed, or the ci monitor's checks-green read) with
+#             positive park-anchor evidence (task_has_park_anchor). The run-step
+#             supersedes a paused: log line in fm-crew-state.sh, so a crew that
+#             declared its merge wait AFTER its run went green would otherwise
+#             read done -> none and treadmill stale wakes until the captain
+#             merges (the 2026-07-16 forex-implementability-fold incident); a
+#             finished green run behind a declared pause or an armed check owes
+#             nothing until the PR merges or closes, so it absorbs on the same
+#             bounded pause cadence;
+#   none    - neither, so the wake must surface (a stopped/failed/gate-parked/
+#             torn-down/unknown crew, an unreadable verdict, or a finished crew
+#             with NO park anchor - fail-closed).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
@@ -246,10 +273,14 @@ crew_absorb_class() {  # <id>
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
+  src=${line#*source: }; src=${src%% *}
   if [ "$state" = paused ]; then printf 'paused'; return; fi
   if [ "$state" = working ]; then
-    src=${line#*source: }; src=${src%% *}
     case "$src" in run-step|pane) printf 'working'; return ;; esac
+  fi
+  if [ "$state" = "done" ] && [ "$src" = run-step ] && task_has_park_anchor "$id"; then
+    printf 'paused'
+    return
   fi
   printf 'none'
 }
@@ -265,9 +296,10 @@ crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }
 
-# 0 if crew <id>'s authoritative current state is a declared external-wait pause.
-# The stale path absorbs such a crew (on a long re-surface cadence) instead of
-# escalating a possible wedge.
+# 0 if crew <id>'s authoritative current state is an absorbable park: a declared
+# external-wait pause, or a finished green run behind park-anchor evidence (see
+# crew_absorb_class). The stale path absorbs such a crew (on a long re-surface
+# cadence) instead of escalating a possible wedge.
 crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
