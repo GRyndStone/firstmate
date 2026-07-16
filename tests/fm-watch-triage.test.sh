@@ -219,8 +219,28 @@ test_crew_absorb_class_classifier() {
   [ "$(crew_absorb_class a)" = none ] || fail "unknown crew classed absorbable"
   ! crew_is_paused a || fail "unknown crew classed paused"
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
+  # Finished-green merge park: a done run-step absorbs ONLY behind positive
+  # park-anchor evidence (a declared paused: last line, or an armed per-task
+  # check script); done alone, done from a weaker source, and every
+  # failed/gate-parked state stay none (fail-closed).
+  export FM_STATE_OVERRIDE="$dir/state"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  [ "$(crew_absorb_class a)" = none ] || fail "finished green run with no park anchor classed absorbable"
+  printf 'paused: PR checks green, awaiting captain merge\n' > "$dir/state/a.status"
+  [ "$(crew_absorb_class a)" = paused ] || fail "finished green run behind a declared pause not classed paused"
+  rm -f "$dir/state/a.status"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/state/a.check.sh"
+  [ "$(crew_absorb_class a)" = paused ] || fail "finished green run with an armed check not classed paused"
+  FM_FAKE_CREW_STATE='state: done · source: status-log · run still monitoring PR'
+  [ "$(crew_absorb_class a)" = none ] || fail "status-log done with an armed check classed absorbable (run-step evidence required)"
+  FM_FAKE_CREW_STATE='state: failed · source: run-step · run failed'
+  [ "$(crew_absorb_class a)" = none ] || fail "failed run with an armed check classed absorbable"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review'
+  [ "$(crew_absorb_class a)" = none ] || fail "gate-parked run with an armed check classed absorbable"
+  rm -f "$dir/state/a.check.sh"
+  unset FM_STATE_OVERRIDE
   unset FM_FAKE_CREW_STATE
-  pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
+  pass "crew_absorb_class: working/paused/none from one read; a finished green run parks only behind anchor evidence"
 }
 
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
@@ -588,6 +608,191 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the paused re-surface failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "paused re-surface was not queued"
   pass "a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated"
+}
+
+# --- non-terminal stale, run finished green behind a declared pause + armed
+#     merge check: absorbed on the pause cadence, never per-poll ---------------
+# The live 2026-07-16 forex-implementability-fold treadmill: the crew's
+# no-mistakes run reached checks-green, so fm-crew-state reports done ·
+# run-step, superseding the crew's own `paused: ... awaiting captain merge`
+# log line (run-step precedence). crew_absorb_class used to map that done
+# state to none, and the paused-line repeat-sight path then re-surfaced the
+# SAME static pane on every poll until the captain merged - one wasted
+# supervision turn per poll. A finished green run behind positive park
+# evidence must absorb exactly like a declared pause, on the same bounded
+# re-surface cadence.
+test_merge_park_stale_absorbed_then_resurfaced() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid back statusf
+  dir=$(make_case merge-park-stale); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-merge-park"
+  printf 'idle composer, checks green, awaiting merge' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park.meta"
+  statusf="$state/merge-park.status"
+  printf 'done: PR https://example.test/pr/2 checks green\npaused: PR checks green, awaiting captain merge; nothing to do until merge/close\n' > "$statusf"
+  # The merge poll fm-pr-check arms: prints nothing until the PR merges.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$state/merge-park.check.sh"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge-park_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle composer, checks green, awaiting merge")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+
+  # Phase A: several polls under a high re-surface threshold. The treadmill
+  # fired on REPEAT sights (the paused-line path re-classified none every
+  # poll), so staying alive across multiple polls is the regression assertion.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced a checks-green merge park (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "checks-green merge park printed a wake reason during absorb: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "checks-green merge park enqueued a wake during absorb"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on merge-park absorb"
+  [ -e "$state/.paused-$key" ] || fail "merge park did not record the pause flag"
+  [ ! -e "$state/.stale-since-$key" ] || fail "a merge-park absorb must not start the wedge timer"
+  reap "$pid"
+
+  # Phase B: age the park past the (now normal) threshold by backdating its
+  # status file; it re-surfaces once as a bounded recheck - never a wedge.
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else touch -m -d "@$back" "$statusf"; fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge-park_status"
+  : > "$out"
+  printf 'idle composer, checks green, awaiting merge (redraw)' > "$capture_file"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not re-surface a merge park past the threshold"
+  grep -F "stale: $window" "$out" >/dev/null || fail "merge-park re-surface did not print a stale wake"
+  grep -F "awaiting external" "$out" >/dev/null || fail "merge-park re-surface was not labeled a bounded recheck"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a checks-green merge park was mislabeled a possible wedge"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the merge-park re-surface failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "merge-park re-surface was not queued"
+  unset FM_FAKE_CREW_STATE
+  pass "the observed checks-green merge park absorbs across polls, then re-surfaces once on the bounded cadence"
+}
+
+# The armed check alone is a valid park anchor: a finished green run whose last
+# status line is still a no-verb working: note (the crew never declared the
+# pause itself) must absorb behind the armed merge poll instead of being
+# surfaced or wedge-escalated.
+test_merge_park_check_anchor_absorbed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case merge-park-check-anchor); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-check-anchor"
+  printf 'idle composer after validation' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/check-anchor.meta"
+  printf 'working: implementing\n' > "$state/check-anchor.status"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$state/check-anchor.check.sh"
+  sig=$(seen_sig "$state/check-anchor.status"); printf '%s' "$sig" > "$state/.seen-check-anchor_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle composer after validation")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced a check-anchored merge park (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "check-anchored merge park printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "check-anchored merge park enqueued a wake"
+  [ -e "$state/.paused-$key" ] || fail "check-anchored merge park did not record the pause flag"
+  [ ! -e "$state/.stale-since-$key" ] || fail "a check-anchored merge park must not start the wedge timer"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "an armed merge check anchors a finished green run's park even without a declared paused: line"
+}
+
+# Fail-closed: done alone is NOT park evidence. A finished run with no declared
+# pause and no armed check may be a crew that stopped without reporting - it
+# surfaces immediately, exactly like any other not-provably-working stale.
+test_finished_run_without_park_anchor_surfaced() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case finished-no-anchor); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-no-anchor"
+  printf 'idle prompt, run finished' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/no-anchor.meta"
+  printf 'working: implementing\n' > "$state/no-anchor.status"
+  sig=$(seen_sig "$state/no-anchor.status"); printf '%s' "$sig" > "$state/.seen-no-anchor_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle prompt, run finished")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a finished run with no park anchor"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "no-anchor finished run did not print the immediate stale wake: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a no-anchor finished run was mislabeled a wedge"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the no-anchor stale failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "no-anchor finished-run stale was not queued"
+  unset FM_FAKE_CREW_STATE
+  pass "a finished run with no park anchor still surfaces immediately (fail-closed)"
+}
+
+# Death always outranks a park: the merge-park absorb must not weaken the
+# endpoint-gone or agent-dead paths.
+test_merge_park_gone_endpoint_surfaced() {
+  local dir state fakebin out window key sig pid
+  dir=$(make_case merge-park-gone); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  window="test:fm-merge-park-gone"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park-gone.meta"
+  printf 'paused: PR checks green, awaiting captain merge\n' > "$state/merge-park-gone.status"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$state/merge-park-gone.check.sh"
+  sig=$(seen_sig "$state/merge-park-gone.status"); printf '%s' "$sig" > "$state/.seen-merge-park-gone_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a merge park whose endpoint is gone"
+  grep -F "stale: $window endpoint-gone" "$out" >/dev/null || fail "merge-park death did not carry the endpoint-gone reason: $(cat "$out")"
+  [ -e "$state/.endpoint-gone-$key" ] || fail "merge-park endpoint-gone marker was not recorded"
+  unset FM_FAKE_CREW_STATE
+  pass "a merge park's gone endpoint still surfaces immediately (death outranks the park)"
+}
+
+test_merge_park_dead_agent_surfaced() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case merge-park-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-merge-park-dead"
+  printf 'bare shell prompt after the agent exited' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park-dead.meta"
+  printf 'working: implementing\n' > "$state/merge-park-dead.status"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$state/merge-park-dead.check.sh"
+  sig=$(seen_sig "$state/merge-park-dead.status"); printf '%s' "$sig" > "$state/.seen-merge-park-dead_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "bare shell prompt after the agent exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  # The check-anchored park's first sight still runs the confident-dead probe:
+  # a crew that died while parked surfaces instead of absorbing for hours.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999999 FM_STALE_ESCALATE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a merge park whose agent process is confidently dead"
+  grep -F "stale: $window agent-dead" "$out" >/dev/null || fail "merge-park death did not carry the agent-dead reason: $(cat "$out")"
+  [ -e "$state/.agent-dead-$key" ] || fail "merge-park agent-dead marker was not recorded"
+  unset FM_FAKE_CREW_STATE
+  pass "a merge park's confidently dead agent still surfaces (death outranks the park)"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1498,6 +1703,11 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_merge_park_stale_absorbed_then_resurfaced
+test_merge_park_check_anchor_absorbed
+test_finished_run_without_park_anchor_surfaced
+test_merge_park_gone_endpoint_surfaced
+test_merge_park_dead_agent_surfaced
 test_paused_crew_gone_endpoint_surfaced_immediately
 test_paused_crew_alive_quiet_endpoint_absorbed
 test_paused_crew_confident_dead_agent_surfaced

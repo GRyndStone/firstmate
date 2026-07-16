@@ -20,7 +20,11 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge. Only when neither
+#                          re-surface cadence, never as a wedge; a finished-green
+#                          crew (done run-step) parked on positive anchor evidence -
+#                          its declared pause or an armed per-task check - absorbs
+#                          the same way (crew_absorb_class, fm-classify-lib.sh, owns
+#                          that decision). Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
@@ -316,9 +320,11 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   esac
 }
 
-# Absorb a stale pane whose crew is in a DECLARED external-wait pause (paused:),
-# and re-surface it once every PAUSE_RESURFACE_SECS for a recheck so it cannot rot
-# invisibly. Called on any stale poll once the crew is known paused (first sight,
+# Absorb a stale pane whose crew is in an absorbable park - a DECLARED
+# external-wait pause (paused:), or a finished green run behind park-anchor
+# evidence (crew_absorb_class) - and re-surface it once every
+# PAUSE_RESURFACE_SECS for a recheck so it cannot rot
+# invisibly. Called on any stale poll once the crew is known parked (first sight,
 # after crew_absorb_class; and repeat sights, gated by the .paused-<key> flag), so
 # it must be cheap: it NEVER re-reads the crew state. The re-surface age is anchored
 # on the pause's own STATUS-FILE mtime, not a per-hash marker, so a churny idle pane
@@ -339,7 +345,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
-    reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
+    reason="stale: $win (paused ${age}s, awaiting external - declared pause or green-run merge park, rechecked on a long cadence not a wedge; confirm the wait still holds)"
     fm_wake_append stale "$win" "$reason" || exit 1
     date +%s > "$rf"
     wake "$reason"
@@ -461,11 +467,14 @@ handle_dead_agent() {  # <window> <hash>
 }
 
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class
+  local win=$1 task=$2 key recheck_file class
   key=$(window_key "$win")
-  last=$(last_status_line "$STATE/$task.status")
   recheck_file="$STATE/.paused-rechecked-$key"
-  if ! status_is_paused "$last"; then
+  # Park-anchor gate, not just the paused: verb: a finished-green merge park may
+  # be anchored by its armed check script alone (crew_absorb_class), and must
+  # keep the same bounded recheck bookkeeping instead of being ejected to a
+  # fresh full crew-state read (or a wedge timer) every poll.
+  if ! task_has_park_anchor "$task"; then
     rm -f "$recheck_file"
     crew_absorb_class "$task"
     return
@@ -838,7 +847,7 @@ EOF
     task=$(window_to_task "$w" "$STATE")
     key=$(window_key "$w")
     last=$(last_status_line "$STATE/$task.status")
-    if ! status_is_paused "$last" && [ -e "$STATE/.paused-$key" ]; then
+    if ! task_has_park_anchor "$task" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
@@ -951,8 +960,10 @@ EOF
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
           #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
-          #   - paused: the crew DECLARED an external wait (paused:), so absorb on the
-          #     long PAUSE_RESURFACE_SECS recheck cadence instead of wedge-escalating;
+          #   - paused: the crew DECLARED an external wait (paused:), or its run
+          #     finished green with park-anchor evidence (a declared pause or an
+          #     armed check; crew_absorb_class), so absorb on the long
+          #     PAUSE_RESURFACE_SECS recheck cadence instead of wedge-escalating;
           #   - none: no running pipeline, idle pane, no busy signature, no declared
           #     pause - the crew has STOPPED. Surface immediately so firstmate peeks
           #     (it may be done via an interactive menu that wrote no done: status,
@@ -1009,7 +1020,7 @@ EOF
         if [ -e "$STATE/.agent-dead-$key" ] && window_is_busy "$w" "$tail40"; then
           rm -f "$STATE/.agent-dead-$key"
         fi
-        if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
+        if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! task_has_park_anchor "$task"; }; then
           clear_pause_tracking "$w"
         fi
       fi
@@ -1022,7 +1033,7 @@ EOF
       # liveness (busy pane, an alive probe read) or a pause-tracking clear.
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
-      if ! status_is_paused "$(last_status_line "$STATE/$task.status")" || window_is_busy "$w" "$tail40"; then
+      if ! task_has_park_anchor "$task" || window_is_busy "$w" "$tail40"; then
         [ -e "$pf" ] && clear_pause_tracking "$w"
       elif afk_present; then
         # Afk keeps the same bounded paused-recheck death probe on a churning

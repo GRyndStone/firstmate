@@ -546,7 +546,7 @@ Whenever at least one task is in flight, keep exactly one live supervision wait 
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when provably working).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait until its bounded recheck cadence, and no-change heartbeats.
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait or a checks-green finished crew parked behind that pause or an armed merge poll until its bounded recheck cadence, and no-change heartbeats.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
 Repeated provably-working stale escalations on one unchanged pane eventually add `demand-deep-inspection` to the wake reason so it is not mistaken for another routine validation wait.
