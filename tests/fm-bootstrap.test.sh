@@ -157,8 +157,14 @@ run_bootstrap_timeout_case() {
   (
     # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
     sleep() {
+      # Pin SECONDS to a fixed base plus a pure virtual total: bash keeps
+      # ticking SECONDS with wall-clock time between assignments, and the
+      # additive form let those leaked seconds accumulate under load,
+      # overshooting the asserted elapsed= value.
       local inc=${1:-1}
-      SECONDS=$((SECONDS + inc))
+      [ -n "${FM_FAKE_SLEEP_BASE:-}" ] || FM_FAKE_SLEEP_BASE=$SECONDS
+      FM_FAKE_SLEEP_TOTAL=$((${FM_FAKE_SLEEP_TOTAL:-0} + inc))
+      SECONDS=$((FM_FAKE_SLEEP_BASE + FM_FAKE_SLEEP_TOTAL))
       if [ "${FM_FAKE_SLEEP_YIELDS:-0}" -lt 5 ]; then
         FM_FAKE_SLEEP_YIELDS=$((${FM_FAKE_SLEEP_YIELDS:-0} + 1))
         command sleep 0.01

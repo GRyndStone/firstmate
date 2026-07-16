@@ -14,7 +14,7 @@ DESTINATION=${1:?usage: fm-install-shellcheck.sh <destination-directory>}
 TMP=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/fm-shellcheck.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
-curl -fsSL "$URL" -o "$TMP/$ARCHIVE"
+curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --retry-all-errors "$URL" -o "$TMP/$ARCHIVE"
 ACTUAL_SHA256=$(sha256sum "$TMP/$ARCHIVE" | awk '{print $1}')
 [ "$ACTUAL_SHA256" = "$SHA256" ] || {
   printf 'fm-install-shellcheck.sh: checksum mismatch for %s\n' "$ARCHIVE" >&2
