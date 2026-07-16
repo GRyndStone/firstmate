@@ -3,7 +3,7 @@ name: drive-gsd
 description: >-
   Agent-only reference for GSD-driving crewmates: standing managers that drive an external GSD.Pi project headless.
   Use before scaffolding (fm-brief.sh --gsd), spawning, steering, or recovering such a crewmate.
-  Covers when to choose the GSD-driving shape, the scaffold and spawn recipe, supervision specifics for long headless runs, the decision-routing contract, the recovery pattern, and known GSD 1.9.0 gotchas.
+  Covers when to choose the GSD-driving shape, the scaffold and spawn recipe, the visible-driving-runs hard rule (bin/fm-gsd-run.sh), supervision specifics for long headless runs, the decision-routing contract, the recovery pattern, and known GSD 1.9.0 gotchas.
 user-invocable: false
 metadata:
   internal: true
@@ -27,12 +27,22 @@ Everything project-specific - the GSD project path, the objective or specificati
 4. The repo argument only decides where the crewmate's scratch worktree sits; pick the cloned project most related to the task.
 5. Add the task to the backlog as usual.
 
+## Visible driving runs - hard rule
+
+Every driving invocation of the external project - `gsd headless new-project`, `gsd headless new-milestone`, `gsd headless auto` - launches in a VISIBLE herdr tab via `bin/fm-gsd-run.sh`; driving one from a raw, invisible session shell is forbidden.
+This is the fleet-wide recursive-visibility decision, kuru-os D010/ISC-55: every layer of delegated agent work must be observable, and a GSD driving run is a whole layer of delegated agent work, so the captain and firstmate must be able to inspect it live rather than trust a subprocess buried in the crewmate's shell.
+Read-only inspection (`gsd headless status`, `gsd headless query`, `gsd sessions`) is not a driving run and may run directly in the crewmate's own shell.
+`bin/fm-gsd-run.sh` owns the launch mechanics - tab naming, exit-code capture, wait versus `--no-wait` behavior; read its header or `--help` rather than reconstructing them here.
+If the helper cannot open a visible tab (herdr missing or refusing), the run does not happen invisibly instead: the crewmate reports `blocked:`, and firstmate escalates the missing capability rather than waiving the rule.
+The `--gsd` brief scaffold embeds the operational rule, so a GSD-driving crewmate is bound by it without loading this skill.
+
 ## Supervision specifics
 
 GSD auto runs are long: treat long quiet as normal, not a wedge.
 The brief requires the crewmate to keep a `paused: driving GSD ...` line as the LAST status line while idle-waiting with no open decision or blocker, so the watcher already classifies the quiet pane as a declared external wait.
 While any `needs-decision:` or `blocked:` line is open - keyed or not - the brief forbids any further status append, so the open line stays the last line and keeps surfacing until the crewmate closes it with the matching `resolved:`.
 When you need current GSD progress, steer the crewmate to run `gsd headless status` and report back; never run `gsd` against the external project yourself and never peek the project's files for state - the crewmate is the single driver of that project.
+The visible run tab `bin/fm-gsd-run.sh` opened is the sanctioned live view of a driving run: peeking it is observation, not driving, and does not violate the single-driver rule.
 Milestone completions arrive as keyed `needs-decision [key=milestone-<id>]: milestone <id> complete - <question>` boundary events, so they surface immediately instead of being absorbed behind the `paused:` last line; `working:` lines are only rare mid-milestone progress.
 Relay each completed milestone to the captain as an outcome together with its proceed/UAT question.
 The brief's context self-preservation rule can surface `paused: context handoff written, requesting relaunch`; treat that as a healthy rotation request, not a failure, and recover per the pattern below with `data/<id>/handoff.md` as the starting state.

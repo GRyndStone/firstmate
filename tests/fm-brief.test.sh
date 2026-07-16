@@ -300,6 +300,14 @@ test_gsd_brief_contract() {
     "gsd brief missing the headless auto/status/query drive loop"
   assert_grep "SQLite-authoritative GSD state: never hand-edit anything under it" "$brief" \
     "gsd brief missing the never-hand-edit .gsd/ rule"
+  assert_grep "HARD RULE - visible runs: launch every driving invocation" "$brief" \
+    "gsd brief missing the visible-runs hard rule"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'bin/fm-gsd-run.sh`, which opens the run in a visible herdr tab; never run a driving invocation as a raw child of your own shell' "$brief" \
+    "gsd brief missing the fm-gsd-run.sh visible-tab launch pointer"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'If the helper cannot open the visible tab, append `blocked: {why}` and stop instead of driving invisibly' "$brief" \
+    "gsd brief missing the no-invisible-fallback blocked escalation"
   assert_grep "Route every NEEDS-HUMAN gate, every milestone-boundary decision" "$brief" \
     "gsd brief missing the needs-decision routing contract"
   # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
