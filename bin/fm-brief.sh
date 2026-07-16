@@ -14,7 +14,9 @@
 #   manager that stands up or resumes the external GSD.Pi project named in {TASK}
 #   and drives it via `gsd headless` (new-project / new-milestone --context, auto
 #   with an explicit --timeout, status, query), never hand-editing the project's
-#   SQLite-authoritative .gsd/ state. The worktree is scratch like a scout's, so
+#   SQLite-authoritative .gsd/ state. Driving invocations launch through
+#   bin/fm-gsd-run.sh's visible herdr tab, never a raw invisible shell (the
+#   drive-gsd skill owns that contract). The worktree is scratch like a scout's, so
 #   spawn with --scout; the deliverable is the driven external project plus a
 #   report at data/<task-id>/report.md, and done means the {TASK}-named
 #   milestone(s) are complete with evidence. Mutually exclusive with --scout and
@@ -303,14 +305,17 @@ If the task names a machine profile or operating guide for \`gsd\`, read it befo
 
 # Driving GSD headless
 1. Reconcile GSD's view before acting: \`gsd headless status\` and \`gsd headless query\`; \`gsd sessions\` lists resumable sessions.
-2. Stand up or resume per the task: a new project needs a committed git repo first; hand GSD the specification with \`gsd headless new-project\` or \`gsd headless new-milestone --context <spec-file>\`.
-3. Run units with \`gsd headless auto\` and an explicit sane \`--timeout\`; track progress with \`gsd headless status\` / \`gsd headless query\`.
-4. The project's \`.gsd/\` is SQLite-authoritative GSD state: never hand-edit anything under it.
+2. HARD RULE - visible runs: launch every driving invocation (\`gsd headless new-project\`, \`gsd headless new-milestone\`, \`gsd headless auto\`) through \`$FM_ROOT/bin/fm-gsd-run.sh\`, which opens the run in a visible herdr tab; never run a driving invocation as a raw child of your own shell.
+   Read-only inspection (\`gsd headless status\`, \`gsd headless query\`, \`gsd sessions\`) may run directly; \`$FM_ROOT/bin/fm-gsd-run.sh --help\` owns the launch mechanics, including \`--no-wait\` for runs longer than your foreground command budget.
+   If the helper cannot open the visible tab, append \`blocked: {why}\` and stop instead of driving invisibly.
+3. Stand up or resume per the task: a new project needs a committed git repo first; hand GSD the specification with \`gsd headless new-project\` or \`gsd headless new-milestone --context <spec-file>\`.
+4. Run units with \`gsd headless auto\` and an explicit sane \`--timeout\`; track progress with \`gsd headless status\` / \`gsd headless query\`.
+5. The project's \`.gsd/\` is SQLite-authoritative GSD state: never hand-edit anything under it.
    Repair a crash-stale unit or lock through GSD's own tooling, never by deleting or rewriting GSD state.
-5. Known GSD 1.9.0 bug - headless shutdown process leak: a headless invocation can print a valid result yet leave a \`gsd\` process alive.
+6. Known GSD 1.9.0 bug - headless shutdown process leak: a headless invocation can print a valid result yet leave a \`gsd\` process alive.
    After every headless invocation completes, check for leftover \`gsd\` processes from it and kill them, so leaked processes never accumulate or hold locks.
    For pure inspection whose headless form is known to leak (e.g. \`gsd headless extensions list\`), prefer the interactive form.
-6. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
+7. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
 
 # Decision routing
 Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision [key=gsd-gate-{slug}]: {concise question + the options GSD surfaced}\` to the status file, with {slug} derived from the gate or check name, and wait silently until firstmate replies.
