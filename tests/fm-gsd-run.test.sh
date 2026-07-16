@@ -8,10 +8,12 @@
 # fail-closed behavior when herdr is missing, the --no-wait launch path (tab
 # labeled gsd-<id>-r<stamp>, never fm-*; pane command cd's into the project,
 # runs via env, records the exit code), per-invocation label/exit-file
-# uniqueness for same-second runs, exit-code propagation through the default
-# wait, the dead-pane abort during a wait (including honoring an exit code
-# recorded in the instant the tab closed), and the loud wait-abandon after
-# consecutive unreadable pane states.
+# uniqueness for same-second runs, relative FM_GSD_RUN_STATE_DIR resolution,
+# exit-code propagation through the default wait, and the wait-side aborts
+# that all share the reserved exit code 96: the dead-pane abort (including
+# honoring an exit code recorded in the instant the tab closed), the loud
+# wait-abandon after consecutive unreadable pane states, and the mid-wait
+# server-restart abort when status --json exposes a server identity.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -32,8 +34,12 @@ mkdir -p "$TMP_ROOT"
 # FM_FAKE_PANE_GONE=1 and FM_FAKE_DEAD_EXIT are set, the gone answer first
 # records that exit code to the run's exit file (label read back from the
 # tab-create line it already logged), reproducing a run that finished in the
-# same instant its tab closed. Responses stay canned JSON; every invocation
-# logs one unit-separated line to $FM_HERDR_LOG.
+# same instant its tab closed. With FM_FAKE_SERVER_RESTART=1, status --json
+# reports a server pid of 111 until the first `pane get` has been logged
+# (i.e. until the wait loop starts polling) and 222 afterwards, reproducing
+# a server restart between launch and the wait; otherwise status exposes no
+# pid/start-time, matching the verified real build. Responses stay canned
+# JSON; every invocation logs one unit-separated line to $FM_HERDR_LOG.
 make_gsd_fake_herdr() {  # <dir> -> echoes fakebin dir
   local fb="$1/fakebin"
   mkdir -p "$fb"
@@ -47,7 +53,14 @@ LOG="${FM_HERDR_LOG:?}"
   printf '\n'
 } >> "$LOG"
 case "${1:-} ${2:-}" in
-  "status --json") printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n' ;;
+  "status --json")
+    if [ "${FM_FAKE_SERVER_RESTART:-0}" = 1 ]; then
+      if grep -q $'\x1fpane\x1fget' "$LOG" 2>/dev/null; then pid=222; else pid=111; fi
+      printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true,"pid":%s}}\n' "$pid"
+    else
+      printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
+    fi
+    ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
   "tab list") printf '{"result":{"tabs":[]}}\n' ;;
   "tab create") printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' ;;
@@ -79,6 +92,7 @@ test_script_parses_and_help() {
   help=$("$ROOT/bin/fm-gsd-run.sh" --help)
   assert_contains "$help" "VISIBLE herdr tab" "fm-gsd-run.sh --help lost the visibility statement"
   assert_contains "$help" "--no-wait" "fm-gsd-run.sh --help omitted --no-wait"
+  assert_contains "$help" "Exit code 96 is RESERVED" "fm-gsd-run.sh --help lost the reserved wait-abort exit code"
   pass "fm-gsd-run.sh: bash -n succeeds and --help renders the header"
 }
 
@@ -130,18 +144,20 @@ test_missing_herdr_fails_closed() {
 }
 
 test_no_wait_launches_visible_tab() {
-  local dir fb log proj proj_real out status
+  local dir fb log proj proj_real state_real out status
   dir="$TMP_ROOT/no-wait"
   fb=$(make_gsd_fake_herdr "$dir")
   log="$dir/calls.log"; : > "$log"
   proj="$dir/gsd-proj"; mkdir -p "$proj"
   proj_real=$(cd "$proj" && pwd -P)
+  mkdir -p "$dir/state"
+  state_real=$(cd "$dir/state" && pwd -P)
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
     "$ROOT/bin/fm-gsd-run.sh" --no-wait task-n1 "$proj" gsd headless auto --timeout 3600 2>&1 ) && status=0 || status=$?
   expect_code 0 "$status" "--no-wait launch should exit 0"
   assert_contains "$out" "tab=gsd-task-n1-r" "run line lost the gsd-<id>-r<epoch> tab label"
   assert_contains "$out" "target=default:w1:p9" "run line lost the pane target"
-  assert_contains "$out" "exit_file=$dir/state/gsd-task-n1-r" "run line lost the exit-file path"
+  assert_contains "$out" "exit_file=$state_real/gsd-task-n1-r" "run line lost the exit-file path"
   assert_contains "$out" "not waiting" "--no-wait lost its poll hint"
   assert_not_contains "$out" "tab=fm-" "run tab must never squat the fm-* task-tab namespace"
   assert_grep "--label" "$log" "tab create lost its --label flag"
@@ -149,7 +165,7 @@ test_no_wait_launches_visible_tab() {
   assert_grep "--no-focus" "$log" "tab create lost --no-focus"
   # The pane command: cd into the (physically resolved) project dir, run via
   # env, record the exit code.
-  assert_grep "cd '$proj_real' && env 'gsd' 'headless' 'auto' '--timeout' '3600'; echo \$? > '$dir/state/" "$log" \
+  assert_grep "cd '$proj_real' && env 'gsd' 'headless' 'auto' '--timeout' '3600'; echo \$? > '$state_real/" "$log" \
     "pane run lost the cd+env+exit-record command shape"
   pass "fm-gsd-run.sh: --no-wait opens the visible run tab and returns"
 }
@@ -210,7 +226,7 @@ test_wait_aborts_on_dead_pane() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
     FM_GSD_RUN_POLL=1 FM_FAKE_PANE_GONE=1 \
     "$ROOT/bin/fm-gsd-run.sh" task-d1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
-  expect_code 1 "$status" "a dead run pane must abort the wait with exit 1"
+  expect_code 96 "$status" "a dead run pane must abort the wait with the reserved code 96"
   assert_contains "$out" "closed before the run recorded an exit code" "dead-pane abort lost its message"
   pass "fm-gsd-run.sh: a dead run pane aborts the wait loudly"
 }
@@ -247,12 +263,58 @@ test_wait_abandons_after_unknown_streak() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
     FM_GSD_RUN_POLL=0 FM_FAKE_PANE_UNKNOWN=1 FM_GSD_RUN_UNKNOWN_LIMIT=3 \
     "$ROOT/bin/fm-gsd-run.sh" task-k1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
-  expect_code 1 "$status" "an unknown-state streak must abandon the wait with exit 1"
+  expect_code 96 "$status" "an unknown-state streak must abandon the wait with the reserved code 96"
   assert_contains "$out" "abandoning the WAIT after 3 consecutive unreadable pane states" \
     "unknown-streak abort lost its message"
   assert_contains "$out" "may still be live" "unknown-streak abort must say the run was not touched"
   ! grep -q "pane.close" "$log" || fail "abandoning the wait must never close the pane"
   pass "fm-gsd-run.sh: an unreadable-state streak abandons only the wait, loudly"
+}
+
+# A relative FM_GSD_RUN_STATE_DIR must be resolved to an absolute path at
+# launch - the pane command cd's into the project before writing the exit
+# file, so a verbatim relative path would split the write and the poll into
+# two different directories (and pollute the external project).
+test_relative_state_dir_resolved_absolute() {
+  local dir fb log proj state_real out status exit_file
+  dir="$TMP_ROOT/relative"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  mkdir -p "$dir/rel-state"
+  state_real=$(cd "$dir/rel-state" && pwd -P)
+  out=$( cd "$dir" && PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="rel-state" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-r1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  expect_code 0 "$status" "a relative FM_GSD_RUN_STATE_DIR launch should still exit 0"
+  exit_file=$(printf '%s\n' "$out" | sed -n 's/.*exit_file=//p' | head -1)
+  [ -n "$exit_file" ] || fail "relative-state-dir launch lost its exit_file line"
+  case "$exit_file" in
+    /*) : ;;
+    *) fail "a relative FM_GSD_RUN_STATE_DIR must be resolved absolute, got: $exit_file" ;;
+  esac
+  assert_contains "$exit_file" "$state_real/" "resolved exit file left the relative state dir"
+  assert_grep "echo \$? > '$state_real/" "$log" "pane command must record to the absolute exit-file path"
+  pass "fm-gsd-run.sh: a relative state dir resolves to one absolute exit-file path"
+}
+
+# A herdr server restart mid-wait (identity changed between launch and a
+# poll) means the run's process died with the server and the exit file can
+# never appear: the wait must abort loudly with the reserved code, without
+# touching the pane.
+test_wait_aborts_on_server_restart() {
+  local dir fb log proj out status
+  dir="$TMP_ROOT/restart"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    FM_GSD_RUN_POLL=0 FM_FAKE_SERVER_RESTART=1 \
+    "$ROOT/bin/fm-gsd-run.sh" task-s1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  expect_code 96 "$status" "a mid-wait server restart must abort the wait with the reserved code 96"
+  assert_contains "$out" "restarted mid-wait (identity 111 -> 222)" "server-restart abort lost its identity message"
+  assert_contains "$out" "pane was NOT touched" "server-restart abort must say the pane was not touched"
+  ! grep -q "pane.close" "$log" || fail "the server-restart abort must never close the pane"
+  pass "fm-gsd-run.sh: a mid-wait server restart abandons only the wait, loudly"
 }
 
 test_script_parses_and_help
@@ -262,6 +324,8 @@ test_missing_herdr_fails_closed
 test_no_wait_launches_visible_tab
 test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code
+test_relative_state_dir_resolved_absolute
 test_wait_aborts_on_dead_pane
 test_dead_pane_honors_just_recorded_exit_code
 test_wait_abandons_after_unknown_streak
+test_wait_aborts_on_server_restart

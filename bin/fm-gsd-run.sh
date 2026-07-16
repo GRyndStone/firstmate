@@ -24,12 +24,30 @@
 #   whose wall-clock exceeds your harness's foreground command budget.
 #   The tab stays open after the run so its output stays inspectable; the
 #   watcher never adopts it because the label does not start with fm-.
+#   Exit code 96 is RESERVED for every wait-side abort - a run tab that
+#   closed before recording an exit code, an unreadable-pane-state streak,
+#   and a mid-wait herdr server restart - so a scripted caller can tell "the
+#   wait was abandoned; the run itself was never touched and may still be
+#   live in its tab" from "the run finished and failed". The run's own exit
+#   code is always passed through unchanged, including a run that itself
+#   exits 96.
+#   At launch the wait records the herdr server's identity (its pid and/or
+#   start time when `status --json` exposes them) and re-reads it each poll:
+#   a changed identity means the server restarted, the run's process died
+#   with it, and the exit file can never appear, so the WAIT aborts loudly
+#   (exit 96) without touching the pane. The verified herdr build (0.7.3,
+#   protocol 16) exposes NO pid or start-time in `status --json`; on such
+#   builds the restart check is skipped rather than substituting a weaker
+#   heuristic, a mid-wait identity read that yields nothing counts toward
+#   the unreadable-state streak, and a restarted-then-restored server is
+#   covered only by that streak.
 #   FM_GSD_RUN_POLL overrides the wait poll interval in seconds (default 5);
 #   FM_GSD_RUN_STATE_DIR overrides the exit-file directory (default: a fresh
-#   mktemp dir per run); FM_GSD_RUN_UNKNOWN_LIMIT overrides how many
-#   consecutive unreadable pane-state polls the wait tolerates before
-#   abandoning the WAIT (default 6) - that abort never touches the pane or
-#   the run, which may still be live with its exit file still to come.
+#   mktemp dir per run; a relative path is resolved to an absolute one at
+#   launch); FM_GSD_RUN_UNKNOWN_LIMIT overrides how many consecutive
+#   unreadable pane-state polls the wait tolerates before abandoning the
+#   WAIT (default 6) - that abort never touches the pane or the run, which
+#   may still be live with its exit file still to come.
 # Requires the herdr CLI: the visibility contract names herdr as the surface,
 # so when herdr is missing or refuses, this fails loudly instead of falling
 # back to an invisible run - the caller reports blocked rather than driving
@@ -96,11 +114,20 @@ shell_quote() {
 . "$SCRIPT_DIR/fm-backend.sh"
 fm_backend_source herdr || exit 1
 
+WAIT_ABORT_CODE=96
+
+# The herdr server's identity for restart detection, or empty when this
+# build's `status --json` exposes no pid/start-time (see header).
+gsd_run_server_identity() {
+  fm_backend_herdr_cli "$SES" status --json 2>/dev/null \
+    | jq -r '.server | [(.pid // empty), (.started_at // empty), (.start_time // empty)] | join("/")' 2>/dev/null
+}
+
 RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
 if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
-  RUN_DIR=$FM_GSD_RUN_STATE_DIR
-  mkdir -p "$RUN_DIR"
+  mkdir -p "$FM_GSD_RUN_STATE_DIR"
+  RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
 else
   RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX")
 fi
@@ -132,6 +159,8 @@ if [ -z "$TAB_ID" ] || [ -z "$PANE_ID" ]; then
 fi
 TARGET="$SES:$PANE_ID"
 
+SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
+
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
   echo "error: failed to start the run in herdr tab $LABEL (target $TARGET)" >&2
   exit 1
@@ -152,13 +181,26 @@ while [ ! -s "$EXIT_FILE" ]; do
   if [ "$STATE" = dead ]; then
     [ -s "$EXIT_FILE" ] && break
     echo "error: run tab $LABEL closed before the run recorded an exit code" >&2
-    exit 1
+    exit "$WAIT_ABORT_CODE"
   fi
-  if [ "$STATE" = unknown ]; then
+  UNREADABLE=0
+  [ "$STATE" = unknown ] && UNREADABLE=1
+  if [ -n "$SERVER_IDENTITY" ]; then
+    NOW_IDENTITY=$(gsd_run_server_identity) || NOW_IDENTITY=""
+    if [ -z "$NOW_IDENTITY" ]; then
+      UNREADABLE=1
+    elif [ "$NOW_IDENTITY" != "$SERVER_IDENTITY" ]; then
+      [ -s "$EXIT_FILE" ] && break
+      echo "error: the herdr server behind run tab $LABEL restarted mid-wait (identity $SERVER_IDENTITY -> $NOW_IDENTITY), so the run's process cannot have survived and $EXIT_FILE can never appear; abandoning the WAIT - the pane was NOT touched, and tab $LABEL still holds the run's output" >&2
+      exit "$WAIT_ABORT_CODE"
+    fi
+  fi
+  if [ "$UNREADABLE" -eq 1 ]; then
     UNKNOWN_STREAK=$((UNKNOWN_STREAK + 1))
     if [ "$UNKNOWN_STREAK" -ge "$UNKNOWN_LIMIT" ]; then
+      [ -s "$EXIT_FILE" ] && break
       echo "error: abandoning the WAIT after $UNKNOWN_STREAK consecutive unreadable pane states for run tab $LABEL (herdr may be down); the run was NOT touched - it may still be live in the tab, and $EXIT_FILE may still appear when it ends" >&2
-      exit 1
+      exit "$WAIT_ABORT_CODE"
     fi
   else
     UNKNOWN_STREAK=0
