@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 let guardFollowupDeliveryActive = false;
 let guardFollowupAwaitingAck = "";
 let guardFollowupRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let guardFollowupPendingMessage = "";
 
 type LockOwnership = "owned" | "missing" | "other";
 
@@ -21,6 +22,13 @@ const handoffDir = `${state}/.turnend-handoffs`;
 const handoffPath = `${handoffDir}/pi.pending`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 let handoffSequence = 0;
+
+function primaryCheckout(): boolean {
+  const result = spawnSync("git", ["-C", root, "rev-parse", "--git-dir", "--git-common-dir"], { encoding: "utf8" });
+  if (result.status !== 0) return false;
+  const paths = result.stdout.trim().split("\n");
+  return paths.length === 2 && paths[0] === paths[1];
+}
 
 function parentPid(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
@@ -125,8 +133,21 @@ function cancelRetryOwner(): void {
   guardFollowupRetryTimer = undefined;
 }
 
+function ensureHandoff(): Handoff | undefined {
+  if (guardFollowupPendingMessage) {
+    try {
+      const handoff = persistHandoff(guardFollowupPendingMessage);
+      guardFollowupPendingMessage = "";
+      return handoff;
+    } catch {
+      return undefined;
+    }
+  }
+  return readHandoff();
+}
+
 function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
-  if (guardFollowupRetryTimer !== undefined || !readHandoff()) return;
+  if (guardFollowupRetryTimer !== undefined || (!readHandoff() && !guardFollowupPendingMessage)) return;
   guardFollowupRetryTimer = setTimeout(() => {
     guardFollowupRetryTimer = undefined;
     deliverHandoff(pi);
@@ -135,8 +156,11 @@ function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
 
 function deliverHandoff(pi: ExtensionAPI): void {
   if (guardFollowupDeliveryActive) return;
-  const handoff = readHandoff();
-  if (!handoff) return;
+  const handoff = ensureHandoff();
+  if (!handoff) {
+    scheduleDelivery(pi);
+    return;
+  }
   guardFollowupDeliveryActive = true;
   try {
     pi.sendUserMessage(handoff.message, { deliverAs: "followUp" });
@@ -154,6 +178,7 @@ function acknowledgeHandoff(): void {
   if (!handoff || handoff.token !== guardFollowupAwaitingAck) return;
   clearHandoff(handoff.record);
   guardFollowupAwaitingAck = "";
+  guardFollowupPendingMessage = "";
   cancelRetryOwner();
 }
 
@@ -187,14 +212,18 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on?.("session_start", () => {
-    markLoaded();
-    scheduleDelivery(pi, 0);
-  });
+  const inPrimaryCheckout = primaryCheckout();
 
-  pi.on?.("agent_start", () => {
-    acknowledgeHandoff();
-  });
+  if (inPrimaryCheckout) {
+    pi.on?.("session_start", () => {
+      markLoaded();
+      scheduleDelivery(pi, 0);
+    });
+
+    pi.on?.("agent_start", () => {
+      acknowledgeHandoff();
+    });
+  }
 
   pi.on("tool_call", async (event) => {
     if (event.type !== "tool_call" || event.toolName !== "bash") return {};
@@ -209,28 +238,31 @@ export default function (pi: ExtensionAPI) {
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
   });
 
-  pi.on("agent_settled", async () => {
-    const result = await runGuard();
-    if (result.code === 0) {
-      clearHandoff();
+  if (inPrimaryCheckout) {
+    pi.on("agent_settled", async () => {
+      const result = await runGuard();
+      if (result.code === 0) {
+        clearHandoff();
+        guardFollowupAwaitingAck = "";
+        guardFollowupPendingMessage = "";
+        cancelRetryOwner();
+        return;
+      }
+      const detail = result.stderr.trim();
+      const reason = result.code === 2
+        ? detail || "shared turn-end guard blocked"
+        : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
+      const message =
+        "TURN WOULD END BLIND - supervision is off. " +
+        "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
+        reason;
+      guardFollowupPendingMessage = message;
       guardFollowupAwaitingAck = "";
       cancelRetryOwner();
-      return;
-    }
-    const detail = result.stderr.trim();
-    const reason = result.code === 2
-      ? detail || "shared turn-end guard blocked"
-      : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
-    const message =
-      "TURN WOULD END BLIND - supervision is off. " +
-      "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
-      reason;
-    persistHandoff(message);
-    guardFollowupAwaitingAck = "";
-    cancelRetryOwner();
-    deliverHandoff(pi);
-  });
+      deliverHandoff(pi);
+    });
 
-  markLoaded();
-  scheduleDelivery(pi, 0);
+    markLoaded();
+    scheduleDelivery(pi, 0);
+  }
 }

@@ -265,6 +265,8 @@ The firstmate PRIMARY's own `.grok/hooks/fm-primary-turnend-guard.json` invokes 
 Grok Stop hooks are passive for this purpose: exit 2 does not make the model continue.
 The adapter therefore runs the shared predicate and, when it returns 2, durably records one same-session follow-up and schedules bounded delivery after the current Stop hook returns; every later Stop event reruns the predicate and schedules again if blindness persists.
 The deterministic per-session worker waits for the originating hook process identity to disappear, serializes delivery with one session lock, retries until resume succeeds, and discards retained pending work when a healthy Stop proves supervision recovered.
+When the payload omits session identity, the adapter continues the latest session scoped to the verified primary checkout, and every newly launched worker must acknowledge its exact handoff token and process identity before the hook reports ownership.
+An unwritable handoff directory remains an explicit Grok product exception because its passive Stop result cannot block.
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.

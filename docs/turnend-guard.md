@@ -53,10 +53,10 @@ All verified primary harnesses have a tracked integration:
 
 - `claude`: `.claude/settings.json` registers a `Stop` hook command anchored through `"$CLAUDE_PROJECT_DIR"/bin/fm-turnend-guard.sh`.
 - `codex`: `.codex/hooks.json` registers a dependency-free `Stop` hook that reads the hook payload once, anchors the executable to the hook command process working directory, verifies that root is firstmate-shaped and hook-bearing, and pipes the original payload to that checkout's `bin/fm-turnend-guard.sh`.
-- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, then runs the shared guard, durably records the required continuation under `state/.turnend-handoffs/`, and uses `client.session.promptAsync` to deliver it when the guard blocks or cannot run.
-- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard for every logical agent run including a generated guard follow-up, durably records the required continuation under `state/.turnend-handoffs/`, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to attempt delivery when the guard blocks or cannot run.
+- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` proves the checkout is not a linked worktree before scanning home-level handoffs, then listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, runs the shared guard, and uses `client.session.promptAsync` to deliver required continuations.
+- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` proves the checkout is not a linked worktree before registering primary lifecycle or recovery handlers, then listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard for every logical agent run including a generated guard follow-up, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to attempt delivery.
 - `grok`: `.grok/hooks/fm-primary-turnend-guard.json` registers a `Stop` hook that invokes `bin/fm-turnend-guard-grok.sh`.
-  The adapter runs the shared guard and, when it blocks or cannot run, atomically records one deterministic exact-session continuation under `state/.turnend-handoffs/` and starts `bin/fm-turnend-guard-grok-deliver.sh` to invoke bounded `grok --resume <sessionId> -p <guard-reason>` attempts only after the originating Stop-hook process identity is gone.
+  The adapter runs the shared guard and, when it blocks or cannot run, atomically records one deterministic continuation under `state/.turnend-handoffs/` and starts `bin/fm-turnend-guard-grok-deliver.sh` to invoke bounded `grok --resume <sessionId>` attempts, or checkout-scoped `grok --continue` when the payload omits session identity, only after the originating Stop-hook process identity is gone.
   It does not pass `--permission-mode`, so the passive Stop hook cannot grant stronger tool permissions than Grok's resumed-session default.
 
 Claude and Codex support a direct blocking Stop hook.
@@ -71,12 +71,16 @@ Pi and OpenCode keep a transient latch only around an SDK delivery call already 
 Pi's real `ExtensionAPI.sendUserMessage` returns `void`, so calling it is never treated as delivery acknowledgement.
 Pi retains the handoff, keeps one process-retaining retry timer alive, recovers the record when the extension loads, and clears both record and timer only when the ensuing `agent_start` proves an assistant continuation began or the predicate becomes healthy.
 OpenCode treats the resolved `promptAsync` promise as explicit queue acknowledgement, while a process-retaining per-session retry timer owns rejected delivery until acknowledgement or healthy invalidation and plugin startup recovers retained records.
+If Pi or OpenCode cannot synchronously persist a handoff, the message remains in process memory under the same referenced retry timer until persistence and delivery succeed or the predicate becomes healthy.
+Neither adapter reads, delivers, acknowledges, or clears a home-level handoff from a linked crewmate checkout.
 A shared-guard launch failure follows the same fail-closed delivery path instead of being converted into a healthy result.
 Grok stores the originating hook pid and process identity in its deterministic per-session handoff.
-One per-session worker lock serializes resumes, the worker waits for the recorded hook identity to disappear before every attempt, and it retains retry ownership until a bounded resume succeeds.
-A healthy later Stop removes that session's stale pending record, and a missing session id is recorded and reported as an adapter failure rather than silently discarded.
+One per-session worker lock serializes resumes, the launching hook waits for a token-bound worker-pid and process-identity readiness acknowledgement, and the worker retains retry ownership until a bounded resume succeeds.
+TERM or INT kills and reaps the exact active resume and timeout children before that worker releases its singleton lock.
+A healthy later Stop removes that session's stale pending record, and a missing session id is recorded in the checkout-scoped fallback reason rather than silently discarded.
 After independently confirming the same primary-checkout scope, a missing shared guard enters that durable delivery path with an explicit adapter-failure reason.
-If exact session identity or durable handoff preparation is unavailable, the Grok wrapper exits nonzero instead of reporting a healthy Stop.
+Missing exact session identity falls back to the latest session scoped by the verified primary checkout.
+Grok exposes no blocking Stop result, so an unwritable durable state directory or a worker that cannot acknowledge readiness is an explicit unsupported product exception: the wrapper exits nonzero, preserves any completed pending record, and cannot claim a guaranteed continuation until a later Stop or `fm-guard.sh` recovers it.
 
 ## Empirical Validation
 
@@ -142,6 +146,6 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, active away-mode daemon provenance plus exact live agent-process validation including a surviving bare-shell pane, a foreground checkpoint that is live at the first Stop and dead at the retry, exact bounded-detail omission disclosure, repeated Pi, OpenCode, and Grok continuation delivery while blindness persists, real Pi void-return acknowledgement, passive startup recovery and retry ownership, fail-closed guard-launch and handoff-preparation errors, Grok hook-exit and per-session serialization barriers, dependency-free fail-closed behavior without `jq` or valid input, tracked hook registration for all five harnesses, and the Grok adapter's permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, active away-mode daemon provenance plus exact live agent-process validation including a surviving bare-shell pane, a foreground checkpoint that is live at the first Stop and dead at the retry, exact bounded-detail omission disclosure, repeated Pi, OpenCode, and Grok continuation delivery while blindness persists, real Pi void-return acknowledgement, linked-crewmate recovery isolation, volatile persistence retry ownership, fail-closed guard-launch and handoff-preparation errors, Grok hook-exit, readiness, signal-reaping, and per-session serialization barriers, dependency-free fail-closed behavior without `jq` or valid input, tracked hook registration for all five harnesses, and the Grok adapter's permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

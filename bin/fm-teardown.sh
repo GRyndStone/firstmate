@@ -148,6 +148,7 @@ STAGE_OUTCOME=
 STAGE_RECORD_CKSUM=
 STAGE_FORCE=
 STAGE_AUX_CKSUM=
+STAGE_DONE_ACK=
 stage_value() {
   local key=$1
   sed -n "s/^${key}=//p" "$TEARDOWN_STAGE" | tail -1
@@ -165,21 +166,36 @@ teardown_stage_schema_valid() {
     $1 == "outcome" { outcomes++; outcome = substr($0, index($0, "=") + 1) }
     $1 == "record-cksum" { records++; record = substr($0, index($0, "=") + 1) }
     $1 == "aux-cksum" { auxes++; aux = substr($0, index($0, "=") + 1) }
+    $1 == "done-ack" { acks++; ack = substr($0, index($0, "=") + 1) }
     { lines++ }
     END {
-      exit !(versions == 1 && version == "3" && tasks == 1 && task != "" \
+      exit !(versions == 1 && version == "4" && tasks == 1 && task != "" \
         && metas == 1 && meta != "" && phases == 1 && phase != "" \
         && identities == 1 && identity != "" && markers == 1 && marker != "" \
         && tokens == 1 && token != "" && forces == 1 && force ~ /^[01]$/ \
         && outcomes == 1 && outcome != "" && records == 1 && record != "" \
-        && auxes == 1 && aux != "" && lines == 11)
+        && auxes == 1 && aux != "" && acks == 1 \
+        && ack ~ /^[0-9a-f]+$/ && length(ack) == 32 && lines == 12)
     }
   ' "$TEARDOWN_STAGE"
+}
+orphan_auxiliary_manifest_recoverable() {
+  local kind target identity marker token
+  [ -f "$AUX_OWNERS" ] && [ ! -L "$AUX_OWNERS" ] || return 1
+  awk -F '\t' '
+    NF != 5 { bad = 1 }
+    $1 == "" || $2 == "" || $3 == "" || $4 == "" { bad = 1 }
+    $5 !~ /^[0-9a-f]+$/ || length($5) != 32 { bad = 1 }
+    END { exit bad }
+  ' "$AUX_OWNERS" || return 1
+  while IFS=$'\t' read -r kind target identity marker token; do
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+  done < "$AUX_OWNERS"
 }
 if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
   if [ ! -f "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ] \
      || ! teardown_stage_schema_valid \
-     || [ "$(stage_value version)" != 3 ] \
+     || [ "$(stage_value version)" != 4 ] \
      || [ "$(stage_value task)" != "$ID" ] \
      || [ "$(stage_value meta-cksum)" != "$META_CKSUM" ]; then
     echo "REFUSED: invalid or stale teardown stage at $TEARDOWN_STAGE; preserving lifecycle state." >&2
@@ -187,7 +203,7 @@ if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
   fi
   STAGE_PHASE=$(stage_value phase)
   case "$STAGE_PHASE" in
-    prepared|endpoint-closed|worktree-cleanup-started|worktree-cleaned|finalizing|backlog-done-started|backlog-hold-started|backlog-held|backlog-reopen-started|backlog-recorded|ownership-lost) ;;
+    preparing|prepared|endpoint-closed|worktree-cleanup-started|worktree-cleaned|finalizing|backlog-done-started|backlog-hold-started|backlog-held|backlog-reopen-started|backlog-recorded|ownership-lost) ;;
     *) echo "REFUSED: invalid teardown phase in $TEARDOWN_STAGE; preserving lifecycle state." >&2; exit 1 ;;
   esac
   STAGE_OWNER_IDENTITY=$(stage_value owner-identity)
@@ -197,9 +213,11 @@ if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
   STAGE_RECORD_CKSUM=$(stage_value record-cksum)
   STAGE_FORCE=$(stage_value force)
   STAGE_AUX_CKSUM=$(stage_value aux-cksum)
+  STAGE_DONE_ACK=$(stage_value done-ack)
   [ -n "$STAGE_OWNER_IDENTITY" ] && [ -n "$STAGE_OWNER_MARKER" ] \
     && [ -n "$STAGE_OWNER_TOKEN" ] && [ -n "$STAGE_OUTCOME" ] \
-    && [ -n "$STAGE_RECORD_CKSUM" ] && [ -n "$STAGE_AUX_CKSUM" ] || {
+    && [ -n "$STAGE_RECORD_CKSUM" ] && [ -n "$STAGE_AUX_CKSUM" ] \
+    && [[ "$STAGE_DONE_ACK" =~ ^[0-9a-f]{32}$ ]] || {
     echo "REFUSED: incomplete teardown stage at $TEARDOWN_STAGE; preserving lifecycle state." >&2
     exit 1
   }
@@ -217,8 +235,15 @@ if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
   fi
   RESUMING_STAGE=1
 elif [ -e "$AUX_OWNERS" ] || [ -L "$AUX_OWNERS" ]; then
-  echo "REFUSED: auxiliary teardown ownership exists without its stage at $AUX_OWNERS; preserving it for reconciliation." >&2
-  exit 1
+  if orphan_auxiliary_manifest_recoverable; then
+    rm -f "$AUX_OWNERS" || {
+      echo "REFUSED: could not clear unclaimed auxiliary teardown plan at $AUX_OWNERS." >&2
+      exit 1
+    }
+  else
+    echo "REFUSED: auxiliary teardown ownership exists without its stage at $AUX_OWNERS; preserving it for reconciliation." >&2
+    exit 1
+  fi
 elif [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
   rm -f "$COMPLETION_PROOF" 2>/dev/null || {
     echo "REFUSED: cannot clear stale completion proof at $COMPLETION_PROOF; preserving lifecycle state." >&2
@@ -269,6 +294,20 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+teardown_stage_outcome_valid() {
+  case "$KIND:$STAGE_FORCE:$STAGE_OUTCOME" in
+    secondmate:0:not-applicable|secondmate:1:not-applicable) return 0 ;;
+    scout:0:delivered-report|scout:1:discarded) return 0 ;;
+    ship:0:unlanded|ship:1:discarded) return 0 ;;
+    ship:0:delivered-local) [ "$MODE" = local-only ] && return 0 ;;
+    ship:0:delivered-pr|ship:0:delivered-default) [ "$MODE" != local-only ] && return 0 ;;
+  esac
+  return 1
+}
+if [ "$RESUMING_STAGE" -eq 1 ] && ! teardown_stage_outcome_valid; then
+  echo "REFUSED: invalid teardown outcome for $KIND/$MODE with force=$STAGE_FORCE in $TEARDOWN_STAGE; preserving lifecycle state." >&2
+  exit 1
+fi
 STAGE_OUTCOME_DELIVERED=0
 case "$STAGE_OUTCOME" in
   delivered-report|delivered-local|delivered-pr|delivered-default) STAGE_OUTCOME_DELIVERED=1 ;;
@@ -728,11 +767,12 @@ write_completion_proof() {
   esac
   tmp="$COMPLETION_PROOF.tmp.$$"
   if ! {
-    printf 'version=1\n'
+    printf 'version=2\n'
     printf 'task=%s\n' "$ID"
     printf 'kind=%s\n' "$KIND"
     printf 'outcome=%s\n' "$DELIVERY_OUTCOME"
     printf 'record-cksum=%s\n' "$BACKLOG_RECORD_CKSUM"
+    printf 'done-ack=%s\n' "$STAGE_DONE_ACK"
   } > "$tmp"; then
     rm -f "$tmp"
     return 1
@@ -758,11 +798,12 @@ completion_proof_required() {
 
 completion_proof_matches() {
   [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ] || return 1
-  [ "$(sed -n 's/^version=//p' "$COMPLETION_PROOF" | tail -1)" = 1 ] \
+  [ "$(sed -n 's/^version=//p' "$COMPLETION_PROOF" | tail -1)" = 2 ] \
     && [ "$(sed -n 's/^task=//p' "$COMPLETION_PROOF" | tail -1)" = "$ID" ] \
     && [ "$(sed -n 's/^kind=//p' "$COMPLETION_PROOF" | tail -1)" = "$KIND" ] \
     && [ "$(sed -n 's/^outcome=//p' "$COMPLETION_PROOF" | tail -1)" = "$DELIVERY_OUTCOME" ] \
-    && [ "$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)" = "$BACKLOG_RECORD_CKSUM" ]
+    && [ "$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)" = "$BACKLOG_RECORD_CKSUM" ] \
+    && [ "$(sed -n 's/^done-ack=//p' "$COMPLETION_PROOF" | tail -1)" = "$STAGE_DONE_ACK" ]
 }
 
 ensure_completion_proof() {
@@ -823,9 +864,16 @@ new_teardown_owner_token() {
   esac
 }
 
+auxiliary_target_canonical() {
+  local target=$1 canonical
+  [ -n "$target" ] && [ -d "$target" ] && [ ! -L "$target" ] || return 1
+  canonical=$(cd -P "$target" 2>/dev/null && pwd -P) || return 1
+  printf '%s\n' "$canonical"
+}
+
 auxiliary_target_identity() {
   local target=$1 canonical inode path_cksum
-  canonical=$(cd "$target" 2>/dev/null && pwd -P) || return 1
+  canonical=$(auxiliary_target_canonical "$target") || return 1
   inode=$(stat -f '%d:%i' "$canonical" 2>/dev/null \
     || stat -c '%d:%i' "$canonical" 2>/dev/null) || return 1
   path_cksum=$(printf '%s' "$canonical" | cksum | awk '{print $1 ":" $2}') || return 1
@@ -833,24 +881,15 @@ auxiliary_target_identity() {
 }
 
 append_auxiliary_owner() {
-  local kind=$1 target=$2 manifest=$3 index=$4 identity marker token old_umask
+  local kind=$1 target=$2 manifest=$3 index=$4 canonical identity marker token
   [ -d "$target" ] || return 0
-  case "$target" in *$'\t'*|*$'\n'*) return 1 ;; esac
-  identity=$(auxiliary_target_identity "$target") || return 1
-  marker="$target/.fm-teardown-owner-$ID-$index"
+  canonical=$(auxiliary_target_canonical "$target") || return 1
+  case "$canonical" in *$'\t'*|*$'\n'*) return 1 ;; esac
+  identity=$(auxiliary_target_identity "$canonical") || return 1
+  marker="$canonical/.fm-teardown-owner-$ID-$index"
   [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
   token=$(new_teardown_owner_token) || return 1
-  old_umask=$(umask)
-  umask 077
-  if ! ( set -C; printf '%s\n' "$token" > "$marker" ) 2>/dev/null; then
-    umask "$old_umask"
-    return 1
-  fi
-  umask "$old_umask"
-  if ! printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$target" "$identity" "$marker" "$token" >> "$manifest"; then
-    [ "$(cat "$marker" 2>/dev/null)" != "$token" ] || rm -f "$marker"
-    return 1
-  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$canonical" "$identity" "$marker" "$token" >> "$manifest"
 }
 
 collect_child_auxiliary_owners() {
@@ -881,7 +920,6 @@ prepare_auxiliary_owners() {
   : > "$tmp" || return 1
   if [ "$KIND" = secondmate ] && [ "$FORCE" = --force ]; then
     collect_child_auxiliary_owners "$HOME_PATH" "$tmp" || {
-      remove_auxiliary_markers_from "$tmp" || true
       rm -f "$tmp"
       return 1
     }
@@ -889,21 +927,45 @@ prepare_auxiliary_owners() {
   if [ -n "$TASK_TMP" ] && [ -d "$TASK_TMP" ]; then
     index=$(awk 'END { print NR + 1 }' "$tmp")
     append_auxiliary_owner tasktmp "$TASK_TMP" "$tmp" "$index" || {
-      remove_auxiliary_markers_from "$tmp" || true
       rm -f "$tmp"
       return 1
     }
   fi
   if [ -L "$AUX_OWNERS" ] || ! mv "$tmp" "$AUX_OWNERS"; then
-    remove_auxiliary_markers_from "$tmp" || true
     rm -f "$tmp"
     return 1
   fi
   STAGE_AUX_CKSUM=$(cksum < "$AUX_OWNERS" | awk '{print $1 ":" $2}') || {
-    remove_auxiliary_markers_from "$AUX_OWNERS" || true
     rm -f "$AUX_OWNERS"
     return 1
   }
+}
+
+ensure_owned_marker() {
+  local marker=$1 token=$2 old_umask
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] \
+      && [ "$(cat "$marker" 2>/dev/null)" = "$token" ]
+    return
+  fi
+  old_umask=$(umask)
+  umask 077
+  if ! ( set -C; printf '%s\n' "$token" > "$marker" ) 2>/dev/null; then
+    umask "$old_umask"
+    return 1
+  fi
+  umask "$old_umask"
+}
+
+ensure_auxiliary_owner_markers() {
+  local kind target identity marker token current
+  while IFS=$'\t' read -r kind target identity marker token; do
+    [ -n "$kind" ] && [ -n "$target" ] && [ -n "$identity" ] \
+      && [ -n "$marker" ] && [ -n "$token" ] || return 1
+    current=$(auxiliary_target_identity "$target") || return 1
+    [ "$current" = "$identity" ] || return 1
+    ensure_owned_marker "$marker" "$token" || return 1
+  done < "$AUX_OWNERS"
 }
 
 remove_auxiliary_markers_from() {
@@ -928,7 +990,7 @@ validate_auxiliary_owners() {
       [ "$allow_absent" -eq 1 ] || return 1
       continue
     fi
-    [ -d "$target" ] || return 1
+    [ -d "$target" ] && [ ! -L "$target" ] || return 1
     current=$(auxiliary_target_identity "$target") || return 1
     [ "$current" = "$identity" ] || return 1
     [ -f "$marker" ] && [ ! -L "$marker" ] \
@@ -937,9 +999,10 @@ validate_auxiliary_owners() {
 }
 
 auxiliary_owner_matches_target() {
-  local wanted=$1 kind target identity marker token current found=0
+  local wanted=$1 canonical kind target identity marker token current found=0
+  canonical=$(auxiliary_target_canonical "$wanted") || return 1
   while IFS=$'\t' read -r kind target identity marker token; do
-    [ "$target" = "$wanted" ] || continue
+    [ "$target" = "$canonical" ] || continue
     found=$((found + 1))
     [ -d "$target" ] || return 1
     current=$(auxiliary_target_identity "$target") || return 1
@@ -950,20 +1013,18 @@ auxiliary_owner_matches_target() {
   [ "$found" -eq 1 ]
 }
 
-create_teardown_owner_marker() {
-  local marker token old_umask
+plan_teardown_owner_marker() {
+  local marker token
   marker=$(teardown_owner_marker_path) || return 1
   [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
   token=$(new_teardown_owner_token) || return 1
-  old_umask=$(umask)
-  umask 077
-  if ! ( set -C; printf '%s\n' "$token" > "$marker" ) 2>/dev/null; then
-    umask "$old_umask"
-    return 1
-  fi
-  umask "$old_umask"
   STAGE_OWNER_MARKER=$marker
   STAGE_OWNER_TOKEN=$token
+}
+
+create_teardown_owner_marker() {
+  [ "$STAGE_OWNER_MARKER" != none ] || return 0
+  ensure_owned_marker "$STAGE_OWNER_MARKER" "$STAGE_OWNER_TOKEN"
 }
 
 remove_teardown_owner_marker() {
@@ -981,7 +1042,7 @@ write_teardown_stage() {
   local phase=$1 owner_identity=$2 tmp
   tmp="$TEARDOWN_STAGE.tmp.$$"
   if ! {
-    printf 'version=3\n'
+    printf 'version=4\n'
     printf 'task=%s\n' "$ID"
     printf 'meta-cksum=%s\n' "$META_CKSUM"
     printf 'phase=%s\n' "$phase"
@@ -992,6 +1053,7 @@ write_teardown_stage() {
     printf 'outcome=%s\n' "$DELIVERY_OUTCOME"
     printf 'record-cksum=%s\n' "${BACKLOG_RECORD_CKSUM:-none}"
     printf 'aux-cksum=%s\n' "$STAGE_AUX_CKSUM"
+    printf 'done-ack=%s\n' "$STAGE_DONE_ACK"
   } > "$tmp"; then
     rm -f "$tmp"
     return 1
@@ -1019,6 +1081,27 @@ owner_identity_matches() {
   [ "$current" = "$expected" ]
 }
 
+preparing_owner_identity_matches() {
+  local expected=${1:-$STAGE_OWNER_IDENTITY} current owner marker
+  if [ "$expected" = absent ]; then
+    owner=$(teardown_owner_path)
+    [ "$STAGE_OWNER_MARKER" = none ] && [ "$STAGE_OWNER_TOKEN" = none ] || return 1
+    [ -z "$owner" ] || { [ ! -e "$owner" ] && [ ! -L "$owner" ]; }
+    return
+  fi
+  marker=$(teardown_owner_marker_path) || return 1
+  [ "$marker" = "$STAGE_OWNER_MARKER" ] || return 1
+  current=$(teardown_owner_identity) || return 1
+  [ "$current" = "$expected" ]
+}
+
+complete_teardown_stage_preparation() {
+  preparing_owner_identity_matches || return 1
+  create_teardown_owner_marker || return 1
+  ensure_auxiliary_owner_markers || return 1
+  advance_teardown_stage prepared || return 1
+}
+
 prepare_teardown_stage() {
   local identity
   identity=$(teardown_owner_identity) || return 1
@@ -1026,22 +1109,24 @@ prepare_teardown_stage() {
     STAGE_OWNER_MARKER=none
     STAGE_OWNER_TOKEN=none
   else
-    create_teardown_owner_marker || return 1
+    plan_teardown_owner_marker || return 1
   fi
   if ! prepare_auxiliary_owners; then
-    remove_teardown_owner_marker || true
     return 1
   fi
-  if ! write_teardown_stage prepared "$identity"; then
-    remove_teardown_owner_marker || true
-    remove_auxiliary_markers_from "$AUX_OWNERS" || true
-    rm -f "$AUX_OWNERS"
-    return 1
-  fi
-  STAGE_PHASE=prepared
   STAGE_OWNER_IDENTITY=$identity
   STAGE_OUTCOME=$DELIVERY_OUTCOME
   STAGE_RECORD_CKSUM=${BACKLOG_RECORD_CKSUM:-none}
+  STAGE_DONE_ACK=$(new_teardown_owner_token) || {
+    rm -f "$AUX_OWNERS"
+    return 1
+  }
+  if ! write_teardown_stage preparing "$identity"; then
+    rm -f "$AUX_OWNERS"
+    return 1
+  fi
+  STAGE_PHASE=preparing
+  complete_teardown_stage_preparation || return 1
   if ! ensure_completion_proof; then
     echo "REFUSED: could not persist completion proof for $ID; no endpoint or worktree cleanup was attempted." >&2
     rm -f "$TEARDOWN_STAGE"
@@ -1702,6 +1787,10 @@ validate_firstmate_operational_dirs_for_removal() {
 validate_child_worktree_for_removal() {
   local target=$1 project=$2 abs_target abs_home abs_root
   [ -n "$target" ] || return 0
+  if [ -L "$target" ]; then
+    echo "REFUSED: unsafe child worktree removal target $target is a symlink" >&2
+    return 1
+  fi
   validate_teardown_stage_storage_external_to "$target" "child worktree" || return 1
   [ -e "$target" ] || return 0
   abs_target=$(validate_removal_target "$target" "child worktree") || return 1
@@ -1736,9 +1825,31 @@ safe_rm_rf_child_worktree() {
   rm -rf -- "$target"
 }
 
+AUXILIARY_REVALIDATE_TARGET=
+AUXILIARY_REVALIDATE_PROJECT=
+AUXILIARY_REVALIDATE_LABEL=
+AUXILIARY_REVALIDATE_ID=
+
+revalidate_auxiliary_child_worktree_cleanup() {
+  auxiliary_owner_matches_target "$AUXILIARY_REVALIDATE_TARGET" || return 1
+  validate_child_worktree_for_removal \
+    "$AUXILIARY_REVALIDATE_TARGET" "$AUXILIARY_REVALIDATE_PROJECT" >/dev/null
+}
+
+revalidate_auxiliary_firstmate_home_cleanup() {
+  auxiliary_owner_matches_target "$AUXILIARY_REVALIDATE_TARGET" || return 1
+  validate_firstmate_home_for_removal \
+    "$AUXILIARY_REVALIDATE_TARGET" "$AUXILIARY_REVALIDATE_LABEL" \
+    "$AUXILIARY_REVALIDATE_ID" >/dev/null
+}
+
 validate_firstmate_home_for_removal() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path marker_id conflict child_id child_home
   [ -n "$home" ] || return 0
+  if [ -L "$home" ]; then
+    echo "REFUSED: unsafe $label removal target $home is a symlink" >&2
+    return 1
+  fi
   validate_teardown_stage_storage_external_to "$home" "$label" || return 1
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_removal_target "$home" "$label") || return 1
@@ -1769,7 +1880,7 @@ EOF
 }
 
 remove_firstmate_home() {
-  local home=$1 label=$2 expected_id=${3:-} abs_home_path
+  local home=$1 label=$2 expected_id=${3:-} post_cleanup_check=${4:-} abs_home_path
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
@@ -1779,7 +1890,7 @@ remove_firstmate_home() {
       echo "error: treehouse command not found; cannot return $label $abs_home_path" >&2
       return 1
     }
-    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" || {
+    teardown_treehouse_return "$abs_home_path" "$FM_ROOT" "$label" "$post_cleanup_check" || {
       echo "error: treehouse return failed for $label $abs_home_path; lease may still be held" >&2
       return 1
     }
@@ -1943,7 +2054,11 @@ cleanup_firstmate_home_children() {
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
         auxiliary_owner_matches_target "$child_home" || return 1
         cleanup_firstmate_home_children "$child_home" || return 1
-        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return 1
+        AUXILIARY_REVALIDATE_TARGET=$child_home
+        AUXILIARY_REVALIDATE_LABEL="child firstmate home"
+        AUXILIARY_REVALIDATE_ID=$child_id
+        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" \
+          revalidate_auxiliary_firstmate_home_cleanup || return 1
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
@@ -1964,7 +2079,10 @@ cleanup_firstmate_home_children() {
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
       if [ -n "$child_proj" ] && [ -d "$child_proj" ] && command -v treehouse >/dev/null 2>&1; then
-        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree"; then
+        AUXILIARY_REVALIDATE_TARGET=$child_wt
+        AUXILIARY_REVALIDATE_PROJECT=$child_proj
+        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" \
+          revalidate_auxiliary_child_worktree_cleanup; then
           :
         else
           child_return_rc=$?
@@ -2071,6 +2189,13 @@ if [ "$RESUMING_STAGE" -eq 1 ]; then
     }
   fi
   case "$STAGE_PHASE" in
+    preparing)
+      complete_teardown_stage_preparation || {
+        echo "REFUSED: could not reconcile interrupted teardown preparation for $ID; preserving exact staged authority." >&2
+        exit 1
+      }
+      revalidate_owned_cleanup || exit 1
+      ;;
     prepared)
       revalidate_owned_cleanup || exit 1
       ;;
@@ -2191,7 +2316,7 @@ perform_owned_cleanup() {
   fi
   if [ "$KIND" = secondmate ]; then
     [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-    remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || return 1
+    remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" revalidate_owned_cleanup || return 1
     remove_secondmate_registry_entry "$ID" || return 1
   fi
   if [ -n "$TASK_TMP" ] && { [ -e "$TASK_TMP" ] || [ -L "$TASK_TMP" ]; }; then
@@ -2332,6 +2457,10 @@ if [ "$STAGE_PHASE" = finalizing ]; then
     case "$DELIVERY_OUTCOME" in
       delivered-*) advance_teardown_stage backlog-done-started || exit 1 ;;
       discarded|unlanded) advance_teardown_stage backlog-hold-started || exit 1 ;;
+      *)
+        echo "REFUSED: invalid staged teardown outcome $DELIVERY_OUTCOME for $ID; preserving lifecycle state." >&2
+        exit 1
+        ;;
     esac
   fi
 fi

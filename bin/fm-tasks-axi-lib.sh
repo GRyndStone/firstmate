@@ -72,6 +72,9 @@ fm_tasks_axi_remove_completion_claim() {  # <claim-path>
   if [ -e "$proof" ] || [ -L "$proof" ]; then
     rm -f "$proof" || return 1
   fi
+  if [ -e "$claim/done-ack" ] || [ -L "$claim/done-ack" ]; then
+    rm -f "$claim/done-ack" || return 1
+  fi
   rmdir "$claim"
 }
 

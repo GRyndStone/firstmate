@@ -4,8 +4,11 @@ set -u
 
 PENDING=${1:-}
 ROOT=${2:-}
+EXPECTED_TOKEN=${3:-}
 [ -n "$PENDING" ] && [ -n "$ROOT" ] || exit 1
 [ -f "$PENDING" ] && [ ! -L "$PENDING" ] || exit 0
+[ -n "$EXPECTED_TOKEN" ] || EXPECTED_TOKEN=$(sed -n '1p' "$PENDING" 2>/dev/null || true)
+[ -n "$EXPECTED_TOKEN" ] || exit 1
 . "$ROOT/bin/fm-wake-lib.sh" || exit 1
 
 DELAY=${FM_GROK_TURNEND_DELAY:-1}
@@ -21,6 +24,12 @@ DELIVERY_LOCK="$PENDING.delivery"
 LOCK_PID=${BASHPID:-$$}
 LOCK_IDENTITY=$(fm_pid_identity "$LOCK_PID") || exit 1
 LOCK_RECORD=$(printf '%s\n%s' "$LOCK_PID" "$LOCK_IDENTITY")
+READY="$PENDING.ready"
+READY_RECORD=$(printf '%s\n%s\n%s' "$EXPECTED_TOKEN" "$LOCK_PID" "$LOCK_IDENTITY")
+DELIVERY_PID=
+TIMER_PID=
+DELIVERY_IDENTITY=
+TIMER_IDENTITY=
 acquire_delivery_lock() {
   ( set -C; printf '%s\n' "$LOCK_RECORD" > "$DELIVERY_LOCK" ) 2>/dev/null
 }
@@ -38,32 +47,109 @@ if ! acquire_delivery_lock; then
   acquire_delivery_lock || exit 0
 fi
 cleanup() {
+  if [ -f "$READY" ] && [ ! -L "$READY" ] \
+    && [ "$(cat "$READY" 2>/dev/null || true)" = "$READY_RECORD" ]; then
+    rm -f "$READY" 2>/dev/null || true
+  fi
   if [ -f "$DELIVERY_LOCK" ] && [ ! -L "$DELIVERY_LOCK" ] \
     && [ "$(cat "$DELIVERY_LOCK" 2>/dev/null || true)" = "$LOCK_RECORD" ]; then
     rm -f "$DELIVERY_LOCK" 2>/dev/null || true
   fi
 }
+child_owned_by_worker() {
+  local pid=$1 identity=$2 active_pid
+  fm_pid_alive "$pid" || return 1
+  while IFS= read -r active_pid; do
+    [ "$active_pid" = "$pid" ] && return 0
+  done < <(jobs -pr 2>/dev/null)
+  if [ -n "$identity" ]; then
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ]
+    return
+  fi
+  return 1
+}
+stop_active_children() {
+  local pid identity attempt
+  for pid in "$TIMER_PID" "$DELIVERY_PID"; do
+    [ -n "$pid" ] || continue
+    if [ "$pid" = "$TIMER_PID" ]; then identity=$TIMER_IDENTITY; else identity=$DELIVERY_IDENTITY; fi
+    child_owned_by_worker "$pid" "$identity" || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  attempt=0
+  while [ "$attempt" -lt 40 ] && { fm_pid_alive "$DELIVERY_PID" || fm_pid_alive "$TIMER_PID"; }; do
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  for pid in "$TIMER_PID" "$DELIVERY_PID"; do
+    [ -n "$pid" ] || continue
+    if [ "$pid" = "$TIMER_PID" ]; then identity=$TIMER_IDENTITY; else identity=$DELIVERY_IDENTITY; fi
+    if child_owned_by_worker "$pid" "$identity"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  DELIVERY_PID=
+  TIMER_PID=
+  DELIVERY_IDENTITY=
+  TIMER_IDENTITY=
+}
+handle_signal() {
+  trap - TERM INT
+  stop_active_children
+  cleanup
+  exit 1
+}
 trap cleanup EXIT
-trap 'cleanup; exit 1' TERM INT
+trap handle_signal TERM INT
+
+[ "$(sed -n '1p' "$PENDING" 2>/dev/null || true)" = "$EXPECTED_TOKEN" ] || exit 0
+READY_TMP="$READY.tmp.$LOCK_PID"
+printf '%s\n' "$READY_RECORD" > "$READY_TMP" || exit 1
+chmod 600 "$READY_TMP" 2>/dev/null || true
+mv -f "$READY_TMP" "$READY" || { rm -f "$READY_TMP"; exit 1; }
 
 run_delivery() {
-  local delivery_pid timer_pid rc
-  GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
-    grok --resume "$SESSION_ID" \
-      --cwd "$ROOT" \
-      --output-format plain \
-      -p "$MESSAGE" >/dev/null 2>&1 &
-  delivery_pid=$!
-  (
-    sleep "$TIMEOUT"
-    kill -TERM "$delivery_pid" 2>/dev/null || exit 0
-    sleep 2
-    kill -KILL "$delivery_pid" 2>/dev/null || true
-  ) &
-  timer_pid=$!
-  if wait "$delivery_pid"; then rc=0; else rc=$?; fi
-  kill "$timer_pid" 2>/dev/null || true
-  wait "$timer_pid" 2>/dev/null || true
+  local rc deadline term_deadline
+  if [ "$SESSION_ID" = '@continue' ]; then
+    GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
+      grok --continue \
+        --cwd "$ROOT" \
+        --output-format plain \
+        -p "$MESSAGE" >/dev/null 2>&1 &
+  else
+    GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
+      grok --resume "$SESSION_ID" \
+        --cwd "$ROOT" \
+        --output-format plain \
+        -p "$MESSAGE" >/dev/null 2>&1 &
+  fi
+  DELIVERY_PID=$!
+  DELIVERY_IDENTITY=$(fm_pid_identity "$DELIVERY_PID" 2>/dev/null || true)
+  deadline=$((SECONDS + TIMEOUT))
+  term_deadline=0
+  while child_owned_by_worker "$DELIVERY_PID" "$DELIVERY_IDENTITY"; do
+    if [ "$term_deadline" -eq 0 ] && [ "$SECONDS" -ge "$deadline" ]; then
+      if child_owned_by_worker "$DELIVERY_PID" "$DELIVERY_IDENTITY"; then
+        kill -TERM "$DELIVERY_PID" 2>/dev/null || true
+      fi
+      term_deadline=$((SECONDS + 2))
+    elif [ "$term_deadline" -ne 0 ] && [ "$SECONDS" -ge "$term_deadline" ]; then
+      if child_owned_by_worker "$DELIVERY_PID" "$DELIVERY_IDENTITY"; then
+        kill -KILL "$DELIVERY_PID" 2>/dev/null || true
+      fi
+      break
+    fi
+    sleep 1 &
+    TIMER_PID=$!
+    TIMER_IDENTITY=$(fm_pid_identity "$TIMER_PID" 2>/dev/null || true)
+    wait "$TIMER_PID" 2>/dev/null || true
+    TIMER_PID=
+    TIMER_IDENTITY=
+  done
+  if wait "$DELIVERY_PID"; then rc=0; else rc=$?; fi
+  DELIVERY_PID=
+  DELIVERY_IDENTITY=
   return "$rc"
 }
 

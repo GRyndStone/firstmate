@@ -80,6 +80,13 @@ supervisor_target_injectable() {
   local backend=$1 target=$2 probe="$SCRIPT_DIR/fm-backend.sh"
   [ -r "$probe" ] || return 1
   case "$backend" in tmux|herdr) ;; *) return 1 ;; esac
+  if [ "$backend" = tmux ]; then
+    case "$target" in
+      %*[!0-9]*|%|'') return 1 ;;
+      %*) ;;
+      *) return 1 ;;
+    esac
+  fi
   if command -v timeout >/dev/null 2>&1; then
     timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
   elif command -v gtimeout >/dev/null 2>&1; then

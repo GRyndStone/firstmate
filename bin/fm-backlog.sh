@@ -153,52 +153,150 @@ run_tasks_axi() {
   (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
 }
 
-archive_has_canonical_done_record() {  # <id>
-  local id=$1
+done_ack_is_valid() {
+  case "${1:-}" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+done_ack_marker() {
+  printf 'fm-done-ack:%s' "$1"
+}
+
+output_has_done_ack() {
+  local output=$1 ack=$2 marker
+  done_ack_is_valid "$ack" || return 1
+  marker=$(done_ack_marker "$ack")
+  printf '%s\n' "$output" | grep -F -- "$marker" >/dev/null
+}
+
+archive_has_done_ack() {  # <id> <done-ack>
+  local id=$1 ack=$2 marker
+  done_ack_is_valid "$ack" || return 1
   [ -f "$ARCHIVE_PATH" ] || return 1
-  awk -v id="$id" '
+  marker=$(done_ack_marker "$ack")
+  awk -v id="$id" -v marker="  $marker" '
     /^- \[x\] / {
       row = $0
       sub(/^- \[x\] /, "", row)
       prefix = id " - "
-      if (substr(row, 1, length(prefix)) == prefix) {
+      owned = (substr(row, 1, length(prefix)) == prefix)
+      next
+    }
+    /^## / { owned = 0 }
+    /^- / { owned = 0 }
+    owned && $0 == marker {
         found = 1
         exit
-      }
     }
     END { exit found ? 0 : 1 }
   ' "$ARCHIVE_PATH"
 }
 
+proof_done_ack() {  # <proof-path> <task-id>
+  local proof=$1 id=$2 version task ack
+  [ -f "$proof" ] && [ ! -L "$proof" ] || return 1
+  awk -F= -v id="$id" '
+    $1 == "version" { versions++; version = substr($0, index($0, "=") + 1) }
+    $1 == "task" { tasks++; task = substr($0, index($0, "=") + 1) }
+    $1 == "kind" { kinds++; kind = substr($0, index($0, "=") + 1) }
+    $1 == "outcome" { outcomes++; outcome = substr($0, index($0, "=") + 1) }
+    $1 == "record-cksum" { records++; record = substr($0, index($0, "=") + 1) }
+    $1 == "done-ack" { acks++; ack = substr($0, index($0, "=") + 1) }
+    { lines++ }
+    END {
+      exit !(versions == 1 && version == "2" && tasks == 1 && task == id \
+        && kinds == 1 && kind != "" && outcomes == 1 && outcome != "" \
+        && records == 1 && record != "" && acks == 1 \
+        && length(ack) == 32 && ack !~ /[^0-9a-f]/ && lines == 6)
+    }
+  ' "$proof" || return 1
+  version=$(sed -n 's/^version=//p' "$proof" | tail -1)
+  task=$(sed -n 's/^task=//p' "$proof" | tail -1)
+  ack=$(sed -n 's/^done-ack=//p' "$proof" | tail -1)
+  [ "$version" = 2 ] && [ "$task" = "$id" ] && done_ack_is_valid "$ack" || return 1
+  printf '%s\n' "$ack"
+}
+
 completion_claim_settle() {
-  local task_info task_state show_status proof_present=0
-  [ -n "${CLAIMED_PROOF:-}" ] || return 0
+  local task_info task_state show_status proof_present=0 proof_ack claim_ack completion_acked=0
+  [ -n "${CLAIM_DIR:-}" ] || return 0
   if [ -L "$CLAIM_DIR" ] || [ ! -d "$CLAIM_DIR" ] || [ -L "$CLAIMED_PROOF" ]; then
     echo "error: teardown proof claim for $ID is not a regular owned claim" >&2
     return 1
   fi
+  if [ ! -e "$CLAIMED_PROOF" ] && [ ! -L "$CLAIMED_PROOF" ] \
+     && proof_ack=$(proof_done_ack "$COMPLETION_PROOF" "$ID" 2>/dev/null); then
+    if [ -L "$CLAIM_ACK" ]; then
+      echo "error: teardown proof claim for $ID is not a regular owned claim" >&2
+      return 1
+    fi
+    if { [ ! -e "$CLAIM_ACK" ] || rm -f "$CLAIM_ACK"; } && rmdir "$CLAIM_DIR"; then
+      CLAIMED_PROOF=
+      CLAIM_ACK=
+      CLAIM_DIR=
+      CLAIM_SETTLED_STATE=retry
+      return 0
+    fi
+  fi
+  if [ -L "$CLAIM_ACK" ]; then
+    echo "error: teardown proof claim for $ID is not a regular owned claim" >&2
+    return 1
+  fi
+  if [ -f "$CLAIM_ACK" ]; then
+    claim_ack=$(cat "$CLAIM_ACK" 2>/dev/null || true)
+  elif done_ack_is_valid "${FINALIZING_DONE_ACK:-}"; then
+    claim_ack=$FINALIZING_DONE_ACK
+  else
+    echo "error: teardown proof claim for $ID has no completion acknowledgement" >&2
+    return 1
+  fi
+  done_ack_is_valid "$claim_ack" || {
+    echo "error: teardown proof claim for $ID has no valid completion acknowledgement" >&2
+    return 1
+  }
   [ ! -f "$CLAIMED_PROOF" ] || proof_present=1
+  if [ "$proof_present" -eq 1 ]; then
+    proof_ack=$(proof_done_ack "$CLAIMED_PROOF" "$ID") || {
+      echo "error: teardown proof claim for $ID is not bound to its completion acknowledgement" >&2
+      return 1
+    }
+    [ "$proof_ack" = "$claim_ack" ] || {
+      echo "error: teardown proof claim for $ID does not match its completion acknowledgement" >&2
+      return 1
+    }
+  elif [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ]; then
+    proof_ack=$(proof_done_ack "$COMPLETION_PROOF" "$ID") || return 1
+    [ "$proof_ack" = "$claim_ack" ] || return 1
+  fi
   show_status=0
   task_info=$(run_tasks_axi show "$ID" --full 2>&1) || show_status=$?
   if [ "$show_status" -ne 0 ]; then
     if printf '%s\n' "$task_info" | grep -Fx 'code: NOT_FOUND' >/dev/null \
-      && archive_has_canonical_done_record "$ID"; then
+      && archive_has_done_ack "$ID" "$claim_ack"; then
       task_state=done
+      completion_acked=1
     else
       echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
       return 1
     fi
   else
     task_state=$(printf '%s\n' "$task_info" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -n 1)
+    if [ "$task_state" = done ] && output_has_done_ack "$task_info" "$claim_ack"; then
+      completion_acked=1
+    fi
   fi
   if [ -z "$task_state" ]; then
     echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
     return 1
   fi
-  if [ "$task_state" = done ]; then
+  if [ "$task_state" = done ] && [ "$completion_acked" -eq 1 ]; then
     rm -f "$CLAIMED_PROOF" || return 1
+    rm -f "$CLAIM_ACK" || return 1
     rmdir "$CLAIM_DIR" || return 1
     CLAIMED_PROOF=
+    CLAIM_ACK=
     CLAIM_DIR=
     CLAIM_SETTLED_STATE=done
     return 0
@@ -207,8 +305,9 @@ completion_claim_settle() {
     queued|in_flight)
       if [ "$proof_present" -ne 1 ]; then
         if [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ] \
-          && rmdir "$CLAIM_DIR"; then
+          && rm -f "$CLAIM_ACK" && rmdir "$CLAIM_DIR"; then
           CLAIMED_PROOF=
+          CLAIM_ACK=
           CLAIM_DIR=
           CLAIM_SETTLED_STATE=retry
           return 0
@@ -221,8 +320,10 @@ completion_claim_settle() {
         return 1
       fi
       mv "$CLAIMED_PROOF" "$COMPLETION_PROOF" || return 1
+      rm -f "$CLAIM_ACK" || return 1
       rmdir "$CLAIM_DIR" || return 1
       CLAIMED_PROOF=
+      CLAIM_ACK=
       CLAIM_DIR=
       CLAIM_SETTLED_STATE=retry
       return 0
@@ -247,6 +348,7 @@ recover_existing_completion_claim() {
   [ "${#claims[@]}" -eq 1 ] || return 0
   CLAIM_DIR=${claims[0]}
   CLAIMED_PROOF="$CLAIM_DIR/proof"
+  CLAIM_ACK="$CLAIM_DIR/done-ack"
   completion_claim_settle
 }
 
@@ -267,10 +369,11 @@ finalizing_stage_is_owned() {  # <stage-path> <task-id>
     $1 == "owner-token" { tokens++; token = substr($0, index($0, "=") + 1) }
     $1 == "force" { forces++; force = substr($0, index($0, "=") + 1) }
     $1 == "outcome" { outcomes++; outcome = substr($0, index($0, "=") + 1) }
+    $1 == "done-ack" { acks++; ack = substr($0, index($0, "=") + 1) }
     $1 == "aux-cksum" { auxes++; aux = substr($0, index($0, "=") + 1) }
     { lines++ }
     END {
-      exit !(versions == 1 && version == "3" && tasks == 1 && task == id \
+      exit !(versions == 1 && version == "4" && tasks == 1 && task == id \
         && phases == 1 && phase == "backlog-done-started" \
         && metas == 1 && meta_cksum == want_meta_cksum \
         && records == 1 && record_cksum != "" \
@@ -279,7 +382,8 @@ finalizing_stage_is_owned() {  # <stage-path> <task-id>
         && tokens == 1 && token != "" \
         && forces == 1 && force == "0" \
         && outcomes == 1 && outcome ~ /^delivered-(report|local|pr|default)$/ \
-        && auxes == 1 && aux != "" && lines == 11 \
+        && acks == 1 && length(ack) == 32 && ack !~ /[^0-9a-f]/ \
+        && auxes == 1 && aux != "" && lines == 12 \
         && ((identity == "absent" && marker == "none" && token == "none") \
           || (identity != "absent" && marker != "none" && token != "none")))
     }
@@ -341,6 +445,7 @@ fi
 
 LOCKED=0
 CLAIMED_PROOF=
+CLAIM_ACK=
 CLAIM_DIR=
 CLAIM_SETTLED_STATE=
 release_backlog_lock() {
@@ -352,7 +457,7 @@ release_backlog_lock() {
 cleanup_backlog_wrapper() {
   local status=$?
   trap - EXIT INT TERM
-  if [ -n "${CLAIMED_PROOF:-}" ] && ! completion_claim_settle; then
+  if [ -n "${CLAIM_DIR:-}" ] && ! completion_claim_settle; then
     [ "$status" -ne 0 ] || status=1
   fi
   release_backlog_lock
@@ -372,10 +477,12 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   FINALIZING_STAGE=0
   FINALIZING_OUTCOME=
   FINALIZING_RECORD_CKSUM=
+  FINALIZING_DONE_ACK=
   if finalizing_stage_is_owned "$STATE/$ID.teardown-stage" "$ID"; then
     FINALIZING_STAGE=1
     FINALIZING_OUTCOME=$(sed -n 's/^outcome=//p' "$STATE/$ID.teardown-stage")
     FINALIZING_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$STATE/$ID.teardown-stage")
+    FINALIZING_DONE_ACK=$(sed -n 's/^done-ack=//p' "$STATE/$ID.teardown-stage")
   fi
   if [ "$FINALIZING_STAGE" -ne 1 ] && { [ -e "$STATE/$ID.tearing-down" ] \
      || [ -e "$STATE/$ID.meta" ] \
@@ -393,13 +500,14 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     FINALIZING_INFO_STATUS=0
     FINALIZING_INFO=$(run_tasks_axi show "$ID" --full 2>&1) || FINALIZING_INFO_STATUS=$?
     if [ "$FINALIZING_INFO_STATUS" -eq 0 ] \
-       && [ "$(printf '%s\n' "$FINALIZING_INFO" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)" = done ]; then
+       && [ "$(printf '%s\n' "$FINALIZING_INFO" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)" = done ] \
+       && output_has_done_ack "$FINALIZING_INFO" "$FINALIZING_DONE_ACK"; then
       echo "Done for $ID was already recorded before teardown finalization completed."
       exit 0
     fi
     if [ "$FINALIZING_INFO_STATUS" -ne 0 ] \
        && printf '%s\n' "$FINALIZING_INFO" | grep -Fx 'code: NOT_FOUND' >/dev/null \
-       && archive_has_canonical_done_record "$ID"; then
+       && archive_has_done_ack "$ID" "$FINALIZING_DONE_ACK"; then
       echo "Done for $ID was already archived before teardown finalization completed."
       exit 0
     fi
@@ -409,18 +517,17 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     echo "Run bin/fm-teardown.sh $ID successfully; never-dispatched work must be removed or cancelled instead of recorded Done." >&2
     exit 1
   fi
-  PROOF_TASK=$(sed -n 's/^task=//p' "$COMPLETION_PROOF" | tail -1)
-  PROOF_VERSION=$(sed -n 's/^version=//p' "$COMPLETION_PROOF" | tail -1)
   PROOF_KIND=$(sed -n 's/^kind=//p' "$COMPLETION_PROOF" | tail -1)
   PROOF_OUTCOME=$(sed -n 's/^outcome=//p' "$COMPLETION_PROOF" | tail -1)
   PROOF_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)
-  if [ "$PROOF_VERSION" != 1 ] || [ "$PROOF_TASK" != "$ID" ]; then
+  PROOF_DONE_ACK=$(proof_done_ack "$COMPLETION_PROOF" "$ID") || {
     echo "REFUSED: teardown proof is not bound to task $ID." >&2
     exit 1
-  fi
+  }
   if [ "$FINALIZING_STAGE" -eq 1 ] \
      && { [ "$PROOF_OUTCOME" != "$FINALIZING_OUTCOME" ] \
-       || [ "$PROOF_RECORD_CKSUM" != "$FINALIZING_RECORD_CKSUM" ]; }; then
+       || [ "$PROOF_RECORD_CKSUM" != "$FINALIZING_RECORD_CKSUM" ] \
+       || [ "$PROOF_DONE_ACK" != "$FINALIZING_DONE_ACK" ]; }; then
     echo "REFUSED: teardown proof does not match the complete finalization stage for $ID." >&2
     exit 1
   fi
@@ -473,28 +580,53 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
     exit 1
   }
   CLAIMED_PROOF="$CLAIM_DIR/proof"
+  CLAIM_ACK="$CLAIM_DIR/done-ack"
+  if ! printf '%s\n' "$PROOF_DONE_ACK" > "$CLAIM_ACK"; then
+    rmdir "$CLAIM_DIR" 2>/dev/null || true
+    echo "error: could not persist completion acknowledgement for $ID" >&2
+    exit 1
+  fi
   if ! mv "$COMPLETION_PROOF" "$CLAIMED_PROOF"; then
+    rm -f "$CLAIM_ACK" 2>/dev/null || true
     rmdir "$CLAIM_DIR" 2>/dev/null || true
     echo "REFUSED: teardown proof for $ID could not be claimed for single use." >&2
     exit 1
   fi
+  DONE_ARGS=()
+  DONE_NOTE_ADDED=0
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --note ] && [ "$#" -gt 1 ]; then
+      DONE_ARGS+=(--note "$2"$'\n'"$(done_ack_marker "$PROOF_DONE_ACK")")
+      DONE_NOTE_ADDED=1
+      shift 2
+    else
+      DONE_ARGS+=("$1")
+      shift
+    fi
+  done
+  if [ "$DONE_NOTE_ADDED" -eq 0 ]; then
+    DONE_ARGS+=(--note "$(done_ack_marker "$PROOF_DONE_ACK")")
+  fi
+  set -- "${DONE_ARGS[@]}"
 fi
 
 run_tasks_axi "$@"
 STATUS=$?
 if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   if [ "$STATUS" -eq 0 ]; then
-    if ! rm -f "$CLAIMED_PROOF" || ! rmdir "$CLAIM_DIR"; then
+    if ! rm -f "$CLAIMED_PROOF" || ! rm -f "$CLAIM_ACK" || ! rmdir "$CLAIM_DIR"; then
       echo "error: Done succeeded but teardown proof claim could not be consumed for $ID" >&2
       STATUS=1
     else
       CLAIMED_PROOF=
+      CLAIM_ACK=
       CLAIM_DIR=
     fi
   else
-    if mv "$CLAIMED_PROOF" "$COMPLETION_PROOF"; then
-      rmdir "$CLAIM_DIR" 2>/dev/null || true
+    if mv "$CLAIMED_PROOF" "$COMPLETION_PROOF" \
+       && rm -f "$CLAIM_ACK" && rmdir "$CLAIM_DIR"; then
       CLAIMED_PROOF=
+      CLAIM_ACK=
       CLAIM_DIR=
     else
       echo "error: Done failed and teardown proof claim could not be restored for $ID" >&2

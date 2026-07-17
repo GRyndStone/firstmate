@@ -1562,6 +1562,19 @@ test_discover_supervisor_target_herdr() {
   pass "discover_supervisor_target: override > TMUX_PANE > herdr '<session>:<pane-id>' composition > firstmate:0 fallback"
 }
 
+test_canonical_supervisor_target_binds_tmux_pane_id() {
+  local out
+  out=$(
+    tmux() {
+      [ "$*" = "display-message -p -t firstmate:0 #{pane_id}" ] || return 1
+      printf '%%77\n'
+    }
+    canonical_supervisor_target tmux firstmate:0
+  ) || fail "tmux supervisor target could not be bound to a pane id"
+  [ "$out" = '%77' ] || fail "tmux supervisor target was not canonicalized to its exact pane id: $out"
+  pass "canonical_supervisor_target binds tmux injection to one exact pane id"
+}
+
 test_pane_is_busy_herdr_native_busy_state() {
   (
     fm_backend_busy_state() { [ "$1" = herdr ] && [ "$2" = "default:w1:p2" ] || fail "unexpected busy_state args: $1 $2"; printf 'busy'; }
@@ -1797,6 +1810,7 @@ test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
+test_canonical_supervisor_target_binds_tmux_pane_id
 test_pane_is_busy_herdr_native_busy_state
 test_pane_is_busy_herdr_falls_back_to_capture_regex
 test_pane_is_busy_herdr_idle_falls_back_to_capture_regex

@@ -4,7 +4,7 @@
 # Grok Stop hooks are passive: exit 2 does not block or feed stderr back to the
 # model. This adapter still uses the shared primary-scoped predicate in
 # fm-turnend-guard.sh. When that predicate says the primary would end blind, the
-# adapter durably records one same-session follow-up and schedules its bounded
+# adapter durably records one session-scoped follow-up and schedules its bounded
 # delivery after the current Stop hook returns. Every later Stop event reruns
 # the predicate and schedules another continuation while the turn would still
 # end blind.
@@ -22,7 +22,12 @@ GIT_COMMON_DIR=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 
 [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
 
 SESSION_ID=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
-[ -n "$SESSION_ID" ] || exit 1
+if [ -n "$SESSION_ID" ]; then
+  SESSION_FALLBACK=false
+else
+  SESSION_ID='@continue'
+  SESSION_FALLBACK=true
+fi
 STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
 [ ! -e "$STATE" ] && exit 0
 [ -d "$STATE" ] || exit 1
@@ -37,6 +42,16 @@ fi
 [ -n "$KEY" ] || exit 1
 PENDING="$HANDOFF_DIR/grok-$KEY.pending"
 . "$ROOT/bin/fm-wake-lib.sh" || exit 1
+
+delivery_owner_alive() {
+  local record owner_pid owner_identity
+  [ -f "$PENDING.delivery" ] && [ ! -L "$PENDING.delivery" ] || return 1
+  record=$(cat "$PENDING.delivery" 2>/dev/null || true)
+  owner_pid=$(printf '%s\n' "$record" | sed -n '1p')
+  owner_identity=$(printf '%s\n' "$record" | sed '1d')
+  fm_pid_alive "$owner_pid" \
+    && [ "$(fm_pid_identity "$owner_pid" 2>/dev/null || true)" = "$owner_identity" ]
+}
 
 if [ -x "$ROOT/bin/fm-turnend-guard.sh" ]; then
   REASON=$(printf '%s' "$PAYLOAD" | "$ROOT/bin/fm-turnend-guard.sh" 2>&1 >/dev/null)
@@ -54,6 +69,8 @@ fi
     REASON="shared turn-end guard failed with exit $RC"
   fi
 }
+[ "$SESSION_FALLBACK" = false ] \
+  || REASON="session identity unavailable; continuing the latest session for this primary checkout. $REASON"
 
 mkdir -p "$HANDOFF_DIR" || exit 1
 TMP=$(mktemp "$HANDOFF_DIR/.grok-$KEY.XXXXXX.tmp") || exit 1
@@ -72,5 +89,25 @@ mv -f "$TMP" "$PENDING" || { rm -f "$TMP"; exit 1; }
 
 DELIVER="$ROOT/bin/fm-turnend-guard-grok-deliver.sh"
 [ -x "$DELIVER" ] || exit 1
-nohup "$DELIVER" "$PENDING" "$ROOT" </dev/null >>"$HANDOFF_DIR/grok-delivery.log" 2>&1 &
-exit 0
+delivery_owner_alive && exit 0
+READY="$PENDING.ready"
+nohup "$DELIVER" "$PENDING" "$ROOT" "$TOKEN" </dev/null >>"$HANDOFF_DIR/grok-delivery.log" 2>&1 &
+WORKER_PID=$!
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+  WORKER_IDENTITY=$(fm_pid_identity "$WORKER_PID" 2>/dev/null || true)
+  if [ -n "$WORKER_IDENTITY" ]; then
+    EXPECTED_READY=$(printf '%s\n%s\n%s' "$TOKEN" "$WORKER_PID" "$WORKER_IDENTITY")
+    if [ -f "$READY" ] && [ ! -L "$READY" ] \
+      && [ "$(cat "$READY" 2>/dev/null || true)" = "$EXPECTED_READY" ]; then
+      rm -f "$READY" 2>/dev/null || true
+      exit 0
+    fi
+  fi
+  fm_pid_alive "$WORKER_PID" || break
+  sleep 0.02
+  attempt=$((attempt + 1))
+done
+kill -TERM "$WORKER_PID" 2>/dev/null || true
+wait "$WORKER_PID" 2>/dev/null || true
+exit 1

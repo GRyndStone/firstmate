@@ -116,6 +116,13 @@ make_primary_dir() {
   printf '%s\n' "$dir"
 }
 
+make_adapter_primary_repo() {
+  local dir=$1
+  mkdir -p "$dir"
+  git init -q "$dir"
+  git -C "$dir" commit -q --allow-empty -m init
+}
+
 # Same shape as primary, plus the .fm-secondmate-home marker bin/fm-home-seed.sh
 # writes at seed time (regardless of treehouse-lease or git-clone acquisition).
 make_secondmate_dir() {
@@ -267,10 +274,10 @@ test_hook_accepts_only_active_away_inject_daemon() {
   cat > "$dir/bin/fm-backend.sh" <<'SH'
 #!/usr/bin/env bash
 fm_backend_target_exists() {
-  [ "$1" = tmux ] && [ "$2" = '%99' ] && [ -f "$FM_HOME/state/.test-supervisor-target-live" ]
+  [ "$1" = tmux ] && [ -n "$2" ] && [ -f "$FM_HOME/state/.test-supervisor-target-live" ]
 }
 fm_backend_agent_alive() {
-  if [ "$1" = tmux ] && [ "$2" = '%99' ] && [ -f "$FM_HOME/state/.test-supervisor-agent-live" ]; then
+  if [ "$1" = tmux ] && [ -n "$2" ] && [ -f "$FM_HOME/state/.test-supervisor-agent-live" ]; then
     printf 'alive'
   else
     printf 'dead'
@@ -286,6 +293,12 @@ SH
   out=$(run_hook "$dir" false); status=$?
   expect_code 0 "$status" "active away-inject daemon ownership with a live agent injection target must authorize stop"
   [ -z "$out" ] || fail "active away-inject daemon produced output: $out"
+
+  printf '%s\n' firstmate:0 > "$dir/state/.supervise-daemon.lock.owner.test/supervisor-target"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "recyclable tmux selector must not authorize daemon supervision"
+  assert_contains "$out" "daemon owner or its injection target is not active" "recyclable daemon target rejection was not explained"
+  printf '%s\n' '%99' > "$dir/state/.supervise-daemon.lock.owner.test/supervisor-target"
 
   rm -f "$dir/state/.test-supervisor-target-live"
   out=$(run_hook "$dir" false); status=$?
@@ -777,6 +790,115 @@ SH
   pass "fm-turnend-guard-grok: handoff preparation failure is conservatively nonzero"
 }
 
+test_grok_missing_session_uses_scoped_continue_owner() {
+  local dir fakebin log out status i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-missing-session")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-missing-session-fakebin")
+  log="$TMP_ROOT/grok-missing-session.log"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'args:' >> "$log"
+for arg in "\$@"; do printf ' <%s>' "\$arg" >> "$log"; done
+printf '\n' >> "$log"
+EOF
+  chmod +x "$fakebin/grok"
+  out=$(printf '{"hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "missing Grok session id must acquire a scoped continuation owner"
+  [ -z "$out" ] || fail "missing-session Grok adapter printed output: $out"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$log" ] && break
+    sleep 0.1
+  done
+  [ -s "$log" ] || fail "missing Grok session id did not trigger a continuation"
+  assert_contains "$(cat "$log")" '<--continue>' "missing-session Grok fallback was not checkout-scoped continue"
+  assert_not_contains "$(cat "$log")" '<--resume>' "missing-session Grok fallback invented an exact session id"
+  pass "fm-turnend-guard-grok: missing session identity retains a checkout-scoped continuation owner"
+}
+
+test_grok_worker_launch_requires_token_readiness() {
+  local dir fakebin out status
+  dir=$(make_primary_dir "$TMP_ROOT/grok-worker-readiness")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-worker-readiness-fakebin")
+  cat > "$dir/bin/fm-turnend-guard-grok-deliver.sh" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$dir/bin/fm-turnend-guard-grok-deliver.sh"
+  out=$(printf '{"sessionId":"readiness-failure","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Grok adapter accepted a worker that never acknowledged its token"
+  [ -n "$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)" ] \
+    || fail "Grok readiness failure discarded the durable handoff"
+  pass "fm-turnend-guard-grok: worker launch requires a token-bound readiness acknowledgement"
+}
+
+test_grok_worker_signal_reaps_delivery_children() {
+  local dir fakebin pending ps_log real_ps worker_pid i candidates children child_count pid command timer_pid descendants
+  dir=$(make_primary_dir "$TMP_ROOT/grok-signal-reap")
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-signal-reap-fakebin")
+  cat > "$fakebin/grok" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 1' TERM INT
+while :; do sleep 1; done
+SH
+  chmod +x "$fakebin/grok"
+  ps_log="$TMP_ROOT/grok-signal-ps.log"
+  real_ps=$(command -v ps) || fail "signal-reap test requires ps"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+previous=
+for argument in "$@"; do
+  if [ "$previous" = -p ]; then
+    printf '%s\n' "$argument" >> "${FM_TEST_PS_LOG:?}"
+    break
+  fi
+  previous=$argument
+done
+exec "${FM_TEST_REAL_PS:?}" "$@"
+SH
+  chmod +x "$fakebin/ps"
+  mkdir -p "$dir/state/.turnend-handoffs"
+  pending="$dir/state/.turnend-handoffs/grok-signal.pending"
+  printf 'signal-token\n999999\nmissing-origin\nsignal-session\nsignal cleanup\n' > "$pending"
+  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_DELIVERY_TIMEOUT=120 \
+    FM_TEST_PS_LOG="$ps_log" FM_TEST_REAL_PS="$real_ps" \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" signal-token &
+  worker_pid=$!
+  children=
+  child_count=0
+  for i in $(seq 1 100); do
+    candidates=$(awk -v worker="$worker_pid" '$1 ~ /^[0-9]+$/ && $1 != worker && !seen[$1]++ { print $1 }' "$ps_log" 2>/dev/null || true)
+    children=
+    for pid in $candidates; do
+      kill -0 "$pid" 2>/dev/null && children="${children}${children:+ }$pid"
+    done
+    child_count=$(printf '%s\n' "$children" | awk '{ count += NF } END { print count + 0 }')
+    [ "$child_count" -ge 2 ] && break
+    sleep 0.02
+  done
+  [ "$child_count" -ge 2 ] || fail "Grok signal-reap setup did not start both delivery children"
+  timer_pid=
+  for pid in $children; do
+    command=$("$real_ps" -p "$pid" -o command= 2>/dev/null || true)
+    case "$command" in
+      *'sleep 1'*) timer_pid=$pid ;;
+    esac
+  done
+  [ -n "$timer_pid" ] || fail "Grok signal-reap setup did not identify the direct timer child"
+  descendants=$("$real_ps" -o pid= -P "$timer_pid" 2>/dev/null || true)
+  [ -z "$(printf '%s' "$descendants" | tr -d '[:space:]')" ] \
+    || fail "Grok timer child unexpectedly owned a descendant: $descendants"
+  kill -TERM "$worker_pid"
+  wait "$worker_pid" 2>/dev/null || true
+  for pid in $children; do
+    kill -0 "$pid" 2>/dev/null && fail "Grok worker signal left child $pid alive"
+  done
+  [ ! -e "$pending.delivery" ] || fail "Grok worker signal released children but retained its singleton lock"
+  pass "fm-turnend-guard-grok: TERM reaps exact resume and timer children before lock release"
+}
+
 test_settings_hook_uses_claude_project_dir() {
   local settings command
   settings="$ROOT/.claude/settings.json"
@@ -886,14 +1008,13 @@ test_opencode_plugin_forces_followup() {
 }
 
 test_opencode_plugin_anchors_guard_to_worktree() {
-  local plugin parent worktree_dir wrong_dir log out status
+  local plugin worktree_dir wrong_dir log out status
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   [ -f "$plugin" ] || fail "tracked OpenCode primary plugin is missing"
-  parent="$TMP_ROOT/opencode-plugin-parent"
-  git init -q "$parent"
-  worktree_dir="$parent/nested/opencode-plugin-worktree"
+  worktree_dir="$TMP_ROOT/opencode-plugin-worktree"
   wrong_dir="$TMP_ROOT/opencode-plugin-cwd/subdir"
   log="$TMP_ROOT/opencode-plugin-guard.log"
+  make_adapter_primary_repo "$worktree_dir"
   mkdir -p "$worktree_dir/bin" "$wrong_dir"
   cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -957,6 +1078,7 @@ test_opencode_plugin_preserves_failed_delivery_handoff() {
   worktree_dir="$TMP_ROOT/opencode-delivery-failure-root"
   home="$TMP_ROOT/opencode-delivery-failure-home"
   healthy="$TMP_ROOT/opencode-delivery-failure-healthy"
+  make_adapter_primary_repo "$worktree_dir"
   mkdir -p "$worktree_dir/bin" "$home/state"
   cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
@@ -1014,6 +1136,7 @@ test_opencode_plugin_fails_closed_when_guard_cannot_launch() {
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   worktree_dir="$TMP_ROOT/opencode-guard-launch-root"
   home="$TMP_ROOT/opencode-guard-launch-home"
+  make_adapter_primary_repo "$worktree_dir"
   mkdir -p "$worktree_dir/bin" "$home/state"
   out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_HOME="$home" node 2>&1 <<'EOF'
 import { existsSync, readdirSync } from "node:fs";
@@ -1044,6 +1167,7 @@ test_opencode_retry_owner_is_referenced_until_healthy() {
   worktree_dir="$TMP_ROOT/opencode-retry-owner-root"
   home="$TMP_ROOT/opencode-retry-owner-home"
   healthy="$TMP_ROOT/opencode-retry-owner-healthy"
+  make_adapter_primary_repo "$worktree_dir"
   mkdir -p "$worktree_dir/bin" "$home/state"
   cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
@@ -1099,6 +1223,83 @@ EOF
   pass ".opencode primary plugin: retry ownership ends only on healthy invalidation"
 }
 
+test_opencode_crewmate_does_not_recover_primary_handoff() {
+  local plugin base crew home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  base="$TMP_ROOT/opencode-crew-base"
+  crew="$TMP_ROOT/opencode-crew-worktree"
+  home="$TMP_ROOT/opencode-crew-home"
+  make_adapter_primary_repo "$base"
+  git -C "$base" worktree add -q -b crew "$crew"
+  mkdir -p "$home/state/.turnend-handoffs"
+  printf '{"token":"retained","sessionID":"primary-session","message":"primary continuation"}\n' \
+    > "$home/state/.turnend-handoffs/opencode-retained.pending"
+  out=$(PLUGIN="$plugin" WORKTREE="$crew" FM_HOME="$home" node 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "primary-session" } } });
+await new Promise((resolve) => setTimeout(resolve, 30));
+if (prompts !== 0) throw new Error("linked crewmate delivered the primary handoff");
+if (!existsSync(`${process.env.FM_HOME}/state/.turnend-handoffs/opencode-retained.pending`)) {
+  throw new Error("linked crewmate cleared the primary handoff");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode linked crewmate must not recover primary handoffs"
+  [ -z "$out" ] || fail "OpenCode crewmate-scope test printed output: $out"
+  pass ".opencode primary plugin: linked crewmates cannot recover primary handoffs"
+}
+
+test_opencode_persistence_failure_retains_retry_owner() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-persist-root"
+  home="$TMP_ROOT/opencode-persist-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state"
+  printf 'blocked\n' > "$home/state/.turnend-handoffs"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'persistence retry guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { unlinkSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const nativeSetTimeout = globalThis.setTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => { activeTimers.delete(timer); callback(...args); }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "persist-retry" } } });
+if (![...activeTimers].some((timer) => timer.hasRef?.())) throw new Error("persistence failure had no process-retaining owner");
+unlinkSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+for (let i = 0; i < 50 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`persistence recovery delivered ${prompts} continuations`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode persistence failure must retain retry ownership"
+  [ -z "$out" ] || fail "OpenCode persistence-retry test printed output: $out"
+  pass ".opencode primary plugin: synchronous persistence failure retains a retry owner"
+}
+
 test_pi_extension_forces_followup() {
   local ext content
   ext="$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
@@ -1129,6 +1330,7 @@ test_pi_extension_injects_once_per_logical_agent_run() {
   home="$TMP_ROOT/pi-logical-run-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
   log="$TMP_ROOT/pi-logical-run-guard.log"
+  make_adapter_primary_repo "$repo"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
@@ -1215,6 +1417,7 @@ test_pi_extension_retries_after_followup_delivery_failure() {
   repo="$TMP_ROOT/pi-delivery-failure-root"
   home="$TMP_ROOT/pi-delivery-failure-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
@@ -1268,6 +1471,7 @@ test_pi_extension_recovers_retained_handoff() {
   repo="$TMP_ROOT/pi-recovery-root"
   home="$TMP_ROOT/pi-recovery-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state/.turnend-handoffs"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
   printf '{"token":"retained-token","message":"retained continuation"}\n' > "$home/state/.turnend-handoffs/pi.pending"
@@ -1302,6 +1506,7 @@ test_pi_extension_fails_closed_when_guard_cannot_launch() {
   repo="$TMP_ROOT/pi-guard-launch-root"
   home="$TMP_ROOT/pi-guard-launch-home"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
   out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
@@ -1328,6 +1533,85 @@ EOF
   expect_code 0 "$status" "Pi guard launch failure must force a fail-closed handoff"
   [ -z "$out" ] || fail "Pi guard-launch test printed output: $out"
   pass ".pi primary extension: shared-guard launch failure is fail closed"
+}
+
+test_pi_crewmate_does_not_consume_primary_handoff() {
+  local base crew home ext out status
+  base="$TMP_ROOT/pi-crew-base"
+  crew="$TMP_ROOT/pi-crew-worktree"
+  home="$TMP_ROOT/pi-crew-home"
+  make_adapter_primary_repo "$base"
+  git -C "$base" worktree add -q -b crew "$crew"
+  ext="$crew/.pi/extensions/fm-primary-turnend-guard.ts"
+  mkdir -p "$crew/.pi/extensions" "$home/state/.turnend-handoffs"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  printf '{"token":"retained","message":"primary continuation"}\n' > "$home/state/.turnend-handoffs/pi.pending"
+  out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let prompts = 0;
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await new Promise((resolve) => setTimeout(resolve, 30));
+if (handlers.has("agent_start") || handlers.has("agent_settled")) throw new Error("linked crewmate registered primary lifecycle handlers");
+if (prompts !== 0) throw new Error("linked crewmate delivered the primary handoff");
+if (!existsSync(`${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`)) throw new Error("linked crewmate cleared the primary handoff");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi linked crewmate must not consume primary handoffs"
+  [ -z "$out" ] || fail "Pi crewmate-scope test printed output: $out"
+  pass ".pi primary extension: linked crewmates cannot consume primary handoffs"
+}
+
+test_pi_persistence_failure_retains_retry_owner() {
+  local repo home ext out status
+  repo="$TMP_ROOT/pi-persist-root"
+  home="$TMP_ROOT/pi-persist-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  printf 'blocked\n' > "$home/state/.turnend-handoffs"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'persistence retry guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { unlinkSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let prompts = 0;
+const nativeSetTimeout = globalThis.setTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => { activeTimers.delete(timer); callback(...args); }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+if (![...activeTimers].some((timer) => timer.hasRef?.())) throw new Error("persistence failure had no process-retaining owner");
+unlinkSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+for (let i = 0; i < 50 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`persistence recovery delivered ${prompts} continuations`);
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi persistence failure must retain retry ownership"
+  [ -z "$out" ] || fail "Pi persistence-retry test printed output: $out"
+  pass ".pi primary extension: synchronous persistence failure retains a retry owner"
 }
 
 test_grok_hook_invokes_adapter() {
@@ -1374,6 +1658,9 @@ test_grok_session_delivery_is_singleton
 test_grok_healthy_stop_invalidates_stale_pending
 test_grok_missing_guard_fails_closed_through_retry_owner
 test_grok_handoff_preparation_failure_is_nonzero
+test_grok_missing_session_uses_scoped_continue_owner
+test_grok_worker_launch_requires_token_readiness
+test_grok_worker_signal_reaps_delivery_children
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
@@ -1383,9 +1670,13 @@ test_opencode_plugin_anchors_guard_to_worktree
 test_opencode_plugin_preserves_failed_delivery_handoff
 test_opencode_plugin_fails_closed_when_guard_cannot_launch
 test_opencode_retry_owner_is_referenced_until_healthy
+test_opencode_crewmate_does_not_recover_primary_handoff
+test_opencode_persistence_failure_retains_retry_owner
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
 test_pi_extension_recovers_retained_handoff
 test_pi_extension_fails_closed_when_guard_cannot_launch
+test_pi_crewmate_does_not_consume_primary_handoff
+test_pi_persistence_failure_retains_retry_owner
 test_grok_hook_invokes_adapter

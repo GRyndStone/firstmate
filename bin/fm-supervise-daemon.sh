@@ -338,6 +338,22 @@ discover_supervisor_target() {
   return 1
 }
 
+canonical_supervisor_target() {  # <backend> <target>
+  local backend=$1 target=$2 exact
+  case "$backend" in
+    tmux)
+      exact=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || return 1
+      case "$exact" in
+        %*[!0-9]*|%|'') return 1 ;;
+        %*) printf '%s' "$exact" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    herdr) printf '%s' "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Auto-discover the supervisor's BACKEND at startup - independent of the
 # target string above, so an explicit FM_SUPERVISOR_TARGET override still
 # needs to know which primitives (tmux vs herdr) to dispatch through. Priority
@@ -1403,6 +1419,15 @@ fm_super_main() {
   fi
   FM_SUPERVISOR_TARGET="$discovered"
   local TARGET="$FM_SUPERVISOR_TARGET"
+
+  TARGET=$(canonical_supervisor_target "$BACKEND" "$TARGET") || {
+    echo "error: supervisor target '$FM_SUPERVISOR_TARGET' cannot be bound to an exact $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+    log "startup failed: target '$FM_SUPERVISOR_TARGET' has no exact pane identity (backend=$BACKEND)"
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    exit 1
+  }
+  FM_SUPERVISOR_TARGET="$TARGET"
 
   # --- validate supervisor target at startup (a missing target is a typo) ---
   # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`

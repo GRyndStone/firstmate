@@ -59,6 +59,13 @@ case "${1:-}" in
     printf '  held: %s\n' "${FM_FAKE_HELD:-no}"
     printf '  kind: %s\n' "${FM_FAKE_TASK_KIND:-ship}"
     printf '  body: stable body\n'
+    if [ -n "${FM_FAKE_BODY_ACK:-}" ]; then
+      printf '  %s\n' "$FM_FAKE_BODY_ACK"
+    elif [ -n "${FM_FAKE_DONE_ACK_FILE:-}" ] && [ -f "$FM_FAKE_DONE_ACK_FILE" ]; then
+      while IFS= read -r ack_line; do
+        printf '  %s\n' "$ack_line"
+      done < "$FM_FAKE_DONE_ACK_FILE"
+    fi
     printf 'help[1]:\n  - %s\n' "${FM_FAKE_HELP:-inspect ready work}"
     exit 0
     ;;
@@ -70,12 +77,27 @@ case "${1:-}" in
     ;;
 esac
 if [ "${1:-}" = done ] && [ -n "${FM_FAKE_INTERRUPT_MARKER:-}" ]; then
+  done_note=
+  previous=
+  for arg in "$@"; do
+    if [ "$previous" = note ]; then
+      done_note=$arg
+      previous=
+      continue
+    fi
+    [ "$arg" != --note ] || previous=note
+  done
+  done_ack=$(printf '%s\n' "$done_note" | sed -n '/^fm-done-ack:[0-9a-f][0-9a-f]*$/p' | tail -1)
+  if [ -n "${FM_FAKE_DONE_ACK_FILE:-}" ] && [ -n "$done_ack" ]; then
+    printf '%s\n' "$done_ack" > "$FM_FAKE_DONE_ACK_FILE"
+  fi
   if [ -n "${FM_FAKE_DONE_STATE_FILE:-}" ]; then
     printf 'done\n' > "$FM_FAKE_DONE_STATE_FILE"
   fi
   if [ -n "${FM_FAKE_ARCHIVE_PATH:-}" ]; then
     printf '\n## Archived 2026-07-17\n- [x] %s - stable task (done 2026-07-17)\n' \
       "${2:-task-a}" >> "$FM_FAKE_ARCHIVE_PATH"
+    [ -z "$done_ack" ] || printf '  %s\n' "$done_ack" >> "$FM_FAKE_ARCHIVE_PATH"
   fi
   if [ -n "${FM_FAKE_SHOW_MODE_FILE:-}" ] && [ -n "${FM_FAKE_DONE_SHOW_MODE:-}" ]; then
     printf '%s\n' "$FM_FAKE_DONE_SHOW_MODE" > "$FM_FAKE_SHOW_MODE_FILE"
@@ -112,24 +134,25 @@ SH
 }
 
 write_completion_proof() {
-  local home=$1 id=$2 kind=$3 outcome=$4 record_kind=${5:-$3} record checksum
+  local home=$1 id=$2 kind=$3 outcome=$4 record_kind=${5:-$3} done_ack=${6:-0123456789abcdef0123456789abcdef} record checksum
   record=$(printf 'task:\n  id: %s\n  title: stable task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  kind: %s\n  body: stable body\n' "$id" "$record_kind")
   checksum=$(printf '%s' "$record" | fm_tasks_axi_task_fingerprint) || fail "could not fingerprint fake task $id"
   {
-    printf 'version=1\n'
+    printf 'version=2\n'
     printf 'task=%s\n' "$id"
     printf 'kind=%s\n' "$kind"
     printf 'outcome=%s\n' "$outcome"
     printf 'record-cksum=%s\n' "$checksum"
+    printf 'done-ack=%s\n' "$done_ack"
   } > "$home/state/$id.teardown-complete"
 }
 
 write_done_started_stage() {
-  local home=$1 id=$2 meta_cksum=$3 record_cksum=$4 aux_cksum
+  local home=$1 id=$2 meta_cksum=$3 record_cksum=$4 done_ack=${5:-0123456789abcdef0123456789abcdef} aux_cksum
   : > "$home/state/$id.teardown-owners"
   aux_cksum=$(cksum < "$home/state/$id.teardown-owners" | awk '{print $1 ":" $2}')
-  printf 'version=3\ntask=%s\nmeta-cksum=%s\nphase=backlog-done-started\nowner-identity=absent\nowner-marker=none\nowner-token=none\nforce=0\noutcome=delivered-local\nrecord-cksum=%s\naux-cksum=%s\n' \
-    "$id" "$meta_cksum" "$record_cksum" "$aux_cksum" > "$home/state/$id.teardown-stage"
+  printf 'version=4\ntask=%s\nmeta-cksum=%s\nphase=backlog-done-started\nowner-identity=absent\nowner-marker=none\nowner-token=none\nforce=0\noutcome=delivered-local\nrecord-cksum=%s\ndone-ack=%s\naux-cksum=%s\n' \
+    "$id" "$meta_cksum" "$record_cksum" "$done_ack" "$aux_cksum" > "$home/state/$id.teardown-stage"
 }
 
 test_same_file_mutations_are_serialized() {
@@ -245,8 +268,10 @@ test_scout_done_requires_owned_report() {
   printf '# Report\n' > "$home/data/scout-a/report.md"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
     "$BACKLOG" "done" scout-a --report data/scout-a/report.md
-  assert_contains "$(cat "$log")" "args=done scout-a --report data/scout-a/report.md --backend markdown --file $home/data/backlog.md" \
+  assert_contains "$(cat "$log")" "args=done scout-a --report data/scout-a/report.md --note fm-done-ack:" \
     "scoped Done call did not reach the owned backlog file"
+  assert_contains "$(cat "$log")" "--backend markdown --file $home/data/backlog.md" \
+    "scoped Done call escaped the selected home backlog"
   pass "scout completion requires the exact owned report after lifecycle cleanup"
 }
 
@@ -276,8 +301,9 @@ test_done_requires_matching_single_use_teardown_proof() {
     "$BACKLOG" done task-a --note 'local main'
   assert_absent "$home/state/task-a.teardown-complete" "successful Done did not consume its proof"
   write_completion_proof "$home" task-a ship delivered-local
-  printf 'record changed after teardown\n' >> "$home/state/task-a.teardown-complete"
-  printf 'record-cksum=1:1\n' >> "$home/state/task-a.teardown-complete"
+  sed 's/^record-cksum=.*/record-cksum=1:1/' "$home/state/task-a.teardown-complete" \
+    > "$home/state/task-a.teardown-complete.tmp"
+  mv "$home/state/task-a.teardown-complete.tmp" "$home/state/task-a.teardown-complete"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 1 "$status" "stale proof checksum"
@@ -288,12 +314,14 @@ test_done_requires_matching_single_use_teardown_proof() {
 }
 
 test_empty_completion_claim_reconciles_completed_state() {
-  local home claim out status
+  local home claim out status ack=0123456789abcdef0123456789abcdef
   home=$(make_home empty-completed-claim)
   claim="$home/state/.task-a.teardown-complete.claimed.empty"
   mkdir "$claim"
+  printf '%s\n' "$ack" > "$claim/done-ack"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+    FM_FAKE_BODY_ACK="fm-done-ack:$ack" \
     "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 0 "$status" "empty completed proof claim recovery"
   assert_contains "$out" "already recorded" "empty completed claim did not reconcile from truthful backlog state"
@@ -313,8 +341,26 @@ test_empty_completion_claim_reconciles_restored_proof() {
   pass "empty proof claims reconcile after backend failure restores the proof"
 }
 
+test_empty_completion_claim_reconciles_exact_finalizing_done() {
+  local home claim out status meta_cksum ack=0123456789abcdef0123456789abcdef
+  home=$(make_home empty-finalizing-done-claim)
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  : > "$home/state/task-a.tearing-down"
+  write_done_started_stage "$home" task-a "$meta_cksum" staged "$ack"
+  claim="$home/state/.task-a.teardown-complete.claimed.empty"
+  mkdir "$claim"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+    FM_FAKE_BODY_ACK="fm-done-ack:$ack" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 0 "$status" "empty post-success claim recovery"
+  assert_contains "$out" "already recorded" "empty post-success claim did not use exact staged Done acknowledgement"
+  assert_absent "$claim" "empty post-success claim remained after exact Done acknowledgement"
+  pass "empty post-success claims reconcile through the exact finalizing Done acknowledgement"
+}
+
 test_finalizing_stage_allows_guarded_and_idempotent_done() {
-  local home out status meta_cksum record_cksum
+  local home out status meta_cksum record_cksum ack=0123456789abcdef0123456789abcdef
   home=$(make_home finalizing-new-done)
   write_completion_proof "$home" task-a ship delivered-local
   printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
@@ -331,6 +377,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   write_done_started_stage "$home" task-a "$meta_cksum" staged
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+    FM_FAKE_BODY_ACK="fm-done-ack:$ack" \
     "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 0 "$status" "idempotent finalizing Done"
   assert_contains "$out" "already recorded" "finalizing retry did not recognize recorded Done"
@@ -343,7 +390,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 1 "$status" "invalid finalizing stage"
-  assert_contains "$out" "unresolved owned lifecycle" "non-v3 finalizing stage bypassed lifecycle guard"
+  assert_contains "$out" "unresolved owned lifecycle" "non-v4 finalizing stage bypassed lifecycle guard"
   home=$(make_home finalizing-live-endpoint)
   write_completion_proof "$home" task-a ship delivered-local
   printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
@@ -356,6 +403,47 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   expect_code 1 "$status" "finalizing stage with live endpoint"
   assert_contains "$out" "unresolved owned lifecycle" "live endpoint bypassed complete finalization validation"
   pass "only an exact finalizing teardown stage supports guarded idempotent Done"
+}
+
+test_completion_recovery_requires_exact_done_ack() {
+  local home claim out status meta_cksum current_ack old_ack
+  current_ack=0123456789abcdef0123456789abcdef
+  old_ack=fedcba9876543210fedcba9876543210
+
+  home=$(make_home finalizing-archive-reuse)
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  : > "$home/state/task-a.tearing-down"
+  write_done_started_stage "$home" task-a "$meta_cksum" staged "$current_ack"
+  printf '\n## Archived 2026-07-17\n- [x] task-a - old task (done 2026-07-17)\n  fm-done-ack:%s\n' \
+    "$old_ack" > "$home/data/done-archive.md"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "finalizing retry with reused archived id"
+  assert_contains "$out" "no durable successful-teardown proof" \
+    "old archived task id bypassed the exact finalization acknowledgement"
+  printf '\n- [x] task-a - current task (done 2026-07-17)\n  fm-done-ack:%s\n' \
+    "$current_ack" >> "$home/data/done-archive.md"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
+    "$BACKLOG" done task-a >/dev/null
+
+  home=$(make_home claim-archive-reuse)
+  write_completion_proof "$home" task-a ship delivered-local ship "$current_ack"
+  claim="$home/state/.task-a.teardown-complete.claimed.stale"
+  mkdir "$claim"
+  mv "$home/state/task-a.teardown-complete" "$claim/proof"
+  printf '%s\n' "$current_ack" > "$claim/done-ack"
+  printf '\n## Archived 2026-07-17\n- [x] task-a - old task (done 2026-07-17)\n  fm-done-ack:%s\n' \
+    "$old_ack" > "$home/data/done-archive.md"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "claim recovery with reused archived id"
+  assert_contains "$out" "could not determine backlog state" \
+    "old archived task id consumed a different claimed teardown receipt"
+  assert_present "$claim/proof" "failed exact archive acknowledgement consumed the claimed proof"
+  pass "completion retries require the exact teardown acknowledgement in live and archived Done records"
 }
 
 test_manual_backend_mutations_stay_serialized_and_receipt_gated() {
@@ -374,8 +462,10 @@ test_manual_backend_mutations_stay_serialized_and_receipt_gated() {
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
     "$BACKLOG" done task-a --note 'local main'
-  assert_contains "$(cat "$log")" "args=done task-a --note local main --backend markdown --file $home/data/backlog.md" \
+  assert_contains "$(cat "$log")" "args=done task-a --note local main" \
     "manual completion did not pass through the serialized scoped backend"
+  assert_contains "$(cat "$log")" "fm-done-ack:0123456789abcdef0123456789abcdef --backend markdown --file $home/data/backlog.md" \
+    "manual completion did not preserve its exact teardown acknowledgement"
   assert_absent "$home/state/task-a.teardown-complete" "manual Done did not consume its lifecycle receipt"
   pass "manual mutations use the serialized lifecycle receipt path"
 }
@@ -454,11 +544,13 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs() {
 }
 
 test_interrupted_completion_claim_reconciles_from_backlog_state() {
-  local home marker state_file mode_file archive_file claim out pid status candidate
+  local home marker state_file mode_file archive_file claim out pid status candidate ack_file
   home=$(make_home interrupted-retry)
   marker="$home/done-started"
+  ack_file="$home/done-ack"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
+    FM_FAKE_DONE_ACK_FILE="$ack_file" \
     "$BACKLOG" done task-a >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
@@ -480,11 +572,13 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
 
   home=$(make_home interrupted-completed)
   marker="$home/done-started"
+  ack_file="$home/done-ack"
   state_file="$home/task-state"
   printf 'queued\n' > "$state_file"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
     FM_FAKE_TASK_STATE_FILE="$state_file" FM_FAKE_DONE_STATE_FILE="$state_file" \
+    FM_FAKE_DONE_ACK_FILE="$ack_file" \
     "$BACKLOG" done task-a >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
@@ -504,13 +598,14 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
 
   home=$(make_home interrupted-archived)
   marker="$home/done-started"
+  ack_file="$home/done-ack"
   mode_file="$home/show-mode"
   archive_file="$home/data/done-archive.md"
   printf 'success\n' > "$mode_file"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
     FM_FAKE_SHOW_MODE_FILE="$mode_file" FM_FAKE_DONE_SHOW_MODE=not_found \
-    FM_FAKE_ARCHIVE_PATH="$archive_file" \
+    FM_FAKE_ARCHIVE_PATH="$archive_file" FM_FAKE_DONE_ACK_FILE="$ack_file" \
     "$BACKLOG" done task-a --keep 0 >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
@@ -538,6 +633,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   write_completion_proof "$home" task-a ship delivered-local
   mkdir "$claim"
   mv "$home/state/task-a.teardown-complete" "$claim/proof"
+  printf '%s\n' 0123456789abcdef0123456789abcdef > "$claim/done-ack"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE_FILE="$mode_file" \
     "$BACKLOG" done task-a --keep 0 2>&1) || status=$?
@@ -692,6 +788,59 @@ EOF
   pass "duplicate markdown.archive assignments cannot bypass home containment"
 }
 
+test_real_tasks_axi_preserves_done_ack_with_multiline_note() {
+  local home task_info checksum note shown archive claim out status ack
+  if ! command -v tasks-axi >/dev/null 2>&1; then
+    pass "SKIP (tasks-axi unavailable): real Done acknowledgement format"
+    return
+  fi
+  home=$(make_home real-done-ack)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] task-a - stable task (kind: ship)
+  stable body
+
+## Done
+EOF
+  task_info=$(cd "$home" && HOME="$home" tasks-axi show task-a --full \
+    --backend markdown --file "$home/data/backlog.md") || fail "real tasks-axi could not read the completion fixture"
+  checksum=$(printf '%s' "$task_info" | fm_tasks_axi_task_fingerprint) \
+    || fail "real tasks-axi completion fixture could not be fingerprinted"
+  ack=0123456789abcdef0123456789abcdef
+  {
+    printf 'version=2\n'
+    printf 'task=task-a\n'
+    printf 'kind=ship\n'
+    printf 'outcome=delivered-local\n'
+    printf 'record-cksum=%s\n' "$checksum"
+    printf 'done-ack=%s\n' "$ack"
+  } > "$home/state/task-a.teardown-complete"
+  note=$'captain note line one\ncaptain note line two'
+  FM_HOME="$home" "$BACKLOG" done task-a --note "$note" --no-prune >/dev/null
+  shown=$(cd "$home" && HOME="$home" tasks-axi show task-a --full \
+    --backend markdown --file "$home/data/backlog.md") || fail "real Done record was not retained for full inspection"
+  assert_contains "$shown" "captain note line one" "real Done dropped the first user note line"
+  assert_contains "$shown" "captain note line two" "real Done dropped the second user note line"
+  assert_contains "$shown" "fm-done-ack:$ack" "real Done dropped the reserved acknowledgement line"
+  FM_HOME="$home" "$BACKLOG" prune --keep 0 >/dev/null
+  archive=$(cat "$home/data/done-archive.md")
+  assert_contains "$archive" "  captain note line one" "real archive dropped the first user note line"
+  assert_contains "$archive" "  captain note line two" "real archive dropped the second user note line"
+  assert_contains "$archive" "  fm-done-ack:$ack" "real archive did not retain the parser's exact acknowledgement form"
+  claim="$home/state/.task-a.teardown-complete.claimed.archived"
+  mkdir "$claim"
+  printf '%s\n' "$ack" > "$claim/done-ack"
+  status=0
+  out=$(FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 0 "$status" "real archived Done acknowledgement recovery"
+  assert_contains "$out" "already recorded" "real archive format did not satisfy exact acknowledgement recovery"
+  assert_absent "$claim" "real archive acknowledgement left its recovery claim"
+  pass "real tasks-axi preserves multiline Done notes and exact acknowledgements through archival"
+}
+
 test_same_file_mutations_are_serialized
 test_done_refuses_unresolved_meta
 test_scout_done_requires_owned_report
@@ -700,8 +849,10 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs
 test_interrupted_completion_claim_reconciles_from_backlog_state
 test_empty_completion_claim_reconciles_completed_state
 test_empty_completion_claim_reconciles_restored_proof
+test_empty_completion_claim_reconciles_exact_finalizing_done
 test_manual_backend_mutations_stay_serialized_and_receipt_gated
 test_finalizing_stage_allows_guarded_and_idempotent_done
+test_completion_recovery_requires_exact_done_ack
 test_default_tasks_kind_matches_legacy_ship_lifecycle
 test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards
@@ -710,3 +861,4 @@ test_help_does_not_require_home_configuration
 test_documented_overrides_remain_compatible
 test_backlog_and_archive_symlink_escapes_are_rejected
 test_duplicate_markdown_archive_is_rejected
+test_real_tasks_axi_preserves_done_ack_with_multiline_note

@@ -196,7 +196,7 @@ if [ "${1:-}" = show ]; then
     held=no
     hold_reason=-
     hold_kind=-
-    body=finalized
+    body=$(cat "$FM_TASKS_DONE_STATE")
   elif [ -n "${FM_TASKS_HELD_STATE:-}" ] && [ -e "$FM_TASKS_HELD_STATE" ]; then
     if [ -e "$FM_TASKS_HELD_STATE.reopened" ]; then task_state=queued; else task_state=in_flight; fi
     held=yes
@@ -217,8 +217,16 @@ fi
 if [ "${1:-}" = done ]; then
   state=${FM_STATE_OVERRIDE:-/nonexistent}
   stage="$state/${2:-}.teardown-stage"
+  note=
+  previous=
+  for arg in "$@"; do
+    if [ "$previous" = note ]; then note=$arg; previous=; continue; fi
+    [ "$arg" != --note ] || previous=note
+  done
   if [ -e "$state/${2:-}.meta" ] || [ -e "$state/${2:-}.tearing-down" ]; then
-    if [ ! -f "$stage" ] || ! grep -q '^version=3$' "$stage" || ! grep -q '^phase=backlog-done-started$' "$stage"; then
+    if [ ! -f "$stage" ] || ! grep -q '^version=4$' "$stage" \
+       || ! grep -Eq '^done-ack=[0-9a-f]{32}$' "$stage" \
+       || ! grep -q '^phase=backlog-done-started$' "$stage"; then
       echo 'tasks-axi done ran outside durable finalization' >&2
       exit 8
     fi
@@ -227,7 +235,7 @@ if [ "${1:-}" = done ]; then
     touch "$FM_TASKS_DONE_FAIL_FLAG"
     exit 9
   fi
-  [ -z "${FM_TASKS_DONE_STATE:-}" ] || touch "$FM_TASKS_DONE_STATE"
+  [ -z "${FM_TASKS_DONE_STATE:-}" ] || printf '%s\n' "$note" > "$FM_TASKS_DONE_STATE"
 fi
 if [ "${1:-}" = hold ] && [ -n "${FM_TASKS_HELD_STATE:-}" ]; then
   reason=
@@ -2992,6 +3000,188 @@ SH
   pass "child worktree cleanup authority cannot transfer to a replacement path"
 }
 
+test_interrupted_stage_preparation_is_retryable() {
+  local case_dir fail_flag rc ack
+  case_dir=$(make_case interrupted-stage-preparation)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  fail_flag="$case_dir/prepared-stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=prepared$' "$src"; then
+  : > "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "interrupted stage preparation"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=preparing' \
+    "interrupted preparation did not retain its provisional stage"
+  ack=$(sed -n 's/^done-ack=//p' "$case_dir/state/task-x1.teardown-stage")
+  [[ "$ack" =~ ^[0-9a-f]{32}$ ]] || fail "interrupted preparation did not persist its Done acknowledgement"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "interrupted stage preparation retry"
+  pass "interrupted stage preparation retains retryable exact authority"
+}
+
+test_orphan_auxiliary_plan_without_markers_is_recoverable() {
+  local case_dir tasktmp fail_flag rc marker
+  case_dir=$(make_case orphan-auxiliary-plan)
+  tasktmp="$case_dir/tasktmp"
+  mkdir "$tasktmp"
+  write_meta "$case_dir" local-only ship
+  printf 'tasktmp=%s\n' "$tasktmp" >> "$case_dir/state/task-x1.meta"
+  add_compatible_tasks_axi "$case_dir"
+  fail_flag="$case_dir/aux-move-killed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_AUX_PATH:?}" ] && [ ! -e "${FM_AUX_FAIL_FLAG:?}" ]; then
+  /bin/mv "$src" "$dst" || exit
+  : > "$FM_AUX_FAIL_FLAG"
+  kill -KILL "$PPID"
+  exit 137
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_AUX_PATH="$case_dir/state/task-x1.teardown-owners" FM_AUX_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "orphan auxiliary plan fixture did not interrupt teardown"
+  [ -f "$case_dir/state/task-x1.teardown-owners" ] || fail "interrupted auxiliary plan was not persisted"
+  [ ! -e "$case_dir/state/task-x1.teardown-stage" ] || fail "orphan auxiliary plan fixture unexpectedly wrote a stage"
+  marker=$(cut -f4 "$case_dir/state/task-x1.teardown-owners")
+  [ ! -e "$marker" ] && [ ! -L "$marker" ] || fail "orphan auxiliary plan created authority before its stage"
+  rc=0
+  FM_AUX_PATH="$case_dir/state/task-x1.teardown-owners" FM_AUX_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "orphan auxiliary plan retry"
+  pass "marker-free orphan auxiliary plans are deterministically recoverable"
+}
+
+test_staged_outcome_requires_valid_context() {
+  local case_dir fail_flag rc
+  for outcome in invalid discarded; do
+    case_dir=$(make_case "invalid-stage-outcome-$outcome")
+    write_meta "$case_dir" local-only ship
+    add_compatible_tasks_axi "$case_dir"
+    fail_flag="$case_dir/endpoint-stage-failed"
+    cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=endpoint-closed$' "$src"; then
+  : > "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+    chmod +x "$case_dir/fakebin/mv"
+    rc=0
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$fail_flag" \
+      run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "$outcome outcome fixture"
+    sed "s/^outcome=.*/outcome=$outcome/" "$case_dir/state/task-x1.teardown-stage" \
+      > "$case_dir/state/task-x1.teardown-stage.next"
+    /bin/mv "$case_dir/state/task-x1.teardown-stage.next" "$case_dir/state/task-x1.teardown-stage"
+    rc=0
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$fail_flag" \
+      run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+    expect_code 1 "$rc" "$outcome staged outcome"
+    assert_contains "$(cat "$case_dir/retry-stderr")" 'invalid teardown outcome' \
+      "$outcome staged outcome was accepted outside its kind/force context"
+    [ -d "$case_dir/wt" ] || fail "$outcome staged outcome removed the worktree"
+  done
+  pass "staged outcomes are restricted to their kind and force posture"
+}
+
+test_symlinked_auxiliary_targets_are_refused() {
+  local case_dir outside rc
+  case_dir=$(make_case symlinked-tasktmp-refusal)
+  outside="$case_dir/outside-tasktmp"
+  mkdir "$outside"
+  ln -s "$outside" "$case_dir/tasktmp-link"
+  write_meta "$case_dir" local-only ship
+  printf 'tasktmp=%s\n' "$case_dir/tasktmp-link" >> "$case_dir/state/task-x1.meta"
+  add_compatible_tasks_axi "$case_dir"
+  rc=0
+  run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "symlinked tasktmp"
+  [ -d "$outside" ] || fail "symlinked tasktmp target was removed"
+
+  case_dir=$(make_case symlinked-child-worktree-refusal)
+  outside="$case_dir/child-wt"
+  git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$outside" main
+  ln -s "$outside" "$case_dir/child-wt-link"
+  mkdir -p "$case_dir/secondmate-home/state" "$case_dir/secondmate-home/data" \
+    "$case_dir/secondmate-home/config" "$case_dir/secondmate-home/projects"
+  printf 'task-x1\n' > "$case_dir/secondmate-home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$case_dir/secondmate-home" \
+    "project=$case_dir/secondmate-home" 'kind=secondmate' 'mode=secondmate' \
+    "home=$case_dir/secondmate-home"
+  fm_write_meta "$case_dir/secondmate-home/state/child-a1.meta" \
+    'window=fm-child-a1' "worktree=$case_dir/child-wt-link" \
+    "project=$case_dir/project" 'kind=ship' 'mode=local-only'
+  rc=0
+  run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "symlinked child worktree"
+  [ -d "$outside" ] || fail "symlinked child worktree target was removed"
+  pass "symlinked auxiliary cleanup targets never gain teardown authority"
+}
+
+test_child_treehouse_retry_revalidates_auxiliary_authority() {
+  local case_dir home child_wt attempts rc
+  case_dir=$(make_case child-treehouse-retry-authority)
+  home="$case_dir/secondmate-home"
+  child_wt="$case_dir/child-wt"
+  attempts="$case_dir/treehouse-attempts"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  fm_write_meta "$home/state/child-a1.meta" \
+    'window=fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+    'kind=ship' 'mode=local-only'
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+target=${!#}
+attempts=${FM_TREEHOUSE_ATTEMPTS:?}
+count=$(cat "$attempts" 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s\n' "$count" > "$attempts"
+if [ "$count" -eq 1 ]; then
+  marker=$(printf '%s\n' "$target"/.fm-teardown-owner-task-x1-* | head -1)
+  printf 'replacement\n' > "$marker"
+  printf "fatal: Unable to create '%s/index.lock': File exists.\n" "$target" >&2
+  exit 128
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  rc=0
+  FM_TREEHOUSE_ATTEMPTS="$attempts" FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=0 \
+    run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "child Treehouse authority change"
+  assert_contains "$(cat "$attempts")" 1 "child Treehouse return retried after authority changed"
+  [ -d "$child_wt" ] || fail "child Treehouse retry removed a target after authority changed"
+  pass "child Treehouse retries revalidate exact auxiliary authority"
+}
+
 test_finalizing_retry_rechecks_current_record() {
   local case_dir fail_flag rc
   case_dir=$(make_case finalizing-record-change)
@@ -3093,6 +3283,11 @@ test_postcleanup_retry_rechecks_endpoint_absence
 test_cleanup_success_requires_confirmed_absence
 test_tasktmp_replacement_loses_auxiliary_cleanup_authority
 test_child_worktree_replacement_loses_auxiliary_cleanup_authority
+test_interrupted_stage_preparation_is_retryable
+test_orphan_auxiliary_plan_without_markers_is_recoverable
+test_staged_outcome_requires_valid_context
+test_symlinked_auxiliary_targets_are_refused
+test_child_treehouse_retry_revalidates_auxiliary_authority
 test_finalizing_retry_rechecks_current_record
 test_concurrent_force_retry_cannot_replace_staged_outcome
 test_squash_merged_branch_deleted_allows

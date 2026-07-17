@@ -40,6 +40,13 @@ async function resolveRoot(anchor) {
   return resolvePath(anchor);
 }
 
+async function primaryCheckout(root) {
+  const result = await runProcess("git", ["-C", root, "rev-parse", "--git-dir", "--git-common-dir"]);
+  if (result.code !== 0) return false;
+  const paths = result.stdout.trim().split("\n");
+  return paths.length === 2 && paths[0] === paths[1];
+}
+
 function resolvePath(anchor) {
   try {
     return realpathSync(anchor);
@@ -108,8 +115,10 @@ async function letWatchArmRun(sessionID, client) {
 
 export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => {
   const root = worktree ? resolvePath(worktree) : await resolveRoot(directory);
+  if (!await primaryCheckout(root)) return { event: async () => {} };
   const followupDeliveryActive = new Set();
   const retryTimers = new Map();
+  const pendingMessages = new Map();
 
   const cancelRetryOwner = (sessionID) => {
     const timer = retryTimers.get(sessionID);
@@ -118,7 +127,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
   };
 
   const scheduleDelivery = (sessionID, delay = retryDelay()) => {
-    if (retryTimers.has(sessionID) || !readHandoff(root, sessionID)) return;
+    if (retryTimers.has(sessionID) || (!readHandoff(root, sessionID) && !pendingMessages.has(sessionID))) return;
     const timer = setTimeout(() => {
       retryTimers.delete(sessionID);
       void deliverHandoff(sessionID);
@@ -126,10 +135,27 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     retryTimers.set(sessionID, timer);
   };
 
+  const ensureHandoff = (sessionID) => {
+    const message = pendingMessages.get(sessionID);
+    if (message !== undefined) {
+      try {
+        const handoff = persistHandoff(root, sessionID, message);
+        pendingMessages.delete(sessionID);
+        return handoff;
+      } catch {
+        return undefined;
+      }
+    }
+    return readHandoff(root, sessionID);
+  };
+
   const deliverHandoff = async (sessionID) => {
     if (followupDeliveryActive.has(sessionID)) return;
-    const handoff = readHandoff(root, sessionID);
-    if (!handoff) return;
+    const handoff = ensureHandoff(sessionID);
+    if (!handoff) {
+      scheduleDelivery(sessionID);
+      return;
+    }
     followupDeliveryActive.add(sessionID);
     try {
       await client.session.promptAsync({
@@ -170,6 +196,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       const result = await runGuard(root);
       if (result.code === 0) {
         clearHandoff(root, sessionID);
+        pendingMessages.delete(sessionID);
         cancelRetryOwner(sessionID);
         return;
       }
@@ -181,7 +208,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
         "TURN WOULD END BLIND - supervision is off. " +
         "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
         reason;
-      persistHandoff(root, sessionID, message);
+      pendingMessages.set(sessionID, message);
       cancelRetryOwner(sessionID);
       await deliverHandoff(sessionID);
     },
