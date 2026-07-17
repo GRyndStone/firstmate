@@ -297,7 +297,8 @@ LOCKED=1
 
 if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   COMPLETION_PROOF="$STATE/$ID.teardown-complete"
-  if [ -e "$STATE/$ID.meta" ] || [ -e "$STATE/$ID.tearing-down" ]; then
+  if [ -e "$STATE/$ID.meta" ] || [ -e "$STATE/$ID.tearing-down" ] \
+     || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ]; then
     echo "REFUSED: task $ID still has unresolved owned lifecycle state." >&2
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2
     exit 1

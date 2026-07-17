@@ -165,7 +165,7 @@ if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   exit 0
 fi
 if [ "${1:-}" = show ]; then
-  printf 'task:\n  id: %s\n  kind: ship\n' "${2:-task-x1}"
+  printf 'task:\n  id: %s\n  kind: ship\n  body: %s\n' "${2:-task-x1}" "${FM_TASKS_SHOW_SUFFIX:-stable}"
   exit 0
 fi
 if [ "${1:-}" = done ]; then
@@ -1350,6 +1350,54 @@ SH
   pass "Herdr duplicate endpoints block teardown and remain inspect-only"
 }
 
+test_secondmate_retirement_preflights_child_duplicates() {
+  local case_dir home log rc
+  case_dir=$(make_case secondmate-child-duplicate-refusal)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' \
+    "worktree=$home" \
+    "project=$home" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$home"
+  fm_write_meta "$home/state/child-a1.meta" \
+    'backend=herdr' \
+    'window=default:childw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=childw' \
+    'herdr_pane_id=childw:p2' \
+    "worktree=$case_dir/missing-child-worktree" \
+    "project=$case_dir/project" \
+    'kind=scout'
+  log="$case_dir/herdr-child.log"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"child"}}}\n' "${3:-}" ;;
+  "tab list") printf '%s\n' '{"result":{"tabs":[{"tab_id":"childw:t1","label":"fm-child-a1"},{"tab_id":"childw:t2","label":"fm-child-a1"}]}}' ;;
+  "pane list") printf '%s\n' '{"result":{"panes":[{"pane_id":"childw:p1","tab_id":"childw:t1"},{"pane_id":"childw:p2","tab_id":"childw:t2"}]}}' ;;
+  *) exit 99 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+
+  rc=0
+  FM_HERDR_LOG="$log" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "secondmate child duplicate preflight"
+  assert_contains "$(cat "$case_dir/stderr")" "child task child-a1 has a same-home endpoint ownership anomaly" \
+    "forced secondmate retirement did not surface the child duplicate"
+  assert_not_contains "$(cat "$log")" "close" "child duplicate preflight automatically closed an endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "child duplicate refusal removed secondmate meta"
+  [ -f "$home/state/child-a1.meta" ] || fail "child duplicate refusal removed child meta"
+  pass "forced secondmate retirement audits child-home duplicates before any closure"
+}
+
 test_zellij_duplicate_endpoints_refuse_teardown_without_closure() {
   local case_dir log rc title
   case_dir=$(make_case zellij-duplicate-refusal)
@@ -1443,11 +1491,9 @@ SH
 }
 
 test_cmux_duplicate_endpoints_refuse_teardown_without_closure() {
-  local case_dir log rc title
+  local case_dir log rc
   case_dir=$(make_case cmux-duplicate-refusal)
   write_meta "$case_dir" local-only ship
-  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
-    bash -c '. "$1"; fm_backend_source cmux; fm_backend_cmux_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
   sed -i.bak 's/^window=.*/window=ws-a:sf-a/' "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' 'backend=cmux' 'cmux_workspace_id=ws-a' 'cmux_surface_id=sf-a' >> "$case_dir/state/task-x1.meta"
@@ -1456,39 +1502,19 @@ test_cmux_duplicate_endpoints_refuse_teardown_without_closure() {
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "$*" >> "${FM_CMUX_LOG:?}"
-case "${1:-}" in
-  ping) printf '%s\n' PONG ;;
-  list-windows) printf '%s\n' '[{"id":"win-a"},{"id":"win-b"}]' ;;
-  workspace)
-    case " $* " in
-      *" --window win-a "*) printf '{"workspaces":[{"id":"ws-a","title":"%s"}]}\n' "${FM_DUPLICATE_TITLE:?}" ;;
-      *" --window win-b "*) printf '{"workspaces":[{"id":"ws-b","title":"%s"}]}\n' "${FM_DUPLICATE_TITLE:?}" ;;
-      *) printf '%s\n' '{"workspaces":[]}' ;;
-    esac
-    ;;
-  list-panes)
-    case " $* " in
-      *" --workspace ws-a "*) printf '%s\n' '{"panes":[{"selected_surface_id":"sf-a","surface_ids":["sf-a","sf-a2"]}]}' ;;
-      *" --workspace ws-b "*) printf '%s\n' '{"panes":[{"selected_surface_id":"sf-b","surface_ids":["sf-b"]}]}' ;;
-      *) exit 1 ;;
-    esac
-    ;;
-esac
-exit 0
+exit 99
 SH
   chmod +x "$case_dir/fakebin/cmux"
 
   rc=0
-  FM_CMUX_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
+  FM_CMUX_LOG="$log" run_teardown "$case_dir" --force \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "cmux duplicate endpoint teardown"
-  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
-    "cmux teardown did not refuse the endpoint ownership anomaly"
-  assert_contains "$(cat "$case_dir/stderr")" "ws-a:sf-a,ws-a:sf-a2,ws-b:sf-b" \
-    "cmux teardown refusal did not identify all exact duplicate surfaces"
-  assert_not_contains "$(cat "$log")" "close-workspace" "cmux duplicate refusal automatically closed an endpoint"
+  assert_contains "$(cat "$case_dir/stderr")" "kind=inventory_unavailable live=unknown" \
+    "cmux teardown did not explain its fail-closed duplicate-audit boundary"
+  [ ! -s "$log" ] || fail "cmux duplicate audit enumerated app-global inventory: $(cat "$log")"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "cmux duplicate refusal removed task meta"
-  pass "cmux duplicate endpoints block teardown before any automatic closure"
+  pass "cmux teardown fails closed without cross-home inventory enumeration"
 }
 
 test_backlog_operational_read_failure_refuses_before_teardown() {
@@ -1631,12 +1657,19 @@ SH
 }
 
 test_completion_proof_write_failure_preserves_lifecycle() {
-  local case_dir rc proof log
+  local case_dir rc proof log return_log
   case_dir=$(make_case completion-proof-write-failure)
   write_meta "$case_dir" local-only ship
   add_compatible_tasks_axi "$case_dir"
   proof="$case_dir/state/task-x1.teardown-complete"
   log="$case_dir/tasks.log"
+  return_log="$case_dir/treehouse.log"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TREEHOUSE_LOG:?}"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -1650,25 +1683,130 @@ SH
   chmod +x "$case_dir/fakebin/mv"
 
   rc=0
-  FM_PROOF_BLOCK_PATH="$proof" FM_TASKS_LOG="$log" run_teardown "$case_dir" \
+  FM_PROOF_BLOCK_PATH="$proof" FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" run_teardown "$case_dir" \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "completion proof persistence failure"
   assert_contains "$(cat "$case_dir/stderr")" "could not persist completion proof" \
     "proof persistence failure was not reported"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "proof persistence failure removed task meta"
-  [ -f "$case_dir/state/task-x1.tearing-down" ] || fail "proof persistence failure removed teardown tombstone"
+  [ -d "$case_dir/wt" ] || fail "proof persistence failure removed the worktree"
+  [ ! -s "$return_log" ] || fail "proof persistence failure ran destructive worktree cleanup"
+  assert_absent "$case_dir/state/task-x1.teardown-stage" "proof persistence failure left a misleading retry stage"
+  assert_absent "$case_dir/state/task-x1.tearing-down" "proof persistence failure entered endpoint cleanup"
   if [ -f "$log" ]; then
     assert_not_contains "$(cat "$log")" "done task-x1" \
       "proof persistence failure recorded backlog completion"
   fi
   rm -f "$case_dir/fakebin/mv"
   rc=0
-  FM_TASKS_LOG="$log" run_teardown "$case_dir" \
+  FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" run_teardown "$case_dir" \
     > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
   expect_code 0 "$rc" "completion proof persistence retry"
   assert_contains "$(cat "$log")" "done task-x1" \
     "proof persistence retry did not complete the backlog record"
-  pass "completion proof persistence failure retains retryable lifecycle state"
+  pass "completion proof persistence is staged before endpoint and worktree destruction"
+}
+
+test_interrupted_cleanup_never_reuses_returned_worktree_path() {
+  local case_dir rc log return_log stage_fail
+  case_dir=$(make_case interrupted-cleanup-stage)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  log="$case_dir/tasks.log"
+  return_log="$case_dir/treehouse.log"
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TREEHOUSE_LOG:?}"
+wt=${3:?}
+rm -f "$wt"/.fm-teardown-owner-*
+touch "$wt/reused-by-another-task"
+exit 0
+SH
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=worktree-cleaned$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/mv"
+
+  rc=0
+  FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "interrupted cleanup phase persistence"
+  assert_contains "$(cat "$case_dir/stderr")" "durable teardown phase could not be advanced" \
+    "cleanup phase persistence failure was not reported"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "cleanup phase failure removed task meta"
+  [ -f "$case_dir/wt/reused-by-another-task" ] || fail "fixture did not model immediate worktree-path reuse"
+  [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] || fail "first cleanup did not return the worktree exactly once"
+
+  rc=0
+  FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "interrupted cleanup retry with lost ownership"
+  [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] \
+    || fail "retry re-ran destructive cleanup against a reused worktree path"
+  [ -f "$case_dir/wt/reused-by-another-task" ] || fail "retry modified the reused worktree path"
+  assert_contains "$(cat "$case_dir/retry-stderr")" "teardown ownership is lost" \
+    "retry did not fail closed after ownership disappeared"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" "phase=ownership-lost" \
+    "retry did not persist the ownership-lost phase"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "ownership-lost retry removed lifecycle meta"
+  if [ -f "$log" ]; then
+    assert_not_contains "$(cat "$log")" "done task-x1" "ownership-lost retry recorded false completion"
+  fi
+  pass "durable cleanup phase blocks finalization after worktree ownership is lost"
+}
+
+test_staged_teardown_refuses_changed_backlog_record() {
+  local case_dir rc stage_fail
+  case_dir=$(make_case staged-backlog-change)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+
+  rc=0
+  FM_TASKS_SHOW_SUFFIX=original FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" \
+    FM_STAGE_FAIL_FLAG="$stage_fail" run_teardown "$case_dir" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "staged teardown interruption"
+  [ -f "$case_dir/state/task-x1.teardown-stage" ] || fail "interrupted teardown lost its durable stage"
+
+  rc=0
+  FM_TASKS_SHOW_SUFFIX=recreated FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" \
+    FM_STAGE_FAIL_FLAG="$stage_fail" run_teardown "$case_dir" \
+    > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "staged teardown with changed backlog record"
+  assert_contains "$(cat "$case_dir/retry-stderr")" "backlog task task-x1 changed after teardown was staged" \
+    "staged retry accepted a changed backlog record"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "changed backlog retry removed lifecycle meta"
+  [ -d "$case_dir/wt" ] || fail "changed backlog retry removed the worktree"
+  pass "durable teardown stage is bound to the exact backlog record"
 }
 
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
@@ -1848,6 +1986,7 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
+test_secondmate_retirement_preflights_child_duplicates
 test_zellij_duplicate_endpoints_refuse_teardown_without_closure
 test_zellij_replacement_endpoint_refuses_teardown_without_closure
 test_cmux_duplicate_endpoints_refuse_teardown_without_closure
@@ -1856,6 +1995,8 @@ test_non_delivery_outcomes_never_record_done
 test_endpoint_close_must_succeed_and_be_absent
 test_unknown_endpoint_state_preserves_lifecycle
 test_completion_proof_write_failure_preserves_lifecycle
+test_interrupted_cleanup_never_reuses_returned_worktree_path
+test_staged_teardown_refuses_changed_backlog_record
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
 test_orca_endpoint_probe_rejects_success_shaped_errors
 test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab

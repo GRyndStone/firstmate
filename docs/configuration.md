@@ -13,7 +13,11 @@ When the default backend is selected and compatible `tasks-axi` is on `PATH`, fi
 That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
 The wrapper refuses `done` while owned task meta or teardown state exists, and it refuses a scout report completion unless the exact owned report exists.
 `fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, clearing owned lifecycle state, and only then asking the wrapper to record Done.
-For a Herdr task, teardown first runs the same-home duplicate audit and refuses when more than one live task endpoint exists, leaving exact reconciliation to the supervisor rather than closing anything automatically.
+It persists the completion proof, a teardown phase bound to the exact backlog record, and an exact worktree ownership marker before destructive cleanup.
+An interrupted retry refuses a changed backlog record and cannot inspect, return, or finalize a path after that marker disappears.
+Before automatic endpoint closure, teardown runs the same-home duplicate audit for Herdr and Zellij tasks and refuses any duplicate or replacement endpoint, leaving exact reconciliation to the supervisor.
+cmux exposes no exact-home inventory source, so its read-only audit emits a structured `inventory_unavailable` finding without issuing an app-global inventory command, and teardown refuses that finding before endpoint closure.
+Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
 If the Done mutation fails after teardown, the lifecycle is safely closed but the command fails loudly and the backlog remains outside Done for explicit reconciliation.
 Manual backend edits cannot be mechanically serialized by this wrapper, so the operating contract requires completion edits only after successful teardown and requires operators not to write the same backlog concurrently.
 Secondmate handoffs are separate and unconditional: `fm-backlog-handoff.sh` keeps only its own fleet-level validation and always delegates the item move to `tasks-axi mv`, the single owner of the backlog format.
@@ -64,8 +68,10 @@ These five sentences are the single owner of the task-selector vocabulary; backe
 `fm-teardown.sh <id>` takes a task id directly and uses the same recorded backend target fields after loading `state/<id>.meta`.
 Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
-`bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate Herdr endpoints.
-It queries only sessions and exact workspace ids named by the active home's own meta, groups duplicate `fm-<id>` labels deterministically, and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
+`bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate endpoints on backends with an exact-home inventory boundary.
+For Herdr it queries only sessions and exact workspace ids named by the active home's own meta, and for Zellij it queries only the exact recorded session for that home's scoped task title.
+It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
+For cmux it emits a structured `inventory_unavailable` finding without enumerating the app-global window namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
 Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.

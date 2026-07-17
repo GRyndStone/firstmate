@@ -408,7 +408,10 @@ recovery_context() {
       case "$note" in
         after-run=*) prefix=after-run= ;;
         validating-after-run=*) prefix=validating-after-run= ;;
-        *) id=""; kind=""; continue ;;
+        *)
+          [ -n "$id" ] && kind=working
+          continue
+          ;;
       esac
       token=${note%%[[:space:]]*}
       id=${token#"$prefix"}
@@ -417,10 +420,15 @@ recovery_context() {
         *) kind=working ;;
       esac
     elif [ -n "$id" ]; then
-      case "$verb" in
-        needs-decision|blocked) kind=signal ;;
-        *) id=""; kind="" ;;
-      esac
+      if status_is_paused "$line"; then
+        kind=signal
+      else
+        case "$verb" in
+          needs-decision|blocked) kind=signal ;;
+          resolved) kind=working ;;
+          done|failed) id=""; kind="" ;;
+        esac
+      fi
     fi
   done < "$LOG"
   [ -n "$id" ] && [ -n "$kind" ] || return 1
@@ -595,18 +603,19 @@ if [ "$HAVE_RUN" = 1 ]; then
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
-    fi
-    [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
-    if [ "$RUN_STATUS" = fixing ]; then
-      CI_LOG_STATE=not-ready
-    elif [ "$CI_STEP_STATUS" = running ] && [ -z "$CI_LOG_STATE" ]; then
-      CI_LOG_STATE=$(nm_ci_checks_state)
-    elif [ "$CI_STEP_STATUS" = fixing ]; then
-      CI_LOG_STATE=not-ready
-    fi
-    if [ "$CI_LOG_STATE" != not-ready ] && [ "$CI_LOG_STATE" != zero-check ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+      RUN_DETAIL="$RUN_DETAIL${SEP}older checks-green status is not bound to this current run"
+    else
+      [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
+      if [ "$RUN_STATUS" = fixing ]; then
+        CI_LOG_STATE=not-ready
+      elif [ "$CI_STEP_STATUS" = running ] && [ -z "$CI_LOG_STATE" ]; then
+        CI_LOG_STATE=$(nm_ci_checks_state)
+      elif [ "$CI_STEP_STATUS" = fixing ]; then
+        CI_LOG_STATE=not-ready
+      fi
+      if [ "$CI_LOG_STATE" != not-ready ] && [ "$CI_LOG_STATE" != zero-check ]; then
+        emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+      fi
     fi
   fi
 

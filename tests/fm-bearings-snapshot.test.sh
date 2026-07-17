@@ -312,11 +312,37 @@ EOF
   pass "bearings surfaces active and raw durable obligations with bounded disclosure"
 }
 
+test_held_blocked_obligation_preserves_both_gates() {
+  local home fakebin json
+  home=$(make_home held-blocked-obligation)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] live-dependency - Live dependency
+
+## Queued
+- [ ] dual-gate - Dual gate (hold: captain review) (hold-kind: captain) blocked-by: live-dependency - provider recovery
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$home")
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .durable_obligations[] | select(.id == "dual-gate")
+    | .type == "held+blocked"
+      and .hold_reason == "captain review"
+      and .blocked_by == "live-dependency"
+      and .blocked_reason == "provider recovery"
+      and (.reason | contains("hold: captain review"))
+      and (.reason | contains("blocker live-dependency: provider recovery"))
+  ' >/dev/null || fail "held+blocked obligation dropped one of its active gates: $json"
+  pass "bearings preserves both hold and blocker detail for dual-gated obligations"
+}
+
 test_bearings_skill_routes_durable_obligations() {
   local skill=$ROOT/.agents/skills/bearings/SKILL.md
   grep -Fq 'Read every `durable_obligations` row even when `runnable_candidates` is zero.' "$skill" \
     || fail "bearings skill does not require durable-obligation consumption"
-  grep -Fq 'Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued**' "$skill" \
+  grep -Fq 'Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued** with both hold and blocker details when present' "$skill" \
     || fail "bearings skill does not route gated durable obligations"
   grep -Fq 'route `unstructured` rows that require supervisor interpretation to **Plans / main pickup points**.' "$skill" \
     || fail "bearings skill does not route unstructured durable obligations"
@@ -527,6 +553,7 @@ test_superseded_queued_item_dropped_by_default
 test_held_work_and_program_boundary_are_never_omitted
 test_program_source_paths_are_bounded_and_disclosed
 test_durable_obligations_are_bounded_and_disclosed
+test_held_blocked_obligation_preserves_both_gates
 test_bearings_skill_routes_durable_obligations
 test_include_prs_is_the_only_fetch_path
 test_partial_github_failure_degrades

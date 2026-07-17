@@ -6,7 +6,7 @@
 #                used by fm-guard.sh and by the hook's banner details.
 #   HOOK       - bin/fm-turnend-guard.sh, the shared primary hook predicate that
 #                scopes in-flight work to the PRIMARY checkout only and requires
-#                a live, identity-matched watcher lock plus a fresh beacon.
+#                a live, identity-matched watcher plus turn-surviving owner provenance.
 # All hermetic over temp dirs; no real agent session is invoked.
 set -u
 
@@ -156,7 +156,7 @@ watcher_identity() {
 }
 
 record_watcher_lock() {
-  local dir=$1 pid=$2 identity=$3 root bin_dir
+  local dir=$1 pid=$2 identity=$3 kind=${4:-} owner_pid=${5:-} owner_identity=${6:-} root bin_dir
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$dir/bin" && pwd)
   mkdir -p "$dir/state/.watch.lock"
@@ -164,6 +164,11 @@ record_watcher_lock() {
   printf '%s\n' "$root" > "$dir/state/.watch.lock/fm-home"
   printf '%s\n' "$bin_dir/fm-watch.sh" > "$dir/state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
+  if [ -n "$kind" ]; then
+    printf '%s\n' "$kind" > "$dir/state/.watch.lock/owner-kind"
+    printf '%s\n' "$owner_pid" > "$dir/state/.watch.lock/owner-pid"
+    printf '%s\n' "$owner_identity" > "$dir/state/.watch.lock/owner-identity"
+  fi
 }
 
 test_hook_silent_when_no_work_in_flight() {
@@ -200,24 +205,56 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon() {
 }
 
 test_hook_silent_with_live_lock_and_fresh_beacon() {
-  local dir pid identity out status
+  local dir pid identity owner_pid owner_identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-fresh")
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  sleep 60 &
+  owner_pid=$!
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     fail "could not identify live watcher holder"
   }
-  record_watcher_lock "$dir" "$pid" "$identity"
+  owner_identity=$(watcher_identity "$dir" "$owner_pid") || {
+    kill "$pid" "$owner_pid" 2>/dev/null || true
+    wait "$pid" "$owner_pid" 2>/dev/null || true
+    fail "could not identify live watcher owner"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity" arm "$owner_pid" "$owner_identity"
   touch "$dir/state/.last-watcher-beat"
   out=$(run_hook "$dir" false); status=$?
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
-  [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
-  pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+  kill "$pid" "$owner_pid" 2>/dev/null || true
+  wait "$pid" "$owner_pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must exit 0 with a live watcher and verified durable arm owner"
+  [ -z "$out" ] || fail "hook produced output despite a durable live watcher owner: $out"
+  pass "fm-turnend-guard: silent no-op with a verified durable watcher owner"
+}
+
+test_hook_blocks_live_foreground_checkpoint_then_blocks_retry() {
+  local dir watcher_pid watcher_identity owner_pid owner_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-live-foreground-checkpoint")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  watcher_pid=$!
+  sleep 60 &
+  owner_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || fail "could not identify checkpoint watcher"
+  owner_identity=$(watcher_identity "$dir" "$owner_pid") || fail "could not identify checkpoint owner"
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity" checkpoint "$owner_pid" "$owner_identity"
+  touch "$dir/state/.last-watcher-beat"
+
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "live foreground checkpoint must not satisfy turn-surviving supervision"
+  assert_contains "$out" "foreground checkpoint owner cannot survive turn yield" "guard did not explain rejected checkpoint provenance"
+
+  kill "$watcher_pid" "$owner_pid" 2>/dev/null || true
+  wait "$watcher_pid" "$owner_pid" 2>/dev/null || true
+  out=$(run_hook "$dir" true); status=$?
+  expect_code 2 "$status" "retry must remain blocked after the yielded checkpoint dies"
+  assert_contains "$out" "prior forced continuation did not establish durable ownership" "retry did not explain the state transition"
+  pass "fm-turnend-guard: foreground checkpoint cannot authorize a blind yield or retry"
 }
 
 test_hook_blocks_with_live_lock_and_stale_beacon() {
@@ -302,14 +339,37 @@ test_hook_uses_state_override() {
   pass "fm-turnend-guard: uses FM_STATE_OVERRIDE ahead of FM_HOME/state"
 }
 
-test_hook_loop_guard_allows_retry() {
+test_hook_retry_requires_durable_ownership() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-loopguard")
   : > "$dir/state/task1.meta"
   out=$(run_hook "$dir" true); status=$?
-  expect_code 0 "$status" "hook must allow the stop when stop_hook_active is already true"
-  [ -z "$out" ] || fail "hook produced output on the loop-guarded retry: $out"
-  pass "fm-turnend-guard: stop_hook_active=true always allows the stop (never blocks twice in one turn)"
+  expect_code 2 "$status" "hook retry must remain blocked without durable ownership"
+  assert_contains "$out" "prior forced continuation did not establish durable ownership" "retry state was not surfaced"
+  pass "fm-turnend-guard: retry cannot end blind without durable ownership"
+}
+
+test_hook_surfaces_bounded_parked_and_idle_tasks() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-attention-detail")
+  : > "$dir/state/parked-task.meta"
+  : > "$dir/state/paused-task.meta"
+  : > "$dir/state/working-task.meta"
+  cat > "$dir/bin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  parked-task) printf 'state: parked · source: run-step · parked at review\n' ;;
+  paused-task) printf 'state: paused · source: status-log · external wait\n' ;;
+  *) printf 'state: working · source: pane · harness busy\n' ;;
+esac
+SH
+  chmod +x "$dir/bin/fm-crew-state.sh"
+  out=$(FM_TURNEND_DETAIL_LIMIT=2 run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "unhealthy guard must block while surfacing task detail"
+  assert_contains "$out" "parked-task=parked" "parked task id/state was omitted"
+  assert_contains "$out" "paused-task=paused" "idle paused task id/state was omitted"
+  assert_not_contains "$out" "working-task=working" "working task polluted parked/idle detail"
+  pass "fm-turnend-guard: fail-closed banner includes bounded parked and idle task detail"
 }
 
 test_hook_silent_in_secondmate_home() {
@@ -721,13 +781,15 @@ test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_blocks_live_foreground_checkpoint_then_blocks_retry
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
-test_hook_loop_guard_allows_retry
+test_hook_retry_requires_durable_ownership
+test_hook_surfaces_bounded_parked_and_idle_tasks
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
 test_hook_silent_without_jq

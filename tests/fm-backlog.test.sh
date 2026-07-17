@@ -161,7 +161,17 @@ test_done_refuses_unresolved_meta() {
   expect_code 1 "$status" "completion during teardown"
   assert_contains "$out" "unresolved owned lifecycle" "teardown tombstone did not block completion"
   assert_absent "$log" "tasks-axi mutation ran despite teardown tombstone"
-  pass "Done cannot be recorded while owned task meta or teardown state remains"
+  rm -f "$home/state/scout-a.tearing-down"
+  write_completion_proof "$home" task-a ship delivered-local
+  : > "$home/state/task-a.teardown-stage"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" task-a --note local 2>&1) || status=$?
+  expect_code 1 "$status" "completion with a durable teardown stage"
+  assert_contains "$out" "unresolved owned lifecycle" "teardown stage did not block completion"
+  assert_present "$home/state/task-a.teardown-complete" "teardown stage consumed the completion proof"
+  assert_absent "$log" "tasks-axi mutation ran despite a durable teardown stage"
+  pass "Done cannot be recorded while meta, tombstone, or durable teardown stage remains"
 }
 
 test_scout_done_requires_owned_report() {

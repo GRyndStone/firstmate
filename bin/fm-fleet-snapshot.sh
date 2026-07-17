@@ -326,27 +326,30 @@ backlog_json() {
              body_excerpt:null}
         end;
     reduce inputs as $line
-      ({path:$path,present:true,records:[],section:null,order:0};
+      ({path:$path,present:true,records:[],section:null,order:0,body_open:false};
        if ($line | test("^##[[:space:]]+")) then
          .section = (($line | sub("^##[[:space:]]+";"") | trim) | section_state)
+         | .body_open = false
        elif .section == null or ($line | trim) == "" then
          .
        elif structured_row($line; .section) then
          .order += 1
          | .records += [parse_row($line; .section; .order)]
-       elif ((.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^  "))) then
+         | .body_open = true
+       elif (.body_open == true and (.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^  "))) then
          ($line | sub("^  ";"")) as $body
          | if $body == "" then .
            else .records[-1].body_lines += [$body] end
        else
          .order += 1
          | .records += [{order:.order,state:.section,structured:false,id:null,raw:$line,body_lines:[],body_excerpt:null}]
+         | .body_open = false
        end)
     | .records |= map(
         if (.body_lines | length) > 0 then
           .body_excerpt = ((.body_lines | join(" "))[:240])
         else . end)
-    | del(.section,.order)
+    | del(.section,.order,.body_open)
   ' < "$BACKLOG"
 }
 
@@ -527,7 +530,7 @@ program_source_lines() {
   while IFS=$'\t' read -r relative source; do
     [ -n "$source" ] || continue
     jq -n --arg path "$source" --arg relative "$relative" '{path:$path,relative_path:$relative}'
-  done < <(fm_program_source_lines "$DATA") | jq -s 'sort_by(.relative_path)'
+  done < <(fm_program_source_lines "$DATA" "$FM_HOME") | jq -s 'sort_by(.relative_path)'
 }
 
 BACKLOG_JSON=$(backlog_json)

@@ -102,7 +102,8 @@ trap cleanup_owned_children EXIT
 # Signal traps terminate and reap only those captured PIDs, so an interrupted
 # foreground tool call cannot reparent fm-watch.sh to PID 1 or touch a watcher
 # belonging to another checkpoint or Firstmate home.
-FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
+FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
+  FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
 WATCH_PID=$!
 (
   i=0

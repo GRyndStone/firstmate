@@ -98,6 +98,7 @@ state/               volatile runtime signals; gitignored
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
+  <id>.teardown-stage   script-owned durable cleanup phase and exact worktree ownership record; bin/fm-teardown.sh owns retry semantics and fm-backlog treats its presence as unresolved lifecycle state
   <id>.teardown-complete   script-owned single-use successful-teardown proof consumed by fm-backlog; bin/fm-teardown.sh and bin/fm-backlog.sh headers own the contract
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
@@ -610,8 +611,8 @@ If a crewmate sent to work firstmate-on-itself branches or commits in the primar
 Only a named non-default branch checked out in the primary alarms: detached HEAD (the legitimate resting state of crewmate worktrees and secondmate homes) and the default branch never do.
 The same assertion runs at session start as the bootstrap `TANGLE:` line (handled via `bootstrap-diagnostics`), and two upstream guards prevent the tangle: `fm-spawn`'s isolated-worktree assertion and the ship brief's opening isolation check (section 11).
 
-On every verified primary harness, "no turn ends blind" has a structural backstop beyond the pull-based banner: `bin/fm-turnend-guard.sh` blocks the turn end (or forces one bounded follow-up on passive harnesses) when tasks are in flight without a live identity-matched watcher lock and fresh beacon, fires only in the actual primary checkout, and stays silent when supervision is healthy.
-`docs/turnend-guard.md` owns the per-harness hook mechanisms, empirical validation, scoping details, and documented fail-open tradeoffs.
+On every verified primary harness, "no turn ends blind" has a structural backstop beyond the pull-based banner: `bin/fm-turnend-guard.sh` applies the script-owned durable-supervision predicate in the actual primary checkout whenever tasks remain in flight.
+`docs/turnend-guard.md` owns the predicate, per-harness hook mechanisms, empirical validation, scoping details, and documented fail-open tradeoffs.
 Watcher liveness is harness-aware.
 Do not assume one primary harness can use another harness's foreground or background shape.
 For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.

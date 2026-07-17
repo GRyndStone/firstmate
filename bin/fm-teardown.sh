@@ -5,6 +5,10 @@
 # tasks, then record backlog completion through the serialized backlog wrapper
 # for ship and scout teardowns when the tasks-axi backend is active.
 # Completion happens only after owned meta and teardown state are gone.
+# Before endpoint or worktree cleanup, teardown persists any required
+# completion proof plus a phase record and an exact ownership marker.
+# An interrupted retry advances that phase only while the marker still matches;
+# once it is gone, teardown never inspects or removes the recorded path again.
 # A secondmate teardown records no backlog completion because secondmates are
 # not backlog items.
 # Touches a state/<task-id>.tearing-down tombstone before the endpoint-affecting
@@ -107,7 +111,39 @@ FORCE=${2:-}
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 COMPLETION_PROOF="$STATE/$ID.teardown-complete"
-if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
+TEARDOWN_STAGE="$STATE/$ID.teardown-stage"
+META_CKSUM=$(cksum < "$META" | awk '{print $1 ":" $2}') || exit 1
+RESUMING_STAGE=0
+STAGE_PHASE=
+STAGE_OWNER_TOKEN=
+STAGE_OUTCOME=
+STAGE_RECORD_CKSUM=
+stage_value() {
+  local key=$1
+  sed -n "s/^${key}=//p" "$TEARDOWN_STAGE" | tail -1
+}
+if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
+  if [ ! -f "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ] \
+     || [ "$(stage_value version)" != 1 ] \
+     || [ "$(stage_value task)" != "$ID" ] \
+     || [ "$(stage_value meta-cksum)" != "$META_CKSUM" ]; then
+    echo "REFUSED: invalid or stale teardown stage at $TEARDOWN_STAGE; preserving lifecycle state." >&2
+    exit 1
+  fi
+  STAGE_PHASE=$(stage_value phase)
+  case "$STAGE_PHASE" in
+    prepared|endpoint-closed|worktree-cleanup-started|worktree-cleaned|ownership-lost) ;;
+    *) echo "REFUSED: invalid teardown phase in $TEARDOWN_STAGE; preserving lifecycle state." >&2; exit 1 ;;
+  esac
+  STAGE_OWNER_TOKEN=$(stage_value owner-token)
+  STAGE_OUTCOME=$(stage_value outcome)
+  STAGE_RECORD_CKSUM=$(stage_value record-cksum)
+  [ -n "$STAGE_OWNER_TOKEN" ] && [ -n "$STAGE_OUTCOME" ] && [ -n "$STAGE_RECORD_CKSUM" ] || {
+    echo "REFUSED: incomplete teardown stage at $TEARDOWN_STAGE; preserving lifecycle state." >&2
+    exit 1
+  }
+  RESUMING_STAGE=1
+elif [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
   rm -f "$COMPLETION_PROOF" 2>/dev/null || {
     echo "REFUSED: cannot clear stale completion proof at $COMPLETION_PROOF; preserving lifecycle state." >&2
     exit 1
@@ -131,8 +167,10 @@ case "$BACKEND" in
   }
   DUPLICATE_LIVE=$(printf '%s' "$DUPLICATE_AUDIT" | jq -r --arg id "$ID" \
     '[.[] | select(.task == $id) | .live_endpoints[]] | unique | join(",")') || exit 1
-  if [ -n "$DUPLICATE_LIVE" ]; then
-    echo "REFUSED: task $ID has a same-home endpoint ownership anomaly: $DUPLICATE_LIVE" >&2
+  DUPLICATE_KINDS=$(printf '%s' "$DUPLICATE_AUDIT" | jq -r --arg id "$ID" \
+    '[.[] | select(.task == $id) | .kind] | unique | join(",")') || exit 1
+  if [ -n "$DUPLICATE_KINDS" ]; then
+    echo "REFUSED: task $ID has a same-home endpoint ownership anomaly: kind=$DUPLICATE_KINDS live=${DUPLICATE_LIVE:-unknown}" >&2
     echo "Inspect and reconcile exact endpoints without a broad sweep or automatic closure, then retry teardown." >&2
     exit 1
   fi
@@ -171,6 +209,12 @@ if fm_tasks_axi_backend_available "$CONFIG"; then
     echo "Repair the selected home's backlog/configuration and retry; teardown will preserve lifecycle state." >&2
     exit 1
   fi
+fi
+if [ "$RESUMING_STAGE" -eq 1 ] \
+   && [ "$STAGE_RECORD_CKSUM" != "${BACKLOG_RECORD_CKSUM:-none}" ]; then
+  echo "REFUSED: backlog task $ID changed after teardown was staged; preserving lifecycle state." >&2
+  echo "Reconcile the staged lifecycle against the current backlog record before retrying." >&2
+  exit 1
 fi
 
 default_branch() {
@@ -464,6 +508,118 @@ write_completion_proof() {
   [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ]
 }
 
+completion_proof_required() {
+  [ "$BACKLOG_TRACKED" -eq 1 ] || return 1
+  case "$DELIVERY_OUTCOME" in
+    delivered-report|delivered-local|delivered-pr|delivered-default) return 0 ;;
+  esac
+  return 1
+}
+
+completion_proof_matches() {
+  [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ] || return 1
+  [ "$(sed -n 's/^version=//p' "$COMPLETION_PROOF" | tail -1)" = 1 ] \
+    && [ "$(sed -n 's/^task=//p' "$COMPLETION_PROOF" | tail -1)" = "$ID" ] \
+    && [ "$(sed -n 's/^kind=//p' "$COMPLETION_PROOF" | tail -1)" = "$KIND" ] \
+    && [ "$(sed -n 's/^outcome=//p' "$COMPLETION_PROOF" | tail -1)" = "$DELIVERY_OUTCOME" ] \
+    && [ "$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)" = "$BACKLOG_RECORD_CKSUM" ]
+}
+
+ensure_completion_proof() {
+  completion_proof_required || return 0
+  if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
+    completion_proof_matches
+    return
+  fi
+  write_completion_proof
+}
+
+teardown_owner_path() {
+  if [ "$KIND" = secondmate ]; then
+    printf '%s\n' "$HOME_PATH"
+  else
+    printf '%s\n' "$WT"
+  fi
+}
+
+teardown_owner_marker() {
+  local owner
+  owner=$(teardown_owner_path)
+  [ -n "$owner" ] || return 1
+  printf '%s/.fm-teardown-owner-%s\n' "$owner" "$ID"
+}
+
+write_teardown_stage() {
+  local phase=$1 owner_token=$2 tmp
+  tmp="$TEARDOWN_STAGE.tmp.$$"
+  if ! {
+    printf 'version=1\n'
+    printf 'task=%s\n' "$ID"
+    printf 'meta-cksum=%s\n' "$META_CKSUM"
+    printf 'phase=%s\n' "$phase"
+    printf 'owner-token=%s\n' "$owner_token"
+    printf 'outcome=%s\n' "$DELIVERY_OUTCOME"
+    printf 'record-cksum=%s\n' "${BACKLOG_RECORD_CKSUM:-none}"
+  } > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ -L "$TEARDOWN_STAGE" ] || ! mv "$tmp" "$TEARDOWN_STAGE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  [ -f "$TEARDOWN_STAGE" ] && [ ! -L "$TEARDOWN_STAGE" ]
+}
+
+owner_marker_matches() {
+  local marker token
+  token=${1:-$STAGE_OWNER_TOKEN}
+  [ "$token" != absent ] || return 1
+  marker=$(teardown_owner_marker) || return 1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  [ "$(cat "$marker" 2>/dev/null)" = "$token" ]
+}
+
+prepare_teardown_stage() {
+  local owner marker marker_tmp token
+  owner=$(teardown_owner_path)
+  token=absent
+  marker=
+  if [ -n "$owner" ] && [ -d "$owner" ]; then
+    marker=$(teardown_owner_marker) || return 1
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      echo "REFUSED: teardown ownership marker already exists at $marker." >&2
+      return 1
+    fi
+    token="$ID-$$-$(date +%s)"
+    marker_tmp="$marker.tmp.$$"
+    if ! printf '%s\n' "$token" > "$marker_tmp" || ! mv "$marker_tmp" "$marker"; then
+      rm -f "$marker_tmp"
+      return 1
+    fi
+  fi
+  if ! write_teardown_stage prepared "$token"; then
+    [ -z "$marker" ] || rm -f "$marker"
+    return 1
+  fi
+  STAGE_PHASE=prepared
+  STAGE_OWNER_TOKEN=$token
+  STAGE_OUTCOME=$DELIVERY_OUTCOME
+  STAGE_RECORD_CKSUM=${BACKLOG_RECORD_CKSUM:-none}
+  if ! ensure_completion_proof; then
+    echo "REFUSED: could not persist completion proof for $ID; no endpoint or worktree cleanup was attempted." >&2
+    owner_marker_matches "$token" && rm -f "$(teardown_owner_marker)"
+    rm -f "$TEARDOWN_STAGE"
+    return 1
+  fi
+}
+
+advance_teardown_stage() {
+  local phase=$1
+  write_teardown_stage "$phase" "$STAGE_OWNER_TOKEN" || return 1
+  STAGE_PHASE=$phase
+}
+
 registry_home_for_line() {
   sed -n 's/^[^(]*(home: \([^;)]*\);.*/\1/p'
 }
@@ -697,7 +853,7 @@ validate_worktree_teardown_safety() {
     echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
     return 1
   fi
-  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE '^\?\? (\.claude/|\.fm-grok-turnend$)' | head -1 || true)
+  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE "^\?\? (\\.claude/|\\.fm-grok-turnend$|\\.fm-teardown-owner-${ID}$)" | head -1 || true)
 
   if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
     if worktree_safety_blocked_by_lock "commits not on a remote"; then
@@ -1065,6 +1221,49 @@ validate_firstmate_home_children_removal() {
   done
 }
 
+audit_firstmate_home_children_endpoints() {
+  local home=$1 sub_state child_meta child_id child_backend child_kind child_home child_wt audit live kinds
+  sub_state="$home/state"
+  [ -d "$sub_state" ] || return 0
+  for child_meta in "$sub_state"/*.meta; do
+    [ -e "$child_meta" ] || continue
+    child_id=$(basename "$child_meta" .meta)
+    child_backend=$(fm_backend_of_meta "$child_meta")
+    case "$child_backend" in
+      herdr|zellij|cmux)
+        audit=$(
+          FM_ROOT_OVERRIDE="$home" \
+            FM_HOME="$home" \
+            FM_STATE_OVERRIDE="$sub_state" \
+            FM_DATA_OVERRIDE="$home/data" \
+            FM_CONFIG_OVERRIDE="$home/config" \
+            "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$child_id"
+        ) || {
+          echo "REFUSED: could not complete the child-home duplicate endpoint audit for $child_id in $home." >&2
+          echo "Restore exact-home $child_backend inventory access and retry; forced retirement will not guess which child endpoint is owned." >&2
+          return 1
+        }
+        live=$(printf '%s' "$audit" | jq -r --arg id "$child_id" \
+          '[.[] | select(.task == $id) | .live_endpoints[]] | unique | join(",")') || return 1
+        kinds=$(printf '%s' "$audit" | jq -r --arg id "$child_id" \
+          '[.[] | select(.task == $id) | .kind] | unique | join(",")') || return 1
+        if [ -n "$kinds" ]; then
+          echo "REFUSED: child task $child_id has a same-home endpoint ownership anomaly: kind=$kinds live=${live:-unknown}" >&2
+          echo "Inspect and reconcile exact child endpoints without automatic closure, then retry retirement." >&2
+          return 1
+        fi
+        ;;
+    esac
+    child_kind=$(meta_value "$child_meta" kind)
+    if [ "$child_kind" = secondmate ]; then
+      child_wt=$(meta_value "$child_meta" worktree)
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+      audit_firstmate_home_children_endpoints "$child_home" || return 1
+    fi
+  done
+}
+
 cleanup_firstmate_home_children() {
   local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
   sub_state="$home/state"
@@ -1148,6 +1347,7 @@ if [ "$KIND" = secondmate ]; then
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+    audit_firstmate_home_children_endpoints "$HOME_PATH" || exit 1
   fi
 fi
 
@@ -1163,10 +1363,6 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH"
-fi
-
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
@@ -1176,7 +1372,14 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+if [ "$RESUMING_STAGE" -eq 1 ] && [ "$STAGE_PHASE" = prepared ] \
+   && [ "$STAGE_OWNER_TOKEN" != absent ] && ! owner_marker_matches; then
+  echo "REFUSED: teardown ownership marker no longer matches before endpoint cleanup for $ID." >&2
+  exit 1
+fi
+
+if { [ "$RESUMING_STAGE" -eq 0 ] || [ "$STAGE_PHASE" = prepared ]; } \
+   && [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
   if ! inspectable_git_worktree "$WT"; then
     echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
     echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
@@ -1186,7 +1389,8 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] &&
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+if { [ "$RESUMING_STAGE" -eq 0 ] || [ "$STAGE_PHASE" = prepared ]; } \
+   && [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   if validate_worktree_teardown_safety; then
     :
   else
@@ -1200,7 +1404,19 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-DELIVERY_OUTCOME=$(delivery_outcome_before_teardown) || exit 1
+if [ "$RESUMING_STAGE" -eq 1 ]; then
+  DELIVERY_OUTCOME=$STAGE_OUTCOME
+else
+  DELIVERY_OUTCOME=$(delivery_outcome_before_teardown) || exit 1
+  prepare_teardown_stage || {
+    echo "REFUSED: could not stage retryable teardown state for $ID; no endpoint or worktree cleanup was attempted." >&2
+    exit 1
+  }
+fi
+ensure_completion_proof || {
+  echo "REFUSED: could not persist completion proof for $ID; no endpoint or worktree cleanup was attempted." >&2
+  exit 1
+}
 
 # Tombstone for the watcher: everything from here to the state-file removal can
 # take the task's endpoint down, and a gone endpoint whose
@@ -1209,15 +1425,35 @@ DELIVERY_OUTCOME=$(delivery_outcome_before_teardown) || exit 1
 # the watcher's absorb is age-bounded, so a crashed teardown cannot suppress a
 # real death past the bound.
 touch "$STATE/$ID.tearing-down"
-close_endpoint_before_lifecycle_cleanup || exit 1
+if [ "$STAGE_PHASE" = prepared ]; then
+  close_endpoint_before_lifecycle_cleanup || exit 1
+  advance_teardown_stage endpoint-closed || {
+    echo "REFUSED: endpoint closed, but the durable teardown phase could not be advanced for $ID." >&2
+    exit 1
+  }
+fi
 
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
-if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
-  if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
-    require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
-    ORCA_PATH_MATCH_VERIFIED=1
+perform_owned_cleanup() {
+  local branch post_lock_cleanup_check
+  if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
+    cleanup_firstmate_home_children "$HOME_PATH" || return 1
   fi
-  if [ -d "$WT" ]; then
+  if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
+    if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ] && [ "$RESUMING_STAGE" -eq 0 ]; then
+      require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || return 1
+      ORCA_PATH_MATCH_VERIFIED=1
+    fi
+    if [ -d "$WT" ]; then
+      branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+      if [ "$branch" != "HEAD" ]; then
+        if git -C "$WT" checkout --detach -q 2>/dev/null; then
+          git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+        fi
+      fi
+      rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+    fi
+    fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID" || return 1
+  elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
     if [ "$branch" != "HEAD" ]; then
       if git -C "$WT" checkout --detach -q 2>/dev/null; then
@@ -1225,46 +1461,69 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
       fi
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-  fi
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-  if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+    post_lock_cleanup_check=
+    if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
+      post_lock_cleanup_check=validate_worktree_teardown_safety
     fi
+    teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      return 1
+    }
   fi
-  # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
-  rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. teardown_treehouse_return tolerates transient and stale git locks
-  # left by a killed crew process; see the script header for retry and stale-lock proof.
-  post_lock_cleanup_check=
-  if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
-    post_lock_cleanup_check=validate_worktree_teardown_safety
+  if [ "$KIND" = secondmate ]; then
+    [ -n "$HOME_PATH" ] || HOME_PATH=$WT
+    remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || return 1
+    remove_secondmate_registry_entry "$ID" || return 1
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+}
+
+STARTED_CLEANUP_THIS_RUN=0
+if [ "$STAGE_PHASE" = endpoint-closed ]; then
+  if [ "$STAGE_OWNER_TOKEN" != absent ] && ! owner_marker_matches; then
+    echo "REFUSED: teardown ownership marker no longer matches before cleanup for $ID." >&2
+    exit 1
+  fi
+  advance_teardown_stage worktree-cleanup-started || {
+    echo "REFUSED: could not record cleanup ownership before destructive work for $ID." >&2
+    exit 1
+  }
+  STARTED_CLEANUP_THIS_RUN=1
+fi
+if [ "$STAGE_PHASE" = worktree-cleanup-started ]; then
+  if [ "$STAGE_OWNER_TOKEN" = absent ]; then
+    perform_owned_cleanup || exit 1
+  elif owner_marker_matches; then
+    perform_owned_cleanup || exit 1
+  elif [ "$STARTED_CLEANUP_THIS_RUN" -eq 1 ]; then
+    advance_teardown_stage ownership-lost || {
+      echo "REFUSED: teardown ownership marker disappeared before cleanup, and that state could not be persisted for $ID." >&2
+      exit 1
+    }
+    echo "REFUSED: teardown ownership marker disappeared before cleanup for $ID; preserving lifecycle state." >&2
+    exit 1
+  else
+    advance_teardown_stage ownership-lost || {
+      echo "REFUSED: ownership was lost after interrupted cleanup, and that state could not be persisted for $ID." >&2
+      exit 1
+    }
+    echo "REFUSED: teardown ownership is lost for $ID; preserving lifecycle state without inspecting or removing the recorded path." >&2
+    exit 1
+  fi
+  advance_teardown_stage worktree-cleaned || {
+    echo "REFUSED: cleanup finished, but the durable teardown phase could not be advanced for $ID." >&2
     exit 1
   }
 fi
-
-if [ "$KIND" = secondmate ]; then
-  [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
-  remove_secondmate_registry_entry "$ID"
+if [ "$STAGE_PHASE" = ownership-lost ]; then
+  echo "REFUSED: teardown ownership is lost for $ID; reconcile the external cleanup state without reusing the recorded path." >&2
+  exit 1
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-write_completion_proof || {
-  echo "REFUSED: could not persist completion proof for $ID; preserving lifecycle state for retry." >&2
-  exit 1
-}
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$TEARDOWN_STAGE"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

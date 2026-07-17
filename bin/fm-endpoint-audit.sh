@@ -2,7 +2,9 @@
 # Read-only duplicate recovery-endpoint audit.
 #
 # The audit examines exact Herdr workspaces and Zellij sessions named by this
-# home's own task meta, and matches cmux workspaces by exact home-scoped title.
+# home's own task meta.
+# cmux does not expose an exact-home inventory, so its audit emits a structured
+# unavailable finding instead of enumerating app-global windows or workspaces.
 # It never closes or mutates an endpoint.
 #
 # A task label with more than one live endpoint, or one live endpoint that does
@@ -48,7 +50,7 @@ TARGETS="$TMP_ROOT/targets.tsv"
 : > "$ROWS"
 : > "$TARGETS"
 cleanup() {
-  rm -f "$LIVE" "$ROWS" "$TARGETS" "$TMP_ROOT"/cmux-live.*
+  rm -f "$LIVE" "$ROWS" "$TARGETS"
   rmdir "$TMP_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -81,6 +83,21 @@ append_anomaly() {
     --arg recorded "$recorded" \
     --argjson live "$live_json" \
     '{kind:$kind,backend:$backend,task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:$live,action:"inspect; do not auto-close"}' \
+    >> "$ROWS"
+}
+
+append_inventory_unavailable() {
+  local backend=$1 meta=$2 reason=$3 id worktree recorded
+  id=$(basename "$meta" .meta)
+  worktree=$(fm_meta_get "$meta" worktree)
+  recorded=$(fm_backend_target_of_meta "$meta")
+  jq -n \
+    --arg backend "$backend" \
+    --arg task "$id" \
+    --arg worktree "$worktree" \
+    --arg recorded "$recorded" \
+    --arg reason "$reason" \
+    '{kind:"inventory_unavailable",backend:$backend,task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:[],reason:$reason,action:"inspect; do not auto-close"}' \
     >> "$ROWS"
 }
 
@@ -139,11 +156,23 @@ while IFS=$'\t' read -r session workspace; do
     echo "fm-endpoint-audit: cannot read panes for $session:$workspace" >&2
     exit 1
   }
-  printf '%s' "$tabs" | jq -e '.result.tabs | type == "array"' >/dev/null 2>&1 || {
+  printf '%s' "$tabs" | jq -e '
+    (.result.tabs | type == "array")
+    and all(.result.tabs[]?;
+      ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+      and ((.label | type) == "string")
+    )
+  ' >/dev/null 2>&1 || {
     echo "fm-endpoint-audit: invalid tab inventory for $session:$workspace" >&2
     exit 1
   }
-  printf '%s' "$panes" | jq -e '.result.panes | type == "array"' >/dev/null 2>&1 || {
+  printf '%s' "$panes" | jq -e '
+    (.result.panes | type == "array")
+    and all(.result.panes[]?;
+      ((.pane_id | type) == "string") and ((.pane_id | length) > 0)
+      and ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+    )
+  ' >/dev/null 2>&1 || {
     echo "fm-endpoint-audit: invalid pane inventory for $session:$workspace" >&2
     exit 1
   }
@@ -247,58 +276,9 @@ audit_zellij_meta() {
 }
 
 audit_cmux_meta() {
-  local meta=$1 id recorded scoped wins wid workspaces wsid panes sfids live_json state live_file
+  local meta=$1 id
   id=$(basename "$meta" .meta)
-  recorded=$(fm_backend_target_of_meta "$meta")
-  fm_backend_source cmux || return 1
-  state=$(fm_backend_cmux_ping_state)
-  [ "$state" = ok ] || { echo "fm-endpoint-audit: cannot read cmux inventory for $id" >&2; return 1; }
-  scoped=$(fm_backend_cmux_scoped_title "fm-$id")
-  wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>&1) || {
-    echo "fm-endpoint-audit: cannot read cmux windows for $id" >&2
-    return 1
-  }
-  printf '%s' "$wins" | jq -e 'type == "array" and all(.[]?; ((.id | type) == "string") and ((.id | length) > 0))' >/dev/null 2>&1 || {
-    echo "fm-endpoint-audit: invalid cmux window inventory for $id" >&2
-    return 1
-  }
-  live_file=$(mktemp "$TMP_ROOT/cmux-live.XXXXXX") || return 1
-  while IFS= read -r wid; do
-    [ -n "$wid" ] || continue
-    workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>&1) || {
-      echo "fm-endpoint-audit: cannot read cmux workspaces in window $wid" >&2
-      return 1
-    }
-    printf '%s' "$workspaces" | jq -e '
-      (.workspaces | type == "array")
-      and all(.workspaces[]?; ((.id | type) == "string") and ((.id | length) > 0) and ((.title | type) == "string"))
-    ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid cmux workspace inventory in window $wid" >&2; return 1; }
-    while IFS= read -r wsid; do
-      [ -n "$wsid" ] || continue
-      panes=$(fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>&1) || {
-        echo "fm-endpoint-audit: cannot read cmux panes for workspace $wsid" >&2
-        return 1
-      }
-      printf '%s' "$panes" | jq -e '
-        (.panes | type == "array")
-        and all(.panes[]?;
-          ((.surface_ids | type) == "array")
-          and all(.surface_ids[]?; ((type == "string") and (length > 0)))
-          and ((.selected_surface_id == null) or (((.selected_surface_id | type) == "string") and ((.selected_surface_id | length) > 0)))
-        )
-      ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid cmux pane inventory for workspace $wsid" >&2; return 1; }
-      sfids=$(printf '%s' "$panes" | jq -r '[.panes[]? | ((.selected_surface_id? // empty), .surface_ids[]?)] | map(select(type == "string" and length > 0)) | unique | sort | .[]' 2>/dev/null) || return 1
-      if [ -n "$sfids" ]; then
-        while IFS= read -r sfid; do
-          [ -n "$sfid" ] && printf '%s:%s\n' "$wsid" "$sfid" >> "$live_file"
-        done <<< "$sfids"
-      else
-        printf '%s:workspace\n' "$wsid" >> "$live_file"
-      fi
-    done < <(printf '%s' "$workspaces" | jq -r --arg want "$scoped" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null)
-  done < <(printf '%s' "$wins" | jq -r '.[]? | .id' 2>/dev/null)
-  live_json=$(LC_ALL=C sort -u "$live_file" | jq -R -s '[splits("\\n") | select(length > 0)]') || return 1
-  append_anomaly cmux "$meta" "$live_json" "$recorded"
+  append_inventory_unavailable cmux "$meta" "cmux has no exact-home duplicate inventory; app-global sweep refused"
 }
 
 for meta in "$STATE"/*.meta; do

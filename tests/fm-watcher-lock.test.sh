@@ -551,6 +551,12 @@ test_arm_starts_and_self_heals() {
     grep -F "watcher: started pid=$lock_pid (beacon fresh)" "$armout" >/dev/null \
       || fail "arm ($row) started line did not name the confirmed live watcher (lock '$lock_pid')"
     kill -0 "$lock_pid" 2>/dev/null || fail "arm ($row) confirmed-started watcher is not actually alive"
+    [ "$(cat "$state/.watch.lock/owner-kind" 2>/dev/null || true)" = arm ] \
+      || fail "arm ($row) watcher omitted durable arm ownership provenance"
+    [ "$(cat "$state/.watch.lock/owner-pid" 2>/dev/null || true)" = "$armpid" ] \
+      || fail "arm ($row) watcher ownership did not name the live arm process"
+    [ -s "$state/.watch.lock/owner-identity" ] \
+      || fail "arm ($row) watcher ownership omitted the arm process identity"
     [ -z "$dead_pid" ] || [ "$lock_pid" != "$dead_pid" ] || fail "arm ($row) did not replace the dead-pid lock with a live watcher"
     kill "$armpid" "$lock_pid" 2>/dev/null || true
     wait "$armpid" 2>/dev/null || true

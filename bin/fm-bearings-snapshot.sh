@@ -84,7 +84,8 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,hold,blocked_by,reason}, durable_obligations{id,type,reason},
+  gates{id,title,hold,blocked_by,reason},
+  durable_obligations{id,type,reason,hold_reason,blocked_by,blocked_reason},
   program{source_paths,...}, reports{id,path},
   recorded_prs{id,url}, duplicate_endpoints{...},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
@@ -293,9 +294,15 @@ MODEL=$(printf '%s' "$SNAP" | jq \
            select(.active_hold == true or .active_blocked == true)
            | {id,
               type:(if .active_hold == true and .active_blocked == true then "held+blocked" elif .active_hold == true then "held" else "blocked" end),
-              reason:((if .active_hold == true then .hold else (.active_blocked_reason // .active_blocked_by // "active dependency") end) | trunc(90))}
+              reason:((if .active_hold == true and .active_blocked == true then
+                         "hold: \(.hold // "active hold"); blocker \(.active_blocked_by // "active dependency"): \(.active_blocked_reason // "active dependency")"
+                       elif .active_hold == true then .hold
+                       else (.active_blocked_reason // .active_blocked_by // "active dependency") end) | trunc(180)),
+              hold_reason:(if .active_hold == true then (.hold | trunc(90)) else "-" end),
+              blocked_by:(if .active_blocked == true then (.active_blocked_by // "active dependency") else "-" end),
+              blocked_reason:(if .active_blocked == true then ((.active_blocked_reason // "active dependency") | trunc(90)) else "-" end)}
          else
-           {id:("raw-" + (.order | tostring)),type:"unstructured",reason:(.raw | trunc(90))}
+           {id:("raw-" + (.order | tostring)),type:"unstructured",reason:(.raw | trunc(90)),hold_reason:"-",blocked_by:"-",blocked_reason:"-"}
          end ]) as $obligations_all
   | ([ .scout_reports[]
        | . as $r

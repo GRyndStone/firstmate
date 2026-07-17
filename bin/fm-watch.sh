@@ -743,6 +743,17 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+WATCH_OWNER_KIND=${FM_WATCH_OWNER_KIND:-unknown}
+WATCH_OWNER_PID=${FM_WATCH_OWNER_PID:-}
+case "$WATCH_OWNER_KIND" in
+  arm|checkpoint|daemon) ;;
+  *) WATCH_OWNER_KIND=unknown ;;
+esac
+printf '%s\n' "$WATCH_OWNER_KIND" > "$WATCH_LOCK/owner-kind" || true
+if fm_pid_alive "$WATCH_OWNER_PID"; then
+  printf '%s\n' "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-pid" || true
+  fm_pid_identity "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-identity" 2>/dev/null || true
+fi
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 

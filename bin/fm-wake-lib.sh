@@ -79,11 +79,37 @@ fm_watcher_healthy() {
   return 0
 }
 
+FM_WATCHER_OWNER_KIND=
+FM_WATCHER_OWNER_PID=
+fm_watcher_live_owner() {
+  local state=$1 lockdir kind pid recorded_identity current_identity
+  FM_WATCHER_OWNER_KIND=
+  FM_WATCHER_OWNER_PID=
+  lockdir="$state/.watch.lock"
+  kind=$(cat "$lockdir/owner-kind" 2>/dev/null || true)
+  pid=$(cat "$lockdir/owner-pid" 2>/dev/null || true)
+  recorded_identity=$(cat "$lockdir/owner-identity" 2>/dev/null || true)
+  case "$kind" in
+    arm|checkpoint|daemon) ;;
+    *) return 1 ;;
+  esac
+  fm_pid_alive "$pid" || return 1
+  [ -n "$recorded_identity" ] || return 1
+  current_identity=$(fm_pid_identity "$pid") || return 1
+  [ "$current_identity" = "$recorded_identity" ] || return 1
+  FM_WATCHER_OWNER_KIND=$kind
+  FM_WATCHER_OWNER_PID=$pid
+  return 0
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
     "$lockdir/pid" \
     "$lockdir/fm-home" \
+    "$lockdir/owner-identity" \
+    "$lockdir/owner-kind" \
+    "$lockdir/owner-pid" \
     "$lockdir/pid-identity" \
     "$lockdir/watcher-path" \
     2>/dev/null || true

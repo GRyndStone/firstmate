@@ -12,7 +12,7 @@ The primary can otherwise end a turn after handling wakes without resuming super
 On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about nine hours.
 
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
-When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
+When tasks are in flight and there is no live identity-matched watcher with a fresh beacon plus a verified turn-surviving owner, a harness hook must either block the turn end or force a follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
 
 ## Shared Predicate
 
@@ -27,6 +27,17 @@ If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+
+Watcher health is necessary but not sufficient at turn end.
+The watcher lock also records its launch owner kind, pid, and process identity.
+An away-mode daemon owner is durable for every harness, and an arm owner is accepted only for the verified Claude, Grok, Pi, and OpenCode tracked-background mechanisms.
+A bounded foreground checkpoint, a Codex arm process, missing provenance, an unknown owner kind, a dead owner, or a reused owner pid all fail closed even while the watcher itself is live and its beacon is fresh.
+This distinction matters because a foreground execution session can be alive while the Stop hook runs and then be torn down as the assistant turn yields.
+
+Blocking is the transition that guarantees another assistant continuation.
+If the next Stop payload has `stop_hook_active=true`, that records the prior transition but does not authorize a second blind stop.
+The retry is allowed only when no task remains in flight or durable watcher ownership has since been established; otherwise the guard blocks again.
+The failure banner includes a bounded list of task ids whose current-state probe is parked, paused, blocked, failed, done, or unknown so an idle pane is not hidden behind the aggregate in-flight count.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
@@ -46,7 +57,7 @@ All verified primary harnesses have a tracked integration:
 
 Claude and Codex support a direct blocking Stop hook.
 For those harnesses, exit status 2 plus stderr from `bin/fm-turnend-guard.sh` blocks the stop and feeds the reason back into the model.
-Both payloads include `stop_hook_active`; when it is true, the shared guard exits 0 so the harness can end after one forced continuation.
+Both payloads include `stop_hook_active`; the shared guard uses it to identify a repeated blocked transition while still requiring durable ownership before the harness can end.
 
 OpenCode, Pi, and Grok expose passive lifecycle callbacks for this purpose.
 Their adapters fail open at the hook boundary to avoid corrupting a user session, but they force one follow-up turn when the shared predicate blocks.
@@ -94,6 +105,10 @@ Observed output after the wake: Pi ran `bin/fm-wake-drain.sh`, read the terminal
 The complete pane contained one guard message and zero foreground `bin/fm-watch-arm.sh` bash calls.
 `/quit` printed `PI_EXIT=0`, and the second arm process plus its watcher child were both gone afterward.
 
+On 2026-07-17, a Codex foreground checkpoint was still live at Stop-hook evaluation under exec session 30732, but its process did not survive the turn yield and the next fleet command found the watcher beacon 763 seconds stale.
+That evidence invalidated watcher-process liveness as a durable-ownership proxy.
+The guard now rejects checkpoint provenance before the yield and rejects a later `stop_hook_active=true` retry when no durable owner was established.
+
 Grok 0.2.91 was validated with a scratch `GROK_HOME` and symlinked auth/config.
 Hook file used for tracked project-hook loading: `<scratch-project>/.grok/hooks/fm-smoke.json`, matching the tracked `.grok/hooks/fm-primary-turnend-guard.json` location.
 Command run for project-hook loading: `GROK_HOME="$scratch/grok-home" grok --trust -p 'Say hi in exactly one word.' --permission-mode bypassPermissions --output-format plain --leader-socket "$scratch/leader.sock"`.
@@ -114,6 +129,6 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, durable owner provenance, a foreground checkpoint that is live at the first Stop and dead at the retry, bounded parked and idle task detail, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

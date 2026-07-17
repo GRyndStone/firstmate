@@ -38,6 +38,10 @@ case "${1:-} ${2:-}" in
     printf '{"result":{"workspace":{"workspace_id":"%s","label":"2ndmate-sub-a1"}}}\n' "${3:-}"
     ;;
   "tab list")
+    if [ "${FM_HERDR_PARTIAL_TAB:-0}" = 1 ]; then
+      printf '{"result":{"tabs":[{"tab_id":"subw:t1"}]}}\n'
+      exit 0
+    fi
     if [ "$workspace" = subw ]; then
       if [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
         printf '{"result":{"tabs":[{"tab_id":"subw:t1","label":"fm-dup-task"}]}}\n'
@@ -49,6 +53,10 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "pane list")
+    if [ "${FM_HERDR_PARTIAL_PANE:-0}" = 1 ]; then
+      printf '{"result":{"panes":[{"pane_id":"subw:p1"}]}}\n'
+      exit 0
+    fi
     if [ "$workspace" = subw ]; then
       if [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
         printf '{"result":{"panes":[{"pane_id":"subw:p1","tab_id":"subw:t1"}]}}\n'
@@ -163,6 +171,59 @@ test_missing_owned_workspace_is_an_empty_inventory() {
   pass "structured workspace_not_found is an absent owned workspace"
 }
 
+test_partial_herdr_inventory_fails_closed() {
+  local home mode out status
+  home=$(make_fixture partial-herdr)
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'worktree=/owned/worktree'
+  for mode in TAB PANE; do
+    status=0
+    out=$(env PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+      "FM_HERDR_PARTIAL_$mode=1" "$AUDIT" --json 2>&1) || status=$?
+    expect_code 1 "$status" "partial Herdr $mode inventory"
+    assert_contains "$out" "invalid" "partial Herdr $mode inventory was silently excluded"
+  done
+  pass "partial Herdr tab and pane records fail closed before duplicate joining"
+}
+
+test_cmux_reports_unavailable_without_cross_home_inventory() {
+  local home log out status
+  home=$(make_fixture cmux-no-sweep)
+  log="$home/cmux.log"
+  fm_write_meta "$home/state/cmux-task.meta" \
+    'backend=cmux' \
+    'window=ws-a:sf-a' \
+    'cmux_workspace_id=ws-a' \
+    'cmux_surface_id=sf-a' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/cmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_CMUX_LOG:?}"
+exit 99
+SH
+  chmod +x "$home/fakebin/cmux"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_CMUX_LOG="$log" "$AUDIT" --json 2>&1) || status=$?
+  expect_code 0 "$status" "cmux exact-home inventory report"
+  printf '%s\n' "$out" | jq -e '
+    length == 1 and
+    .[0].kind == "inventory_unavailable" and
+    .[0].backend == "cmux" and
+    .[0].task == "cmux-task" and
+    .[0].worktree == "/owned/worktree" and
+    .[0].recorded_endpoint == "ws-a:sf-a" and
+    .[0].live_endpoints == [] and
+    .[0].reason == "cmux has no exact-home duplicate inventory; app-global sweep refused"
+  ' >/dev/null || fail "cmux audit did not emit its structured unavailable finding: $out"
+  [ ! -s "$log" ] || fail "cmux audit enumerated app-global inventory: $(cat "$log")"
+  pass "cmux duplicate audit reports unavailable without enumerating another home's windows"
+}
+
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable() {
   local home log state actual
   home=$(make_fixture herdr-tristate)
@@ -179,4 +240,6 @@ test_duplicate_is_reported_inside_owned_workspace_only
 test_inventory_failure_is_loud
 test_singleton_mismatch_is_reported
 test_missing_owned_workspace_is_an_empty_inventory
+test_partial_herdr_inventory_fails_closed
+test_cmux_reports_unavailable_without_cross_home_inventory
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

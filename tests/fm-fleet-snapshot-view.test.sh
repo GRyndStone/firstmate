@@ -543,6 +543,64 @@ EOF
   pass "snapshot recognizes tasks-axi rows and exact two-space continuations"
 }
 
+test_heading_resets_body_continuation_context() {
+  local home out
+  home=$(make_home heading-body-context)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] active-task - Active task
+
+## Queued
+  raw queued obligation after section change
+- [ ] queued-before-repeat - Queued before repeated heading
+
+## Queued
+  raw queued obligation after repeated heading
+- [ ] runnable - Runnable task
+EOF
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.backlog.records[] | select(.id == "active-task") | .body_excerpt == null)
+      and (.backlog.records[] | select(.id == "queued-before-repeat") | .body_excerpt == null)
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true and .raw == "  raw queued obligation after section change")] | length) == 1
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true and .raw == "  raw queued obligation after repeated heading")] | length) == 1
+      and .queue_accounting.queued_total == 4
+      and .queue_accounting.structured_queued == 2
+      and .queue_accounting.unstructured_queued == 2
+  ' >/dev/null || fail "a heading did not reset body continuation context: $out"
+  pass "snapshot resets body continuation context at every heading"
+}
+
+test_program_sources_stay_inside_selected_home() {
+  local home escaped_home outside out
+  home=$(make_home contained-program-sources)
+  outside=$TMP_ROOT/outside-program-sources
+  mkdir -p "$outside/programs"
+  printf '## Queued\n' > "$home/data/backlog.md"
+  printf '# Safe\n' > "$home/data/safe-program.md"
+  printf '# Escaped file\n' > "$outside/escaped.md"
+  printf '# Escaped directory\n' > "$outside/programs/escaped.md"
+  ln -s "$outside/escaped.md" "$home/data/escaped-program.md"
+  ln -s "$outside/programs" "$home/data/programs"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e --arg path "$home/data/safe-program.md" '
+    .program_sources == [{path:$path,relative_path:"safe-program.md"}]
+      and .queue_accounting.durable_program_source_count == 1
+  ' >/dev/null || fail "snapshot followed a program source outside the selected home: $out"
+  escaped_home=$(make_home escaped-data-program-sources)
+  mkdir -p "$outside/data"
+  printf '## Queued\n' > "$outside/data/backlog.md"
+  printf '# Escaped data\n' > "$outside/data/escaped-program.md"
+  rmdir "$escaped_home/data"
+  ln -s "$outside/data" "$escaped_home/data"
+  out=$(FM_HOME="$escaped_home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.program_sources | length) == 0
+      and .queue_accounting.durable_program_source_count == 0
+  ' >/dev/null || fail "snapshot followed a data directory outside the selected home: $out"
+  pass "snapshot rejects program-source symlinks that escape the selected home"
+}
+
 test_view_renders_dead_secondmate_agent_status() {
   local home fakebin view
   home=$(make_home dead-secondmate)
@@ -726,4 +784,6 @@ test_view_renders_snapshot
 test_queue_accounting_surfaces_holds_and_durable_program_boundary
 test_queue_accounting_uses_active_hold_and_blocker_semantics
 test_backlog_rows_match_tasks_axi_section_grammar
+test_heading_resets_body_continuation_context
+test_program_sources_stay_inside_selected_home
 test_view_renders_dead_secondmate_agent_status

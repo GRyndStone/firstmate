@@ -717,6 +717,42 @@ test_recovery_context_survives_later_blocked() {
   pass "exact recovery identity survives a later blocked event"
 }
 
+test_recovery_context_survives_resolved_then_working() {
+  reset_fakes
+  local d; d=$(new_case recovered-resolved-working)
+  make_repo_on_branch "$d/wt" fm/feat-recovered-resolved
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovered-resolved.meta" "window=fm:fm-feat-recovered-resolved" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery\nresolved: provider recovered\nworking: resumed implementation after provider recovery\n' > "$d/state/feat-recovered-resolved.status"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-recovered-resolved)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-recovered-resolved)"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-recovered-resolved)
+  assert_contains "$out" "state: working" "resolved and ordinary working events retain exact recovery identity"
+  assert_contains "$out" "source: pane" "resumed recovery remains pane sourced"
+  assert_contains "$out" "exact-run recovery status" "legitimate recovery events preserve the old run identity"
+  assert_not_contains "$out" "state: failed" "named old failure cannot supersede resumed recovery work"
+  pass "exact recovery identity survives resolved and ordinary working events"
+}
+
+test_recovery_context_survives_later_pause() {
+  reset_fakes
+  local d; d=$(new_case recovered-paused)
+  make_repo_on_branch "$d/wt" fm/feat-recovered-paused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovered-paused.meta" "window=fm:fm-feat-recovered-paused" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery\npaused: waiting for provider maintenance window\n' > "$d/state/feat-recovered-paused.status"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-recovered-paused)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_checks_passed fm/feat-recovered-paused)"
+  FM_FAKE_BUSY=0
+  local out; out=$(run_crew_state "$d" feat-recovered-paused)
+  assert_contains "$out" "state: paused" "later pause remains current after exact recovery"
+  assert_contains "$out" "source: status-log" "recovered pause is status-log sourced"
+  assert_contains "$out" "exact-run recovery context" "later pause retains its exact old-run identity"
+  assert_not_contains "$out" "state: done" "named old checks-green run cannot supersede the later pause"
+  pass "exact recovery identity survives a later pause"
+}
+
 test_later_recovery_event_cannot_override_new_terminal_run() {
   reset_fakes
   local d; d=$(new_case recovered-blocked-new-terminal)
@@ -1078,10 +1114,11 @@ EOF
 )"
   FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
   local out; out=$(run_crew_state "$d" feat-coarseready)
-  assert_contains "$out" "state: done" "coarse ready status -> done"
-  assert_contains "$out" "source: status-log" "coarse ready status remains status-log sourced"
-  assert_not_contains "$out" "state: working" "coarse ready status must not be suppressed by another branch log"
-  pass "coarse run does not probe another branch's ci log"
+  assert_contains "$out" "state: working" "current coarse running row remains authoritative"
+  assert_contains "$out" "source: run-step" "coarse running status remains run-step sourced"
+  assert_contains "$out" "not bound to this current run" "stale readiness is explicitly rejected as unbound"
+  assert_not_contains "$out" "state: done" "older checks-green status must not complete a current coarse rerun"
+  pass "coarse current running row outranks stale checks-green status"
 }
 
 # A different-branch run with NO matching runs-list row must NOT be
@@ -1457,6 +1494,8 @@ test_failed_run_yields_to_newer_live_work
 test_checks_passed_yields_to_newer_live_work
 test_recovery_context_survives_later_needs_decision
 test_recovery_context_survives_later_blocked
+test_recovery_context_survives_resolved_then_working
+test_recovery_context_survives_later_pause
 test_later_recovery_event_cannot_override_new_terminal_run
 test_pre_run_working_event_does_not_override_terminal
 test_validation_handoff_interval_yields_to_live_work

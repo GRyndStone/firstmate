@@ -100,6 +100,12 @@ test_interrupted_checkpoint_reaps_only_its_watcher() {
   [ -n "$watcher_pid" ] || fail "interrupted checkpoint never recorded its watcher child"
   [ "$(ps -p "$watcher_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')" = "$checkpoint_pid" ] \
     || fail "watcher $watcher_pid was not the checkpoint's direct child"
+  [ "$(cat "$home/state/.watch.lock/owner-kind" 2>/dev/null || true)" = checkpoint ] \
+    || fail "checkpoint watcher did not record foreground ownership provenance"
+  [ "$(cat "$home/state/.watch.lock/owner-pid" 2>/dev/null || true)" = "$checkpoint_pid" ] \
+    || fail "checkpoint watcher ownership did not name the checkpoint process"
+  [ -s "$home/state/.watch.lock/owner-identity" ] \
+    || fail "checkpoint watcher ownership omitted the checkpoint process identity"
 
   kill -TERM "$checkpoint_pid"
   status=0

@@ -20,15 +20,10 @@
 # (treehouse-leased or git-cloned). It must therefore scope itself to the
 # PRIMARY at runtime and stay a silent, fast no-op everywhere else.
 #
-# Loop-guard: never block twice in the same turn. Claude Code and codex Stop
-# payloads carry stop_hook_active=true when the CURRENT stop attempt was itself
-# already forced by an earlier block this turn; on that signal we always allow
-# the stop, whether or not watcher supervision actually got resumed. Passive
-# harness adapters provide their own one-follow-up guard before calling this
-# script.
-# That bounds this to at most one forced continuation per turn - never a wedged,
-# un-endable session - while still nagging again on a later turn if the problem
-# persists.
+# A blocked stop is the state transition that guarantees another assistant
+# continuation. A retry may end only after a turn-surviving watcher owner is
+# confirmed; stop_hook_active is evidence of the earlier transition, not
+# permission to end blind.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,7 +48,6 @@ PAYLOAD=$(cat 2>/dev/null || true)
 command -v jq >/dev/null 2>&1 || exit 0
 
 STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2>/dev/null) || exit 0
-[ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
 
 # --- scope precisely to the PRIMARY checkout --------------------------------
 # Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
@@ -78,7 +72,74 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
-fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+
+HARNESS=${FM_TURNEND_HARNESS:-}
+[ -n "$HARNESS" ] || HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
+WATCH_OWNER_DESC="no healthy watcher"
+if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+  WATCH_OWNER_DESC="healthy watcher has no live owner provenance"
+  if fm_watcher_live_owner "$STATE"; then
+    WATCH_OWNER_DESC="$FM_WATCHER_OWNER_KIND owner pid=$FM_WATCHER_OWNER_PID"
+    case "$FM_WATCHER_OWNER_KIND:$HARNESS" in
+      daemon:*) exit 0 ;;
+      arm:claude|arm:grok|arm:pi|arm:opencode) exit 0 ;;
+      arm:codex) WATCH_OWNER_DESC="arm owner is not durable in Codex" ;;
+      checkpoint:*) WATCH_OWNER_DESC="foreground checkpoint owner cannot survive turn yield" ;;
+      *) WATCH_OWNER_DESC="$FM_WATCHER_OWNER_KIND owner is not verified for $HARNESS" ;;
+    esac
+  fi
+fi
+
+DETAIL_LIMIT=${FM_TURNEND_DETAIL_LIMIT:-5}
+DETAIL_TIMEOUT=${FM_TURNEND_DETAIL_TIMEOUT:-1}
+case "$DETAIL_LIMIT" in ''|*[!0-9]*|0) DETAIL_LIMIT=5 ;; esac
+case "$DETAIL_TIMEOUT" in ''|*[!0-9]*|0) DETAIL_TIMEOUT=1 ;; esac
+[ "$DETAIL_LIMIT" -le 10 ] || DETAIL_LIMIT=10
+
+crew_state_bounded() {
+  local id=$1 state_bin="$SCRIPT_DIR/fm-crew-state.sh"
+  [ -x "$state_bin" ] || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$DETAIL_TIMEOUT" env FM_CREW_STATE_NM_TIMEOUT=1 "$state_bin" "$id" 2>/dev/null
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$DETAIL_TIMEOUT" env FM_CREW_STATE_NM_TIMEOUT=1 "$state_bin" "$id" 2>/dev/null
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '$seconds=shift; alarm $seconds; exec @ARGV' "$DETAIL_TIMEOUT" \
+      env FM_CREW_STATE_NM_TIMEOUT=1 "$state_bin" "$id" 2>/dev/null
+  else
+    FM_CREW_STATE_NM_TIMEOUT=1 "$state_bin" "$id" 2>/dev/null
+  fi
+}
+
+attention_detail() {
+  local meta id line state scanned=0 shown=0 scan_limit detail="" omitted=0
+  scan_limit=$((DETAIL_LIMIT * 2))
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ "$scanned" -lt "$scan_limit" ] || { omitted=1; break; }
+    scanned=$((scanned + 1))
+    id=$(basename "$meta" .meta)
+    line=$(crew_state_bounded "$id" || true)
+    read -r _ state _ <<< "$line"
+    [ -n "$state" ] || state=unknown
+    case "$state" in
+      working) continue ;;
+    esac
+    if [ "$shown" -ge "$DETAIL_LIMIT" ]; then
+      omitted=1
+      continue
+    fi
+    [ -z "$detail" ] || detail="$detail, "
+    detail="$detail${id:0:48}=$state"
+    shown=$((shown + 1))
+  done
+  if [ -z "$detail" ]; then
+    detail="none among $scanned bounded probe(s)"
+  elif [ "$omitted" -eq 1 ]; then
+    detail="$detail, additional tasks omitted"
+  fi
+  printf '%s\n' "$detail"
+}
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
@@ -89,8 +150,12 @@ REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 {
   printf '●%s\n' "$rule"
-  printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-  printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+  printf '●  TURN WOULD END BLIND - NO DURABLE SUPERVISION OWNER\n'
+  printf '●  %s task(s) in flight; %s (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$WATCH_OWNER_DESC" "$FM_SUP_BEACON_DESC"
+  printf '●  Parked/idle task detail (bounded): %s.\n' "$(attention_detail)"
+  if [ "$STOP_HOOK_ACTIVE" = true ]; then
+    printf '●  The prior forced continuation did not establish durable ownership; this stop is blocked again.\n'
+  fi
   printf '●  %s\n' "$REASON"
   printf '●%s\n' "$rule"
 } >&2
