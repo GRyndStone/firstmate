@@ -4,9 +4,10 @@
 # Grok Stop hooks are passive: exit 2 does not block or feed stderr back to the
 # model. This adapter still uses the shared primary-scoped predicate in
 # fm-turnend-guard.sh. When that predicate says the primary would end blind, the
-# adapter forces one same-session follow-up by running `grok --resume <session>`
-# with a guard instruction. Every later Stop event reruns the predicate and
-# schedules another continuation while the turn would still end blind.
+# adapter durably records one same-session follow-up and schedules its bounded
+# delivery after the current Stop hook returns. Every later Stop event reruns
+# the predicate and schedules another continuation while the turn would still
+# end blind.
 set -u
 
 PAYLOAD=$(cat 2>/dev/null || true)
@@ -24,15 +25,27 @@ RC=$?
 [ "$RC" -eq 2 ] || exit 0
 
 SESSION_ID=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
-[ -n "$SESSION_ID" ] || exit 0
-
 REASON=$(cat "$ERR" 2>/dev/null || true)
 [ -n "$REASON" ] || REASON='tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn'
 
-GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
-  grok --resume "$SESSION_ID" \
-    --cwd "$ROOT" \
-    --output-format plain \
-    -p "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
+STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
+HANDOFF_DIR="$STATE/.turnend-handoffs"
+mkdir -p "$HANDOFF_DIR" || exit 1
+KEY=$(printf '%s' "${SESSION_ID:-missing}" | cksum | awk '{print $1 "-" $2}')
+TMP=$(mktemp "$HANDOFF_DIR/grok-$KEY.XXXXXX.tmp") || exit 1
+PENDING=${TMP%.tmp}.pending
+{
+  printf '%s\n' "$SESSION_ID"
+  printf '%s\n' "$REASON"
+} > "$TMP" || { rm -f "$TMP"; exit 1; }
+chmod 600 "$TMP" 2>/dev/null || true
+mv -f "$TMP" "$PENDING" || { rm -f "$TMP"; exit 1; }
 
-$REASON" >/dev/null 2>&1 || true
+[ -n "$SESSION_ID" ] || exit 1
+DELIVER="$ROOT/bin/fm-turnend-guard-grok-deliver.sh"
+[ -x "$DELIVER" ] || exit 1
+for PENDING in "$HANDOFF_DIR"/grok-*.pending; do
+  [ -f "$PENDING" ] && [ ! -L "$PENDING" ] || continue
+  nohup "$DELIVER" "$PENDING" "$ROOT" </dev/null >>"$HANDOFF_DIR/grok-delivery.log" 2>&1 &
+done
+exit 0

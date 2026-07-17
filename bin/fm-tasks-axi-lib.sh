@@ -7,7 +7,8 @@
 # and `tasks-axi mv --help` exposes [<id>...] for atomic multi-ID moves required
 # by secondmate handoffs (introduced in tasks-axi 0.2.2).
 # `config/backlog-backend=manual` opts out of tasks-axi for routine firstmate
-# backlog mutations, but validated secondmate handoffs always use `tasks-axi mv`.
+# backlog mutations, while lifecycle show/Done and validated secondmate
+# handoffs still use their serialized tasks-axi paths.
 # Absent or any other value keeps the default tasks-axi backend path, falling
 # back to manual mutation when the tool is not compatible.
 
@@ -112,8 +113,6 @@ fm_tasks_axi_task_fingerprint() {
     }
     in_task && /^[^[:space:]]/ { exit }
     in_task {
-      if ($0 ~ /^  (blocked|blocked_by|held):/)
-        next
       if ($0 ~ /^  id:/)
         found_id = 1
       print
@@ -125,6 +124,28 @@ fm_tasks_axi_task_fingerprint() {
   ') || return 1
   [ -n "$normalized" ] || return 1
   printf '%s' "$normalized" | cksum | awk '{print $1 ":" $2}'
+}
+
+fm_firstmate_scout_report_path() {  # <firstmate-home> <task-id>
+  local home=$1 id=$2 data_dir data_root task_dir task_root report report_parent
+  fm_tasks_axi_valid_task_id "$id" || return 1
+  home=$(cd "$home" 2>/dev/null && pwd -P) || return 1
+  data_dir="$home/data"
+  [ -d "$data_dir" ] || return 1
+  data_root=$(cd "$data_dir" 2>/dev/null && pwd -P) || return 1
+  case "$data_root" in
+    "$home"|"$home"/*) ;;
+    *) return 1 ;;
+  esac
+  task_dir="$data_dir/$id"
+  [ -d "$task_dir" ] || return 1
+  task_root=$(cd "$task_dir" 2>/dev/null && pwd -P) || return 1
+  [ "$task_root" = "$data_root/$id" ] || return 1
+  report="$task_dir/report.md"
+  [ ! -L "$report" ] && [ -f "$report" ] || return 1
+  report_parent=$(cd "$(dirname "$report")" 2>/dev/null && pwd -P) || return 1
+  [ "$report_parent" = "$task_root" ] || return 1
+  printf '%s/report.md\n' "$report_parent"
 }
 
 fm_tasks_axi_markdown_archive() {  # <config>

@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
 const followupDeliveryActive = new Set();
+let handoffSequence = 0;
 
 function runProcess(command, args, input = "") {
   return new Promise((resolve) => {
@@ -45,6 +47,55 @@ function runGuard(root) {
   return runProcess(`${root}/bin/fm-turnend-guard.sh`, [], '{"stop_hook_active":false}');
 }
 
+function handoffPath(root, sessionID) {
+  const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
+  const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
+  const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+  return { dir: `${state}/.turnend-handoffs`, path: `${state}/.turnend-handoffs/opencode-${key}.pending` };
+}
+
+function persistHandoff(root, sessionID, message) {
+  const handoff = handoffPath(root, sessionID);
+  mkdirSync(handoff.dir, { recursive: true });
+  handoffSequence += 1;
+  const token = `${process.pid}-${Date.now()}-${handoffSequence}`;
+  const record = JSON.stringify({ token, sessionID, message });
+  const temp = `${handoff.path}.tmp.${token}`;
+  writeFileSync(temp, `${record}\n`, { mode: 0o600 });
+  renameSync(temp, handoff.path);
+  return { ...handoff, record };
+}
+
+function clearHandoff(root, sessionID, record) {
+  const handoff = handoffPath(root, sessionID);
+  try {
+    if (record !== undefined && readFileSync(handoff.path, "utf8").trim() !== record) return;
+    unlinkSync(handoff.path);
+  } catch {
+  }
+}
+
+async function deliverHandoff(client, sessionID, message, handoff) {
+  let failure;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await client.session.promptAsync({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: message }] },
+      });
+      try {
+        if (readFileSync(handoff.path, "utf8").trim() === handoff.record) unlinkSync(handoff.path);
+      } catch {
+      }
+      return;
+    } catch (error) {
+      failure = error;
+      if (attempt === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+  }
+  throw failure instanceof Error ? failure : new Error("turn-end continuation delivery failed");
+}
+
 async function letWatchArmRun(sessionID, client) {
   const coordinator = globalThis[COORDINATOR_KEY];
   if (!coordinator?.ensureArmed) return false;
@@ -65,26 +116,20 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       await letWatchArmRun(sessionID, client);
 
       const result = await runGuard(root);
-      if (result.code !== 2) return;
+      if (result.code !== 2) {
+        clearHandoff(root, sessionID);
+        return;
+      }
+      const message =
+        "TURN WOULD END BLIND - supervision is off. " +
+        "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
+        result.stderr;
+      const handoff = persistHandoff(root, sessionID, message);
       if (followupDeliveryActive.has(sessionID)) return;
       followupDeliveryActive.add(sessionID);
 
       try {
-        await client.session.promptAsync({
-          path: { id: sessionID },
-          body: {
-            parts: [
-              {
-                type: "text",
-                text:
-                  "TURN WOULD END BLIND - supervision is off. " +
-                  "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
-                  result.stderr,
-              },
-            ],
-          },
-        });
-      } catch {
+        await deliverHandoff(client, sessionID, message, handoff);
       } finally {
         followupDeliveryActive.delete(sessionID);
       }

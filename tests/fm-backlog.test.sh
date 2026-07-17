@@ -175,7 +175,7 @@ test_done_refuses_unresolved_meta() {
 }
 
 test_scout_done_requires_owned_report() {
-  local home log out status
+  local home log out status outside outside_dir inside_dir
   home=$(make_home report)
   log="$home/args.log"
   write_completion_proof "$home" scout-a scout delivered-report
@@ -193,7 +193,37 @@ test_scout_done_requires_owned_report() {
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
     "$BACKLOG" "done" scout-a --report data/scout-a/report.md 2>&1) || status=$?
   expect_code 1 "$status" "missing scout report"
-  assert_contains "$out" "has no report" "missing scout report refusal absent"
+  assert_contains "$out" "no regular home-contained report" "missing scout report refusal absent"
+  outside="$TMP_ROOT/outside-scout-report.md"
+  printf '# Foreign report\n' > "$outside"
+  mkdir -p "$home/data/scout-a"
+  ln -s "$outside" "$home/data/scout-a/report.md"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" scout-a --report data/scout-a/report.md 2>&1) || status=$?
+  expect_code 1 "$status" "symlinked scout report"
+  assert_contains "$out" "no regular home-contained report" "symlinked scout report escaped home containment"
+  rm -rf "$home/data/scout-a"
+  outside_dir="$TMP_ROOT/outside-scout-task"
+  mkdir -p "$outside_dir"
+  printf '# Foreign parent report\n' > "$outside_dir/report.md"
+  ln -s "$outside_dir" "$home/data/scout-a"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" scout-a --report data/scout-a/report.md 2>&1) || status=$?
+  expect_code 1 "$status" "out-of-home scout report parent"
+  assert_contains "$out" "no regular home-contained report" "scout report parent escaped home containment"
+  rm -f "$home/data/scout-a"
+  inside_dir="$home/data/other-task"
+  mkdir -p "$inside_dir"
+  printf '# Wrong task report\n' > "$inside_dir/report.md"
+  ln -s "$inside_dir" "$home/data/scout-a"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" scout-a --report data/scout-a/report.md 2>&1) || status=$?
+  expect_code 1 "$status" "cross-task scout report parent"
+  assert_contains "$out" "no regular home-contained report" "scout report escaped its exact task directory"
+  rm -f "$home/data/scout-a"
   mkdir -p "$home/data/scout-a"
   printf '# Report\n' > "$home/data/scout-a/report.md"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
@@ -214,13 +244,18 @@ test_done_requires_matching_single_use_teardown_proof() {
   assert_contains "$out" "no durable successful-teardown proof" "never-dispatched work was not kept outside Done"
   write_completion_proof "$home" task-a ship delivered-local
   status=0
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" FM_FAKE_FAIL_MUTATION=1 \
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
     FM_FAKE_BLOCKED=yes FM_FAKE_BLOCKED_BY=dep-a FM_FAKE_HELD=yes FM_FAKE_HELP='changed suggestion' \
+    "$BACKLOG" done task-a --note 'local main' 2>&1) || status=$?
+  expect_code 1 "$status" "gate-mutated teardown proof"
+  assert_contains "$out" "does not match the current backlog record" "gate mutation did not invalidate staged proof"
+  assert_present "$home/state/task-a.teardown-complete" "gate mutation consumed the stale proof"
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" FM_FAKE_FAIL_MUTATION=1 \
     "$BACKLOG" done task-a --note 'local main' >/dev/null 2>&1 || status=$?
   expect_code 9 "$status" "backend Done failure"
   assert_present "$home/state/task-a.teardown-complete" "backend failure consumed the retry proof"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
-    FM_FAKE_BLOCKED=yes FM_FAKE_BLOCKED_BY=dep-a FM_FAKE_HELD=yes FM_FAKE_HELP='another suggestion' \
     "$BACKLOG" done task-a --note 'local main'
   assert_absent "$home/state/task-a.teardown-complete" "successful Done did not consume its proof"
   write_completion_proof "$home" task-a ship delivered-local
@@ -233,6 +268,90 @@ test_done_requires_matching_single_use_teardown_proof() {
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" rm task-a
   assert_absent "$home/state/task-a.teardown-complete" "successful record removal left a reusable teardown proof"
   pass "Done requires a matching single-use proof and preserves it only for retryable backend failure"
+}
+
+test_empty_completion_claim_reconciles_completed_state() {
+  local home claim out status
+  home=$(make_home empty-completed-claim)
+  claim="$home/state/.task-a.teardown-complete.claimed.empty"
+  mkdir "$claim"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 0 "$status" "empty completed proof claim recovery"
+  assert_contains "$out" "already recorded" "empty completed claim did not reconcile from truthful backlog state"
+  assert_absent "$claim" "empty completed proof claim remained stranded"
+  pass "empty proof claims reconcile after Done before claim cleanup"
+}
+
+test_empty_completion_claim_reconciles_restored_proof() {
+  local home claim
+  home=$(make_home empty-restored-claim)
+  write_completion_proof "$home" task-a ship delivered-local
+  claim="$home/state/.task-a.teardown-complete.claimed.empty"
+  mkdir "$claim"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  assert_absent "$claim" "empty restored proof claim remained stranded"
+  assert_absent "$home/state/task-a.teardown-complete" "restored proof was not consumed after claim recovery"
+  pass "empty proof claims reconcile after backend failure restores the proof"
+}
+
+test_finalizing_stage_allows_guarded_and_idempotent_done() {
+  local home out status meta_cksum record_cksum
+  home=$(make_home finalizing-new-done)
+  write_completion_proof "$home" task-a ship delivered-local
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
+  : > "$home/state/task-a.tearing-down"
+  printf 'version=3\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=%s\nphase=finalizing\n' \
+    "$meta_cksum" "$record_cksum" > "$home/state/task-a.teardown-stage"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  assert_absent "$home/state/task-a.teardown-complete" "finalizing Done did not consume its receipt"
+  home=$(make_home finalizing-idempotent)
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  : > "$home/state/task-a.tearing-down"
+  printf 'version=3\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=staged\nphase=finalizing\n' \
+    "$meta_cksum" > "$home/state/task-a.teardown-stage"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 0 "$status" "idempotent finalizing Done"
+  assert_contains "$out" "already recorded" "finalizing retry did not recognize recorded Done"
+  home=$(make_home invalid-finalizing)
+  write_completion_proof "$home" task-a ship delivered-local
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  printf 'version=2\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=staged\nphase=finalizing\n' \
+    "$meta_cksum" > "$home/state/task-a.teardown-stage"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "invalid finalizing stage"
+  assert_contains "$out" "unresolved owned lifecycle" "non-v3 finalizing stage bypassed lifecycle guard"
+  pass "only an exact finalizing teardown stage supports guarded idempotent Done"
+}
+
+test_manual_backend_done_stays_serialized_and_receipt_gated() {
+  local home log out status
+  home=$(make_home manual-completion)
+  log="$home/args.log"
+  printf 'manual\n' > "$home/config/backlog-backend"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" update task-a --title changed 2>&1) || status=$?
+  expect_code 1 "$status" "manual routine wrapper mutation"
+  assert_contains "$out" "use manual edits for routine operations" "manual routine mutation was not kept operator-owned"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "manual Done without teardown proof"
+  assert_contains "$out" "no durable successful-teardown proof" "manual Done bypassed lifecycle receipt"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" done task-a --note 'local main'
+  assert_contains "$(cat "$log")" "args=done task-a --note local main --backend markdown --file $home/data/backlog.md" \
+    "manual completion did not pass through the serialized scoped backend"
+  assert_absent "$home/state/task-a.teardown-complete" "manual Done did not consume its lifecycle receipt"
+  pass "manual completion uses the serialized lifecycle receipt path"
 }
 
 test_all_mutation_verbs_and_aliases_invalidate_proofs() {
@@ -553,6 +672,10 @@ test_scout_done_requires_owned_report
 test_done_requires_matching_single_use_teardown_proof
 test_all_mutation_verbs_and_aliases_invalidate_proofs
 test_interrupted_completion_claim_reconciles_from_backlog_state
+test_empty_completion_claim_reconciles_completed_state
+test_empty_completion_claim_reconciles_restored_proof
+test_manual_backend_done_stays_serialized_and_receipt_gated
+test_finalizing_stage_allows_guarded_and_idempotent_done
 test_default_tasks_kind_matches_legacy_ship_lifecycle
 test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards

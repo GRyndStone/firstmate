@@ -203,6 +203,25 @@ test_lock_steals_dead_pid_lock() {
   pass "dead-pid stale lock is reclaimed by a single acquirer"
 }
 
+test_lock_release_cleans_supervisor_target_metadata() {
+  local dir state lockdir owner
+  dir=$(make_case lock-supervisor-metadata)
+  state="$dir/state"
+  lockdir="$state/.supervise-daemon.lock"
+  owner=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 7
+    owner=$(fm_lock_link_owner "$2") || exit 8
+    printf "%s\n" tmux > "$2/supervisor-backend"
+    printf "%s\n" %99 > "$2/supervisor-target"
+    printf "%s\n" "$owner"
+    fm_lock_release "$2"
+  ' _ "$LIB" "$lockdir") || fail "could not acquire and release supervisor lock"
+  [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] || fail "supervisor lock link survived release"
+  [ ! -d "$owner" ] || fail "supervisor lock owner directory survived release"
+  pass "portable lock release cleans recorded supervisor target metadata"
+}
+
 test_lock_stale_steal_single_winner_under_concurrency() {
   local dir state lockdir dead marker i pids pid wins
   dir=$(make_case lock-stale-concurrency)
@@ -741,6 +760,7 @@ test_live_stale_watch_lock_is_actionable
 test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
+test_lock_release_cleans_supervisor_target_metadata
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock

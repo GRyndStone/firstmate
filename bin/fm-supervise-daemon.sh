@@ -1419,6 +1419,14 @@ fm_super_main() {
     rm -f "$PIDFILE" 2>/dev/null || true
     exit 1
   fi
+  if ! printf '%s\n' "$BACKEND" > "$LOCK/supervisor-backend" \
+    || ! printf '%s\n' "$TARGET" > "$LOCK/supervisor-target"; then
+    echo "error: could not persist supervisor injection target ownership" >&2
+    log "startup failed: could not persist supervisor injection target ownership"
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    exit 1
+  fi
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"

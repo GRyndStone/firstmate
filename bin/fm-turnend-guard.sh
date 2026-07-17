@@ -33,6 +33,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
+TARGET_PROBE_TIMEOUT=${FM_TURNEND_TARGET_PROBE_TIMEOUT:-2}
+case "$TARGET_PROBE_TIMEOUT" in ''|*[!0-9]*|0) TARGET_PROBE_TIMEOUT=2 ;; esac
 
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
@@ -74,8 +76,24 @@ fm_supervision_status "$STATE" "$GRACE"
 HARNESS=${FM_TURNEND_HARNESS:-}
 [ -n "$HARNESS" ] || HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
+supervisor_target_live() {
+  local backend=$1 target=$2 probe="$SCRIPT_DIR/fm-backend.sh"
+  [ -r "$probe" ] || return 1
+  case "$backend" in tmux|herdr) ;; *) return 1 ;; esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '$seconds=shift; alarm $seconds; exec @ARGV' "$TARGET_PROBE_TIMEOUT" \
+      bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+  else
+    return 1
+  fi
+}
+
 daemon_owner_active() {
-  local pid=$1 identity=$2 daemon_pid daemon_lock daemon_lock_owner lock_pid lock_identity
+  local pid=$1 identity=$2 daemon_pid daemon_lock daemon_lock_owner lock_pid lock_identity backend target
   [ "$FM_WATCHER_OWNER_MODE" = away-inject ] || return 1
   [ -f "$STATE/.afk" ] || return 1
   [ ! -L "$STATE/.afk" ] || return 1
@@ -94,10 +112,18 @@ daemon_owner_active() {
   [ ! -L "$daemon_lock_owner" ] || return 1
   lock_pid=$(cat "$daemon_lock_owner/pid" 2>/dev/null || true)
   lock_identity=$(cat "$daemon_lock_owner/pid-identity" 2>/dev/null || true)
+  [ -f "$daemon_lock_owner/supervisor-backend" ] || return 1
+  [ ! -L "$daemon_lock_owner/supervisor-backend" ] || return 1
+  [ -f "$daemon_lock_owner/supervisor-target" ] || return 1
+  [ ! -L "$daemon_lock_owner/supervisor-target" ] || return 1
+  backend=$(cat "$daemon_lock_owner/supervisor-backend" 2>/dev/null || true)
+  target=$(cat "$daemon_lock_owner/supervisor-target" 2>/dev/null || true)
+  [ -n "$target" ] || return 1
   [ "$daemon_pid" = "$pid" ] || return 1
   [ "$lock_pid" = "$pid" ] || return 1
   [ "$lock_identity" = "$identity" ] || return 1
-  fm_pid_alive "$pid"
+  fm_pid_alive "$pid" || return 1
+  supervisor_target_live "$backend" "$target"
 }
 
 WATCH_OWNER_DESC="no healthy watcher"
@@ -110,7 +136,7 @@ if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
         if daemon_owner_active "$FM_WATCHER_OWNER_PID" "$(cat "$STATE/.watch.lock/owner-identity" 2>/dev/null || true)"; then
           exit 0
         fi
-        WATCH_OWNER_DESC="daemon owner is not active in declared away-inject mode"
+        WATCH_OWNER_DESC="daemon owner or its injection target is not active in declared away-inject mode"
         ;;
       arm:claude|arm:grok|arm:pi|arm:opencode) exit 0 ;;
       arm:codex) WATCH_OWNER_DESC="arm owner is not durable in Codex" ;;

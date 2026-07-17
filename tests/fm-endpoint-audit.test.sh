@@ -213,6 +213,41 @@ test_unresolved_herdr_pane_tab_fails_closed() {
   pass "Herdr panes must resolve to tabs in the exact workspace inventory"
 }
 
+test_unresolved_zellij_pane_tab_fails_closed_without_scoped_tab() {
+  local home out status
+  home=$(make_fixture unresolved-zellij-pane)
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=zellij' \
+    'window=fm:42' \
+    'zellij_session=fm' \
+    'zellij_tab_id=7' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = list-sessions ]; then
+  printf 'fm\n'
+  exit 0
+fi
+if [ "${1:-}" = --session ]; then
+  shift 2
+fi
+case "$*" in
+  "action list-tabs --json") printf '%s\n' '[{"tab_id":1,"name":"unrelated"}]' ;;
+  "action list-panes --json") printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false}]' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$home/fakebin/zellij"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+    "$AUDIT" --json 2>&1) || status=$?
+  expect_code 1 "$status" "unresolved Zellij pane tab reference"
+  assert_contains "$out" "unresolved Zellij pane tab reference" \
+    "orphan Zellij pane vanished when the scoped task tab was absent"
+  pass "Zellij panes resolve to tabs before scoped duplicate filtering"
+}
+
 test_cmux_reports_unavailable_without_cross_home_inventory() {
   local home log out status
   home=$(make_fixture cmux-no-sweep)
@@ -264,5 +299,6 @@ test_singleton_mismatch_is_reported
 test_missing_owned_workspace_is_an_empty_inventory
 test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
+test_unresolved_zellij_pane_tab_fails_closed_without_scoped_tab
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

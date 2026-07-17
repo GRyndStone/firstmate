@@ -666,7 +666,7 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # Prints present, absent, or unknown; backend inventory/read failures are
 # unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
 fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
-  local backend=$1 target=$2 expected_label=${3:-} backend_id=${4:-} out code session pane tabs panes state workspace expected_title workspace_title wins wid wss exact_found recovered_found inventory_unknown pane_tab_id scoped label_count
+  local backend=$1 target=$2 expected_label=${3:-} backend_id=${4:-} out code session pane tabs panes state pane_tab_id scoped label_count
   if [ "$backend" = herdr ]; then
     fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
     session=${target%%:*}
@@ -690,10 +690,15 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
     esac
     return 0
   fi
-  if fm_backend_target_exists "$backend" "$target" "$expected_label" >/dev/null 2>&1; then
-    printf 'present'
-    return 0
-  fi
+  case "$backend" in
+    zellij|cmux) ;;
+    *)
+      if fm_backend_target_exists "$backend" "$target" "$expected_label" >/dev/null 2>&1; then
+        printf 'present'
+        return 0
+      fi
+      ;;
+  esac
   case "$backend" in
     tmux)
       fm_backend_source tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
@@ -760,6 +765,28 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
         printf 'unknown'
         return 0
       }
+      tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
+        printf 'unknown'
+        return 0
+      }
+      printf '%s' "$tabs" | jq -e '
+        type == "array"
+        and all(.[]?;
+          ((.tab_id | type) == "number")
+          and (.tab_id == (.tab_id | floor))
+          and ((.name | type) == "string")
+        )
+      ' >/dev/null 2>&1 || {
+        printf 'unknown'
+        return 0
+      }
+      jq -en --argjson tabs "$tabs" --argjson panes "$panes" '
+        ($tabs | map(.tab_id)) as $tab_ids
+        | all($panes[]?; .tab_id as $pane_tab_id | ($tab_ids | index($pane_tab_id)) != null)
+      ' >/dev/null 2>&1 || {
+        printf 'unknown'
+        return 0
+      }
       case "$FM_BACKEND_ZELLIJ_PANE" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
       pane_tab_id=$(printf '%s' "$panes" | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)
       if [ -n "$pane_tab_id" ]; then
@@ -768,14 +795,6 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
           printf 'present'
           return 0
         fi
-        tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
-          printf 'unknown'
-          return 0
-        }
-        printf '%s' "$tabs" | jq -e 'type == "array" and all(.[]?; ((.tab_id | type) == "number") and ((.name | type) == "string"))' >/dev/null 2>&1 || {
-          printf 'unknown'
-          return 0
-        }
         scoped=$(fm_backend_zellij_scoped_title "$expected_label")
         if printf '%s' "$tabs" | jq -e --argjson t "$pane_tab_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
           printf 'present'
@@ -790,14 +809,6 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
         return 0
       fi
       if [ -n "$expected_label" ]; then
-        tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
-          printf 'unknown'
-          return 0
-        }
-        printf '%s' "$tabs" | jq -e 'type == "array" and all(.[]?; ((.tab_id | type) == "number") and ((.name | type) == "string"))' >/dev/null 2>&1 || {
-          printf 'unknown'
-          return 0
-        }
         scoped=$(fm_backend_zellij_scoped_title "$expected_label")
         if printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
           printf 'present'
@@ -846,52 +857,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
         ok) ;;
         *) printf 'unknown'; return 0 ;;
       esac
-      workspace=$FM_BACKEND_CMUX_WORKSPACE
-      wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>&1) || {
-        printf 'unknown'
-        return 0
-      }
-      printf '%s' "$wins" | jq -e 'type == "array" and all(.[]?; ((.id | type) == "string") and ((.id | length) > 0))' >/dev/null 2>&1 || {
-        printf 'unknown'
-        return 0
-      }
-      expected_title=
-      [ -z "$expected_label" ] || expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
-      exact_found=0
-      recovered_found=0
-      inventory_unknown=0
-      workspace_title=
-      while IFS= read -r wid; do
-        [ -n "$wid" ] || continue
-        if ! wss=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>&1); then
-          inventory_unknown=1
-          continue
-        fi
-        if ! printf '%s' "$wss" | jq -e '(.workspaces | type == "array") and all(.workspaces[]?; ((.id | type) == "string") and ((.id | length) > 0) and ((.title | type) == "string"))' >/dev/null 2>&1; then
-          inventory_unknown=1
-          continue
-        fi
-        if printf '%s' "$wss" | jq -e --arg id "$workspace" 'any(.workspaces[]?; .id == $id)' >/dev/null 2>&1; then
-          exact_found=1
-          workspace_title=$(printf '%s' "$wss" | jq -r --arg id "$workspace" '.workspaces[]? | select(.id == $id) | .title // empty' 2>/dev/null)
-        fi
-        if [ -n "$expected_title" ] && printf '%s' "$wss" | jq -e --arg title "$expected_title" 'any(.workspaces[]?; .title == $title)' >/dev/null 2>&1; then
-          recovered_found=1
-        fi
-      done < <(printf '%s' "$wins" | jq -r '.[]? | .id // empty' 2>/dev/null)
-      if [ "$exact_found" -eq 1 ]; then
-        if [ -z "$expected_title" ] || [ "$workspace_title" = "$expected_title" ]; then
-          printf 'present'
-        else
-          printf 'unknown'
-        fi
-      elif [ "$recovered_found" -eq 1 ]; then
-        printf 'present'
-      elif [ "$inventory_unknown" -eq 1 ]; then
-        printf 'unknown'
-      else
-        printf 'absent'
-      fi
+      printf 'unknown'
       ;;
     *) printf 'unknown' ;;
   esac

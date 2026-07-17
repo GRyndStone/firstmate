@@ -238,10 +238,6 @@ audit_zellij_meta() {
     type == "array"
     and all(.[]?; ((.tab_id | type) == "number") and (.tab_id == (.tab_id | floor)) and ((.name | type) == "string"))
   ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid Zellij tab inventory for $session" >&2; return 1; }
-  scoped=$(fm_backend_zellij_scoped_title "fm-$id")
-  if ! printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
-    return 0
-  fi
   panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>&1) || {
     echo "fm-endpoint-audit: cannot read Zellij panes for $session" >&2
     return 1
@@ -254,6 +250,17 @@ audit_zellij_meta() {
       and ((.is_plugin | type) == "boolean")
     )
   ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid Zellij pane inventory for $session" >&2; return 1; }
+  jq -en --argjson tabs "$tabs" --argjson panes "$panes" '
+    ($tabs | map(.tab_id)) as $tab_ids
+    | all($panes[]?; .tab_id as $pane_tab_id | ($tab_ids | index($pane_tab_id)) != null)
+  ' >/dev/null 2>&1 || {
+    echo "fm-endpoint-audit: unresolved Zellij pane tab reference for $session" >&2
+    return 1
+  }
+  scoped=$(fm_backend_zellij_scoped_title "fm-$id")
+  if ! printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
+    return 0
+  fi
   live_json=$(jq -cn \
     --arg session "$session" \
     --arg want "$scoped" \

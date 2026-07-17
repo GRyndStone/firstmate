@@ -8,14 +8,14 @@
 # written by successful lifecycle teardown.
 # Interrupted proof claims are reconciled from the task's resulting backlog
 # state, and every other successful mutation invalidates affected receipts.
-# A scout report completion must name the owned data/<id>/report.md and that
-# report must exist.
-# fm-teardown.sh calls this command only after successful endpoint/worktree and
-# meta cleanup, after its duplicate-endpoint preflight, which makes the
-# supported completion order fail-closed.
+# A scout report completion must name the owned data/<id>/report.md, which must
+# be a regular non-symlink file canonically contained by this home.
+# fm-teardown.sh calls this command only after successful endpoint/worktree
+# cleanup from its retained finalizing stage, after duplicate-endpoint preflight,
+# which makes the supported completion order fail-closed.
 #
-# Manual backlog mode remains an explicit operator-owned path and is outside
-# this mechanical serialization boundary.
+# Manual backlog mode keeps routine edits operator-owned, but lifecycle show
+# and Done still use this serialized wrapper and the same teardown receipt.
 # Usage: fm-backlog.sh <tasks-axi-command> [args...]
 set -u
 
@@ -121,10 +121,8 @@ case "$1" in
   delete) shift; set -- "rm" "$@" ;;
 esac
 
-if fm_backlog_backend_manual "$CONFIG"; then
-  echo "error: config/backlog-backend=manual; fm-backlog.sh will not mutate or reinterpret the manual backend" >&2
-  exit 1
-fi
+MANUAL_BACKEND=0
+fm_backlog_backend_manual "$CONFIG" && MANUAL_BACKEND=1
 (cd "$FM_HOME" && HOME="$FM_HOME" fm_tasks_axi_compatible) || {
   echo "error: compatible tasks-axi is required for fm-backlog.sh" >&2
   exit 1
@@ -152,6 +150,16 @@ case "$COMMAND" in
     ;;
 esac
 
+if [ "$MANUAL_BACKEND" -eq 1 ]; then
+  case "$COMMAND" in
+    show|done) ;;
+    *)
+      echo "error: config/backlog-backend=manual; use manual edits for routine operations, but use fm-backlog.sh done after teardown" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 run_tasks_axi() {
   (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
 }
@@ -174,12 +182,13 @@ archive_has_canonical_done_record() {  # <id>
 }
 
 completion_claim_settle() {
-  local task_info task_state show_status
+  local task_info task_state show_status proof_present=0
   [ -n "${CLAIMED_PROOF:-}" ] || return 0
-  if [ -L "$CLAIM_DIR" ] || [ ! -d "$CLAIM_DIR" ] || [ -L "$CLAIMED_PROOF" ] || [ ! -f "$CLAIMED_PROOF" ]; then
+  if [ -L "$CLAIM_DIR" ] || [ ! -d "$CLAIM_DIR" ] || [ -L "$CLAIMED_PROOF" ]; then
     echo "error: teardown proof claim for $ID is not a regular owned claim" >&2
     return 1
   fi
+  [ ! -f "$CLAIMED_PROOF" ] || proof_present=1
   show_status=0
   task_info=$(run_tasks_axi show "$ID" --full 2>&1) || show_status=$?
   if [ "$show_status" -ne 0 ]; then
@@ -207,6 +216,17 @@ completion_claim_settle() {
   fi
   case "$task_state" in
     queued|in_flight)
+      if [ "$proof_present" -ne 1 ]; then
+        if [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ] \
+          && rmdir "$CLAIM_DIR"; then
+          CLAIMED_PROOF=
+          CLAIM_DIR=
+          CLAIM_SETTLED_STATE=retry
+          return 0
+        fi
+        echo "error: cannot recover empty teardown proof claim for active task $ID" >&2
+        return 1
+      fi
       if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
         echo "error: cannot recover teardown proof claim for $ID because its proof path is occupied" >&2
         return 1
@@ -239,6 +259,27 @@ recover_existing_completion_claim() {
   CLAIM_DIR=${claims[0]}
   CLAIMED_PROOF="$CLAIM_DIR/proof"
   completion_claim_settle
+}
+
+finalizing_stage_is_owned() {  # <stage-path> <task-id>
+  local stage=$1 id=$2 meta meta_cksum
+  [ ! -L "$stage" ] && [ -f "$stage" ] || return 1
+  meta="$STATE/$id.meta"
+  [ ! -L "$meta" ] && [ -f "$meta" ] || return 1
+  meta_cksum=$(cksum < "$meta" | awk '{print $1 ":" $2}') || return 1
+  awk -F= -v id="$id" -v want_meta_cksum="$meta_cksum" '
+    $1 == "version" { versions++; version = substr($0, index($0, "=") + 1) }
+    $1 == "task" { tasks++; task = substr($0, index($0, "=") + 1) }
+    $1 == "phase" { phases++; phase = substr($0, index($0, "=") + 1) }
+    $1 == "meta-cksum" { metas++; meta_cksum = substr($0, index($0, "=") + 1) }
+    $1 == "record-cksum" { records++; record_cksum = substr($0, index($0, "=") + 1) }
+    END {
+      exit !(versions == 1 && version == "3" && tasks == 1 && task == id \
+        && phases == 1 && phase == "finalizing" \
+        && metas == 1 && meta_cksum == want_meta_cksum \
+        && records == 1 && record_cksum != "")
+    }
+  ' "$stage"
 }
 
 if [ "$COMMAND" = "done" ]; then
@@ -297,8 +338,13 @@ LOCKED=1
 
 if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   COMPLETION_PROOF="$STATE/$ID.teardown-complete"
-  if [ -e "$STATE/$ID.meta" ] || [ -e "$STATE/$ID.tearing-down" ] \
-     || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ]; then
+  FINALIZING_STAGE=0
+  if finalizing_stage_is_owned "$STATE/$ID.teardown-stage" "$ID"; then
+    FINALIZING_STAGE=1
+  fi
+  if [ "$FINALIZING_STAGE" -ne 1 ] && { [ -e "$STATE/$ID.tearing-down" ] \
+     || [ -e "$STATE/$ID.meta" ] \
+     || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ]; }; then
     echo "REFUSED: task $ID still has unresolved owned lifecycle state." >&2
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2
     exit 1
@@ -307,6 +353,21 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   if [ "$CLAIM_SETTLED_STATE" = done ]; then
     echo "Done for $ID was already recorded before interrupted proof cleanup completed."
     exit 0
+  fi
+  if [ "$FINALIZING_STAGE" -eq 1 ]; then
+    FINALIZING_INFO_STATUS=0
+    FINALIZING_INFO=$(run_tasks_axi show "$ID" --full 2>&1) || FINALIZING_INFO_STATUS=$?
+    if [ "$FINALIZING_INFO_STATUS" -eq 0 ] \
+       && [ "$(printf '%s\n' "$FINALIZING_INFO" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)" = done ]; then
+      echo "Done for $ID was already recorded before teardown finalization completed."
+      exit 0
+    fi
+    if [ "$FINALIZING_INFO_STATUS" -ne 0 ] \
+       && printf '%s\n' "$FINALIZING_INFO" | grep -Fx 'code: NOT_FOUND' >/dev/null \
+       && archive_has_canonical_done_record "$ID"; then
+      echo "Done for $ID was already archived before teardown finalization completed."
+      exit 0
+    fi
   fi
   if [ -L "$COMPLETION_PROOF" ] || [ ! -f "$COMPLETION_PROOF" ]; then
     echo "REFUSED: task $ID has no durable successful-teardown proof." >&2
@@ -346,7 +407,7 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   esac
   if [ "$TASK_KIND" = scout ]; then
     EXPECTED_REL="data/$ID/report.md"
-    EXPECTED_ABS="$DATA/$ID/report.md"
+    EXPECTED_ABS="$FM_HOME/data/$ID/report.md"
     if [ -z "$REPORT_ARG" ]; then
       echo "REFUSED: scout completion for $ID requires --report $EXPECTED_REL." >&2
       exit 1
@@ -358,8 +419,8 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
         exit 1
         ;;
     esac
-    if [ ! -f "$EXPECTED_ABS" ]; then
-      echo "REFUSED: scout task $ID has no report at $EXPECTED_ABS." >&2
+    if ! fm_firstmate_scout_report_path "$FM_HOME" "$ID" >/dev/null; then
+      echo "REFUSED: scout task $ID has no regular home-contained report at $EXPECTED_ABS." >&2
       exit 1
     fi
   fi

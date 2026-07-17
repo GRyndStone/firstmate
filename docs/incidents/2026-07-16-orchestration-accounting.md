@@ -67,7 +67,7 @@ These were Firstmate operator violations, not captain error and not failures in 
 
 `bin/fm-backlog.sh` is now the supported home-scoped tasks-axi entry point.
 It serializes mutations with `state/.backlog.lock`, refuses file/backend overrides, refuses `done` while meta or teardown state remains, and validates the exact scout report path and file.
-`bin/fm-teardown.sh` now records tasks-axi completion only after successful cleanup removes owned lifecycle state.
+`bin/fm-teardown.sh` now records completion only from a durable finalizing phase after successful cleanup, retaining owned lifecycle state until the serialized mutation succeeds.
 Herdr and Zellij teardown first refuse any duplicate or replacement same-home task endpoint reported by the audit, so a hidden earlier recovery endpoint blocks clean completion until explicitly reconciled.
 cmux read-only audit emits a structured unavailable finding because its CLI cannot query an exact-home inventory without enumerating app-global windows, and teardown refuses that finding before endpoint closure.
 Forced secondmate retirement audits every supported child-home endpoint before closing children and refuses the whole retirement on an anomaly or unknown inventory.
@@ -89,13 +89,13 @@ Before the fix, an interrupted checkpoint left PID 37616 with PPID 1 and the nex
 After the fix, `tests/fm-watch-checkpoint.test.sh` sends TERM to the checkpoint parent, verifies the watcher was its direct child, verifies that watcher no longer exists, verifies the lock is gone, and verifies an unrelated process remains alive.
 Before the fix, `tasks-axi done billables-extract` succeeded while meta remained and the required report was absent.
 After the fix, `tests/fm-backlog.test.sh` proves `done` cannot reach tasks-axi with unresolved meta, a scout cannot complete through either `--note` or `--report` without its exact owned report, and a valid post-cleanup report completion is scoped to the owned backlog.
-`tests/fm-teardown.test.sh` proves the compatible backend's Done call observes meta and teardown state already absent.
+`tests/fm-teardown.test.sh` proves Done observes the exact finalizing stage, interrupted finalization remains idempotently retryable, and lifecycle state disappears only after backlog recording succeeds.
 Before the fix, `update` and `hold` ran concurrently against `forex-datafix-q4`.
 After the fix, `tests/fm-backlog.test.sh` launches update and hold concurrently and proves their critical sections never overlap.
 Before the fix, panes `p1F`, `p1K`, and `p1M` accumulated while only `p1M` remained recorded.
 After the fix, `tests/fm-endpoint-audit.test.sh` models two live same-label endpoints, proves deterministic reporting, proves only the active home's workspace was queried, and proves no close operation was issued.
 `tests/fm-teardown.test.sh` also proves those duplicates block teardown, preserve task meta, and trigger no endpoint closure.
-It additionally proves forced secondmate retirement surfaces a child-home duplicate before closure and that interrupted cleanup never reuses a returned worktree path after its state-owned canonical path, device, and inode identity changes.
+It additionally proves forced secondmate retirement surfaces a child-home duplicate before closure and that interrupted cleanup never reuses a replacement worktree after its random task-owned marker disappears.
 Before the fix, captain-facing accounting omitted held tasks and treated a sparse queue as the whole program.
 After the fix, `tests/fm-fleet-snapshot-view.test.sh` and `tests/fm-bearings-snapshot.test.sh` prove held work remains visible and a zero-candidate queue with a durable program source reports `requires_supervisor_judgment`.
 

@@ -122,6 +122,8 @@ fm_lock_clean_known_files() {
     "$lockdir/owner-mode" \
     "$lockdir/owner-pid" \
     "$lockdir/pid-identity" \
+    "$lockdir/supervisor-backend" \
+    "$lockdir/supervisor-target" \
     "$lockdir/watcher-path" \
     2>/dev/null || true
 }
