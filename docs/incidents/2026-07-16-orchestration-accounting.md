@@ -68,14 +68,14 @@ These were Firstmate operator violations, not captain error and not failures in 
 `bin/fm-backlog.sh` is now the supported home-scoped tasks-axi entry point.
 It serializes mutations with `state/.backlog.lock`, refuses file/backend overrides, refuses `done` while meta or teardown state remains, and validates the exact scout report path and file.
 `bin/fm-teardown.sh` now records completion only from a durable finalizing phase after successful cleanup, retaining owned lifecycle state until the serialized mutation succeeds.
-Herdr and Zellij teardown first refuse any duplicate or replacement same-home task endpoint reported by the audit, so a hidden earlier recovery endpoint blocks clean completion until explicitly reconciled.
-cmux read-only audit emits a structured unavailable finding because its CLI cannot query an exact-home inventory without enumerating app-global windows, and teardown refuses that finding before endpoint closure.
+Herdr teardown first refuses any duplicate or replacement same-home task endpoint reported by the audit, so a hidden earlier recovery endpoint blocks clean completion until explicitly reconciled.
+Zellij and cmux teardown refuse their unavailable exact-home inventories rather than sweep a shared namespace before closure.
 Forced secondmate retirement audits every supported child-home endpoint before closing children and refuses the whole retirement on an anomaly or unknown inventory.
 If artifact information or the Done mutation is unavailable after teardown, it leaves the task outside Done and reports the reconciliation action instead of fabricating completion.
 `bin/fm-backlog-handoff.sh` now holds both homes' backlog locks in deterministic path order through classification and the atomic move.
-`bin/fm-endpoint-audit.sh` compares Herdr live tabs only in sessions and exact workspace ids named by this home's meta, and compares Zellij tabs only in the recorded session under the exact home-scoped title.
+`bin/fm-endpoint-audit.sh` compares Herdr live tabs only in sessions and exact workspace ids named by this home's meta.
 It emits stable duplicate task, worktree, recorded endpoint, and live endpoint data to session-start recovery, fleet view, and bearings, and it contains no close path.
-For cmux it emits `inventory_unavailable` without issuing any global inventory command, preserving the anomaly for read-only fleet accounting while teardown fails closed.
+For Zellij and cmux it emits `inventory_unavailable` without issuing any shared-session or global inventory command, preserving the anomaly for read-only fleet accounting while teardown fails closed.
 `bin/fm-watch-checkpoint.sh` now captures one watcher PID and one timer PID, and its signal and exit cleanup terminates and reaps only those owned children.
 `bin/fm-fleet-snapshot.sh` now parses structured holds, counts runnable candidates separately from held and blocked work, and points to convention-named durable program files.
 When program sources exist, decomposition remains `requires_supervisor_judgment` because code cannot safely infer every obligation from prose.
@@ -108,7 +108,7 @@ All other test scripts, including real Herdr and tmux backend smoke and safety c
 
 ## Residual boundary
 
-Mechanical reporting can identify known durable program files, structured queue rows, holds, blockers, and duplicate same-home Herdr or Zellij labels.
-cmux remains fail-closed because it has no exact-home inventory query.
+Mechanical reporting can identify known durable program files, structured queue rows, holds, blockers, and duplicate same-home Herdr labels.
+Zellij and cmux duplicate reporting remains explicitly unavailable until either backend exposes an exact-home inventory primitive.
 Only a supervisor can decide whether prose obligations have been decomposed completely, whether two endpoints contain unique state, or whether a manual-backend edit is semantically correct.
 The guardrails therefore fail closed or report loudly at those boundaries rather than closing endpoints, inventing tasks, or interpreting plans automatically.

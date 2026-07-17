@@ -23,7 +23,7 @@ case "$TIMEOUT" in ''|*[!0-9]*|0) TIMEOUT=120 ;; esac
 DELIVERY_LOCK="$PENDING.delivery"
 LOCK_PID=${BASHPID:-$$}
 LOCK_IDENTITY=$(fm_pid_identity "$LOCK_PID") || exit 1
-LOCK_RECORD=$(printf '%s\n%s' "$LOCK_PID" "$LOCK_IDENTITY")
+LOCK_RECORD=$(printf '%s\n%s\n%s' "$EXPECTED_TOKEN" "$LOCK_PID" "$LOCK_IDENTITY")
 READY="$PENDING.ready"
 READY_RECORD=$(printf '%s\n%s\n%s' "$EXPECTED_TOKEN" "$LOCK_PID" "$LOCK_IDENTITY")
 DELIVERY_PID=
@@ -36,8 +36,14 @@ acquire_delivery_lock() {
 if ! acquire_delivery_lock; then
   [ -f "$DELIVERY_LOCK" ] && [ ! -L "$DELIVERY_LOCK" ] || exit 0
   old_record=$(cat "$DELIVERY_LOCK" 2>/dev/null || true)
-  old_pid=$(printf '%s\n' "$old_record" | sed -n '1p')
-  old_identity=$(printf '%s\n' "$old_record" | sed '1d')
+  old_pid=$(printf '%s\n' "$old_record" | sed -n '2p')
+  old_identity=$(printf '%s\n' "$old_record" | sed '1,2d')
+  case "$old_pid" in
+    ''|*[!0-9]*)
+      old_pid=$(printf '%s\n' "$old_record" | sed -n '1p')
+      old_identity=$(printf '%s\n' "$old_record" | sed '1d')
+      ;;
+  esac
   if fm_pid_alive "$old_pid" \
     && [ "$(fm_pid_identity "$old_pid" 2>/dev/null || true)" = "$old_identity" ]; then
     exit 0

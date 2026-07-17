@@ -45,6 +45,9 @@ case "$SECONDS_ARG" in
   0) echo "error: --seconds must be greater than zero" >&2; exit 2 ;;
 esac
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
@@ -56,12 +59,72 @@ TIMEOUT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.timeout.XXXXXX") ||
 }
 rm -f "$TIMEOUT_MARKER"
 WATCH_PID=
+WATCH_IDENTITY=
+CHECKPOINT_PID=${BASHPID:-$$}
 TIMER_PID=
 CLEANED=0
+TIMED_OUT=0
+
+watch_birth_identity() {
+  local identity
+  identity=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null) || return 1
+  identity=$(printf '%s\n' "$identity" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+
+capture_watch_identity() {
+  local current_identity current_parent previous_identity= i=0
+  while [ "$i" -lt 40 ]; do
+    current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)
+    current_identity=$(watch_birth_identity "$WATCH_PID" 2>/dev/null || true)
+    if [ "$current_parent" = "$CHECKPOINT_PID" ] && [ -n "$current_identity" ] \
+       && [ -n "$previous_identity" ] && [ "$current_identity" = "$previous_identity" ]; then
+      WATCH_IDENTITY=$current_identity
+      return 0
+    fi
+    previous_identity=$current_identity
+    sleep 0.01
+    i=$((i + 1))
+  done
+  WATCH_IDENTITY="direct-child:$CHECKPOINT_PID:$WATCH_PID"
+  return 0
+}
+
+watch_child_matches() {
+  local current_identity current_parent
+  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || return 1
+  fm_pid_alive "$WATCH_PID" || return 1
+  current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]') || return 1
+  [ "$current_parent" = "$CHECKPOINT_PID" ] || return 1
+  if [ "$WATCH_IDENTITY" = "direct-child:$CHECKPOINT_PID:$WATCH_PID" ]; then
+    return 0
+  fi
+  current_identity=$(watch_birth_identity "$WATCH_PID") || return 1
+  [ "$current_identity" = "$WATCH_IDENTITY" ]
+}
+
+signal_watch_child() {
+  local signal=$1
+  watch_child_matches || return 1
+  kill "-$signal" "$WATCH_PID" 2>/dev/null
+}
+
+stop_watch_child() {
+  local limit=$1 i=0
+  if signal_watch_child TERM; then
+    while watch_child_matches && [ "$i" -lt "$limit" ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    if watch_child_matches; then
+      signal_watch_child KILL || true
+    fi
+  fi
+}
 
 # shellcheck disable=SC2329 # Invoked by EXIT and signal traps below.
 cleanup_owned_children() {
-  local i
   [ "$CLEANED" -eq 0 ] || return 0
   CLEANED=1
   if [ -n "$TIMER_PID" ] && kill -0 "$TIMER_PID" 2>/dev/null; then
@@ -69,17 +132,7 @@ cleanup_owned_children() {
   fi
   [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
   TIMER_PID=
-  if [ -n "$WATCH_PID" ] && kill -0 "$WATCH_PID" 2>/dev/null; then
-    kill -TERM "$WATCH_PID" 2>/dev/null || true
-    i=0
-    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 20 ]; do
-      sleep 0.05
-      i=$((i + 1))
-    done
-    if kill -0 "$WATCH_PID" 2>/dev/null; then
-      kill -KILL "$WATCH_PID" 2>/dev/null || true
-    fi
-  fi
+  stop_watch_child 20
   [ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null || true
   WATCH_PID=
   rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER"
@@ -105,22 +158,20 @@ trap cleanup_owned_children EXIT
 FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
   FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
 WATCH_PID=$!
+capture_watch_identity
 (
-  i=0
   sleep "$SECONDS_ARG"
   : > "$TIMEOUT_MARKER"
-  if kill -TERM "$WATCH_PID" 2>/dev/null; then
-    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 40 ]; do
-      sleep 0.05
-      i=$((i + 1))
-    done
-    if kill -0 "$WATCH_PID" 2>/dev/null; then
-      kill -KILL "$WATCH_PID" 2>/dev/null || true
-    fi
-  fi
 ) &
 TIMER_PID=$!
 
+while [ ! -e "$TIMEOUT_MARKER" ] && watch_child_matches; do
+  sleep 0.05
+done
+if [ -e "$TIMEOUT_MARKER" ]; then
+  TIMED_OUT=1
+  stop_watch_child 40
+fi
 set +e
 wait "$WATCH_PID"
 RC=$?

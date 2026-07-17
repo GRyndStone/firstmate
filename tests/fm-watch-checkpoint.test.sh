@@ -158,9 +158,42 @@ SH
   pass "timeout marks before TERM, escalates exact watcher to KILL, and reaps it"
 }
 
+test_timeout_revalidates_watcher_birth_identity_before_escalation() {
+  local home out err watcher fakebin flip identity_log status
+  home=$(make_home identity-recheck)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/identity-changing-watch.sh"
+  fakebin="$home/fakebin"
+  flip="$home/identity-flipped"
+  identity_log="$home/identity.log"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap ': > "$WATCH_IDENTITY_FLIP"; sleep 0.3; exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_IDENTITY_FLIP" ]; then
+  printf 'birth-identity-probed\n' >> "$WATCH_IDENTITY_LOG"
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" WATCH_IDENTITY_FLIP="$flip" WATCH_IDENTITY_LOG="$identity_log" \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "identity-changing timeout exit"
+  assert_contains "$(cat "$identity_log" 2>/dev/null || true)" "birth-identity-probed" \
+    "timeout escalation did not revalidate watcher birth identity after TERM"
+  pass "timeout escalation revalidates stable watcher birth identity before every later signal"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success
 test_interrupted_checkpoint_reaps_only_its_watcher
 test_timeout_marks_then_kills_only_term_resistant_watcher
+test_timeout_revalidates_watcher_birth_identity_before_escalation

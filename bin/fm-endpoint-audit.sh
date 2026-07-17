@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Read-only duplicate recovery-endpoint audit.
 #
-# The audit examines exact Herdr workspaces and Zellij sessions named by this
-# home's own task meta.
-# cmux does not expose an exact-home inventory, so its audit emits a structured
-# unavailable finding instead of enumerating app-global windows or workspaces.
+# The audit examines exact Herdr workspaces named by this home's own task meta.
+# Zellij and cmux do not expose exact-home inventories, so their audits emit
+# structured unavailable findings instead of enumerating shared namespaces.
 # It never closes or mutates an endpoint.
 #
 # A task label with more than one live endpoint, or one live endpoint that does
@@ -215,83 +214,8 @@ for meta in "$STATE"/*.meta; do
 done
 
 audit_zellij_meta() {
-  local meta=$1 id session target sessions tabs panes scoped live_json recorded recorded_tab ghost count
-  id=$(basename "$meta" .meta)
-  target=$(fm_backend_target_of_meta "$meta")
-  session=$(fm_meta_get "$meta" zellij_session)
-  [ -n "$session" ] || session=${target%%:*}
-  [ -n "$session" ] || { echo "fm-endpoint-audit: Zellij meta $meta lacks an exact session target" >&2; return 1; }
-  fm_backend_source zellij || return 1
-  if ! sessions=$(zellij list-sessions --short --no-formatting 2>&1); then
-    if printf '%s\n' "$sessions" | grep -Eqi 'no active zellij sessions|no sessions'; then
-      return 0
-    fi
-    echo "fm-endpoint-audit: cannot read Zellij session inventory for $session" >&2
-    return 1
-  fi
-  printf '%s\n' "$sessions" | grep -qxF "$session" || return 0
-  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>&1) || {
-    echo "fm-endpoint-audit: cannot read Zellij tabs for $session" >&2
-    return 1
-  }
-  printf '%s' "$tabs" | jq -e '
-    type == "array"
-    and all(.[]?; ((.tab_id | type) == "number") and (.tab_id == (.tab_id | floor)) and ((.name | type) == "string"))
-  ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid Zellij tab inventory for $session" >&2; return 1; }
-  panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>&1) || {
-    echo "fm-endpoint-audit: cannot read Zellij panes for $session" >&2
-    return 1
-  }
-  printf '%s' "$panes" | jq -e '
-    type == "array"
-    and all(.[]?;
-      ((.id | type) == "number") and (.id == (.id | floor))
-      and ((.tab_id | type) == "number") and (.tab_id == (.tab_id | floor))
-      and ((.is_plugin | type) == "boolean")
-    )
-  ' >/dev/null 2>&1 || { echo "fm-endpoint-audit: invalid Zellij pane inventory for $session" >&2; return 1; }
-  jq -en --argjson tabs "$tabs" --argjson panes "$panes" '
-    ($tabs | map(.tab_id)) as $tab_ids
-    | all($panes[]?; .tab_id as $pane_tab_id | ($tab_ids | index($pane_tab_id)) != null)
-  ' >/dev/null 2>&1 || {
-    echo "fm-endpoint-audit: unresolved Zellij pane tab reference for $session" >&2
-    return 1
-  }
-  scoped=$(fm_backend_zellij_scoped_title "fm-$id")
-  if ! printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
-    return 0
-  fi
-  live_json=$(jq -cn \
-    --arg session "$session" \
-    --arg want "$scoped" \
-    --argjson tabs "$tabs" \
-    --argjson panes "$panes" '
-      [
-        $tabs[]?
-        | select(.name == $want)
-        | . as $tab
-        | ([$panes[]? | select(.tab_id == $tab.tab_id and .is_plugin == false) | .id] | unique | sort) as $terminal
-        | if ($terminal | length) > 0
-          then $terminal[] | "\($session):\(.)"
-          else "\($session):tab:\($tab.tab_id)"
-          end
-      ]
-      | unique
-      | sort
-    ') || return 1
-  recorded=$target
-  recorded_tab=$(fm_meta_get "$meta" zellij_tab_id)
-  count=$(printf '%s' "$live_json" | jq 'length') || return 1
-  case "$recorded_tab" in
-    ''|*[!0-9]*) ;;
-    *)
-      ghost="$session:tab:$recorded_tab"
-      if [ "$count" -eq 1 ] && printf '%s' "$live_json" | jq -e --arg ghost "$ghost" 'index($ghost) != null' >/dev/null; then
-        return 0
-      fi
-      ;;
-  esac
-  append_anomaly zellij "$meta" "$live_json" "$recorded"
+  local meta=$1
+  append_inventory_unavailable zellij "$meta" "zellij has no exact-home duplicate inventory; shared-session sweep refused"
 }
 
 audit_cmux_meta() {

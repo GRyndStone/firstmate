@@ -84,10 +84,11 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,hold,blocked_by,reason},
+  gates{id,title,hold,blocked_by,reason,annotations},
   durable_obligations{id,type,reason,hold_reason,blocked_by,blocked_reason},
   program{source_paths,...}, reports{id,path},
-  recorded_prs{id,url}, duplicate_endpoints{...},
+  recorded_prs{id,url},
+  duplicate_endpoints{id,kind,backend,recorded,live,worktree,reason,action},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
   --all-decisions, --all-reports, --all-queued, --all-recorded-prs,
@@ -280,14 +281,17 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | {id:$t.id, key, verb, summary:(.summary | trunc(90))} ]) as $decisions_all
   | ([ .backlog.records[]
        | select(.state == "queued" and .structured)
-       | select(($all_queued == 1)
-                or .active_hold == true
-                or .active_blocked == true
-                or (((.body_excerpt // "") | test("SUPERSEDED|NOT REQUIRED|NOT-REQUIRED|DEFERRED"; "i")) | not))
+       | . as $record
        | {id, title:(.title | trunc(60)),
           hold:(if .active_hold != true then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
           blocked_by:(.active_blocked_by // "-"),
-          reason:((if .active_hold == true then .hold else (.active_blocked_reason // "-") end) | trunc(60))} ]) as $gates_all
+          reason:((if .active_hold == true then .hold else (.active_blocked_reason // "-") end) | trunc(60)),
+          annotations:(["SUPERSEDED","NOT REQUIRED","NOT-REQUIRED","DEFERRED"]
+                       | map(. as $term
+                             | select((($record.title + " " + ($record.body_excerpt // "")) | test($term; "i"))))
+                       | unique
+                       | join("|")
+                       | if . == "" then "-" else . end)} ]) as $gates_all
   | ([ .backlog.records[]
        | select(.state == "queued")
        | if .structured == true then
@@ -336,7 +340,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       }],
       reports: (if $all_reports == 1 then $reports_all else $reports_all[:$reports_n] end),
       recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end),
-      duplicate_endpoints:($snap.endpoint_anomalies | map({id:.task,backend,recorded:.recorded_endpoint,live:(.live_endpoints | join("|")),worktree,action}))
+      duplicate_endpoints:($snap.endpoint_anomalies | map({id:.task,kind,backend,recorded:.recorded_endpoint,live:(.live_endpoints | join("|")),worktree,reason:(.reason // "-"),action}))
     }
   | . + (if ($unhealthy_all | length) > 0 then
            {unhealthy_endpoints:(if $all_unhealthy == 1 then $unhealthy_all else $unhealthy_all[:$unhealthy_n] end)}
@@ -352,7 +356,6 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $f_actions then empty else {surface:"watch/steer actions", reveal:"--fields actions"} end),
         (if $f_endpoints then empty else {surface:"healthy endpoint detail", reveal:"--fields endpoints"} end),
         (if $all_reports == 1 then empty else {surface:"full scout-report inventory", reveal:"--all-reports"} end),
-        (if $all_queued == 1 then empty else {surface:"non-active superseded queued items", reveal:"--all-queued"} end),
         (if $all_in_flight == 0 and ($in_flight_all | length) > $in_flight_n then {surface:("in_flight showing \($in_flight_n) of \($in_flight_all | length)"), reveal:"--all-in-flight"} else empty end),
         (if $all_decisions == 0 and ($decisions_all | length) > $decisions_n then {surface:("decisions_open showing \($decisions_n) of \($decisions_all | length)"), reveal:"--all-decisions"} else empty end),
         (if $all_queued == 0 and ($gates_all | length) > $gates_n then {surface:("gates showing \($gates_n) of \($gates_all | length)"), reveal:"--all-queued"} else empty end),

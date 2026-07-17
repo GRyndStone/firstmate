@@ -18,13 +18,14 @@ It persists the completion proof and exact-backlog-record phase in canonically e
 Cleanup ownership combines canonical path identity with a random task-owned marker outside worktree contents, so filesystem identity reuse cannot authorize removal of a replacement target.
 An interrupted retry refuses a changed backlog record and cannot inspect or remove a path after either ownership binding no longer matches.
 After independently confirmed cleanup, lifecycle state remains through serialized backlog finalization and is removed only after that mutation succeeds.
-Before automatic endpoint closure, teardown runs the same-home duplicate audit for Herdr and Zellij tasks and refuses any duplicate or replacement endpoint, leaving exact reconciliation to the supervisor.
-cmux exposes no exact-home inventory source, so its read-only audit emits a structured `inventory_unavailable` finding without issuing an app-global inventory command, and teardown refuses that finding before endpoint closure.
+Before automatic endpoint closure, teardown runs the same-home duplicate audit for Herdr tasks and refuses any duplicate or replacement endpoint, leaving exact reconciliation to the supervisor.
+Zellij and cmux expose no exact-home inventory source, so their read-only audits emit a structured `inventory_unavailable` finding without issuing a shared-session or app-global inventory command, and teardown refuses that finding before endpoint closure.
 Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
 If the Done mutation fails after teardown, the lifecycle is safely closed, finalization remains retryable, and the command fails loudly with the backlog outside Done.
 Manual backend mode suppresses the `TASKS_AXI: available` capability notice, while the wrapper remains the normal path for home-scoped reads, serialized mutations, and receipt-gated completion.
-Direct hand-editing is the sanctioned narrow fallback for routine non-completion changes only when one operator has exclusive single-owner authority over the home, no other agent or session can mutate its backlog, and no completion proof, claim, or teardown stage exists for an affected task.
-Any concurrent-agent or multi-session context must use the wrapper and its home-scoped lock; if the wrapper is unavailable, that mutation waits.
+Direct hand-editing is sanctioned only in manual mode when one operator has exclusive single-owner authority over the home, no executable backend wrapper or lock-backed mutation path is available, no other agent or session can mutate its backlog, and no completion proof, claim, or teardown stage exists for an affected task.
+Whenever the serialized wrapper or a lock-backed mutation path is available, every edit must route through it.
+Any concurrent-agent or multi-session mutation waits unless it can use that serialized path.
 Manual edits must never add, move, alter, or remove a Done record, because all completion and scout-report recording remains mechanically owned by `fm-teardown.sh` and receipt-gated `bin/fm-backlog.sh done`.
 Inspect the current record immediately before an allowed manual edit and preserve the existing backlog grammar exactly.
 Secondmate handoffs are separate and unconditional: `fm-backlog-handoff.sh` keeps only its own fleet-level validation and always delegates the item move to `tasks-axi mv`, the single owner of the backlog format.
@@ -76,9 +77,9 @@ These five sentences are the single owner of the task-selector vocabulary; backe
 Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
 `bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate endpoints on backends with an exact-home inventory boundary.
-For Herdr it queries only sessions and exact workspace ids named by the active home's own meta, and for Zellij it queries only the exact recorded session for that home's scoped task title.
+For Herdr it queries only sessions and exact workspace ids named by the active home's own meta.
 It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
-For cmux it emits a structured `inventory_unavailable` finding without enumerating the app-global window namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
+For Zellij and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global window namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
 Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.

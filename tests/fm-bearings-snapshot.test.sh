@@ -202,18 +202,48 @@ test_report_pointers_surface() {
   pass "current report pointers surface"
 }
 
-test_superseded_queued_item_dropped_by_default() {
+test_queued_prose_annotations_do_not_hide_tasks() {
   local home fakebin json
   home=$(make_home superseded); write_fixture "$home"
   fakebin=$(make_fakebin "$home")
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
-    (.gates | any(.[]; .id == "live-gate")) and (.gates | any(.[]; .id == "dead-gate") | not)
-  ' >/dev/null || fail "default gates must include live and drop superseded: $json"
-  json=$(run "$home" "$fakebin" --json --all-queued)
-  printf '%s' "$json" | jq -e '.gates | any(.[]; .id == "dead-gate")' >/dev/null \
-    || fail "--all-queued must restore the superseded item"
-  pass "superseded queued items are dropped by default and restored with --all-queued"
+    (.gates | any(.[]; .id == "live-gate" and .annotations == "-"))
+      and (.gates | any(.[]; .id == "dead-gate" and (.annotations | contains("NOT REQUIRED"))))
+  ' >/dev/null || fail "queued prose annotations hid a tasks-axi runnable record: $json"
+  pass "queued prose annotations are visible without changing task state"
+}
+
+test_endpoint_anomaly_kind_and_reason_surface() {
+  local home fakebin json
+  home=$(make_home endpoint-anomaly)
+  printf '## Queued\n' > "$home/data/backlog.md"
+  fm_write_meta "$home/state/cmux-task.meta" \
+    'backend=cmux' \
+    'window=ws-a:sf-a' \
+    'cmux_workspace_id=ws-a' \
+    'cmux_surface_id=sf-a' \
+    'worktree=/owned/worktree' \
+    'project=firstmate' \
+    'kind=ship' \
+    'mode=no-mistakes'
+  fakebin=$(make_fakebin "$home")
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/cmux"
+  chmod +x "$fakebin/cmux"
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .duplicate_endpoints == [{
+      id:"cmux-task",
+      kind:"inventory_unavailable",
+      backend:"cmux",
+      recorded:"ws-a:sf-a",
+      live:"",
+      worktree:"/owned/worktree",
+      reason:"cmux has no exact-home duplicate inventory; app-global sweep refused",
+      action:"inspect; do not auto-close"
+    }]
+  ' >/dev/null || fail "bearings dropped endpoint anomaly kind or reason: $json"
+  pass "bearings preserves endpoint anomaly kind and reason"
 }
 
 test_held_work_and_program_boundary_are_never_omitted() {
@@ -549,7 +579,8 @@ test_toon_json_parity
 test_completed_scout_report_not_pending
 test_open_decision_surfaces_end_to_end
 test_report_pointers_surface
-test_superseded_queued_item_dropped_by_default
+test_queued_prose_annotations_do_not_hide_tasks
+test_endpoint_anomaly_kind_and_reason_surface
 test_held_work_and_program_boundary_are_never_omitted
 test_program_source_paths_are_bounded_and_disclosed
 test_durable_obligations_are_bounded_and_disclosed

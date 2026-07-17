@@ -113,6 +113,26 @@ function retryDelay() {
   return Math.max(10, Math.min(300000, Math.trunc(configured)));
 }
 
+function promptTimeout() {
+  const configured = Number(process.env.FM_TURNEND_HANDOFF_PROMPT_TIMEOUT_MS ?? 15000);
+  if (!Number.isFinite(configured)) return 15000;
+  return Math.max(10, Math.min(300000, Math.trunc(configured)));
+}
+
+async function promptWithTimeout(client, request) {
+  let timer;
+  try {
+    await Promise.race([
+      client.session.promptAsync(request),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("OpenCode continuation delivery timed out")), promptTimeout());
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function letWatchArmRun(sessionID, client) {
   const coordinator = globalThis[COORDINATOR_KEY];
   if (!coordinator?.ensureArmed) return false;
@@ -181,7 +201,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     }
     followupDeliveryActive.add(sessionID);
     try {
-      await client.session.promptAsync({
+      await promptWithTimeout(client, {
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: handoff.message }] },
       });

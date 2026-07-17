@@ -709,6 +709,54 @@ EOF
   pass "fm-turnend-guard-grok: pending replacement and token readiness are one serialized transition"
 }
 
+test_grok_live_owner_must_match_current_pending_token() {
+  local dir fakebin log key pending owner_pid owner_identity release_pid out status i delivery
+  dir=$(make_primary_dir "$TMP_ROOT/grok-owner-token-race")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-owner-token-race-fakebin")
+  log="$TMP_ROOT/grok-owner-token-race.log"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$log"
+EOF
+  chmod +x "$fakebin/grok"
+  if command -v shasum >/dev/null 2>&1; then
+    key=$(printf '%s' 'session-owner-token' | shasum -a 256 | awk '{print substr($1,1,24)}')
+  else
+    key=$(printf '%s' 'session-owner-token' | sha256sum | awk '{print substr($1,1,24)}')
+  fi
+  mkdir -p "$dir/state/.turnend-handoffs"
+  pending="$dir/state/.turnend-handoffs/grok-$key.pending"
+  sleep 1 &
+  owner_pid=$!
+  owner_identity=$(. "$dir/bin/fm-wake-lib.sh"; fm_pid_identity "$owner_pid")
+  printf 'completed-token\n%s\n%s\n' "$owner_pid" "$owner_identity" > "$pending.delivery"
+  (
+    sleep 0.2
+    rm -f "$pending.delivery"
+  ) &
+  release_pid=$!
+  out=$(printf '{"sessionId":"session-owner-token","hookEventName":"stop"}' \
+    | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "Grok must replace a live owner that is not bound to a current pending token"
+  [ -z "$out" ] || fail "Grok owner-token race printed output: $out"
+  wait "$release_pid"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$log" ] && break
+    sleep 0.1
+  done
+  [ -s "$log" ] || fail "Grok accepted a live delivery pid without a matching pending token"
+  kill "$owner_pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    delivery=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.delivery' -print -quit 2>/dev/null)
+    [ -z "$delivery" ] && break
+    sleep 0.1
+  done
+  [ -z "$delivery" ] || fail "Grok token-bound replacement retained its delivery owner"
+  pass "fm-turnend-guard-grok: live owners are bound to current pending tokens"
+}
+
 test_grok_healthy_stop_invalidates_stale_pending() {
   local dir fakebin started release out status i pending delivery
   dir=$(make_primary_dir "$TMP_ROOT/grok-stale-pending")
@@ -1135,6 +1183,56 @@ EOF
   expect_code 0 "$status" "OpenCode guard must persist and retry failed continuation delivery"
   [ -z "$out" ] || fail "OpenCode delivery-failure test printed output: $out"
   pass ".opencode primary plugin: retry owner retains handoff until SDK acknowledgement"
+}
+
+test_opencode_plugin_retries_hung_prompt_delivery() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-prompt-hang-root"
+  home="$TMP_ROOT/opencode-prompt-hang-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'hung prompt guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 FM_TURNEND_HANDOFF_PROMPT_TIMEOUT_MS=10 node 2>&1 <<'EOF'
+import { existsSync, readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let attempts = 0;
+const client = { session: { promptAsync: () => {
+  attempts += 1;
+  if (attempts < 3) return new Promise(() => {});
+  return Promise.resolve();
+} } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+const idle = { event: { type: "session.idle", properties: { sessionID: "prompt-hang" } } };
+const started = Date.now();
+await hooks.event(idle);
+if (Date.now() - started > 1000) throw new Error("hung promptAsync was not bounded");
+const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
+if (!existsSync(handoffDir) || !readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
+  throw new Error("timed-out OpenCode delivery lost its durable handoff");
+}
+for (let i = 0; i < 100 && attempts < 3; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (attempts < 3) throw new Error(`hung OpenCode delivery stopped after ${attempts} attempts`);
+for (let i = 0; i < 50 && readdirSync(handoffDir).some((name) => name.endsWith(".pending")); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
+  throw new Error("acknowledged OpenCode retry retained its handoff");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode hung prompt delivery must time out and retain retry ownership"
+  [ -z "$out" ] || fail "OpenCode prompt-hang test printed output: $out"
+  pass ".opencode primary plugin: hung prompt delivery retains future retry ownership"
 }
 
 test_opencode_plugin_fails_closed_when_guard_cannot_launch() {
@@ -1784,6 +1882,7 @@ test_grok_adapter_repeats_resume_when_still_blind
 test_grok_adapter_preserves_failed_delivery_handoff
 test_grok_worker_waits_for_originating_hook_exit
 test_grok_session_delivery_is_singleton
+test_grok_live_owner_must_match_current_pending_token
 test_grok_healthy_stop_invalidates_stale_pending
 test_grok_missing_guard_fails_closed_through_retry_owner
 test_grok_handoff_preparation_failure_is_nonzero
@@ -1797,6 +1896,7 @@ test_codex_hook_ignores_nested_git_root_guard
 test_opencode_plugin_forces_followup
 test_opencode_plugin_anchors_guard_to_worktree
 test_opencode_plugin_preserves_failed_delivery_handoff
+test_opencode_plugin_retries_hung_prompt_delivery
 test_opencode_plugin_fails_closed_when_guard_cannot_launch
 test_opencode_retry_owner_is_referenced_until_healthy
 test_opencode_crewmate_does_not_recover_primary_handoff

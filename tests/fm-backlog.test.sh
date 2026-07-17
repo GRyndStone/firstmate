@@ -127,6 +127,12 @@ fi
 if [ -n "${FM_FAKE_MUTATE_BACKLOG_FILE:-}" ]; then
   printf '\nmutation-before-failure\n' >> "$FM_FAKE_MUTATE_BACKLOG_FILE"
 fi
+if [ -n "${FM_FAKE_MUTATION_WAIT_MARKER:-}" ]; then
+  : > "$FM_FAKE_MUTATION_WAIT_MARKER"
+  while [ ! -e "${FM_FAKE_MUTATION_WAIT_RELEASE:-}" ]; do
+    sleep 0.05
+  done
+fi
 [ "${FM_FAKE_FAIL_MUTATION:-0}" != 1 ] || exit 9
 exit 0
 SH
@@ -141,6 +147,17 @@ exit 1
 SH
   chmod +x "$home/fakebin/tasks-axi" "$home/fakebin/tmux"
   printf '%s\n' "$home"
+}
+
+wait_for_file() {
+  local path=$1 seconds=$2 attempts i=0
+  attempts=$((seconds * 20))
+  while [ "$i" -lt "$attempts" ]; do
+    [ ! -e "$path" ] || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
 }
 
 write_completion_proof() {
@@ -774,7 +791,62 @@ test_help_does_not_require_home_configuration() {
   status=0
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done --help >/dev/null 2>&1 || status=$?
   expect_code 0 "$status" "Done help without a task id"
-  pass "wrapper and Done help succeed without lifecycle arguments"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" update --help >/dev/null
+  assert_present "$home/state/task-a.teardown-complete" "verb-scoped help consumed a completion receipt"
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "verb-scoped help left a mutation receipt claim"
+  fi
+  pass "wrapper and verb-scoped help preserve lifecycle receipts"
+}
+
+test_interrupted_mutation_receipt_claims_reconcile_from_files() {
+  local home marker release wrapper_pid status
+  home=$(make_home interrupted-mutation-claim-unchanged)
+  marker="$home/backend-started"
+  release="$home/backend-release"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_MUTATION_WAIT_MARKER="$marker" FM_FAKE_MUTATION_WAIT_RELEASE="$release" \
+    "$BACKLOG" block task-a --by dependency-a >/dev/null 2>&1 &
+  wrapper_pid=$!
+  wait_for_file "$marker" 5 || fail "unchanged mutation never reached the backend"
+  kill -KILL "$wrapper_pid"
+  status=0
+  wait "$wrapper_pid" 2>/dev/null || status=$?
+  expect_code 137 "$status" "interrupted unchanged mutation"
+  : > "$release"
+  sleep 0.2
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" show task-a >/dev/null
+  assert_present "$home/state/task-a.teardown-complete" \
+    "unchanged interrupted mutation did not restore its receipt"
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "unchanged interrupted mutation left an orphan receipt claim"
+  fi
+
+  home=$(make_home interrupted-mutation-claim-changed)
+  marker="$home/backend-started"
+  release="$home/backend-release"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_MUTATE_BACKLOG_FILE="$home/data/backlog.md" \
+    FM_FAKE_MUTATION_WAIT_MARKER="$marker" FM_FAKE_MUTATION_WAIT_RELEASE="$release" \
+    "$BACKLOG" block task-a --by dependency-a >/dev/null 2>&1 &
+  wrapper_pid=$!
+  wait_for_file "$marker" 5 || fail "changed mutation never reached the backend"
+  kill -KILL "$wrapper_pid"
+  status=0
+  wait "$wrapper_pid" 2>/dev/null || status=$?
+  expect_code 137 "$status" "interrupted changed mutation"
+  : > "$release"
+  sleep 0.2
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" show task-a >/dev/null
+  assert_absent "$home/state/task-a.teardown-complete" \
+    "changed interrupted mutation restored stale receipt authority"
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "changed interrupted mutation left an orphan receipt claim"
+  fi
+  pass "interrupted mutation claims reconcile from durable before and current file state"
 }
 
 test_documented_overrides_remain_compatible() {
@@ -902,6 +974,7 @@ test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards
 test_tasks_axi_is_scoped_to_selected_home
 test_help_does_not_require_home_configuration
+test_interrupted_mutation_receipt_claims_reconcile_from_files
 test_documented_overrides_remain_compatible
 test_backlog_and_archive_symlink_escapes_are_rejected
 test_duplicate_markdown_archive_is_rejected

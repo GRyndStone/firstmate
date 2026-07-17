@@ -90,13 +90,52 @@ trap release_preparation EXIT
 trap 'release_preparation; exit 1' TERM INT
 
 delivery_owner_alive() {
-  local record owner_pid owner_identity
+  local pending_record expected_token pending_hook_pid pending_hook_identity pending_session record owner_token owner_pid owner_identity
+  [ -f "$PENDING" ] && [ ! -L "$PENDING" ] || return 1
+  pending_record=$(cat "$PENDING" 2>/dev/null || true)
+  expected_token=$(printf '%s\n' "$pending_record" | sed -n '1p')
+  pending_hook_pid=$(printf '%s\n' "$pending_record" | sed -n '2p')
+  pending_hook_identity=$(printf '%s\n' "$pending_record" | sed -n '3p')
+  pending_session=$(printf '%s\n' "$pending_record" | sed -n '4p')
+  [ -n "$expected_token" ] && [ -n "$pending_hook_identity" ] \
+    && [ "$pending_session" = "$SESSION_ID" ] || return 1
+  case "$pending_hook_pid" in ''|*[!0-9]*) return 1 ;; esac
   [ -f "$PENDING.delivery" ] && [ ! -L "$PENDING.delivery" ] || return 1
   record=$(cat "$PENDING.delivery" 2>/dev/null || true)
-  owner_pid=$(printf '%s\n' "$record" | sed -n '1p')
-  owner_identity=$(printf '%s\n' "$record" | sed '1d')
-  fm_pid_alive "$owner_pid" \
-    && [ "$(fm_pid_identity "$owner_pid" 2>/dev/null || true)" = "$owner_identity" ]
+  owner_token=$(printf '%s\n' "$record" | sed -n '1p')
+  owner_pid=$(printf '%s\n' "$record" | sed -n '2p')
+  owner_identity=$(printf '%s\n' "$record" | sed '1,2d')
+  [ "$owner_token" = "$expected_token" ] \
+    && fm_pid_alive "$owner_pid" \
+    && [ "$(fm_pid_identity "$owner_pid" 2>/dev/null || true)" = "$owner_identity" ] \
+    && [ "$(cat "$PENDING" 2>/dev/null || true)" = "$pending_record" ]
+}
+
+wait_for_delivery_owner_release() {
+  local attempt record owner_pid owner_identity
+  attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    [ -e "$PENDING.delivery" ] || return 0
+    [ -f "$PENDING.delivery" ] && [ ! -L "$PENDING.delivery" ] || return 1
+    record=$(cat "$PENDING.delivery" 2>/dev/null || true)
+    owner_pid=$(printf '%s\n' "$record" | sed -n '2p')
+    owner_identity=$(printf '%s\n' "$record" | sed '1,2d')
+    case "$owner_pid" in
+      ''|*[!0-9]*)
+        owner_pid=$(printf '%s\n' "$record" | sed -n '1p')
+        owner_identity=$(printf '%s\n' "$record" | sed '1d')
+        ;;
+    esac
+    if ! fm_pid_alive "$owner_pid" \
+      || [ "$(fm_pid_identity "$owner_pid" 2>/dev/null || true)" != "$owner_identity" ]; then
+      [ "$(cat "$PENDING.delivery" 2>/dev/null || true)" = "$record" ] || continue
+      rm -f "$PENDING.delivery" || return 1
+      return 0
+    fi
+    sleep 0.02
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 mkdir -p "$HANDOFF_DIR" || exit 1
@@ -118,6 +157,7 @@ fi
   fi
 }
 delivery_owner_alive && exit 0
+wait_for_delivery_owner_release || exit 1
 TMP=$(mktemp "$HANDOFF_DIR/.grok-$KEY.XXXXXX.tmp") || exit 1
 TOKEN=$(basename "$TMP")
 {

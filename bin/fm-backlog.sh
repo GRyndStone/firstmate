@@ -148,6 +148,12 @@ case "$COMMAND" in
     exit 2
     ;;
 esac
+COMMAND_HELP=0
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) COMMAND_HELP=1 ;;
+  esac
+done
 
 run_tasks_axi() {
   (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
@@ -484,16 +490,42 @@ mutation_claim_is_removable() {
   done
 }
 
+mutation_receipt_claim_is_valid() {
+  local claim=$1 entry name snapshots=0
+  [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
+  for entry in "$claim"/* "$claim"/.[!.]* "$claim"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=$(basename "$entry")
+    case "$name" in
+      snapshot-before)
+        [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+        snapshots=$((snapshots + 1))
+        ;;
+      *.teardown-complete)
+        [ ! -d "$entry" ] && [ ! -L "$entry" ] || return 1
+        ;;
+      .*.teardown-complete.claimed.*)
+        mutation_claim_is_removable "$entry" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$snapshots" -eq 1 ]
+}
+
 restore_mutation_receipts() {
-  local held destination
+  local held destination name
   [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
   for held in "$MUTATION_RECEIPT_DIR"/* "$MUTATION_RECEIPT_DIR"/.[!.]* "$MUTATION_RECEIPT_DIR"/..?*; do
     [ -e "$held" ] || [ -L "$held" ] || continue
-    destination="$STATE/$(basename "$held")"
+    name=$(basename "$held")
+    [ "$name" != snapshot-before ] || continue
+    destination="$STATE/$name"
     if [ -e "$destination" ] || [ -L "$destination" ] || ! mv "$held" "$destination"; then
       return 1
     fi
   done
+  rm -f "$MUTATION_RECEIPT_DIR/snapshot-before" || return 1
   rmdir "$MUTATION_RECEIPT_DIR" || return 1
   MUTATION_RECEIPT_DIR=
 }
@@ -505,6 +537,7 @@ discard_mutation_receipts() {
     [ -e "$held" ] || [ -L "$held" ] || continue
     name=$(basename "$held")
     case "$name" in
+      snapshot-before) rm -f "$held" || status=1 ;;
       *.teardown-complete) rm -f "$held" || status=1 ;;
       .*.teardown-complete.claimed.*) fm_tasks_axi_remove_completion_claim "$held" || status=1 ;;
       *) status=1 ;;
@@ -545,10 +578,51 @@ claim_mutation_receipts() {
     esac
   done
   MUTATION_RECEIPT_DIR=$(mktemp -d "$STATE/.backlog-receipts.claimed.XXXXXXXX") || return 1
+  if ! printf '%s\n' "$MUTATION_SNAPSHOT_BEFORE" > "$MUTATION_RECEIPT_DIR/.snapshot-before.tmp" \
+     || ! mv "$MUTATION_RECEIPT_DIR/.snapshot-before.tmp" "$MUTATION_RECEIPT_DIR/snapshot-before"; then
+    rm -f "$MUTATION_RECEIPT_DIR/.snapshot-before.tmp" 2>/dev/null || true
+    rmdir "$MUTATION_RECEIPT_DIR" 2>/dev/null || true
+    MUTATION_RECEIPT_DIR=
+    return 1
+  fi
   for candidate in "${candidates[@]}"; do
     if ! mv "$candidate" "$MUTATION_RECEIPT_DIR/"; then
       restore_mutation_receipts || true
       return 1
+    fi
+  done
+}
+
+recover_mutation_receipt_claims() {
+  local claim entry name has_receipt snapshot_before snapshot_after cleanup_only
+  for claim in "$STATE"/.backlog-receipts.claimed.*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
+    if [ ! -f "$claim/snapshot-before" ] || [ -L "$claim/snapshot-before" ]; then
+      has_receipt=0
+      cleanup_only=1
+      for entry in "$claim"/* "$claim"/.[!.]* "$claim"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name=$(basename "$entry")
+        case "$name" in
+          .snapshot-before.tmp) ;;
+          *.teardown-complete|.*.teardown-complete.claimed.*) has_receipt=1 ;;
+          *) cleanup_only=0 ;;
+        esac
+      done
+      [ "$has_receipt" -eq 0 ] && [ "$cleanup_only" -eq 1 ] || return 1
+      rm -f "$claim/.snapshot-before.tmp" || return 1
+      rmdir "$claim" || return 1
+      continue
+    fi
+    mutation_receipt_claim_is_valid "$claim" || return 1
+    snapshot_before=$(cat "$claim/snapshot-before") || return 1
+    snapshot_after=$(mutation_files_snapshot) || return 1
+    MUTATION_RECEIPT_DIR=$claim
+    if [ "$snapshot_after" = "$snapshot_before" ]; then
+      restore_mutation_receipts || return 1
+    else
+      discard_mutation_receipts || return 1
     fi
   done
 }
@@ -597,6 +671,10 @@ trap 'exit 143' TERM
 # half-completed mutation or cross-home move.
 fm_lock_acquire_wait "$BACKLOG_LOCK"
 LOCKED=1
+if ! recover_mutation_receipt_claims; then
+  echo "error: interrupted backlog mutation receipts could not be reconciled safely" >&2
+  exit 1
+fi
 
 if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   COMPLETION_PROOF="$STATE/$ID.teardown-complete"
@@ -740,7 +818,7 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   set -- "${DONE_ARGS[@]}"
 fi
 
-if [ "$COMMAND" != done ]; then
+if [ "$COMMAND" != done ] && [ "$COMMAND_HELP" -eq 0 ]; then
   MUTATION_SCOPE=
   MUTATION_ID=
   case "$COMMAND" in
