@@ -117,6 +117,16 @@ fi
 if [ -n "${FM_FAKE_ARGS_LOG:-}" ]; then
   printf 'pwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$FM_FAKE_ARGS_LOG"
 fi
+if [ -n "${FM_FAKE_RECEIPT_PATH:-}" ] && [ -n "${FM_FAKE_RECEIPT_STATE_LOG:-}" ]; then
+  if [ -e "$FM_FAKE_RECEIPT_PATH" ] || [ -L "$FM_FAKE_RECEIPT_PATH" ]; then
+    printf 'present\n' >> "$FM_FAKE_RECEIPT_STATE_LOG"
+  else
+    printf 'claimed\n' >> "$FM_FAKE_RECEIPT_STATE_LOG"
+  fi
+fi
+if [ -n "${FM_FAKE_MUTATE_BACKLOG_FILE:-}" ]; then
+  printf '\nmutation-before-failure\n' >> "$FM_FAKE_MUTATE_BACKLOG_FILE"
+fi
 [ "${FM_FAKE_FAIL_MUTATION:-0}" != 1 ] || exit 9
 exit 0
 SH
@@ -471,7 +481,7 @@ test_manual_backend_mutations_stay_serialized_and_receipt_gated() {
 }
 
 test_all_mutation_verbs_and_aliases_invalidate_proofs() {
-  local home claim out status
+  local home claim out status args_log receipt_log
 
   mutation_invalidates() {
     local name=$1
@@ -509,11 +519,25 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs() {
 
   home=$(make_home failed-block)
   write_completion_proof "$home" task-a ship delivered-local
+  receipt_log="$home/receipt-state.log"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_FAIL_MUTATION=1 \
+    FM_FAKE_RECEIPT_PATH="$home/state/task-a.teardown-complete" \
+    FM_FAKE_RECEIPT_STATE_LOG="$receipt_log" \
     "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
   expect_code 9 "$status" "failed block mutation"
+  assert_contains "$(cat "$receipt_log")" "claimed" "failed mutation reached the backend with live receipt authority"
   assert_present "$home/state/task-a.teardown-complete" "failed mutation invalidated a retryable proof"
+
+  home=$(make_home failed-after-write)
+  write_completion_proof "$home" task-a ship delivered-local
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_FAIL_MUTATION=1 \
+    FM_FAKE_MUTATE_BACKLOG_FILE="$home/data/backlog.md" \
+    "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
+  expect_code 9 "$status" "failed mutation after backend write"
+  assert_absent "$home/state/task-a.teardown-complete" \
+    "backend write followed by failure restored stale receipt authority"
 
   home=$(make_home stale-claimed-delete)
   write_completion_proof "$home" task-a ship delivered-local
@@ -535,12 +559,31 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs() {
   mkdir "$claim"
   mv "$home/state/task-a.teardown-complete" "$claim/proof"
   printf 'unexpected\n' > "$claim/extra"
+  args_log="$home/args.log"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$args_log" \
+    "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
   expect_code 1 "$status" "unsafe interrupted claim invalidation"
-  assert_contains "$out" "could not be invalidated safely" \
-    "unsafe interrupted claim invalidation did not report the partial post-mutation state"
-  pass "all successful mutation verbs and aliases invalidate affected teardown proofs"
+  assert_contains "$out" "could not be invalidated safely before backlog mutation" \
+    "unsafe interrupted claim was not rejected before mutation"
+  assert_absent "$args_log" "unsafe interrupted claim reached the mutating backend"
+  pass "mutations withdraw receipt authority before write and restore it only without mutation"
+}
+
+test_equals_note_completion_is_normalized() {
+  local home log
+  home=$(make_home equals-note)
+  log="$home/args.log"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" done task-a '--note=local main'
+  assert_contains "$(cat "$log")" "args=done task-a --note local main" \
+    "equals-form completion note was not normalized"
+  assert_not_contains "$(cat "$log")" "--note=local main" \
+    "equals-form completion note leaked alongside the wrapper acknowledgement"
+  assert_contains "$(cat "$log")" "fm-done-ack:0123456789abcdef0123456789abcdef --backend markdown" \
+    "equals-form completion note lost its teardown acknowledgement"
+  pass "equals and separated completion notes share receipt injection"
 }
 
 test_interrupted_completion_claim_reconciles_from_backlog_state() {
@@ -846,6 +889,7 @@ test_done_refuses_unresolved_meta
 test_scout_done_requires_owned_report
 test_done_requires_matching_single_use_teardown_proof
 test_all_mutation_verbs_and_aliases_invalidate_proofs
+test_equals_note_completion_is_normalized
 test_interrupted_completion_claim_reconciles_from_backlog_state
 test_empty_completion_claim_reconciles_completed_state
 test_empty_completion_claim_reconciles_restored_proof

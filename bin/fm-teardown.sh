@@ -112,6 +112,19 @@ fm_tasks_axi_valid_task_id "$ID" || {
 }
 FORCE=${2:-}
 REQUESTED_FORCE=$FORCE
+if [ "$#" -gt 2 ]; then
+  echo "error: teardown accepts only one optional --force argument" >&2
+  echo "usage: fm-teardown.sh <task-id> [--force]" >&2
+  exit 2
+fi
+case "$REQUESTED_FORCE" in
+  ''|--force) ;;
+  *)
+    echo "error: invalid teardown force request: $REQUESTED_FORCE" >&2
+    echo "usage: fm-teardown.sh <task-id> [--force]" >&2
+    exit 2
+    ;;
+esac
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
@@ -139,6 +152,22 @@ TEARDOWN_STAGE="$STATE/$ID.teardown-stage"
 AUX_OWNERS="$STATE/$ID.teardown-owners"
 BACKLOG_MUTATION_INTENT="$STATE/$ID.backlog-mutation-intent"
 META_CKSUM=$(cksum < "$META" | awk '{print $1 ":" $2}') || exit 1
+KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
+[ -n "$KIND" ] || KIND=ship
+MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
+[ -n "$MODE" ] || MODE=no-mistakes
+teardown_metadata_context_valid() {
+  case "$KIND:$MODE" in
+    ship:no-mistakes|ship:direct-PR|ship:local-only) return 0 ;;
+    scout:no-mistakes|scout:direct-PR|scout:local-only) return 0 ;;
+    secondmate:secondmate) return 0 ;;
+  esac
+  return 1
+}
+if ! teardown_metadata_context_valid; then
+  echo "REFUSED: invalid teardown metadata context kind=$KIND mode=$MODE; preserving lifecycle state." >&2
+  exit 1
+fi
 RESUMING_STAGE=0
 STAGE_PHASE=
 STAGE_OWNER_IDENTITY=
@@ -290,21 +319,21 @@ ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 ORCA_WORKTREE_STATE=
 
-KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
-[ -n "$KIND" ] || KIND=ship
-MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
-[ -n "$MODE" ] || MODE=no-mistakes
-teardown_stage_outcome_valid() {
-  case "$KIND:$STAGE_FORCE:$STAGE_OUTCOME" in
+teardown_outcome_valid() {
+  local kind=$1 mode=$2 force=$3 outcome=$4
+  case "$kind:$force:$outcome" in
     secondmate:0:not-applicable|secondmate:1:not-applicable) return 0 ;;
     scout:0:delivered-report|scout:1:discarded) return 0 ;;
     ship:0:unlanded|ship:1:discarded) return 0 ;;
-    ship:0:delivered-local) [ "$MODE" = local-only ] && return 0 ;;
-    ship:0:delivered-pr|ship:0:delivered-default) [ "$MODE" != local-only ] && return 0 ;;
+    ship:0:delivered-local) [ "$mode" = local-only ] && return 0 ;;
+    ship:0:delivered-pr|ship:0:delivered-default)
+      case "$mode" in no-mistakes|direct-PR) return 0 ;; esac
+      ;;
   esac
   return 1
 }
-if [ "$RESUMING_STAGE" -eq 1 ] && ! teardown_stage_outcome_valid; then
+if [ "$RESUMING_STAGE" -eq 1 ] \
+   && ! teardown_outcome_valid "$KIND" "$MODE" "$STAGE_FORCE" "$STAGE_OUTCOME"; then
   echo "REFUSED: invalid teardown outcome for $KIND/$MODE with force=$STAGE_FORCE in $TEARDOWN_STAGE; preserving lifecycle state." >&2
   exit 1
 fi
@@ -1129,10 +1158,6 @@ prepare_teardown_stage() {
   complete_teardown_stage_preparation || return 1
   if ! ensure_completion_proof; then
     echo "REFUSED: could not persist completion proof for $ID; no endpoint or worktree cleanup was attempted." >&2
-    rm -f "$TEARDOWN_STAGE"
-    remove_teardown_owner_marker || true
-    remove_auxiliary_markers_from "$AUX_OWNERS" || true
-    rm -f "$AUX_OWNERS"
     return 1
   fi
 }
@@ -1813,8 +1838,9 @@ validate_child_worktree_for_removal() {
 }
 
 safe_rm_rf() {
-  local target=$1 label=$2
+  local target=$1 label=$2 post_cleanup_check=${3:-}
   validate_removal_target "$target" "$label" >/dev/null || return 1
+  [ -z "$post_cleanup_check" ] || "$post_cleanup_check" || return 1
   rm -rf -- "$target"
 }
 
@@ -1896,7 +1922,7 @@ remove_firstmate_home() {
     }
     return 0
   fi
-  safe_rm_rf "$abs_home_path" "$label"
+  safe_rm_rf "$abs_home_path" "$label" "$post_cleanup_check"
 }
 
 validate_firstmate_home_children_removal() {
@@ -2242,6 +2268,10 @@ if [ "$RESUMING_STAGE" -eq 0 ]; then
     STAGE_FORCE=1
   else
     STAGE_FORCE=0
+  fi
+  if ! teardown_outcome_valid "$KIND" "$MODE" "$STAGE_FORCE" "$DELIVERY_OUTCOME"; then
+    echo "REFUSED: invalid computed teardown outcome $DELIVERY_OUTCOME for $KIND/$MODE with force=$STAGE_FORCE; preserving lifecycle state." >&2
+    exit 1
   fi
   prepare_teardown_stage || {
     echo "REFUSED: could not stage retryable teardown state for $ID; no endpoint or worktree cleanup was attempted." >&2

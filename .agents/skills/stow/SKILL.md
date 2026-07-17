@@ -39,7 +39,7 @@ The goal is a session that is safe to reset or destroy because everything durabl
    - Task-scoped notes: inspect the relevant backlog item with `bin/fm-backlog.sh show <id> --full`, judge whether the new note is new, duplicate, superseding, or obsolete, then write a considered replacement body with `bin/fm-backlog.sh update <id> --body-file <path>`.
      When the replacement intentionally supersedes prior state that should remain recoverable, add `--archive-body` to that update command so the prior body stays recoverable without copying it into the replacement.
      Never append.
-     If hand-editing `data/backlog.md` per the active backend, make the same inspect-then-update edit in place.
+     If `docs/configuration.md`'s manual single-owner exception applies, make the same inspect-then-update edit in place and never edit Done.
    - Undone next steps: file each as a queued backlog item (section 10), with `blocked-by` recorded if it genuinely depends on something else.
 
 4. **Curate with inspect-then-update.**

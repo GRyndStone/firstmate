@@ -9,6 +9,7 @@ let guardFollowupDeliveryActive = false;
 let guardFollowupAwaitingAck = "";
 let guardFollowupRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let guardFollowupPendingMessage = "";
+let guardFollowupCleanupPending = false;
 
 type LockOwnership = "owned" | "missing" | "other";
 
@@ -104,6 +105,7 @@ function readHandoff(): Handoff | undefined {
 }
 
 function persistHandoff(message: string): Handoff {
+  if (lockOwnership() !== "owned") throw new Error("Firstmate session lock is not owned");
   mkdirSync(handoffDir, { recursive: true });
   handoffSequence += 1;
   const token = `${process.pid}-${Date.now()}-${handoffSequence}`;
@@ -114,11 +116,28 @@ function persistHandoff(message: string): Handoff {
   return { record, token, message };
 }
 
-function clearHandoff(record?: string): void {
+function clearHandoff(record?: string): boolean {
+  if (lockOwnership() !== "owned") return false;
   try {
-    if (record !== undefined && readFileSync(handoffPath, "utf8").trim() !== record) return;
+    if (record !== undefined && readFileSync(handoffPath, "utf8").trim() !== record) return false;
     unlinkSync(handoffPath);
-  } catch {
+  } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") return false;
+  }
+  try {
+    readFileSync(handoffPath, "utf8");
+    return false;
+  } catch (error) {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+  }
+}
+
+function handoffAbsent(): boolean {
+  try {
+    readFileSync(handoffPath, "utf8");
+    return false;
+  } catch (error) {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
   }
 }
 
@@ -147,7 +166,12 @@ function ensureHandoff(): Handoff | undefined {
 }
 
 function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
-  if (guardFollowupRetryTimer !== undefined || (!readHandoff() && !guardFollowupPendingMessage)) return;
+  if (lockOwnership() !== "owned") {
+    cancelRetryOwner();
+    return;
+  }
+  if (guardFollowupRetryTimer !== undefined
+    || (!readHandoff() && !guardFollowupPendingMessage && !guardFollowupCleanupPending)) return;
   guardFollowupRetryTimer = setTimeout(() => {
     guardFollowupRetryTimer = undefined;
     deliverHandoff(pi);
@@ -155,7 +179,16 @@ function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
 }
 
 function deliverHandoff(pi: ExtensionAPI): void {
+  if (lockOwnership() !== "owned") {
+    cancelRetryOwner();
+    return;
+  }
   if (guardFollowupDeliveryActive) return;
+  if (guardFollowupCleanupPending) {
+    acknowledgeHandoff();
+    if (guardFollowupCleanupPending || readHandoff()) scheduleDelivery(pi);
+    return;
+  }
   const handoff = ensureHandoff();
   if (!handoff) {
     scheduleDelivery(pi);
@@ -174,11 +207,32 @@ function deliverHandoff(pi: ExtensionAPI): void {
 }
 
 function acknowledgeHandoff(): void {
+  if (lockOwnership() !== "owned") {
+    cancelRetryOwner();
+    return;
+  }
   const handoff = readHandoff();
-  if (!handoff || handoff.token !== guardFollowupAwaitingAck) return;
-  clearHandoff(handoff.record);
+  if (!handoff) {
+    if (handoffAbsent()) {
+      guardFollowupAwaitingAck = "";
+      guardFollowupPendingMessage = "";
+      guardFollowupCleanupPending = false;
+      cancelRetryOwner();
+    }
+    return;
+  }
+  if (handoff.token !== guardFollowupAwaitingAck) {
+    guardFollowupCleanupPending = false;
+    guardFollowupAwaitingAck = "";
+    return;
+  }
+  if (!clearHandoff(handoff.record)) {
+    guardFollowupCleanupPending = true;
+    return;
+  }
   guardFollowupAwaitingAck = "";
   guardFollowupPendingMessage = "";
+  guardFollowupCleanupPending = false;
   cancelRetryOwner();
 }
 
@@ -216,12 +270,22 @@ export default function (pi: ExtensionAPI) {
 
   if (inPrimaryCheckout) {
     pi.on?.("session_start", () => {
+      if (lockOwnership() !== "owned") {
+        cancelRetryOwner();
+        return;
+      }
       markLoaded();
       scheduleDelivery(pi, 0);
     });
 
     pi.on?.("agent_start", () => {
+      if (lockOwnership() !== "owned") {
+        cancelRetryOwner();
+        return;
+      }
+      guardFollowupCleanupPending = true;
       acknowledgeHandoff();
+      if (guardFollowupCleanupPending || readHandoff()) scheduleDelivery(pi);
     });
   }
 
@@ -240,11 +304,26 @@ export default function (pi: ExtensionAPI) {
 
   if (inPrimaryCheckout) {
     pi.on("agent_settled", async () => {
+      if (lockOwnership() !== "owned") {
+        cancelRetryOwner();
+        return;
+      }
       const result = await runGuard();
+      if (lockOwnership() !== "owned") {
+        cancelRetryOwner();
+        return;
+      }
       if (result.code === 0) {
-        clearHandoff();
+        const retained = readHandoff();
+        if (!clearHandoff()) {
+          if (retained) guardFollowupAwaitingAck = retained.token;
+          guardFollowupCleanupPending = true;
+          scheduleDelivery(pi);
+          return;
+        }
         guardFollowupAwaitingAck = "";
         guardFollowupPendingMessage = "";
+        guardFollowupCleanupPending = false;
         cancelRetryOwner();
         return;
       }
@@ -258,11 +337,12 @@ export default function (pi: ExtensionAPI) {
         reason;
       guardFollowupPendingMessage = message;
       guardFollowupAwaitingAck = "";
+      guardFollowupCleanupPending = false;
       cancelRetryOwner();
       deliverHandoff(pi);
     });
 
     markLoaded();
-    scheduleDelivery(pi, 0);
+    if (lockOwnership() === "owned") scheduleDelivery(pi, 0);
   }
 }

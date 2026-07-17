@@ -7,15 +7,15 @@
 # `done` additionally requires a single-use state/<id>.teardown-complete proof
 # written by successful lifecycle teardown.
 # Interrupted proof claims are reconciled from the task's resulting backlog
-# state, and every other successful mutation invalidates affected receipts.
+# state, and every other mutation claims affected receipts before backend write.
 # A scout report completion must name the owned data/<id>/report.md, which must
 # be a regular non-symlink file canonically contained by this home.
 # fm-teardown.sh calls this command only after successful endpoint/worktree
 # cleanup from its retained backlog-done-started stage, after duplicate-endpoint preflight,
 # which makes the supported completion order fail-closed.
 #
-# Manual backlog mode suppresses automatic availability reporting, but every
-# read and mutation still uses this serialized wrapper.
+# Manual backlog mode suppresses automatic availability reporting.
+# docs/configuration.md owns its exclusive single-owner hand-edit exception.
 # Usage: fm-backlog.sh <tasks-axi-command> [args...]
 set -u
 
@@ -448,6 +448,129 @@ CLAIMED_PROOF=
 CLAIM_ACK=
 CLAIM_DIR=
 CLAIM_SETTLED_STATE=
+MUTATION_RECEIPT_DIR=
+MUTATION_SNAPSHOT_BEFORE=
+MUTATION_COMMAND_SUCCEEDED=0
+MUTATION_SCOPE=
+MUTATION_ID=
+
+mutation_files_snapshot() {
+  local path
+  for path in "$BACKLOG" "$ARCHIVE_PATH"; do
+    if [ -L "$path" ]; then
+      printf 'symlink:%s:%s\n' "$path" "$(readlink "$path" 2>/dev/null || true)"
+    elif [ -f "$path" ]; then
+      printf 'file:%s:' "$path"
+      cksum < "$path" || return 1
+    elif [ -e "$path" ]; then
+      printf 'other:%s\n' "$path"
+    else
+      printf 'absent:%s\n' "$path"
+    fi
+  done
+}
+
+mutation_claim_is_removable() {
+  local claim=$1 entry name
+  [ -L "$claim" ] && return 0
+  [ -d "$claim" ] || return 0
+  for entry in "$claim"/* "$claim"/.[!.]* "$claim"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=$(basename "$entry")
+    case "$name" in
+      proof|done-ack) [ ! -d "$entry" ] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+restore_mutation_receipts() {
+  local held destination
+  [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
+  for held in "$MUTATION_RECEIPT_DIR"/* "$MUTATION_RECEIPT_DIR"/.[!.]* "$MUTATION_RECEIPT_DIR"/..?*; do
+    [ -e "$held" ] || [ -L "$held" ] || continue
+    destination="$STATE/$(basename "$held")"
+    if [ -e "$destination" ] || [ -L "$destination" ] || ! mv "$held" "$destination"; then
+      return 1
+    fi
+  done
+  rmdir "$MUTATION_RECEIPT_DIR" || return 1
+  MUTATION_RECEIPT_DIR=
+}
+
+discard_mutation_receipts() {
+  local held name status=0
+  [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
+  for held in "$MUTATION_RECEIPT_DIR"/* "$MUTATION_RECEIPT_DIR"/.[!.]* "$MUTATION_RECEIPT_DIR"/..?*; do
+    [ -e "$held" ] || [ -L "$held" ] || continue
+    name=$(basename "$held")
+    case "$name" in
+      *.teardown-complete) rm -f "$held" || status=1 ;;
+      .*.teardown-complete.claimed.*) fm_tasks_axi_remove_completion_claim "$held" || status=1 ;;
+      *) status=1 ;;
+    esac
+  done
+  [ "$status" -eq 0 ] && rmdir "$MUTATION_RECEIPT_DIR" || status=1
+  if [ "$status" -eq 0 ]; then
+    MUTATION_RECEIPT_DIR=
+  fi
+  return "$status"
+}
+
+claim_mutation_receipts() {
+  local scope=$1 id=${2:-} candidate name
+  local -a candidates=()
+  if [ "$scope" = all ]; then
+    for candidate in "$STATE"/*.teardown-complete "$STATE"/.*.teardown-complete.claimed.*; do
+      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+      candidates+=("$candidate")
+    done
+  else
+    candidate="$STATE/$id.teardown-complete"
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      candidates+=("$candidate")
+    fi
+    for candidate in "$STATE"/."$id".teardown-complete.claimed.*; do
+      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+      candidates+=("$candidate")
+    done
+  fi
+  [ "${#candidates[@]}" -gt 0 ] || return 0
+  for candidate in "${candidates[@]}"; do
+    name=$(basename "$candidate")
+    case "$name" in
+      *.teardown-complete) [ ! -d "$candidate" ] || return 1 ;;
+      .*.teardown-complete.claimed.*) mutation_claim_is_removable "$candidate" || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  MUTATION_RECEIPT_DIR=$(mktemp -d "$STATE/.backlog-receipts.claimed.XXXXXXXX") || return 1
+  for candidate in "${candidates[@]}"; do
+    if ! mv "$candidate" "$MUTATION_RECEIPT_DIR/"; then
+      restore_mutation_receipts || true
+      return 1
+    fi
+  done
+}
+
+settle_mutation_receipts() {
+  local snapshot_after
+  [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
+  if [ "$MUTATION_COMMAND_SUCCEEDED" -eq 1 ]; then
+    discard_mutation_receipts
+    return $?
+  fi
+  snapshot_after=$(mutation_files_snapshot) || {
+    discard_mutation_receipts
+    return 1
+  }
+  if [ "$snapshot_after" = "$MUTATION_SNAPSHOT_BEFORE" ]; then
+    restore_mutation_receipts
+  else
+    discard_mutation_receipts
+  fi
+}
+
 release_backlog_lock() {
   if [ "$LOCKED" -eq 1 ]; then
     fm_lock_release "$BACKLOG_LOCK"
@@ -458,6 +581,9 @@ cleanup_backlog_wrapper() {
   local status=$?
   trap - EXIT INT TERM
   if [ -n "${CLAIM_DIR:-}" ] && ! completion_claim_settle; then
+    [ "$status" -ne 0 ] || status=1
+  fi
+  if [ -n "${MUTATION_RECEIPT_DIR:-}" ] && ! settle_mutation_receipts; then
     [ "$status" -ne 0 ] || status=1
   fi
   release_backlog_lock
@@ -599,6 +725,10 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
       DONE_ARGS+=(--note "$2"$'\n'"$(done_ack_marker "$PROOF_DONE_ACK")")
       DONE_NOTE_ADDED=1
       shift 2
+    elif [ "${1#--note=}" != "$1" ]; then
+      DONE_ARGS+=(--note "${1#--note=}"$'\n'"$(done_ack_marker "$PROOF_DONE_ACK")")
+      DONE_NOTE_ADDED=1
+      shift
     else
       DONE_ARGS+=("$1")
       shift
@@ -610,8 +740,49 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   set -- "${DONE_ARGS[@]}"
 fi
 
+if [ "$COMMAND" != done ]; then
+  MUTATION_SCOPE=
+  MUTATION_ID=
+  case "$COMMAND" in
+    add)
+      MUTATION_ID=${2:-}
+      ADD_MINTED=0
+      for arg in "$@"; do
+        [ "$arg" != --mint ] || ADD_MINTED=1
+      done
+      if [ "$ADD_MINTED" -eq 1 ] || ! fm_tasks_axi_valid_task_id "$MUTATION_ID"; then
+        MUTATION_SCOPE=all
+      else
+        MUTATION_SCOPE=id
+      fi
+      ;;
+    start|reopen|update|rm|block|unblock|hold|unhold)
+      MUTATION_ID=${2:-}
+      if fm_tasks_axi_valid_task_id "$MUTATION_ID"; then
+        MUTATION_SCOPE=id
+      else
+        MUTATION_SCOPE=all
+      fi
+      ;;
+    prune|render) MUTATION_SCOPE=all ;;
+  esac
+  if [ -n "$MUTATION_SCOPE" ]; then
+    MUTATION_SNAPSHOT_BEFORE=$(mutation_files_snapshot) || {
+      echo "error: backlog state could not be captured before mutation" >&2
+      exit 1
+    }
+    if ! claim_mutation_receipts "$MUTATION_SCOPE" "$MUTATION_ID"; then
+      echo "error: completion receipts could not be invalidated safely before backlog mutation" >&2
+      exit 1
+    fi
+  fi
+fi
+
 run_tasks_axi "$@"
 STATUS=$?
+if [ "$STATUS" -eq 0 ] && [ -n "$MUTATION_SCOPE" ]; then
+  MUTATION_COMMAND_SUCCEEDED=1
+fi
 if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   if [ "$STATUS" -eq 0 ]; then
     if ! rm -f "$CLAIMED_PROOF" || ! rm -f "$CLAIM_ACK" || ! rmdir "$CLAIM_DIR"; then
@@ -634,35 +805,9 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
     fi
   fi
 fi
-if [ "$STATUS" -eq 0 ] && [ "$COMMAND" != "done" ]; then
-  case "$COMMAND" in
-    add|start|reopen|update|rm|block|unblock|hold|unhold)
-      MUTATED_ID=${2:-}
-      ADD_MINTED=0
-      if [ "$COMMAND" = add ]; then
-        for arg in "$@"; do
-          [ "$arg" != --mint ] || ADD_MINTED=1
-        done
-      fi
-      if [ "$ADD_MINTED" -eq 1 ]; then
-        if ! fm_tasks_axi_invalidate_all_completion_receipts "$STATE"; then
-          echo "error: backlog mutation succeeded but completion receipts could not be invalidated safely" >&2
-          STATUS=1
-        fi
-      elif fm_tasks_axi_valid_task_id "$MUTATED_ID"; then
-        if ! fm_tasks_axi_invalidate_completion_receipt "$STATE" "$MUTATED_ID"; then
-          echo "error: backlog mutation succeeded but completion receipts for $MUTATED_ID could not be invalidated safely" >&2
-          STATUS=1
-        fi
-      fi
-      ;;
-    prune|render)
-      if ! fm_tasks_axi_invalidate_all_completion_receipts "$STATE"; then
-        echo "error: backlog mutation succeeded but completion receipts could not be invalidated safely" >&2
-        STATUS=1
-      fi
-      ;;
-  esac
+if [ -n "$MUTATION_RECEIPT_DIR" ] && ! settle_mutation_receipts; then
+  echo "error: backlog mutation receipt claim could not be settled safely" >&2
+  STATUS=1
 fi
 release_backlog_lock
 exit "$STATUS"

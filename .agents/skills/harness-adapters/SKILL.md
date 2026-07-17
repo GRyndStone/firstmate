@@ -206,7 +206,8 @@ Pi sets `PI_CODING_AGENT=true` for its children; this is its harness-detection e
 **Primary-session guard fact (verified 2026-07-09, Pi 0.80.5).**
 The firstmate PRIMARY's own `.pi/extensions/fm-primary-turnend-guard.ts` listens for logical-run `agent_settled`, not per-tool-loop `turn_end`, durably records a blocked continuation, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to deliver it when `bin/fm-turnend-guard.sh` returns 2.
 Without `deliverAs: "followUp"`, Pi rejects the send while the agent is still processing.
-Pi's API returns `void`, so the adapter retains the process with its retry timer until the ensuing `agent_start` acknowledges a real assistant continuation or the predicate becomes healthy.
+Pi's API returns `void`, so the adapter retains the process with its retry timer until the ensuing `agent_start` acknowledges a real assistant continuation and durable handoff removal is confirmed, or the predicate becomes healthy and removal is confirmed.
+Only the Pi process that currently owns the Firstmate home session lock may schedule, deliver, recover, acknowledge, or remove the home-wide handoff; a process that loses ownership cancels its retry timer and leaves the record untouched.
 Pi's primary watcher protocol also requires the tracked `.pi/extensions/fm-primary-pi-watch.ts` extension, same trust-once discovery as the turn-end guard.
 The model arms through `fm_watch_arm_pi`, never a foreground bash arm; the watcher tool result and clean-exit fallback are owned by `docs/supervision-protocols/pi.md`.
 `bin/fm-session-start.sh` reports when the live Pi session has not loaded both the turn-end guard and watcher extensions, and points at plain `pi` after project trust as the fix, with `-e` as a trust-free fallback.
@@ -263,9 +264,10 @@ Secondmate spawns skip the pointer (idle panes are healthy, no stale-pane detect
 **Primary-session guard fact (verified 2026-07-08, Grok 0.2.91).**
 The firstmate PRIMARY's own `.grok/hooks/fm-primary-turnend-guard.json` invokes `bin/fm-turnend-guard-grok.sh`.
 Grok Stop hooks are passive for this purpose: exit 2 does not make the model continue.
-The adapter therefore runs the shared predicate and, when it returns 2, durably records one same-session follow-up and schedules bounded delivery after the current Stop hook returns; every later Stop event reruns the predicate and schedules again if blindness persists.
-The deterministic per-session worker waits for the originating hook process identity to disappear, serializes delivery with one session lock, retries until resume succeeds, and discards retained pending work when a healthy Stop proves supervision recovered.
-When the payload omits session identity, the adapter continues the latest session scoped to the verified primary checkout, and every newly launched worker must acknowledge its exact handoff token and process identity before the hook reports ownership.
+The adapter therefore runs the shared predicate and, when it returns 2, durably records one same-session follow-up and schedules bounded delivery after the current Stop hook returns; every later Stop event reruns the predicate and preserves or establishes one readiness-acknowledged owner if blindness persists.
+The deterministic per-session worker waits for the originating hook process identity to disappear, serializes pending replacement and delivery ownership with session locks, retries until resume succeeds, and discards retained pending work when a healthy Stop proves supervision recovered.
+Every newly launched worker must acknowledge its exact handoff token and process identity before the hook reports ownership.
+When the payload omits exact session identity, the adapter loudly reports the explicitly unsupported passive-product exception and schedules no ambiguous `--continue` fallback.
 An unwritable handoff directory remains an explicit Grok product exception because its passive Stop result cannot block.
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.

@@ -1827,7 +1827,7 @@ SH
 }
 
 test_completion_proof_write_failure_preserves_lifecycle() {
-  local case_dir rc proof log return_log
+  local case_dir rc proof log return_log stage marker token
   case_dir=$(make_case completion-proof-write-failure)
   write_meta "$case_dir" local-only ship
   add_compatible_tasks_axi "$case_dir"
@@ -1862,7 +1862,15 @@ SH
   [ -f "$case_dir/state/task-x1.meta" ] || fail "proof persistence failure removed task meta"
   [ -d "$case_dir/wt" ] || fail "proof persistence failure removed the worktree"
   [ ! -s "$return_log" ] || fail "proof persistence failure ran destructive worktree cleanup"
-  assert_absent "$case_dir/state/task-x1.teardown-stage" "proof persistence failure left a misleading retry stage"
+  stage="$case_dir/state/task-x1.teardown-stage"
+  [ -f "$stage" ] || fail "proof persistence failure removed durable retry authority"
+  assert_contains "$(cat "$stage")" 'phase=prepared' \
+    "proof persistence failure did not retain its prepared retry stage"
+  marker=$(sed -n 's/^owner-marker=//p' "$stage")
+  token=$(sed -n 's/^owner-token=//p' "$stage")
+  [ -f "$marker" ] || fail "proof persistence failure removed the exact owner marker"
+  assert_contains "$(cat "$marker")" "$token" \
+    "proof persistence failure changed the exact owner token"
   assert_absent "$case_dir/state/task-x1.tearing-down" "proof persistence failure entered endpoint cleanup"
   if [ -f "$log" ]; then
     assert_not_contains "$(cat "$log")" "done task-x1" \
@@ -1875,7 +1883,7 @@ SH
   expect_code 0 "$rc" "completion proof persistence retry"
   assert_contains "$(cat "$log")" "done task-x1" \
     "proof persistence retry did not complete the backlog record"
-  pass "completion proof persistence is staged before endpoint and worktree destruction"
+  pass "completion proof failures retain prepared retry authority before destructive cleanup"
 }
 
 test_cleanup_reuse_never_reuses_returned_worktree_path() {
@@ -3070,6 +3078,45 @@ SH
   pass "marker-free orphan auxiliary plans are deterministically recoverable"
 }
 
+test_fresh_teardown_context_is_validated_before_staging() {
+  local case_dir kind mode force expected rc
+  while IFS='|' read -r kind mode force expected; do
+    case_dir=$(make_case "fresh-context-${kind}-${mode}-${force#--}")
+    write_meta "$case_dir" "$mode" "$kind"
+    rc=0
+    if [ -n "$force" ]; then
+      run_teardown "$case_dir" "$force" >/dev/null 2>"$case_dir/stderr" || rc=$?
+    else
+      run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+    fi
+    [ "$rc" -ne 0 ] || fail "invalid fresh teardown context $kind/$mode/$force was accepted"
+    assert_contains "$(cat "$case_dir/stderr")" "$expected" \
+      "invalid fresh teardown context $kind/$mode/$force was not diagnosed"
+    assert_absent "$case_dir/state/task-x1.teardown-stage" \
+      "invalid fresh teardown context $kind/$mode/$force gained a teardown stage"
+    assert_absent "$case_dir/state/task-x1.teardown-complete" \
+      "invalid fresh teardown context $kind/$mode/$force gained a completion proof"
+    [ -d "$case_dir/wt" ] || fail "invalid fresh teardown context $kind/$mode/$force removed the worktree"
+    [ -f "$case_dir/state/task-x1.meta" ] || fail "invalid fresh teardown context $kind/$mode/$force removed lifecycle metadata"
+  done <<'EOF'
+unknown|local-only||invalid teardown metadata context
+ship|unknown||invalid teardown metadata context
+secondmate|local-only||invalid teardown metadata context
+ship|local-only|--discard|invalid teardown force request
+EOF
+  case_dir=$(make_case fresh-context-extra-force-argument)
+  write_meta "$case_dir" local-only ship
+  rc=0
+  run_teardown "$case_dir" --force extra >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 2 "$rc" "extra teardown force argument"
+  assert_contains "$(cat "$case_dir/stderr")" 'only one optional --force argument' \
+    "extra teardown force argument was not diagnosed"
+  assert_absent "$case_dir/state/task-x1.teardown-stage" \
+    "extra teardown force argument gained a teardown stage"
+  [ -d "$case_dir/wt" ] || fail "extra teardown force argument removed the worktree"
+  pass "fresh teardown kind, mode, and force context is validated before staging"
+}
+
 test_staged_outcome_requires_valid_context() {
   local case_dir fail_flag rc
   for outcome in invalid discarded; do
@@ -3105,6 +3152,53 @@ SH
     [ -d "$case_dir/wt" ] || fail "$outcome staged outcome removed the worktree"
   done
   pass "staged outcomes are restricted to their kind and force posture"
+}
+
+test_plain_secondmate_home_rechecks_exact_owner_before_removal() {
+  local case_dir home rc
+  case_dir=$(make_case plain-secondmate-home-replacement)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+set -u
+is_root=0
+has_worktree=0
+has_list=0
+previous=
+for arg in "$@"; do
+  if [ "$previous" = -C ] && [ "$arg" = "${FM_REPLACE_ROOT:?}" ]; then
+    is_root=1
+  fi
+  [ "$arg" != worktree ] || has_worktree=1
+  [ "$arg" != list ] || has_list=1
+  previous=$arg
+done
+if [ "$is_root" -eq 1 ] && [ "$has_worktree" -eq 1 ] && [ "$has_list" -eq 1 ] \
+   && [ ! -e "${FM_REPLACE_FLAG:?}" ]; then
+  : > "$FM_REPLACE_FLAG"
+  /bin/rm -rf -- "${FM_REPLACE_HOME:?}"
+  mkdir -p "$FM_REPLACE_HOME/state" "$FM_REPLACE_HOME/data" \
+    "$FM_REPLACE_HOME/config" "$FM_REPLACE_HOME/projects"
+  printf 'task-x1\n' > "$FM_REPLACE_HOME/.fm-secondmate-home"
+  : > "$FM_REPLACE_HOME/replacement-owned"
+fi
+exec "${REAL_GIT_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+  rc=0
+  FM_REPLACE_ROOT="$ROOT" FM_REPLACE_HOME="$home" FM_REPLACE_FLAG="$case_dir/home-replaced" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "plain secondmate home replacement"
+  [ -f "$home/replacement-owned" ] || fail "plain secondmate home cleanup removed a replacement without exact authority"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "plain secondmate home authority loss removed lifecycle metadata"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=worktree-cleanup-started' \
+    "plain secondmate home authority loss was not retained for reconciliation"
+  pass "plain secondmate home removal rechecks exact staged authority"
 }
 
 test_symlinked_auxiliary_targets_are_refused() {
@@ -3285,7 +3379,9 @@ test_tasktmp_replacement_loses_auxiliary_cleanup_authority
 test_child_worktree_replacement_loses_auxiliary_cleanup_authority
 test_interrupted_stage_preparation_is_retryable
 test_orphan_auxiliary_plan_without_markers_is_recoverable
+test_fresh_teardown_context_is_validated_before_staging
 test_staged_outcome_requires_valid_context
+test_plain_secondmate_home_rechecks_exact_owner_before_removal
 test_symlinked_auxiliary_targets_are_refused
 test_child_treehouse_retry_revalidates_auxiliary_authority
 test_finalizing_retry_rechecks_current_record

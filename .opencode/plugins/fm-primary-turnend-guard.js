@@ -94,9 +94,16 @@ function readHandoff(root, sessionID) {
 function clearHandoff(root, sessionID, record) {
   const handoff = handoffPath(root, sessionID);
   try {
-    if (record !== undefined && readFileSync(handoff.path, "utf8").trim() !== record) return;
+    if (record !== undefined && readFileSync(handoff.path, "utf8").trim() !== record) return false;
     unlinkSync(handoff.path);
-  } catch {
+  } catch (error) {
+    if (error?.code !== "ENOENT") return false;
+  }
+  try {
+    readFileSync(handoff.path, "utf8");
+    return false;
+  } catch (error) {
+    return error?.code === "ENOENT";
   }
 }
 
@@ -119,6 +126,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
   const followupDeliveryActive = new Set();
   const retryTimers = new Map();
   const pendingMessages = new Map();
+  const acknowledgedRecords = new Map();
 
   const cancelRetryOwner = (sessionID) => {
     const timer = retryTimers.get(sessionID);
@@ -127,7 +135,8 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
   };
 
   const scheduleDelivery = (sessionID, delay = retryDelay()) => {
-    if (retryTimers.has(sessionID) || (!readHandoff(root, sessionID) && !pendingMessages.has(sessionID))) return;
+    if (retryTimers.has(sessionID)
+      || (!readHandoff(root, sessionID) && !pendingMessages.has(sessionID) && !acknowledgedRecords.has(sessionID))) return;
     const timer = setTimeout(() => {
       retryTimers.delete(sessionID);
       void deliverHandoff(sessionID);
@@ -151,6 +160,20 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
 
   const deliverHandoff = async (sessionID) => {
     if (followupDeliveryActive.has(sessionID)) return;
+    const acknowledgedRecord = acknowledgedRecords.get(sessionID);
+    if (acknowledgedRecord !== undefined) {
+      const current = readHandoff(root, sessionID);
+      if (current && current.record !== acknowledgedRecord) {
+        acknowledgedRecords.delete(sessionID);
+      } else if (clearHandoff(root, sessionID, acknowledgedRecord)) {
+        acknowledgedRecords.delete(sessionID);
+        cancelRetryOwner(sessionID);
+        return;
+      } else {
+        scheduleDelivery(sessionID);
+        return;
+      }
+    }
     const handoff = ensureHandoff(sessionID);
     if (!handoff) {
       scheduleDelivery(sessionID);
@@ -162,8 +185,11 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: handoff.message }] },
       });
-      clearHandoff(root, sessionID, handoff.record);
-      cancelRetryOwner(sessionID);
+      acknowledgedRecords.set(sessionID, handoff.record);
+      if (clearHandoff(root, sessionID, handoff.record)) {
+        acknowledgedRecords.delete(sessionID);
+        cancelRetryOwner(sessionID);
+      }
     } catch {
     } finally {
       followupDeliveryActive.delete(sessionID);
@@ -195,7 +221,13 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
 
       const result = await runGuard(root);
       if (result.code === 0) {
-        clearHandoff(root, sessionID);
+        const retained = readHandoff(root, sessionID);
+        if (!clearHandoff(root, sessionID)) {
+          if (retained) acknowledgedRecords.set(sessionID, retained.record);
+          scheduleDelivery(sessionID);
+          return;
+        }
+        acknowledgedRecords.delete(sessionID);
         pendingMessages.delete(sessionID);
         cancelRetryOwner(sessionID);
         return;
@@ -209,6 +241,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
         "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
         reason;
       pendingMessages.set(sessionID, message);
+      acknowledgedRecords.delete(sessionID);
       cancelRetryOwner(sessionID);
       await deliverHandoff(sessionID);
     },
