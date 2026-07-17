@@ -25,6 +25,9 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
    If the command is unavailable, fall back to `bin/fm-fleet-snapshot.sh --json` and `bin/fm-crew-state.sh <id>`; never infer current state from a raw `tail` of `state/<id>.status`, which is append-only wake-event history whose last line goes stale.
    A queued item under `gates` only becomes "next work" when its blocker and structured hold are gone and its time/date gate has arrived; until then it stays queued with the reason.
    Always include held queued items in the accounting instead of treating them as omitted work.
+   Read every `durable_obligations` row even when `runnable_candidates` is zero.
+   Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued** with their reasons, and route `unstructured` rows that require supervisor interpretation to **Plans / main pickup points**.
+   When an `omitted` row says `durable obligations showing ...`, state that the projection is truncated and include its `reveal` action; never describe the durable-obligation accounting as complete.
    Read the `program` row even when `runnable_candidates` is zero.
    When it names durable program sources, report that an empty runnable queue does not prove program completion and audit the named sources for obligations that were never materialized as tasks.
    That decomposition audit requires supervisor judgment because the snapshot can point to durable program documents but cannot infer every intended obligation from prose.

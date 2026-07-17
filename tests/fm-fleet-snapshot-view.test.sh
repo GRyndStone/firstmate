@@ -59,7 +59,16 @@ case "${1:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux"
+  cat > "$fb/cmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ping) printf '%s\n' PONG ;;
+  list-windows) printf '%s\n' '[{"id":"fixture-window"}]' ;;
+  workspace) printf '%s\n' '{"workspaces":[]}' ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/cmux"
   printf '%s\n' "$fb"
 }
 
@@ -493,9 +502,10 @@ EOF
 }
 
 test_backlog_rows_match_tasks_axi_section_grammar() {
-  local home out
+  local home out tab
   home=$(make_home exact-row-grammar)
-  cat > "$home/data/backlog.md" <<'EOF'
+  tab=$(printf '\t')
+  cat > "$home/data/backlog.md" <<EOF
 ## In flight
 - [ ] active-checkbox - Active checkbox
 - **active-legacy** - Active legacy
@@ -503,6 +513,9 @@ test_backlog_rows_match_tasks_axi_section_grammar() {
 
 ## Queued
 - [ ] runnable - Runnable task
+  canonical body continuation
+ one-space raw obligation
+${tab}tab-prefixed raw obligation
 - [x] checked-queued - Not queued
 - **bold-queued** - Not queued
 * [ ] star-bullet - Not queued
@@ -515,16 +528,19 @@ test_backlog_rows_match_tasks_axi_section_grammar() {
 EOF
   out=$(FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
-    .queue_accounting.queued_total == 6
+    .queue_accounting.queued_total == 8
       and .queue_accounting.structured_queued == 1
-      and .queue_accounting.unstructured_queued == 5
+      and .queue_accounting.unstructured_queued == 7
       and .queue_accounting.runnable_candidates == 1
       and ([.backlog.records[] | select(.structured) | .id]
            == ["active-checkbox","active-legacy","runnable","landed"])
-      and ([.backlog.records[] | select(.state == "queued" and .structured != true)] | length == 5)
+      and (.backlog.records[] | select(.id == "runnable") | .body_excerpt == "canonical body continuation")
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true)] | length == 7)
+      and ([.backlog.records[] | select(.raw == " one-space raw obligation")] | length == 1)
+      and ([.backlog.records[] | select(.raw == "\ttab-prefixed raw obligation")] | length == 1)
       and ([.backlog.records[] | select(.state == "done" and .structured != true)] | length == 1)
   ' >/dev/null || fail "snapshot accepted rows outside tasks-axi section grammar: $out"
-  pass "snapshot recognizes only tasks-axi canonical section rows"
+  pass "snapshot recognizes tasks-axi rows and exact two-space continuations"
 }
 
 test_view_renders_dead_secondmate_agent_status() {

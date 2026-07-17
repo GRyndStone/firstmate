@@ -30,6 +30,7 @@
 #      start a new run. A working event plus a readable busy pane can therefore
 #      supersede a recoverable terminal classification when that event names
 #      the exact terminal run as `after-run=<id>`; passed stays final.
+#      A coarse runs-list entry carries no run id and cannot be superseded.
 #      Before recovered work starts a new run, its brief requires a distinct
 #      `working: validating-after-run=<id>` event. During that handoff the named
 #      old terminal remains recoverable; a full current run with a different id
@@ -396,29 +397,45 @@ nm_runs_record_for_branch() {  # <branch>
   return 0
 }
 
-recovery_run_id() {
-  local note token prefix id
-  [ "$LOG_VERB" = working ] || return 1
-  note=$(status_line_note "$LOG_LINE")
-  case "$note" in
-    after-run=*) prefix=after-run= ;;
-    validating-after-run=*) prefix=validating-after-run= ;;
-    *) return 1 ;;
-  esac
-  token=${note%%[[:space:]]*}
-  id=${token#"$prefix"}
-  case "$id" in ''|*[!A-Za-z0-9]*) return 1 ;; esac
-  printf '%s' "$id"
+recovery_context() {
+  local line verb note token prefix id="" kind=""
+  [ -f "$LOG" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$(trim "$line")" ] || continue
+    verb=$(status_line_verb "$line")
+    if [ "$verb" = working ]; then
+      note=$(status_line_note "$line")
+      case "$note" in
+        after-run=*) prefix=after-run= ;;
+        validating-after-run=*) prefix=validating-after-run= ;;
+        *) id=""; kind=""; continue ;;
+      esac
+      token=${note%%[[:space:]]*}
+      id=${token#"$prefix"}
+      case "$id" in
+        ''|*[!A-Za-z0-9]*) id=""; kind="" ;;
+        *) kind=working ;;
+      esac
+    elif [ -n "$id" ]; then
+      case "$verb" in
+        needs-decision|blocked) kind=signal ;;
+        *) id=""; kind="" ;;
+      esac
+    fi
+  done < "$LOG"
+  [ -n "$id" ] && [ -n "$kind" ] || return 1
+  printf '%s|%s' "$id" "$kind"
 }
 
-exact_recovery_pane_evidence() {
-  local recovery_id current_id recovery_out saved_out recovery_branch recovery_outcome recovery_status recovery_head expected_coarse
-  recovery_id=$(recovery_run_id) || return 1
-
-  if [ "$RUN_SOURCE" = full ]; then
-    current_id=$(strip_quotes "$(nm_field id)")
-    [ -n "$current_id" ] && [ "$current_id" = "$recovery_id" ] || return 1
-  fi
+RECOVERY_CONTEXT_KIND=""
+exact_recovery_evidence() {
+  local context recovery_id current_id recovery_out saved_out recovery_branch recovery_outcome recovery_status
+  [ "$RUN_SOURCE" = full ] || return 1
+  context=$(recovery_context) || return 1
+  recovery_id=${context%%|*}
+  RECOVERY_CONTEXT_KIND=${context#*|}
+  current_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$current_id" ] && [ "$current_id" = "$recovery_id" ] || return 1
 
   recovery_out=$(nm_run axi status --run "$recovery_id")
   [ -n "$recovery_out" ] || return 1
@@ -427,33 +444,25 @@ exact_recovery_pane_evidence() {
   recovery_branch=$(strip_quotes "$(nm_field branch)")
   recovery_outcome=$(strip_quotes "$(nm_field outcome)")
   recovery_status=$(strip_quotes "$(nm_field status)")
-  recovery_head=$(strip_quotes "$(nm_field head)")
   RUN_OUT=$saved_out
 
   [ "$recovery_branch" = "$CREW_BRANCH" ] || return 1
   case "$recovery_outcome" in
-    checks-passed) expected_coarse=completed ;;
-    failed) expected_coarse=failed ;;
-    cancelled) expected_coarse=cancelled ;;
+    checks-passed|failed|cancelled) ;;
     passed) return 1 ;;
     "")
       case "$recovery_status" in
-        failed) expected_coarse=failed ;;
-        cancelled) expected_coarse=cancelled ;;
+        failed|cancelled) ;;
         *) return 1 ;;
       esac
       ;;
     *) return 1 ;;
   esac
 
-  if [ "$RUN_SOURCE" = coarse ]; then
-    [ "$COARSE_STATUS" = "$expected_coarse" ] || return 1
-    [ -n "$COARSE_HEAD" ] && [ -n "$recovery_head" ] || return 1
-    case "$recovery_head" in "$COARSE_HEAD"*) ;; *) return 1 ;; esac
+  if [ "$RECOVERY_CONTEXT_KIND" = working ]; then
+    [ -n "$BACKEND_TARGET" ] || return 1
+    pane_readable "$BACKEND_TARGET" && crew_pane_is_busy "$BACKEND_TARGET"
   fi
-
-  [ -n "$BACKEND_TARGET" ] || return 1
-  pane_readable "$BACKEND_TARGET" && crew_pane_is_busy "$BACKEND_TARGET"
 }
 
 # CREW_BRANCH is empty at detached HEAD (a just-spawned crew, or a scout's
@@ -602,7 +611,10 @@ if [ "$HAVE_RUN" = 1 ]; then
   fi
 
   if [ "$RUN_RECOVERABLE_TERMINAL" = 1 ]; then
-    if exact_recovery_pane_evidence; then
+    if exact_recovery_evidence; then
+      if [ "$RECOVERY_CONTEXT_KIND" = signal ]; then
+        emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")${SEP}exact-run recovery context supersedes $RUN_DETAIL"
+      fi
       emit working pane "exact-run recovery status and busy pane supersede $RUN_DETAIL"
     fi
   fi

@@ -107,20 +107,26 @@ FORCE=${2:-}
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 COMPLETION_PROOF="$STATE/$ID.teardown-complete"
-rm -f "$COMPLETION_PROOF"
+if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
+  rm -f "$COMPLETION_PROOF" 2>/dev/null || {
+    echo "REFUSED: cannot clear stale completion proof at $COMPLETION_PROOF; preserving lifecycle state." >&2
+    exit 1
+  }
+fi
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 BACKEND=$(fm_backend_of_meta "$META")
-if [ "$BACKEND" = herdr ]; then
+case "$BACKEND" in
+  herdr|zellij|cmux)
   DUPLICATE_AUDIT=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
       FM_STATE_OVERRIDE="$STATE" \
-      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$ID"
   ) || {
     echo "REFUSED: could not complete the same-home duplicate endpoint audit for $ID." >&2
-    echo "Restore read-only Herdr inventory access and retry; teardown will not guess which endpoint is owned." >&2
+    echo "Restore read-only $BACKEND inventory access and retry; teardown will not guess which endpoint is owned." >&2
     exit 1
   }
   DUPLICATE_LIVE=$(printf '%s' "$DUPLICATE_AUDIT" | jq -r --arg id "$ID" \
@@ -130,7 +136,8 @@ if [ "$BACKEND" = herdr ]; then
     echo "Inspect and reconcile exact endpoints without a broad sweep or automatic closure, then retry teardown." >&2
     exit 1
   fi
-fi
+  ;;
+esac
 if [ "$BACKEND" = orca ]; then
   T_ORCA=$(grep '^terminal=' "$META" | tail -1 | cut -d= -f2- || true)
   [ -n "$T_ORCA" ] && T=$T_ORCA
@@ -436,14 +443,25 @@ write_completion_proof() {
     *) return 0 ;;
   esac
   tmp="$COMPLETION_PROOF.tmp.$$"
-  {
+  if ! {
     printf 'version=1\n'
     printf 'task=%s\n' "$ID"
     printf 'kind=%s\n' "$KIND"
     printf 'outcome=%s\n' "$DELIVERY_OUTCOME"
     printf 'record-cksum=%s\n' "$BACKLOG_RECORD_CKSUM"
-  } > "$tmp"
-  mv "$tmp" "$COMPLETION_PROOF"
+  } > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv "$tmp" "$COMPLETION_PROOF"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  [ -f "$COMPLETION_PROOF" ] && [ ! -L "$COMPLETION_PROOF" ]
 }
 
 registry_home_for_line() {
@@ -1242,7 +1260,10 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-write_completion_proof
+write_completion_proof || {
+  echo "REFUSED: could not persist completion proof for $ID; preserving lifecycle state for retry." >&2
+  exit 1
+}
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

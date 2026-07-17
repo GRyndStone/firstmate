@@ -1350,6 +1350,147 @@ SH
   pass "Herdr duplicate endpoints block teardown and remain inspect-only"
 }
 
+test_zellij_duplicate_endpoints_refuse_teardown_without_closure() {
+  local case_dir log rc title
+  case_dir=$(make_case zellij-duplicate-refusal)
+  write_meta "$case_dir" local-only ship
+  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  sed -i.bak 's/^window=.*/window=fm:42/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=zellij' 'zellij_session=fm' 'zellij_tab_id=7' 'zellij_pane_id=42' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/zellij.log"
+  cat > "$case_dir/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
+if [ "${1:-}" = list-sessions ]; then
+  printf '%s\n' fm
+  exit 0
+fi
+if [ "${1:-}" = --session ]; then
+  shift 2
+fi
+case "$*" in
+  "action list-tabs --json")
+    printf '[{"tab_id":7,"name":"%s"},{"tab_id":8,"name":"%s"}]\n' "${FM_DUPLICATE_TITLE:?}" "${FM_DUPLICATE_TITLE:?}"
+    ;;
+  "action list-panes --json")
+    printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false},{"id":43,"tab_id":8,"is_plugin":false}]'
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/zellij"
+
+  rc=0
+  FM_ZELLIJ_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "Zellij duplicate endpoint teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
+    "Zellij teardown did not refuse the endpoint ownership anomaly"
+  assert_contains "$(cat "$case_dir/stderr")" "fm:42,fm:43" \
+    "Zellij teardown refusal did not identify both exact duplicate tabs"
+  assert_not_contains "$(cat "$log")" "close-tab" "Zellij duplicate refusal automatically closed an endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "Zellij duplicate refusal removed task meta"
+  pass "Zellij duplicate endpoints block teardown before any automatic closure"
+}
+
+test_zellij_replacement_endpoint_refuses_teardown_without_closure() {
+  local case_dir log rc title
+  case_dir=$(make_case zellij-replacement-refusal)
+  write_meta "$case_dir" local-only ship
+  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  sed -i.bak 's/^window=.*/window=fm:42/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=zellij' 'zellij_session=fm' 'zellij_tab_id=7' 'zellij_pane_id=42' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/zellij.log"
+  cat > "$case_dir/fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
+if [ "${1:-}" = list-sessions ]; then
+  printf '%s\n' fm
+  exit 0
+fi
+if [ "${1:-}" = --session ]; then
+  shift 2
+fi
+case "$*" in
+  "action list-tabs --json")
+    printf '[{"tab_id":7,"name":"%s"}]\n' "${FM_DUPLICATE_TITLE:?}"
+    ;;
+  "action list-panes --json")
+    printf '%s\n' '[{"id":43,"tab_id":7,"is_plugin":false}]'
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/zellij"
+
+  rc=0
+  FM_ZELLIJ_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "Zellij replacement endpoint teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
+    "Zellij teardown did not refuse the replacement endpoint mismatch"
+  assert_contains "$(cat "$case_dir/stderr")" "fm:43" \
+    "Zellij teardown refusal did not identify the exact replacement pane"
+  assert_not_contains "$(cat "$log")" "close-tab" "Zellij replacement refusal automatically closed the endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "Zellij replacement refusal removed task meta"
+  pass "Zellij replacement endpoint blocks teardown before automatic closure"
+}
+
+test_cmux_duplicate_endpoints_refuse_teardown_without_closure() {
+  local case_dir log rc title
+  case_dir=$(make_case cmux-duplicate-refusal)
+  write_meta "$case_dir" local-only ship
+  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_source cmux; fm_backend_cmux_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  sed -i.bak 's/^window=.*/window=ws-a:sf-a/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=cmux' 'cmux_workspace_id=ws-a' 'cmux_surface_id=sf-a' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/cmux.log"
+  cat > "$case_dir/fakebin/cmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_CMUX_LOG:?}"
+case "${1:-}" in
+  ping) printf '%s\n' PONG ;;
+  list-windows) printf '%s\n' '[{"id":"win-a"},{"id":"win-b"}]' ;;
+  workspace)
+    case " $* " in
+      *" --window win-a "*) printf '{"workspaces":[{"id":"ws-a","title":"%s"}]}\n' "${FM_DUPLICATE_TITLE:?}" ;;
+      *" --window win-b "*) printf '{"workspaces":[{"id":"ws-b","title":"%s"}]}\n' "${FM_DUPLICATE_TITLE:?}" ;;
+      *) printf '%s\n' '{"workspaces":[]}' ;;
+    esac
+    ;;
+  list-panes)
+    case " $* " in
+      *" --workspace ws-a "*) printf '%s\n' '{"panes":[{"selected_surface_id":"sf-a","surface_ids":["sf-a","sf-a2"]}]}' ;;
+      *" --workspace ws-b "*) printf '%s\n' '{"panes":[{"selected_surface_id":"sf-b","surface_ids":["sf-b"]}]}' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/cmux"
+
+  rc=0
+  FM_CMUX_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "cmux duplicate endpoint teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
+    "cmux teardown did not refuse the endpoint ownership anomaly"
+  assert_contains "$(cat "$case_dir/stderr")" "ws-a:sf-a,ws-a:sf-a2,ws-b:sf-b" \
+    "cmux teardown refusal did not identify all exact duplicate surfaces"
+  assert_not_contains "$(cat "$log")" "close-workspace" "cmux duplicate refusal automatically closed an endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "cmux duplicate refusal removed task meta"
+  pass "cmux duplicate endpoints block teardown before any automatic closure"
+}
+
 test_backlog_operational_read_failure_refuses_before_teardown() {
   local case_dir rc
   case_dir=$(make_case backlog-read-failure)
@@ -1489,6 +1630,47 @@ SH
   pass "unknown endpoint inventory fails closed and preserves retryable lifecycle state"
 }
 
+test_completion_proof_write_failure_preserves_lifecycle() {
+  local case_dir rc proof log
+  case_dir=$(make_case completion-proof-write-failure)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  proof="$case_dir/state/task-x1.teardown-complete"
+  log="$case_dir/tasks.log"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  if [ "$arg" = "${FM_PROOF_BLOCK_PATH:?}" ]; then
+    exit 1
+  fi
+done
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+
+  rc=0
+  FM_PROOF_BLOCK_PATH="$proof" FM_TASKS_LOG="$log" run_teardown "$case_dir" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "completion proof persistence failure"
+  assert_contains "$(cat "$case_dir/stderr")" "could not persist completion proof" \
+    "proof persistence failure was not reported"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "proof persistence failure removed task meta"
+  [ -f "$case_dir/state/task-x1.tearing-down" ] || fail "proof persistence failure removed teardown tombstone"
+  if [ -f "$log" ]; then
+    assert_not_contains "$(cat "$log")" "done task-x1" \
+      "proof persistence failure recorded backlog completion"
+  fi
+  rm -f "$case_dir/fakebin/mv"
+  rc=0
+  FM_TASKS_LOG="$log" run_teardown "$case_dir" \
+    > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "completion proof persistence retry"
+  assert_contains "$(cat "$log")" "done task-x1" \
+    "proof persistence retry did not complete the backlog record"
+  pass "completion proof persistence failure retains retryable lifecycle state"
+}
+
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
   local case_dir fakebin state actual
   case_dir="$TMP_ROOT/endpoint-state-unit"
@@ -1565,6 +1747,7 @@ case "$*" in
     case "${FM_ZELLIJ_STATE:?}" in
       live|mismatch) printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false}]' ;;
       ghost|recovered|foreign|inventory-error|absent) printf '%s\n' '[]' ;;
+      partial) printf '%s\n' '[{"id":42}]' ;;
       unknown) printf '%s\n' 'pane inventory unavailable' >&2; exit 3 ;;
     esac
     ;;
@@ -1582,14 +1765,14 @@ case "$*" in
 esac
 SH
   chmod +x "$fakebin/zellij"
-  for state in live ghost recovered foreign inventory-error absent mismatch unknown; do
+  for state in live ghost recovered foreign inventory-error absent mismatch unknown partial; do
     actual=$(PATH="$fakebin:$PATH" FM_ZELLIJ_STATE="$state" FM_ZELLIJ_EXPECTED_TITLE="$title" \
       FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
       bash -c '. "$1"; fm_backend_target_state zellij fm:42 fm-task-x1 7' _ "$ROOT/bin/fm-backend.sh")
     case "$state" in
       live|ghost|recovered) [ "$actual" = present ] || fail "$state Zellij endpoint read $actual" ;;
       foreign|absent) [ "$actual" = absent ] || fail "$state Zellij endpoint read $actual" ;;
-      inventory-error|mismatch|unknown) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
+      inventory-error|mismatch|unknown|partial) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
     esac
   done
   pass "Zellij endpoint probe finds exact same-home recovery tabs and fails closed on unreadable inventory"
@@ -1665,10 +1848,14 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
+test_zellij_duplicate_endpoints_refuse_teardown_without_closure
+test_zellij_replacement_endpoint_refuses_teardown_without_closure
+test_cmux_duplicate_endpoints_refuse_teardown_without_closure
 test_backlog_operational_read_failure_refuses_before_teardown
 test_non_delivery_outcomes_never_record_done
 test_endpoint_close_must_succeed_and_be_absent
 test_unknown_endpoint_state_preserves_lifecycle
+test_completion_proof_write_failure_preserves_lifecycle
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
 test_orca_endpoint_probe_rejects_success_shaped_errors
 test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab

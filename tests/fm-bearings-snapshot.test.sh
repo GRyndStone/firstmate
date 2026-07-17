@@ -272,9 +272,10 @@ test_program_source_paths_are_bounded_and_disclosed() {
 }
 
 test_durable_obligations_are_bounded_and_disclosed() {
-  local home fakebin json expanded
+  local home fakebin json expanded tab
   home=$(make_home durable-obligations)
-  cat > "$home/data/backlog.md" <<'EOF'
+  tab=$(printf '\t')
+  cat > "$home/data/backlog.md" <<EOF
 ## In flight
 - [ ] live-dependency - Live dependency
 
@@ -283,6 +284,8 @@ test_durable_obligations_are_bounded_and_disclosed() {
   NOT REQUIRED until the captain resolves the retained obligation.
 - [ ] blocked-obligation - Blocked obligation blocked-by: live-dependency - provider recovery
   DEFERRED while the dependency remains active.
+ one-space raw obligation
+${tab}tab-prefixed raw obligation
 - [x] raw-obligation - Checked rows are durable raw queued prose, not tasks-axi tasks
 
 ## Done
@@ -294,17 +297,32 @@ EOF
       and (.durable_obligations | length) == 2
       and (.durable_obligations[0] | .id == "held-obligation" and .type == "held" and .reason == "captain review")
       and (.durable_obligations[1] | .id == "blocked-obligation" and .type == "blocked" and .reason == "provider recovery")
-      and .program[0].unstructured_queued == 1
-      and .program[0].durable_obligations == 3
-      and ([.omitted[] | select(.surface == "durable obligations showing 2 of 3" and .reveal == "--all-queued")] | length) == 1
+      and .program[0].unstructured_queued == 3
+      and .program[0].durable_obligations == 5
+      and ([.omitted[] | select(.surface == "durable obligations showing 2 of 5" and .reveal == "--all-queued")] | length) == 1
   ' >/dev/null || fail "bearings dropped or failed to disclose durable obligations: $json"
   expanded=$(FM_BEARINGS_GATES=2 run "$home" "$fakebin" --json --all-queued)
   printf '%s' "$expanded" | jq -e '
-    (.durable_obligations | length) == 3
+    (.durable_obligations | length) == 5
       and (.durable_obligations | any(.[]; (.id | startswith("raw-")) and .type == "unstructured" and (.reason | contains("raw-obligation"))))
+      and (.durable_obligations | any(.[]; .type == "unstructured" and .reason == " one-space raw obligation"))
+      and (.durable_obligations | any(.[]; .type == "unstructured" and .reason == " tab-prefixed raw obligation"))
       and ([.omitted[].surface | select(startswith("durable obligations showing"))] | length) == 0
   ' >/dev/null || fail "--all-queued did not reveal the bounded raw obligation: $expanded"
   pass "bearings surfaces active and raw durable obligations with bounded disclosure"
+}
+
+test_bearings_skill_routes_durable_obligations() {
+  local skill=$ROOT/.agents/skills/bearings/SKILL.md
+  grep -Fq 'Read every `durable_obligations` row even when `runnable_candidates` is zero.' "$skill" \
+    || fail "bearings skill does not require durable-obligation consumption"
+  grep -Fq 'Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued**' "$skill" \
+    || fail "bearings skill does not route gated durable obligations"
+  grep -Fq 'route `unstructured` rows that require supervisor interpretation to **Plans / main pickup points**.' "$skill" \
+    || fail "bearings skill does not route unstructured durable obligations"
+  grep -Fq 'When an `omitted` row says `durable obligations showing ...`, state that the projection is truncated and include its `reveal` action' "$skill" \
+    || fail "bearings skill does not disclose durable-obligation truncation"
+  pass "bearings skill routes durable obligations and truncation disclosure"
 }
 
 test_include_prs_is_the_only_fetch_path() {
@@ -509,6 +527,7 @@ test_superseded_queued_item_dropped_by_default
 test_held_work_and_program_boundary_are_never_omitted
 test_program_source_paths_are_bounded_and_disclosed
 test_durable_obligations_are_bounded_and_disclosed
+test_bearings_skill_routes_durable_obligations
 test_include_prs_is_the_only_fetch_path
 test_partial_github_failure_degrades
 test_perl_fallback_bounds_github_call

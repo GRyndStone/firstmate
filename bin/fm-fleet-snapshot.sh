@@ -334,8 +334,8 @@ backlog_json() {
        elif structured_row($line; .section) then
          .order += 1
          | .records += [parse_row($line; .section; .order)]
-       elif ((.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^[[:space:]]+"))) then
-         ($line | trim) as $body
+       elif ((.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^  "))) then
+         ($line | sub("^  ";"")) as $body
          | if $body == "" then .
            else .records[-1].body_lines += [$body] end
        else

@@ -280,6 +280,19 @@ outcome: failed
 EOF
 }
 
+run_failed_with_id() {  # <branch> <id>
+  cat <<EOF
+run:
+  id: "$2"
+  branch: $1
+  status: completed
+  head: "abc1234"
+  pr: ""
+  findings: none
+outcome: failed
+EOF
+}
+
 run_checks_passed() {  # <branch>
   cat <<EOF
 run:
@@ -565,7 +578,7 @@ test_cancelled_zero_check_monitor_yields_to_live_work() {
   pass "same-minute exact-run recovery evidence outranks its cancelled zero-check monitor"
 }
 
-test_coarse_cancelled_zero_check_run_yields_to_newer_live_work() {
+test_coarse_cancelled_run_remains_terminal_without_exact_identity() {
   reset_fakes
   local d; d=$(new_case coarse-cancelled-live-work)
   make_repo_on_branch "$d/wt" fm/feat-coarse-cancelled
@@ -582,13 +595,13 @@ EOF
   FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-coarse-cancelled)
-  assert_contains "$out" "state: working" "coarse cancelled run yields to newer live work"
-  assert_contains "$out" "source: pane" "coarse cancellation recovery is pane sourced"
-  assert_contains "$out" "exact-run recovery status" "coarse cancellation keeps recovery context"
-  pass "coarse cancellation yields to working evidence newer than its attributed run instance"
+  assert_contains "$out" "state: failed" "coarse cancelled run remains terminal without current run identity"
+  assert_contains "$out" "source: run-step" "ambiguous coarse cancellation remains run-step sourced"
+  assert_not_contains "$out" "exact-run recovery status" "old exact-run lookup cannot identify the current coarse row"
+  pass "coarse cancellation fails closed when current run identity is unavailable"
 }
 
-test_coarse_checks_passed_run_yields_to_exact_live_recovery() {
+test_coarse_completed_run_remains_terminal_without_exact_identity() {
   reset_fakes
   local d; d=$(new_case coarse-checks-passed-live-work)
   make_repo_on_branch "$d/wt" fm/feat-coarse-green
@@ -604,10 +617,10 @@ EOF
 )
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-coarse-green)
-  assert_contains "$out" "state: working" "coarse checks-passed run yields to exact live recovery"
-  assert_contains "$out" "source: pane" "coarse checks-passed recovery is pane sourced"
-  assert_contains "$out" "exact-run recovery status" "coarse checks-passed recovery keeps exact-run context"
-  pass "coarse completed status preserves recoverable checks-passed identity"
+  assert_contains "$out" "state: done" "coarse completed row remains terminal when a same-head rerun is ambiguous"
+  assert_contains "$out" "source: run-step" "ambiguous coarse completion remains run-step sourced"
+  assert_not_contains "$out" "exact-run recovery status" "named old checks-passed run cannot identify the current coarse row"
+  pass "coarse completion fails closed across ambiguous same-head reruns"
 }
 
 test_coarse_passed_run_remains_authoritative() {
@@ -666,6 +679,59 @@ test_checks_passed_yields_to_newer_live_work() {
   assert_contains "$out" "source: pane" "checks-green recovery is pane sourced"
   assert_contains "$out" "exact-run recovery status" "checks-green recovery keeps recovery context"
   pass "working evidence newer than the attributed run instance outranks its checks-green classification"
+}
+
+test_recovery_context_survives_later_needs_decision() {
+  reset_fakes
+  local d; d=$(new_case recovered-needs-decision)
+  make_repo_on_branch "$d/wt" fm/feat-recovered-decision
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovered-decision.meta" "window=fm:fm-feat-recovered-decision" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery\nneeds-decision: choose the durable schema\n' > "$d/state/feat-recovered-decision.status"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-recovered-decision)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-recovered-decision)"
+  FM_FAKE_BUSY=0
+  local out; out=$(run_crew_state "$d" feat-recovered-decision)
+  assert_contains "$out" "state: parked" "later needs-decision event remains current after exact recovery"
+  assert_contains "$out" "source: status-log" "recovered needs-decision is status-log sourced"
+  assert_contains "$out" "exact-run recovery context" "later decision retains its exact old-run identity"
+  assert_not_contains "$out" "state: failed" "named old failure cannot supersede the later decision"
+  pass "exact recovery identity survives a later needs-decision event"
+}
+
+test_recovery_context_survives_later_blocked() {
+  reset_fakes
+  local d; d=$(new_case recovered-blocked)
+  make_repo_on_branch "$d/wt" fm/feat-recovered-blocked
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovered-blocked.meta" "window=fm:fm-feat-recovered-blocked" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery\nblocked: provider unavailable\n' > "$d/state/feat-recovered-blocked.status"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-recovered-blocked)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_checks_passed fm/feat-recovered-blocked)"
+  FM_FAKE_BUSY=0
+  local out; out=$(run_crew_state "$d" feat-recovered-blocked)
+  assert_contains "$out" "state: blocked" "later blocked event remains current after exact recovery"
+  assert_contains "$out" "source: status-log" "recovered blocked event is status-log sourced"
+  assert_contains "$out" "exact-run recovery context" "later block retains its exact old-run identity"
+  assert_not_contains "$out" "state: done" "named old checks-green run cannot supersede the later block"
+  pass "exact recovery identity survives a later blocked event"
+}
+
+test_later_recovery_event_cannot_override_new_terminal_run() {
+  reset_fakes
+  local d; d=$(new_case recovered-blocked-new-terminal)
+  make_repo_on_branch "$d/wt" fm/feat-recovered-new-terminal
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovered-new-terminal.meta" "window=fm:fm-feat-recovered-new-terminal" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery\nblocked: retrying validation provider\n' > "$d/state/feat-recovered-new-terminal.status"
+  FM_FAKE_AXI_STATUS="$(run_failed_with_id fm/feat-recovered-new-terminal 01NEW)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-recovered-new-terminal)"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-recovered-new-terminal)
+  assert_contains "$out" "state: failed" "different current run id remains authoritative"
+  assert_contains "$out" "source: run-step" "new terminal run remains run-step sourced"
+  assert_not_contains "$out" "exact-run recovery context" "old recovery identity cannot demote a new terminal run"
+  pass "genuinely current terminal identity outranks later recovery events"
 }
 
 test_pre_run_working_event_does_not_override_terminal() {
@@ -1384,11 +1450,14 @@ test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_ci_monitoring_zero_checks_stays_non_green
 test_cancelled_zero_check_monitor_yields_to_live_work
-test_coarse_cancelled_zero_check_run_yields_to_newer_live_work
-test_coarse_checks_passed_run_yields_to_exact_live_recovery
+test_coarse_cancelled_run_remains_terminal_without_exact_identity
+test_coarse_completed_run_remains_terminal_without_exact_identity
 test_coarse_passed_run_remains_authoritative
 test_failed_run_yields_to_newer_live_work
 test_checks_passed_yields_to_newer_live_work
+test_recovery_context_survives_later_needs_decision
+test_recovery_context_survives_later_blocked
+test_later_recovery_event_cannot_override_new_terminal_run
 test_pre_run_working_event_does_not_override_terminal
 test_validation_handoff_interval_yields_to_live_work
 test_new_validation_run_remains_authoritative_after_recovery

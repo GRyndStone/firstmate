@@ -747,7 +747,16 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
         printf 'unknown'
         return 0
       }
-      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || {
+      printf '%s' "$panes" | jq -e '
+        type == "array"
+        and all(.[]?;
+          ((.id | type) == "number")
+          and (.id == (.id | floor))
+          and ((.tab_id | type) == "number")
+          and (.tab_id == (.tab_id | floor))
+          and ((.is_plugin | type) == "boolean")
+        )
+      ' >/dev/null 2>&1 || {
         printf 'unknown'
         return 0
       }
