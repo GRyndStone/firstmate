@@ -25,7 +25,13 @@ esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window) exit 0 ;;
+  has-session|new-session|kill-window) exit 0 ;;
+  new-window)
+    if [ -n "${FM_FAKE_ENDPOINT_LOG:-}" ]; then
+      printf '%s\n' "$*" >> "$FM_FAKE_ENDPOINT_LOG"
+    fi
+    exit 0
+    ;;
   send-keys)
     if [ -n "${FM_FAKE_SHELL_LOG:-}" ] && [ "${4:-}" != "-l" ]; then
       printf '%s\n' "${4:-}" >> "$FM_FAKE_SHELL_LOG"
@@ -94,6 +100,7 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_SHELL_LOG="$shelllog" \
+    FM_FAKE_ENDPOINT_LOG="${FM_FAKE_ENDPOINT_LOG:-}" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -428,6 +435,45 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint() {
+  local rec id out status claim endpoint_log
+  id=profile-receipt-z19
+  rec=$(make_spawn_case profile-receipt claude "$id")
+  read_case_record "$rec"
+  claim="$HOME_DIR/state/.$id.teardown-complete.claimed.stale"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  printf 'canonical\n' > "$HOME_DIR/state/$id.teardown-complete"
+  mkdir "$claim"
+  printf 'claimed\n' > "$claim/proof"
+
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "spawn with stale completion receipts should succeed after invalidation"
+  assert_absent "$HOME_DIR/state/$id.teardown-complete" \
+    "spawn left a reusable canonical completion proof"
+  assert_absent "$claim" "spawn left a reusable interrupted completion claim"
+  assert_present "$endpoint_log" "spawn did not create its endpoint after safe receipt invalidation"
+
+  id=profile-receipt-failure-z20
+  rec=$(make_spawn_case profile-receipt-failure claude "$id")
+  read_case_record "$rec"
+  claim="$HOME_DIR/state/.$id.teardown-complete.claimed.unsafe"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  mkdir "$claim"
+  printf 'claimed\n' > "$claim/proof"
+  printf 'unexpected\n' > "$claim/extra"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with an unsafe completion claim"
+  assert_contains "$out" "could not invalidate completion receipts safely before spawning $id" \
+    "spawn did not report unsafe receipt invalidation"
+  assert_absent "$endpoint_log" "spawn created an endpoint after receipt invalidation failed"
+  assert_absent "$HOME_DIR/state/$id.meta" "spawn wrote lifecycle meta after receipt invalidation failed"
+  pass "spawn invalidates canonical and claimed receipts before endpoint creation"
+}
+
 test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
@@ -444,5 +490,6 @@ test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint
 
 echo "# all fm-spawn-dispatch-profile tests passed"

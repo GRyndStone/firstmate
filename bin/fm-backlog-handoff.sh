@@ -54,8 +54,8 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-REG="$DATA/secondmates.md"
-MAIN_BACKLOG="$DATA/backlog.md"
+REG=
+MAIN_BACKLOG=
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh disable=SC1091
@@ -93,6 +93,12 @@ path_is_ancestor_of() {
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
+  cd "$path" && pwd -P
+}
+
+resolved_existing_data_dir() {
+  local path=$1
+  [ -d "$path" ] || { echo "error: active firstmate data directory does not exist or is not a directory: $path" >&2; return 1; }
   cd "$path" && pwd -P
 }
 
@@ -268,10 +274,24 @@ backlog_key_noncanonical_body_lines() {
   ' "$file"
 }
 
+ACTIVE_HOME=$(resolved_existing_dir "$FM_HOME") || exit 1
+ACTIVE_DATA=$(resolved_existing_data_dir "$DATA") || exit 1
+if [ -z "${FM_DATA_OVERRIDE:-}" ]; then
+  case "$ACTIVE_DATA" in
+    "$ACTIVE_HOME"/*) ;;
+    *)
+      echo "error: active firstmate data directory must resolve inside the active home: $DATA" >&2
+      exit 1
+      ;;
+  esac
+fi
+DATA=$ACTIVE_DATA
+REG="$DATA/secondmates.md"
+MAIN_BACKLOG="$DATA/backlog.md"
+
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
 SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
-ACTIVE_HOME=$(resolved_existing_dir "$FM_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
@@ -399,9 +419,15 @@ if ! MV_OUT=$(cd "$ACTIVE_HOME" && HOME="$ACTIVE_HOME" tasks-axi mv "${TO_MOVE[@
   echo "error: tasks-axi mv failed; nothing was moved." >&2
   exit 1
 fi
+RECEIPT_INVALIDATION_FAILED=0
 for key in "${TO_MOVE[@]}"; do
-  rm -f "$STATE/$key.teardown-complete" "$SUB_HOME/state/$key.teardown-complete"
+  fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || RECEIPT_INVALIDATION_FAILED=1
+  fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || RECEIPT_INVALIDATION_FAILED=1
 done
+if [ "$RECEIPT_INVALIDATION_FAILED" -ne 0 ]; then
+  echo "error: handoff succeeded but one or more completion receipts could not be invalidated safely" >&2
+  exit 1
+fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"

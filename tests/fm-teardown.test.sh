@@ -1564,13 +1564,16 @@ case "$*" in
   "action list-panes --json")
     case "${FM_ZELLIJ_STATE:?}" in
       live|mismatch) printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false}]' ;;
-      ghost|absent) printf '%s\n' '[]' ;;
+      ghost|recovered|foreign|inventory-error|absent) printf '%s\n' '[]' ;;
       unknown) printf '%s\n' 'pane inventory unavailable' >&2; exit 3 ;;
     esac
     ;;
   "action list-tabs --json")
     case "${FM_ZELLIJ_STATE:?}" in
       live|ghost) printf '[{"tab_id":7,"name":"%s"}]\n' "${FM_ZELLIJ_EXPECTED_TITLE:?}" ;;
+      recovered) printf '[{"tab_id":99,"name":"%s"}]\n' "${FM_ZELLIJ_EXPECTED_TITLE:?}" ;;
+      foreign) printf '%s\n' '[{"tab_id":99,"name":"fm-another-home-task-x1"}]' ;;
+      inventory-error) printf '%s\n' 'tab inventory unavailable' >&2; exit 4 ;;
       mismatch) printf '%s\n' '[{"tab_id":7,"name":"fm-other"}]' ;;
       absent) printf '%s\n' '[]' ;;
     esac
@@ -1579,17 +1582,17 @@ case "$*" in
 esac
 SH
   chmod +x "$fakebin/zellij"
-  for state in live ghost absent mismatch unknown; do
+  for state in live ghost recovered foreign inventory-error absent mismatch unknown; do
     actual=$(PATH="$fakebin:$PATH" FM_ZELLIJ_STATE="$state" FM_ZELLIJ_EXPECTED_TITLE="$title" \
       FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
       bash -c '. "$1"; fm_backend_target_state zellij fm:42 fm-task-x1 7' _ "$ROOT/bin/fm-backend.sh")
     case "$state" in
-      live|ghost) [ "$actual" = present ] || fail "$state Zellij endpoint read $actual" ;;
-      absent) [ "$actual" = absent ] || fail "absent Zellij endpoint read $actual" ;;
-      mismatch|unknown) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
+      live|ghost|recovered) [ "$actual" = present ] || fail "$state Zellij endpoint read $actual" ;;
+      foreign|absent) [ "$actual" = absent ] || fail "$state Zellij endpoint read $actual" ;;
+      inventory-error|mismatch|unknown) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
     esac
   done
-  pass "Zellij endpoint probe verifies live panes and owned ghost tabs"
+  pass "Zellij endpoint probe finds exact same-home recovery tabs and fails closed on unreadable inventory"
 }
 
 test_cmux_endpoint_probe_searches_all_windows_fail_closed() {

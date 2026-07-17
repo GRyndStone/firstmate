@@ -780,8 +780,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
         fi
         return 0
       fi
-      if [ -n "$expected_label" ] && [ -n "$backend_id" ]; then
-        case "$backend_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
+      if [ -n "$expected_label" ]; then
         tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
           printf 'unknown'
           return 0
@@ -790,8 +789,14 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
           printf 'unknown'
           return 0
         }
+        scoped=$(fm_backend_zellij_scoped_title "$expected_label")
+        if printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
+          printf 'present'
+          return 0
+        fi
+        [ -n "$backend_id" ] || { printf 'absent'; return 0; }
+        case "$backend_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
         if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" 'any(.[]?; .tab_id == $t)' >/dev/null 2>&1; then
-          scoped=$(fm_backend_zellij_scoped_title "$expected_label")
           if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
             printf 'present'
           else

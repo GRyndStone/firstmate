@@ -550,18 +550,19 @@ test_cancelled_zero_check_monitor_yields_to_live_work() {
   make_repo_on_branch "$d/wt" fm/feat-cancelled-zero
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-cancelled-zero.meta" "window=fm:fm-feat-cancelled-zero" "worktree=$d/wt" "kind=ship"
-  printf 'working: substantive same-pane recovery to add required CI checks\n' > "$d/state/feat-cancelled-zero.status"
-  touch -t 202607022210 "$d/state/feat-cancelled-zero.status"
+  printf 'working: after-run=01RUN substantive same-pane recovery to add required CI checks\n' > "$d/state/feat-cancelled-zero.status"
+  touch -t 202607022205 "$d/state/feat-cancelled-zero.status"
   FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-zero)"
-  FM_FAKE_RUNS_LIST="cancelled  fm/feat-cancelled-zero bbbbbbb  2026-07-02 22:05"
+  FM_FAKE_AXI_STATUS_RUN="$(run_cancelled fm/feat-cancelled-zero)"
+  FM_FAKE_RUNS_LIST="cancelled  fm/feat-cancelled-zero abc1234  2026-07-02 22:05"
   FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-cancelled-zero)
   assert_contains "$out" "state: working" "busy live pane must outrank stale zero-check cancellation"
   assert_contains "$out" "source: pane" "zero-check cancellation override must name the live pane source"
-  assert_contains "$out" "post-creation working status" "zero-check cancellation detail records the recovery evidence"
+  assert_contains "$out" "exact-run recovery status" "zero-check cancellation detail records the recovery evidence"
   assert_not_contains "$out" "state: failed" "stale zero-check cancellation must not false-fail live work"
-  pass "working evidence newer than the attributed run instance outranks its cancelled zero-check monitor"
+  pass "same-minute exact-run recovery evidence outranks its cancelled zero-check monitor"
 }
 
 test_coarse_cancelled_zero_check_run_yields_to_newer_live_work() {
@@ -570,12 +571,12 @@ test_coarse_cancelled_zero_check_run_yields_to_newer_live_work() {
   make_repo_on_branch "$d/wt" fm/feat-coarse-cancelled
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-coarse-cancelled.meta" "window=fm:fm-feat-coarse-cancelled" "worktree=$d/wt" "kind=ship"
-  printf 'working: substantive same-pane recovery to add required CI checks\n' > "$d/state/feat-coarse-cancelled.status"
-  touch -t 202607022210 "$d/state/feat-coarse-cancelled.status"
+  printf 'working: after-run=01RUN substantive same-pane recovery to add required CI checks\n' > "$d/state/feat-coarse-cancelled.status"
   FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_cancelled fm/feat-coarse-cancelled)"
   FM_FAKE_RUNS_LIST=$(cat <<'EOF'
 running    fm/other-crew aaaaaaa  2026-07-02 22:12
-cancelled  fm/feat-coarse-cancelled bbbbbbb  2026-07-02 22:05
+cancelled  fm/feat-coarse-cancelled abc1234  2026-07-02 22:05
 EOF
 )
   FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
@@ -583,8 +584,52 @@ EOF
   local out; out=$(run_crew_state "$d" feat-coarse-cancelled)
   assert_contains "$out" "state: working" "coarse cancelled run yields to newer live work"
   assert_contains "$out" "source: pane" "coarse cancellation recovery is pane sourced"
-  assert_contains "$out" "post-creation working status" "coarse cancellation keeps recovery context"
+  assert_contains "$out" "exact-run recovery status" "coarse cancellation keeps recovery context"
   pass "coarse cancellation yields to working evidence newer than its attributed run instance"
+}
+
+test_coarse_checks_passed_run_yields_to_exact_live_recovery() {
+  reset_fakes
+  local d; d=$(new_case coarse-checks-passed-live-work)
+  make_repo_on_branch "$d/wt" fm/feat-coarse-green
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-coarse-green.meta" "window=fm:fm-feat-coarse-green" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN substantive same-pane recovery after checks green\n' > "$d/state/feat-coarse-green.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_checks_passed fm/feat-coarse-green)"
+  FM_FAKE_RUNS_LIST=$(cat <<'EOF'
+running    fm/other-crew aaaaaaa  2026-07-02 22:06
+completed  fm/feat-coarse-green abc1234  2026-07-02 22:05
+EOF
+)
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-coarse-green)
+  assert_contains "$out" "state: working" "coarse checks-passed run yields to exact live recovery"
+  assert_contains "$out" "source: pane" "coarse checks-passed recovery is pane sourced"
+  assert_contains "$out" "exact-run recovery status" "coarse checks-passed recovery keeps exact-run context"
+  pass "coarse completed status preserves recoverable checks-passed identity"
+}
+
+test_coarse_passed_run_remains_authoritative() {
+  reset_fakes
+  local d; d=$(new_case coarse-passed-live-pane)
+  make_repo_on_branch "$d/wt" fm/feat-coarse-passed
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-coarse-passed.meta" "window=fm:fm-feat-coarse-passed" "worktree=$d/wt" "kind=ship"
+  printf 'working: after-run=01RUN stale activity after merge\n' > "$d/state/feat-coarse-passed.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_passed fm/feat-coarse-passed)"
+  FM_FAKE_RUNS_LIST=$(cat <<'EOF'
+running    fm/other-crew aaaaaaa  2026-07-02 22:06
+completed  fm/feat-coarse-passed abc1234  2026-07-02 22:05
+EOF
+)
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-coarse-passed)
+  assert_contains "$out" "state: done" "coarse passed run remains terminal"
+  assert_contains "$out" "source: run-step" "coarse passed run remains run-step sourced"
+  assert_not_contains "$out" "exact-run recovery status" "passed outcome cannot be demoted by pane activity"
+  pass "coarse completed status preserves final passed authority"
 }
 
 test_failed_run_yields_to_newer_live_work() {
@@ -593,15 +638,15 @@ test_failed_run_yields_to_newer_live_work() {
   make_repo_on_branch "$d/wt" fm/feat-failed-recovered
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-failed-recovered.meta" "window=fm:fm-feat-failed-recovered" "worktree=$d/wt" "kind=ship"
-  printf 'working: substantive same-pane recovery after provider failure\n' > "$d/state/feat-failed-recovered.status"
-  touch -t 202607022210 "$d/state/feat-failed-recovered.status"
+  printf 'working: after-run=01RUN substantive same-pane recovery after provider failure\n' > "$d/state/feat-failed-recovered.status"
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-failed-recovered)"
-  FM_FAKE_RUNS_LIST="failed  fm/feat-failed-recovered bbbbbbb  2026-07-02 22:05"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-failed-recovered)"
+  FM_FAKE_RUNS_LIST="failed  fm/feat-failed-recovered abc1234  2026-07-02 22:05"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-failed-recovered)
-  assert_contains "$out" "state: working" "post-creation live work outranks the failed classification"
+  assert_contains "$out" "state: working" "exact-run live recovery outranks the failed classification"
   assert_contains "$out" "source: pane" "failed-run recovery is pane sourced"
-  assert_contains "$out" "post-creation working status" "failed-run recovery keeps recovery context"
+  assert_contains "$out" "exact-run recovery status" "failed-run recovery keeps recovery context"
   pass "working evidence newer than the attributed run instance outranks its failed classification"
 }
 
@@ -611,15 +656,15 @@ test_checks_passed_yields_to_newer_live_work() {
   make_repo_on_branch "$d/wt" fm/feat-green-recovered
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-green-recovered.meta" "window=fm:fm-feat-green-recovered" "worktree=$d/wt" "kind=ship"
-  printf 'working: substantive same-pane recovery after provider failure\n' > "$d/state/feat-green-recovered.status"
-  touch -t 202607022210 "$d/state/feat-green-recovered.status"
+  printf 'working: after-run=01RUN substantive same-pane recovery after provider failure\n' > "$d/state/feat-green-recovered.status"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-green-recovered)"
-  FM_FAKE_RUNS_LIST="completed  fm/feat-green-recovered bbbbbbb  2026-07-02 22:05"
+  FM_FAKE_AXI_STATUS_RUN="$(run_checks_passed fm/feat-green-recovered)"
+  FM_FAKE_RUNS_LIST="completed  fm/feat-green-recovered abc1234  2026-07-02 22:05"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-green-recovered)
-  assert_contains "$out" "state: working" "post-creation live work outranks checks-green evidence"
+  assert_contains "$out" "state: working" "exact-run live recovery outranks checks-green evidence"
   assert_contains "$out" "source: pane" "checks-green recovery is pane sourced"
-  assert_contains "$out" "post-creation working status" "checks-green recovery keeps recovery context"
+  assert_contains "$out" "exact-run recovery status" "checks-green recovery keeps recovery context"
   pass "working evidence newer than the attributed run instance outranks its checks-green classification"
 }
 
@@ -637,8 +682,26 @@ test_pre_run_working_event_does_not_override_terminal() {
   local out; out=$(run_crew_state "$d" feat-current-failed)
   assert_contains "$out" "state: failed" "newer failed run remains authoritative"
   assert_contains "$out" "source: run-step" "newer failed run remains run-step sourced"
-  assert_not_contains "$out" "post-creation working status" "pre-run working evidence cannot override a terminal classification"
+  assert_not_contains "$out" "exact-run recovery status" "pre-run working evidence cannot override a terminal classification"
   pass "normal pre-run working evidence loses to the current terminal"
+}
+
+test_validation_handoff_interval_yields_to_live_work() {
+  reset_fakes
+  local d; d=$(new_case validation-handoff-interval)
+  make_repo_on_branch "$d/wt" fm/feat-validation-handoff
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-validation-handoff.meta" "window=fm:fm-feat-validation-handoff" "worktree=$d/wt" "kind=ship"
+  printf 'working: validating-after-run=01RUN starting a fresh no-mistakes run\n' > "$d/state/feat-validation-handoff.status"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-validation-handoff)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-validation-handoff)"
+  FM_FAKE_RUNS_LIST="failed  fm/feat-validation-handoff abc1234  2026-07-02 22:05"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-validation-handoff)
+  assert_contains "$out" "state: working" "validation handoff keeps the named old terminal recoverable"
+  assert_contains "$out" "source: pane" "validation handoff is pane sourced before the fresh run appears"
+  assert_contains "$out" "exact-run recovery status" "validation handoff keeps exact old-run attribution"
+  pass "validation handoff marker avoids a transient old-run false terminal"
 }
 
 test_new_validation_run_remains_authoritative_after_recovery() {
@@ -647,15 +710,14 @@ test_new_validation_run_remains_authoritative_after_recovery() {
   make_repo_on_branch "$d/wt" fm/feat-recovered-validation
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-recovered-validation.meta" "window=fm:fm-feat-recovered-validation" "worktree=$d/wt" "kind=ship"
-  printf 'working: substantive same-pane recovery after terminal run\n' > "$d/state/feat-recovered-validation.status"
-  touch -t 202607022210 "$d/state/feat-recovered-validation.status"
+  printf 'working: validating-after-run=01OLD starting a fresh no-mistakes run\n' > "$d/state/feat-recovered-validation.status"
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-recovered-validation)"
   FM_FAKE_RUNS_LIST="failed  fm/feat-recovered-validation ccccccc  2026-07-02 22:15"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-recovered-validation)
   assert_contains "$out" "state: failed" "new validation run terminal remains authoritative after recovery"
   assert_contains "$out" "source: run-step" "new validation terminal remains run-step sourced"
-  assert_not_contains "$out" "post-creation working status" "recovery evidence cannot override its newer validation run"
+  assert_not_contains "$out" "exact-run recovery status" "recovery evidence cannot override its newer validation run"
   pass "new validation run supersedes the recovery status that preceded it"
 }
 
@@ -842,10 +904,8 @@ test_terminal_passed() {
   make_repo_on_branch "$d/wt" fm/feat-d
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-d.meta" "window=fm:fm-feat-d" "worktree=$d/wt" "kind=ship"
-  printf 'working: resumed before merge completed\n' > "$d/state/feat-d.status"
-  touch -t 202607022210 "$d/state/feat-d.status"
+  printf 'working: after-run=01RUN resumed before merge completed\n' > "$d/state/feat-d.status"
   FM_FAKE_AXI_STATUS="$(run_passed fm/feat-d)"
-  FM_FAKE_RUNS_LIST="completed  fm/feat-d bbbbbbb  2026-07-02 22:05"
   FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-d)
   assert_contains "$out" "state: done" "passed run -> done"
@@ -873,7 +933,7 @@ test_terminal_checks_passed() {
   make_repo_on_branch "$d/wt" fm/feat-checks-passed
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-checks-passed.meta" "window=fm:fm-feat-checks-passed" "worktree=$d/wt" "kind=ship"
-  printf 'working: validation was still active\n' > "$d/state/feat-checks-passed.status"
+  printf 'working: validating-after-run=01OLD starting a fresh no-mistakes run\n' > "$d/state/feat-checks-passed.status"
   touch -t 202607022200 "$d/state/feat-checks-passed.status"
   FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-checks-passed)"
   FM_FAKE_RUNS_LIST="completed  fm/feat-checks-passed bbbbbbb  2026-07-02 22:05"
@@ -1325,9 +1385,12 @@ test_top_level_ci_checks_green_surfaces_done
 test_ci_monitoring_zero_checks_stays_non_green
 test_cancelled_zero_check_monitor_yields_to_live_work
 test_coarse_cancelled_zero_check_run_yields_to_newer_live_work
+test_coarse_checks_passed_run_yields_to_exact_live_recovery
+test_coarse_passed_run_remains_authoritative
 test_failed_run_yields_to_newer_live_work
 test_checks_passed_yields_to_newer_live_work
 test_pre_run_working_event_does_not_override_terminal
+test_validation_handoff_interval_yields_to_live_work
 test_new_validation_run_remains_authoritative_after_recovery
 test_ordinary_cancelled_run_remains_failed_with_busy_pane
 test_failed_outcome_never_yields_to_cancelled_status

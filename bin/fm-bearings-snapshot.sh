@@ -21,6 +21,8 @@
 #
 # This wrapper consumes the canonical snapshot's hints.open_decisions field.
 # fm-classify-lib.sh owns the durable keyed-decision contract.
+# durable_obligations keeps every active queued hold or blocker and every
+# unstructured queued record, with the same bound and expansion flag as gates.
 #
 # Flags:
 #   (default)        compact projection, TOON, local-only
@@ -30,7 +32,7 @@
 #   --all-in-flight  include every in-flight task
 #   --all-decisions  include every open decision
 #   --all-reports    include the full scout-report inventory (default: relevant only)
-#   --all-queued     include superseded queued items (default: dropped)
+#   --all-queued     expand queued projections and durable obligations
 #   --all-recorded-prs include every locally recorded PR
 #   --all-unhealthy  include every unhealthy endpoint
 #   --all-pr-repos   query every discovered repository under --include-prs
@@ -82,7 +84,8 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,hold,blocked_by,reason}, program{source_paths,...}, reports{id,path},
+  gates{id,title,hold,blocked_by,reason}, durable_obligations{id,type,reason},
+  program{source_paths,...}, reports{id,path},
   recorded_prs{id,url}, duplicate_endpoints{...},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
@@ -277,11 +280,23 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | ([ .backlog.records[]
        | select(.state == "queued" and .structured)
        | select(($all_queued == 1)
+                or .active_hold == true
+                or .active_blocked == true
                 or (((.body_excerpt // "") | test("SUPERSEDED|NOT REQUIRED|NOT-REQUIRED|DEFERRED"; "i")) | not))
        | {id, title:(.title | trunc(60)),
           hold:(if .active_hold != true then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
           blocked_by:(.active_blocked_by // "-"),
           reason:((if .active_hold == true then .hold else (.active_blocked_reason // "-") end) | trunc(60))} ]) as $gates_all
+  | ([ .backlog.records[]
+       | select(.state == "queued")
+       | if .structured == true then
+           select(.active_hold == true or .active_blocked == true)
+           | {id,
+              type:(if .active_hold == true and .active_blocked == true then "held+blocked" elif .active_hold == true then "held" else "blocked" end),
+              reason:((if .active_hold == true then .hold else (.active_blocked_reason // .active_blocked_by // "active dependency") end) | trunc(90))}
+         else
+           {id:("raw-" + (.order | tostring)),type:"unstructured",reason:(.raw | trunc(90))}
+         end ]) as $obligations_all
   | ([ .scout_reports[]
        | . as $r
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))
@@ -298,10 +313,13 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       landed: ($done | map({id, what:(.title | trunc(70)),
                             artifact:(.pr_url // .report_path // .local_note // "-")})),
       gates: (if $all_queued == 1 then $gates_all else $gates_all[:$gates_n] end),
+      durable_obligations: (if $all_queued == 1 then $obligations_all else $obligations_all[:$gates_n] end),
       program:[{
         runnable_candidates:$snap.queue_accounting.runnable_candidates,
         held:$snap.queue_accounting.held,
         blocked:$snap.queue_accounting.blocked,
+        unstructured_queued:$snap.queue_accounting.unstructured_queued,
+        durable_obligations:($obligations_all | length),
         durable_sources:$snap.queue_accounting.durable_program_source_count,
         sources_shown:([$snap.program_sources[:$program_sources_n][]] | length),
         source_paths:([$snap.program_sources[:$program_sources_n][] | .relative_path] | join("|")),
@@ -327,10 +345,11 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $f_actions then empty else {surface:"watch/steer actions", reveal:"--fields actions"} end),
         (if $f_endpoints then empty else {surface:"healthy endpoint detail", reveal:"--fields endpoints"} end),
         (if $all_reports == 1 then empty else {surface:"full scout-report inventory", reveal:"--all-reports"} end),
-        (if $all_queued == 1 then empty else {surface:"superseded queued items", reveal:"--all-queued"} end),
+        (if $all_queued == 1 then empty else {surface:"non-active superseded queued items", reveal:"--all-queued"} end),
         (if $all_in_flight == 0 and ($in_flight_all | length) > $in_flight_n then {surface:("in_flight showing \($in_flight_n) of \($in_flight_all | length)"), reveal:"--all-in-flight"} else empty end),
         (if $all_decisions == 0 and ($decisions_all | length) > $decisions_n then {surface:("decisions_open showing \($decisions_n) of \($decisions_all | length)"), reveal:"--all-decisions"} else empty end),
         (if $all_queued == 0 and ($gates_all | length) > $gates_n then {surface:("gates showing \($gates_n) of \($gates_all | length)"), reveal:"--all-queued"} else empty end),
+        (if $all_queued == 0 and ($obligations_all | length) > $gates_n then {surface:("durable obligations showing \($gates_n) of \($obligations_all | length)"), reveal:"--all-queued"} else empty end),
         (if $all_reports == 0 and ($reports_all | length) > $reports_n then {surface:("reports showing \($reports_n) of \($reports_all | length)"), reveal:"--all-reports"} else empty end),
         (if $all_recorded_prs == 0 and ($recorded_prs_all | length) > $recorded_prs_n then {surface:("recorded_prs showing \($recorded_prs_n) of \($recorded_prs_all | length)"), reveal:"--all-recorded-prs"} else empty end),
         (if $all_unhealthy == 0 and ($unhealthy_all | length) > $unhealthy_n then {surface:("unhealthy_endpoints showing \($unhealthy_n) of \($unhealthy_all | length)"), reveal:"--all-unhealthy"} else empty end),

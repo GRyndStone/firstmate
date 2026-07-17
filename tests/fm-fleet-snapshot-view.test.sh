@@ -492,6 +492,41 @@ EOF
   pass "queue accounting matches tasks-axi active hold and blocker semantics"
 }
 
+test_backlog_rows_match_tasks_axi_section_grammar() {
+  local home out
+  home=$(make_home exact-row-grammar)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] active-checkbox - Active checkbox
+- **active-legacy** - Active legacy
+- [x] active-wrong-check - Not an in-flight task
+
+## Queued
+- [ ] runnable - Runnable task
+- [x] checked-queued - Not queued
+- **bold-queued** - Not queued
+* [ ] star-bullet - Not queued
+- [ ] bad/id - Invalid id
+- [X] uppercase-check - Not queued
+
+## Done archive
+- [x] landed - Landed task
+- [X] uppercase-done - Not done
+EOF
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .queue_accounting.queued_total == 6
+      and .queue_accounting.structured_queued == 1
+      and .queue_accounting.unstructured_queued == 5
+      and .queue_accounting.runnable_candidates == 1
+      and ([.backlog.records[] | select(.structured) | .id]
+           == ["active-checkbox","active-legacy","runnable","landed"])
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true)] | length == 5)
+      and ([.backlog.records[] | select(.state == "done" and .structured != true)] | length == 1)
+  ' >/dev/null || fail "snapshot accepted rows outside tasks-axi section grammar: $out"
+  pass "snapshot recognizes only tasks-axi canonical section rows"
+}
+
 test_view_renders_dead_secondmate_agent_status() {
   local home fakebin view
   home=$(make_home dead-secondmate)
@@ -674,4 +709,5 @@ test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_queue_accounting_surfaces_holds_and_durable_program_boundary
 test_queue_accounting_uses_active_hold_and_blocker_semantics
+test_backlog_rows_match_tasks_axi_section_grammar
 test_view_renders_dead_secondmate_agent_status

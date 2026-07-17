@@ -6,6 +6,8 @@
 #
 # `done` additionally requires a single-use state/<id>.teardown-complete proof
 # written by successful lifecycle teardown.
+# Interrupted proof claims are reconciled from the task's resulting backlog
+# state, and every other successful mutation invalidates affected receipts.
 # A scout report completion must name the owned data/<id>/report.md and that
 # report must exist.
 # fm-teardown.sh calls this command only after successful endpoint/worktree and
@@ -112,7 +114,11 @@ if [ "$1" = task ]; then
   [ "$#" -gt 0 ] || { usage >&2; exit 2; }
 fi
 case "$1" in
+  create) shift; set -- "add" "$@" ;;
+  view) shift; set -- "show" "$@" ;;
   close) shift; set -- "done" "$@" ;;
+  edit) shift; set -- "update" "$@" ;;
+  delete) shift; set -- "rm" "$@" ;;
 esac
 
 if fm_backlog_backend_manual "$CONFIG"; then
@@ -139,10 +145,100 @@ case "$COMMAND" in
     echo "error: use bin/fm-backlog-handoff.sh for cross-home backlog moves" >&2
     exit 2
     ;;
+  add|list|show|start|done|reopen|update|rm|block|unblock|hold|unhold|ready|prune|render|setup|-v|-V|--version) ;;
+  *)
+    echo "error: unsupported tasks-axi command: $COMMAND" >&2
+    exit 2
+    ;;
 esac
 
 run_tasks_axi() {
   (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
+}
+
+archive_has_canonical_done_record() {  # <id>
+  local id=$1
+  [ -f "$ARCHIVE_PATH" ] || return 1
+  awk -v id="$id" '
+    /^- \[x\] / {
+      row = $0
+      sub(/^- \[x\] /, "", row)
+      prefix = id " - "
+      if (substr(row, 1, length(prefix)) == prefix) {
+        found = 1
+        exit
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$ARCHIVE_PATH"
+}
+
+completion_claim_settle() {
+  local task_info task_state show_status
+  [ -n "${CLAIMED_PROOF:-}" ] || return 0
+  if [ -L "$CLAIM_DIR" ] || [ ! -d "$CLAIM_DIR" ] || [ -L "$CLAIMED_PROOF" ] || [ ! -f "$CLAIMED_PROOF" ]; then
+    echo "error: teardown proof claim for $ID is not a regular owned claim" >&2
+    return 1
+  fi
+  show_status=0
+  task_info=$(run_tasks_axi show "$ID" --full 2>&1) || show_status=$?
+  if [ "$show_status" -ne 0 ]; then
+    if printf '%s\n' "$task_info" | grep -Fx 'code: NOT_FOUND' >/dev/null \
+      && archive_has_canonical_done_record "$ID"; then
+      task_state=done
+    else
+      echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
+      return 1
+    fi
+  else
+    task_state=$(printf '%s\n' "$task_info" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -n 1)
+  fi
+  if [ -z "$task_state" ]; then
+    echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
+    return 1
+  fi
+  if [ "$task_state" = done ]; then
+    rm -f "$CLAIMED_PROOF" || return 1
+    rmdir "$CLAIM_DIR" || return 1
+    CLAIMED_PROOF=
+    CLAIM_DIR=
+    CLAIM_SETTLED_STATE=done
+    return 0
+  fi
+  case "$task_state" in
+    queued|in_flight)
+      if [ -e "$COMPLETION_PROOF" ] || [ -L "$COMPLETION_PROOF" ]; then
+        echo "error: cannot recover teardown proof claim for $ID because its proof path is occupied" >&2
+        return 1
+      fi
+      mv "$CLAIMED_PROOF" "$COMPLETION_PROOF" || return 1
+      rmdir "$CLAIM_DIR" || return 1
+      CLAIMED_PROOF=
+      CLAIM_DIR=
+      CLAIM_SETTLED_STATE=retry
+      return 0
+      ;;
+  esac
+  echo "error: cannot recover teardown proof claim for $ID from backlog state ${task_state:-unknown}" >&2
+  return 1
+}
+
+recover_existing_completion_claim() {
+  local candidate
+  local -a claims=()
+  for candidate in "$STATE"/."$ID".teardown-complete.claimed.*; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      claims+=("$candidate")
+    fi
+  done
+  if [ "${#claims[@]}" -gt 1 ]; then
+    echo "error: multiple interrupted teardown proof claims exist for $ID" >&2
+    return 1
+  fi
+  [ "${#claims[@]}" -eq 1 ] || return 0
+  CLAIM_DIR=${claims[0]}
+  CLAIMED_PROOF="$CLAIM_DIR/proof"
+  completion_claim_settle
 }
 
 if [ "$COMMAND" = "done" ]; then
@@ -172,13 +268,27 @@ if [ "$COMMAND" = "done" ]; then
 fi
 
 LOCKED=0
+CLAIMED_PROOF=
+CLAIM_DIR=
+CLAIM_SETTLED_STATE=
 release_backlog_lock() {
   if [ "$LOCKED" -eq 1 ]; then
     fm_lock_release "$BACKLOG_LOCK"
     LOCKED=0
   fi
 }
-trap release_backlog_lock EXIT
+cleanup_backlog_wrapper() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [ -n "${CLAIMED_PROOF:-}" ] && ! completion_claim_settle; then
+    [ "$status" -ne 0 ] || status=1
+  fi
+  release_backlog_lock
+  exit "$status"
+}
+trap cleanup_backlog_wrapper EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Reads take the same lock as writes so a show/ready result cannot observe a
 # half-completed mutation or cross-home move.
@@ -191,6 +301,11 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     echo "REFUSED: task $ID still has unresolved owned lifecycle state." >&2
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2
     exit 1
+  fi
+  recover_existing_completion_claim || exit 1
+  if [ "$CLAIM_SETTLED_STATE" = done ]; then
+    echo "Done for $ID was already recorded before interrupted proof cleanup completed."
+    exit 0
   fi
   if [ -L "$COMPLETION_PROOF" ] || [ ! -f "$COMPLETION_PROOF" ]; then
     echo "REFUSED: task $ID has no durable successful-teardown proof." >&2
@@ -249,8 +364,6 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   fi
 fi
 
-CLAIMED_PROOF=
-CLAIM_DIR=
 if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   CLAIM_DIR=$(mktemp -d "$STATE/.${ID}.teardown-complete.claimed.XXXXXXXX") || {
     echo "error: could not prepare a single-use teardown proof claim for $ID" >&2
@@ -271,10 +384,15 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
     if ! rm -f "$CLAIMED_PROOF" || ! rmdir "$CLAIM_DIR"; then
       echo "error: Done succeeded but teardown proof claim could not be consumed for $ID" >&2
       STATUS=1
+    else
+      CLAIMED_PROOF=
+      CLAIM_DIR=
     fi
   else
     if mv "$CLAIMED_PROOF" "$COMPLETION_PROOF"; then
       rmdir "$CLAIM_DIR" 2>/dev/null || true
+      CLAIMED_PROOF=
+      CLAIM_DIR=
     else
       echo "error: Done failed and teardown proof claim could not be restored for $ID" >&2
       STATUS=1
@@ -283,10 +401,30 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
 fi
 if [ "$STATUS" -eq 0 ] && [ "$COMMAND" != "done" ]; then
   case "$COMMAND" in
-    add|update|hold|reopen|start|rm|remove|cancel)
+    add|start|reopen|update|rm|block|unblock|hold|unhold)
       MUTATED_ID=${2:-}
-      if fm_tasks_axi_valid_task_id "$MUTATED_ID"; then
-        rm -f "$STATE/$MUTATED_ID.teardown-complete"
+      ADD_MINTED=0
+      if [ "$COMMAND" = add ]; then
+        for arg in "$@"; do
+          [ "$arg" != --mint ] || ADD_MINTED=1
+        done
+      fi
+      if [ "$ADD_MINTED" -eq 1 ]; then
+        if ! fm_tasks_axi_invalidate_all_completion_receipts "$STATE"; then
+          echo "error: backlog mutation succeeded but completion receipts could not be invalidated safely" >&2
+          STATUS=1
+        fi
+      elif fm_tasks_axi_valid_task_id "$MUTATED_ID"; then
+        if ! fm_tasks_axi_invalidate_completion_receipt "$STATE" "$MUTATED_ID"; then
+          echo "error: backlog mutation succeeded but completion receipts for $MUTATED_ID could not be invalidated safely" >&2
+          STATUS=1
+        fi
+      fi
+      ;;
+    prune|render)
+      if ! fm_tasks_axi_invalidate_all_completion_receipts "$STATE"; then
+        echo "error: backlog mutation succeeded but completion receipts could not be invalidated safely" >&2
+        STATUS=1
       fi
       ;;
   esac

@@ -57,8 +57,8 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
-#   Backend endpoint creation invalidates any same-id teardown-complete proof
-#   first, so a new lifecycle can never reuse a prior delivery proof.
+#   Backend endpoint creation invalidates every same-id completion receipt first,
+#   so a new lifecycle can never reuse a prior delivery proof or interrupted claim.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -108,6 +108,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
@@ -700,7 +702,10 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 W="fm-$ID"
-rm -f "$STATE/$ID.teardown-complete"
+if ! fm_tasks_axi_invalidate_completion_receipt "$STATE" "$ID"; then
+  echo "error: could not invalidate completion receipts safely before spawning $ID" >&2
+  exit 1
+fi
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)

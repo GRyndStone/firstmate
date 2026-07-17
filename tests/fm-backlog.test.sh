@@ -30,10 +30,30 @@ set -u
 case "${1:-}" in
   --version) printf 'tasks-axi 0.2.2\n'; exit 0 ;;
   show)
+    show_mode=${FM_FAKE_SHOW_MODE:-success}
+    if [ -n "${FM_FAKE_SHOW_MODE_FILE:-}" ] && [ -f "$FM_FAKE_SHOW_MODE_FILE" ]; then
+      show_mode=$(cat "$FM_FAKE_SHOW_MODE_FILE")
+    fi
+    case "$show_mode" in
+      not_found)
+        printf 'error: Task "%s" not found in this backlog\n' "${2:-task-a}"
+        printf 'code: NOT_FOUND\n'
+        exit 1
+        ;;
+      operational)
+        printf 'error: backend inventory unavailable\n'
+        printf 'code: UNKNOWN\n'
+        exit 1
+        ;;
+    esac
+    task_state=${FM_FAKE_TASK_STATE:-queued}
+    if [ -n "${FM_FAKE_TASK_STATE_FILE:-}" ] && [ -f "$FM_FAKE_TASK_STATE_FILE" ]; then
+      task_state=$(cat "$FM_FAKE_TASK_STATE_FILE")
+    fi
     printf 'task:\n'
     printf '  id: %s\n' "${2:-task-a}"
     printf '  title: stable task\n'
-    printf '  state: queued\n'
+    printf '  state: %s\n' "$task_state"
     printf '  blocked: %s\n' "${FM_FAKE_BLOCKED:-no}"
     printf '  blocked_by: %s\n' "${FM_FAKE_BLOCKED_BY:-none}"
     printf '  held: %s\n' "${FM_FAKE_HELD:-no}"
@@ -49,6 +69,20 @@ case "${1:-}" in
     if [ "${2:-}" = --help ]; then printf '%s\n' '[<id>...]'; exit 0; fi
     ;;
 esac
+if [ "${1:-}" = done ] && [ -n "${FM_FAKE_INTERRUPT_MARKER:-}" ]; then
+  if [ -n "${FM_FAKE_DONE_STATE_FILE:-}" ]; then
+    printf 'done\n' > "$FM_FAKE_DONE_STATE_FILE"
+  fi
+  if [ -n "${FM_FAKE_ARCHIVE_PATH:-}" ]; then
+    printf '\n## Archived 2026-07-17\n- [x] %s - stable task (done 2026-07-17)\n' \
+      "${2:-task-a}" >> "$FM_FAKE_ARCHIVE_PATH"
+  fi
+  if [ -n "${FM_FAKE_SHOW_MODE_FILE:-}" ] && [ -n "${FM_FAKE_DONE_SHOW_MODE:-}" ]; then
+    printf '%s\n' "$FM_FAKE_DONE_SHOW_MODE" > "$FM_FAKE_SHOW_MODE_FILE"
+  fi
+  : > "$FM_FAKE_INTERRUPT_MARKER"
+  sleep 0.5
+fi
 if [ -n "${FM_FAKE_MUTATION_LOG:-}" ]; then
   if ! mkdir "$FM_FAKE_CRITICAL" 2>/dev/null; then
     printf 'overlap %s\n' "$$" >> "$FM_FAKE_MUTATION_LOG"
@@ -189,6 +223,174 @@ test_done_requires_matching_single_use_teardown_proof() {
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" rm task-a
   assert_absent "$home/state/task-a.teardown-complete" "successful record removal left a reusable teardown proof"
   pass "Done requires a matching single-use proof and preserves it only for retryable backend failure"
+}
+
+test_all_mutation_verbs_and_aliases_invalidate_proofs() {
+  local home claim out status
+
+  mutation_invalidates() {
+    local name=$1
+    shift
+    home=$(make_home "mutation-$name")
+    write_completion_proof "$home" task-a ship delivered-local
+    PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" "$@" >/dev/null
+    assert_absent "$home/state/task-a.teardown-complete" "$name left a reusable teardown proof"
+  }
+
+  mutation_invalidates block block task-a --by dependency-a
+  mutation_invalidates task-unblock task unblock task-a --by dependency-a
+  mutation_invalidates create create task-a replacement
+  mutation_invalidates task-edit task edit task-a --title replacement
+  mutation_invalidates delete delete task-a
+  mutation_invalidates unhold unhold task-a
+  mutation_invalidates render render
+  mutation_invalidates prune prune --keep 10
+  mutation_invalidates minted-create create 'minted replacement' --mint
+
+  global_mutation_invalidates_claim() {
+    local name=$1
+    shift
+    home=$(make_home "global-claim-$name")
+    write_completion_proof "$home" task-b ship delivered-local
+    claim="$home/state/.task-b.teardown-complete.claimed.stale"
+    mkdir "$claim"
+    mv "$home/state/task-b.teardown-complete" "$claim/proof"
+    PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" "$@" >/dev/null
+    assert_absent "$claim" "$name left an interrupted completion claim"
+  }
+  global_mutation_invalidates_claim minted-create create 'minted replacement' --mint
+  global_mutation_invalidates_claim render render
+  global_mutation_invalidates_claim prune prune --keep 10
+
+  home=$(make_home failed-block)
+  write_completion_proof "$home" task-a ship delivered-local
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_FAIL_MUTATION=1 \
+    "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
+  expect_code 9 "$status" "failed block mutation"
+  assert_present "$home/state/task-a.teardown-complete" "failed mutation invalidated a retryable proof"
+
+  home=$(make_home stale-claimed-delete)
+  write_completion_proof "$home" task-a ship delivered-local
+  claim="$home/state/.task-a.teardown-complete.claimed.stale"
+  mkdir "$claim"
+  mv "$home/state/task-a.teardown-complete" "$claim/proof"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" delete task-a >/dev/null
+  assert_absent "$claim" "successful delete left an interrupted completion claim"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" create task-a replacement >/dev/null
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "recreated task with stale interrupted claim"
+  assert_contains "$out" "no durable successful-teardown proof" \
+    "recreated task reused an interrupted claim from the deleted record"
+
+  home=$(make_home unsafe-claim-invalidation)
+  write_completion_proof "$home" task-a ship delivered-local
+  claim="$home/state/.task-a.teardown-complete.claimed.unsafe"
+  mkdir "$claim"
+  mv "$home/state/task-a.teardown-complete" "$claim/proof"
+  printf 'unexpected\n' > "$claim/extra"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" block task-a --by dependency-a 2>&1) || status=$?
+  expect_code 1 "$status" "unsafe interrupted claim invalidation"
+  assert_contains "$out" "could not be invalidated safely" \
+    "unsafe interrupted claim invalidation did not report the partial post-mutation state"
+  pass "all successful mutation verbs and aliases invalidate affected teardown proofs"
+}
+
+test_interrupted_completion_claim_reconciles_from_backlog_state() {
+  local home marker state_file mode_file archive_file claim out pid status candidate
+  home=$(make_home interrupted-retry)
+  marker="$home/done-started"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
+    "$BACKLOG" done task-a >/dev/null 2>&1 &
+  pid=$!
+  for _ in {1..100}; do
+    [ -f "$marker" ] && break
+    sleep 0.01
+  done
+  [ -f "$marker" ] || fail "interrupted Done did not reach the claimed-proof interval"
+  kill -TERM "$pid"
+  status=0
+  wait "$pid" || status=$?
+  expect_code 143 "$status" "interrupted Done before backlog mutation"
+  assert_present "$home/state/task-a.teardown-complete" "interrupted active task did not recover its retryable proof"
+  for candidate in "$home/state"/.task-a.teardown-complete.claimed.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    fail "interrupted active task left a stranded proof claim"
+  done
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  assert_absent "$home/state/task-a.teardown-complete" "retry after interrupted proof recovery did not consume proof"
+
+  home=$(make_home interrupted-completed)
+  marker="$home/done-started"
+  state_file="$home/task-state"
+  printf 'queued\n' > "$state_file"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
+    FM_FAKE_TASK_STATE_FILE="$state_file" FM_FAKE_DONE_STATE_FILE="$state_file" \
+    "$BACKLOG" done task-a >/dev/null 2>&1 &
+  pid=$!
+  for _ in {1..100}; do
+    [ -f "$marker" ] && break
+    sleep 0.01
+  done
+  [ -f "$marker" ] || fail "completed interrupted Done did not reach the claimed-proof interval"
+  kill -TERM "$pid"
+  status=0
+  wait "$pid" || status=$?
+  expect_code 143 "$status" "interrupted Done after backlog mutation"
+  assert_absent "$home/state/task-a.teardown-complete" "completed interrupted Done restored a consumed proof"
+  for candidate in "$home/state"/.task-a.teardown-complete.claimed.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    fail "completed interrupted Done left a stranded proof claim"
+  done
+
+  home=$(make_home interrupted-archived)
+  marker="$home/done-started"
+  mode_file="$home/show-mode"
+  archive_file="$home/data/done-archive.md"
+  printf 'success\n' > "$mode_file"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
+    FM_FAKE_SHOW_MODE_FILE="$mode_file" FM_FAKE_DONE_SHOW_MODE=not_found \
+    FM_FAKE_ARCHIVE_PATH="$archive_file" \
+    "$BACKLOG" done task-a --keep 0 >/dev/null 2>&1 &
+  pid=$!
+  for _ in {1..100}; do
+    [ -f "$marker" ] && break
+    sleep 0.01
+  done
+  [ -f "$marker" ] || fail "archived interrupted Done did not reach the claimed-proof interval"
+  kill -TERM "$pid"
+  status=0
+  wait "$pid" || status=$?
+  expect_code 143 "$status" "interrupted Done after immediate archival"
+  assert_grep '- [x] task-a - ' "$archive_file" "fake Done did not record the canonical archived row"
+  assert_absent "$home/state/task-a.teardown-complete" "archived interrupted Done restored a consumed proof"
+  for candidate in "$home/state"/.task-a.teardown-complete.claimed.*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    fail "archived interrupted Done left a stranded proof claim"
+  done
+
+  home=$(make_home interrupted-operational-error)
+  mode_file="$home/show-mode"
+  archive_file="$home/data/done-archive.md"
+  claim="$home/state/.task-a.teardown-complete.claimed.stale"
+  printf 'operational\n' > "$mode_file"
+  printf '\n## Archived 2026-07-17\n- [x] task-a - stable task (done 2026-07-17)\n' > "$archive_file"
+  write_completion_proof "$home" task-a ship delivered-local
+  mkdir "$claim"
+  mv "$home/state/task-a.teardown-complete" "$claim/proof"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE_FILE="$mode_file" \
+    "$BACKLOG" done task-a --keep 0 2>&1) || status=$?
+  expect_code 1 "$status" "claim recovery after operational show failure"
+  assert_contains "$out" "could not determine backlog state" \
+    "operational show failure did not fail claim recovery closed"
+  assert_present "$claim" "operational show failure consumed a claim from archive evidence"
+  pass "interrupted proof claims reconcile active, retained Done, and archived Done state"
 }
 
 test_default_tasks_kind_matches_legacy_ship_lifecycle() {
@@ -339,6 +541,8 @@ test_same_file_mutations_are_serialized
 test_done_refuses_unresolved_meta
 test_scout_done_requires_owned_report
 test_done_requires_matching_single_use_teardown_proof
+test_all_mutation_verbs_and_aliases_invalidate_proofs
+test_interrupted_completion_claim_reconciles_from_backlog_state
 test_default_tasks_kind_matches_legacy_ship_lifecycle
 test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards

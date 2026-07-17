@@ -27,9 +27,13 @@
 #      ordinary ship brief's run-step/status invariant forbids working events
 #      while a run is active, reserves a later working event for substantive
 #      same-pane recovery after terminal, and requires recovered validation to
-#      start a new run. A working event that postdates run creation plus a
-#      readable busy pane can therefore supersede that run's recoverable
-#      terminal classification; passed stays final.
+#      start a new run. A working event plus a readable busy pane can therefore
+#      supersede a recoverable terminal classification when that event names
+#      the exact terminal run as `after-run=<id>`; passed stays final.
+#      Before recovered work starts a new run, its brief requires a distinct
+#      `working: validating-after-run=<id>` event. During that handoff the named
+#      old terminal remains recoverable; a full current run with a different id
+#      is the fresh validation and remains authoritative.
 #      While
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
@@ -371,54 +375,83 @@ nm_ci_checks_state() {
 # oriented text - no run id, no JSON/TOON, newest-first, columns
 # "<status> <branch> <short-sha> <YYYY-MM-DD> <HH:MM> [<pr-url>]" separated
 # by whitespace. The displayed timestamp is the run's `CreatedAt`. The first
-# matching row supplies its coarse status and creation time as
-# "<status>|<epoch>", or the function returns empty when the branch has no run
-# within FM_CREW_STATE_RUNS_LIMIT rows.
-nm_datetime_epoch() {  # <YYYY-MM-DD HH:MM>
-  local value=$1
-  if date -j -f '%Y-%m-%d %H:%M' "$value" '+%s' >/dev/null 2>&1; then
-    date -j -f '%Y-%m-%d %H:%M' "$value" '+%s' 2>/dev/null
-  else
-    date -d "$value" '+%s' 2>/dev/null
-  fi
-}
+# matching row supplies its coarse status and head as "<status>|<head>", or
+# the function returns empty when the branch has no run within
+# FM_CREW_STATE_RUNS_LIMIT rows.
 
 nm_runs_record_for_branch() {  # <branch>
-  local branch=$1 out row st br run_date run_time epoch
+  local branch=$1 out row st br head
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
   while IFS= read -r row; do
     row=$(trim "$row")
     [ -n "$row" ] || continue
-    read -r st br _ run_date run_time _ <<< "$row"
+    read -r st br head _ <<< "$row"
     [ -n "$st" ] && [ -n "$br" ] || continue
     if [ "$br" = "$branch" ]; then
-      epoch=""
-      if [ -n "$run_date" ] && [ -n "$run_time" ]; then
-        epoch=$(nm_datetime_epoch "$run_date $run_time" || true)
-      fi
-      printf '%s|%s' "$st" "$epoch"
+      printf '%s|%s' "$st" "$head"
       return 0
     fi
   done <<< "$out"
   return 0
 }
 
-status_file_mtime() {
-  if [ "$(uname -s)" = Darwin ]; then
-    stat -f %m "$LOG" 2>/dev/null
-  else
-    stat -c %Y "$LOG" 2>/dev/null
-  fi
+recovery_run_id() {
+  local note token prefix id
+  [ "$LOG_VERB" = working ] || return 1
+  note=$(status_line_note "$LOG_LINE")
+  case "$note" in
+    after-run=*) prefix=after-run= ;;
+    validating-after-run=*) prefix=validating-after-run= ;;
+    *) return 1 ;;
+  esac
+  token=${note%%[[:space:]]*}
+  id=${token#"$prefix"}
+  case "$id" in ''|*[!A-Za-z0-9]*) return 1 ;; esac
+  printf '%s' "$id"
 }
 
-newer_working_pane_evidence() {  # <run-created-epoch>
-  local run_created_epoch=$1 log_epoch
-  [ "$LOG_VERB" = working ] || return 1
-  case "$run_created_epoch" in ''|*[!0-9]*) return 1 ;; esac
-  log_epoch=$(status_file_mtime) || return 1
-  case "$log_epoch" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$log_epoch" -ge "$((run_created_epoch + 60))" ] || return 1
+exact_recovery_pane_evidence() {
+  local recovery_id current_id recovery_out saved_out recovery_branch recovery_outcome recovery_status recovery_head expected_coarse
+  recovery_id=$(recovery_run_id) || return 1
+
+  if [ "$RUN_SOURCE" = full ]; then
+    current_id=$(strip_quotes "$(nm_field id)")
+    [ -n "$current_id" ] && [ "$current_id" = "$recovery_id" ] || return 1
+  fi
+
+  recovery_out=$(nm_run axi status --run "$recovery_id")
+  [ -n "$recovery_out" ] || return 1
+  saved_out=$RUN_OUT
+  RUN_OUT=$recovery_out
+  recovery_branch=$(strip_quotes "$(nm_field branch)")
+  recovery_outcome=$(strip_quotes "$(nm_field outcome)")
+  recovery_status=$(strip_quotes "$(nm_field status)")
+  recovery_head=$(strip_quotes "$(nm_field head)")
+  RUN_OUT=$saved_out
+
+  [ "$recovery_branch" = "$CREW_BRANCH" ] || return 1
+  case "$recovery_outcome" in
+    checks-passed) expected_coarse=completed ;;
+    failed) expected_coarse=failed ;;
+    cancelled) expected_coarse=cancelled ;;
+    passed) return 1 ;;
+    "")
+      case "$recovery_status" in
+        failed) expected_coarse=failed ;;
+        cancelled) expected_coarse=cancelled ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$RUN_SOURCE" = coarse ]; then
+    [ "$COARSE_STATUS" = "$expected_coarse" ] || return 1
+    [ -n "$COARSE_HEAD" ] && [ -n "$recovery_head" ] || return 1
+    case "$recovery_head" in "$COARSE_HEAD"*) ;; *) return 1 ;; esac
+  fi
+
   [ -n "$BACKEND_TARGET" ] || return 1
   pane_readable "$BACKEND_TARGET" && crew_pane_is_busy "$BACKEND_TARGET"
 }
@@ -434,7 +467,7 @@ HAVE_RUN=0
 # run-step block below skips the TOON field parsing entirely for this crew.
 RUN_SOURCE=full
 COARSE_STATUS=""
-COARSE_RUN_CREATED_EPOCH=""
+COARSE_HEAD=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -452,7 +485,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # for no better answer.
       COARSE_RECORD=$(nm_runs_record_for_branch "$CREW_BRANCH")
       COARSE_STATUS=${COARSE_RECORD%%|*}
-      COARSE_RUN_CREATED_EPOCH=${COARSE_RECORD#*|}
+      COARSE_HEAD=${COARSE_RECORD#*|}
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
@@ -470,7 +503,6 @@ if [ "$HAVE_RUN" = 1 ]; then
   CI_LOG_STATE=""
   RUN_STATUS=""
   RUN_RECOVERABLE_TERMINAL=0
-  RUN_CREATED_EPOCH=""
   if [ "$RUN_SOURCE" = coarse ]; then
     # No step/gate detail is available from the plain runs list - only ever
     # true/working, done, or failed. A crew genuinely parked at a gate still
@@ -481,12 +513,11 @@ if [ "$HAVE_RUN" = 1 ]; then
     # coarse-vs-full distinction, so a real gate is never silently missed.
     case "$COARSE_STATUS" in
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
-      completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
+      completed) RUN_STATE="done";  RUN_DETAIL="run completed"; RUN_RECOVERABLE_TERMINAL=1 ;;
       failed)    RUN_STATE=failed;  RUN_DETAIL="run failed"; RUN_RECOVERABLE_TERMINAL=1 ;;
       cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_RECOVERABLE_TERMINAL=1 ;;
       *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
     esac
-    RUN_CREATED_EPOCH=$COARSE_RUN_CREATED_EPOCH
   else
     status=$(strip_quotes "$(nm_field status)")
     RUN_STATUS=$status
@@ -523,7 +554,7 @@ if [ "$HAVE_RUN" = 1 ]; then
       case "$status" in
         ci)             RUN_STATE=working; RUN_DETAIL="ci running" ;;
         running|fixing) RUN_STATE=working; RUN_DETAIL="validating ($status)" ;;
-        completed)      RUN_STATE="done"; RUN_DETAIL="run completed" ;;
+        completed)      RUN_STATE="done"; RUN_DETAIL="run completed"; RUN_RECOVERABLE_TERMINAL=1 ;;
         failed)         RUN_STATE=failed;  RUN_DETAIL="run failed"; RUN_RECOVERABLE_TERMINAL=1 ;;
         cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_RECOVERABLE_TERMINAL=1 ;;
         "")             RUN_STATE=working; RUN_DETAIL="run active" ;;
@@ -571,12 +602,8 @@ if [ "$HAVE_RUN" = 1 ]; then
   fi
 
   if [ "$RUN_RECOVERABLE_TERMINAL" = 1 ]; then
-    if [ "$RUN_SOURCE" = full ]; then
-      RUN_RECORD=$(nm_runs_record_for_branch "$CREW_BRANCH")
-      RUN_CREATED_EPOCH=${RUN_RECORD#*|}
-    fi
-    if newer_working_pane_evidence "$RUN_CREATED_EPOCH"; then
-      emit working pane "post-creation working status and busy pane supersede $RUN_DETAIL"
+    if exact_recovery_pane_evidence; then
+      emit working pane "exact-run recovery status and busy pane supersede $RUN_DETAIL"
     fi
   fi
 

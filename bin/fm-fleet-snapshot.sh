@@ -159,9 +159,10 @@ backlog_json() {
   jq -Rn --arg path "$BACKLOG" '
     def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
     def section_state:
-      if . == "In flight" then "in_flight"
-      elif . == "Queued" then "queued"
-      elif . == "Done" then "done"
+      ascii_downcase
+      | if . == "in flight" then "in_flight"
+      elif . == "queued" then "queued"
+      elif startswith("done") then "done"
       else null end;
     def cap($rest; $re):
       (((($rest | capture($re)?) // {}) | .v) // null) as $v
@@ -272,15 +273,23 @@ backlog_json() {
         elif $reported != null then {verb:"reported",date:$reported}
         elif $done != null then {verb:"done",date:$done}
         else {verb:null,date:null} end;
-    def row_match($line):
-      (($line | capture("^[-*][[:space:]]+\\[(?<check>[ xX])\\][[:space:]]+(?<id>[^[:space:]]+)[[:space:]]+-[[:space:]]+(?<rest>.*)$")?) //
-       (($line | capture("^[-*][[:space:]]+\\*\\*(?<id>[^*]+)\\*\\*[[:space:]]+-[[:space:]]+(?<rest>.*)$")?)
-        | if . == null then null else . + {check:" "} end));
-    def structured_row($line):
-      ($line | test("^[-*][[:space:]]+\\[[ xX]\\][[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+"))
-      or ($line | test("^[-*][[:space:]]+\\*\\*[^*]+\\*\\*[[:space:]]+-[[:space:]]+"));
+    def unchecked_row($line):
+      (($line | capture("^- \\[ \\] (?<id>[A-Za-z0-9][A-Za-z0-9._-]*) - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:" "} end;
+    def legacy_in_flight_row($line):
+      (($line | capture("^- \\*\\*(?<id>[A-Za-z0-9][A-Za-z0-9._-]*)\\*\\* - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:" "} end;
+    def done_row($line):
+      (($line | capture("^- \\[x\\] (?<id>[A-Za-z0-9][A-Za-z0-9._-]*) - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:"x"} end;
+    def row_match($line; $section):
+      if $section == "queued" then unchecked_row($line)
+      elif $section == "in_flight" then (unchecked_row($line) // legacy_in_flight_row($line))
+      elif $section == "done" then done_row($line)
+      else null end;
+    def structured_row($line; $section): row_match($line; $section) != null;
     def parse_row($line; $section; $order):
-      row_match($line) as $m
+      row_match($line; $section) as $m
       | if $m == null then
           {order:$order,state:$section,structured:false,id:null,raw:$line,body_lines:[],body_excerpt:null}
         else
@@ -322,7 +331,7 @@ backlog_json() {
          .section = (($line | sub("^##[[:space:]]+";"") | trim) | section_state)
        elif .section == null or ($line | trim) == "" then
          .
-       elif structured_row($line) then
+       elif structured_row($line; .section) then
          .order += 1
          | .records += [parse_row($line; .section; .order)]
        elif ((.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^[[:space:]]+"))) then

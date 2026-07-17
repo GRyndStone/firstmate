@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Shared tasks-axi backend selection and compatibility probe for bootstrap,
-# teardown, and secondmate backlog handoff.
+# Shared tasks-axi backend selection, compatibility probe, and lifecycle receipt
+# invalidation for bootstrap, teardown, and backlog operations.
 # Usage: . bin/fm-tasks-axi-lib.sh
 # Compatible means tasks-axi --version reports 0.1.1 or newer,
 # `tasks-axi update --help` exposes --archive-body for recoverable note rewrites,
@@ -62,6 +62,43 @@ fm_tasks_axi_valid_task_id() {  # <id>
       ;;
     *) return 1 ;;
   esac
+}
+
+fm_tasks_axi_remove_completion_claim() {  # <claim-path>
+  local claim=$1 proof
+  if [ -L "$claim" ] || [ ! -d "$claim" ]; then
+    rm -f "$claim"
+    return $?
+  fi
+  proof="$claim/proof"
+  if [ -e "$proof" ] || [ -L "$proof" ]; then
+    rm -f "$proof" || return 1
+  fi
+  rmdir "$claim"
+}
+
+fm_tasks_axi_invalidate_completion_receipt() {  # <state-dir> <id>
+  local state=$1 id=$2 claim status=0
+  fm_tasks_axi_valid_task_id "$id" || return 1
+  rm -f "$state/$id.teardown-complete" || status=1
+  for claim in "$state"/."$id".teardown-complete.claimed.*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    fm_tasks_axi_remove_completion_claim "$claim" || status=1
+  done
+  return "$status"
+}
+
+fm_tasks_axi_invalidate_all_completion_receipts() {  # <state-dir>
+  local state=$1 receipt claim status=0
+  for receipt in "$state"/*.teardown-complete; do
+    [ -e "$receipt" ] || [ -L "$receipt" ] || continue
+    rm -f "$receipt" || status=1
+  done
+  for claim in "$state"/.*.teardown-complete.claimed.*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    fm_tasks_axi_remove_completion_claim "$claim" || status=1
+  done
+  return "$status"
 }
 
 fm_tasks_axi_task_fingerprint() {

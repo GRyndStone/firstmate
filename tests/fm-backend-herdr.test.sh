@@ -1942,6 +1942,50 @@ test_wait_transition_not_capable_returns_2() {
   pass "fm_backend_herdr_wait_transition: below-capability protocol/schema falls back to polling (rc 2)"
 }
 
+test_large_early_marker_schema_and_checkpoint_are_quiet() {
+  local dir fb watcher out err direct_err status
+  dir="$TMP_ROOT/large-schema-capability"; fb="$dir/fakebin"; mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "status --json")
+    printf '%s\n' '{"client":{"protocol":16},"server":{"running":true}}'
+    ;;
+  "api schema")
+    printf '%s' '{"events.subscribe":{},"pane.agent_status_changed":{},"padding":"'
+    awk 'BEGIN { for (i = 0; i < 240000; i++) printf "x" }'
+    printf '%s\n' '"}'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  direct_err="$dir/direct.err"
+  status=0
+  PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENT_READER=fake-reader \
+    /bin/bash -o pipefail -c '. "$1"; fm_backend_herdr_events_capable test' _ "$ROOT/bin/backends/herdr.sh" \
+    >"$dir/direct.out" 2>"$direct_err" || status=$?
+  expect_code 0 "$status" "large-schema capability exit"
+  [ ! -s "$direct_err" ] || fail "large-schema capability wrote stderr: $(cat "$direct_err")"
+
+  watcher="$dir/watcher.sh"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+. "$FM_TEST_ROOT/bin/backends/herdr.sh"
+fm_backend_herdr_events_capable test || exit 2
+printf '%s\n' 'signal: large-schema capability wake'
+SH
+  chmod +x "$watcher"
+  out="$dir/checkpoint.out"; err="$dir/checkpoint.err"; status=0
+  PATH="$fb:$PATH" FM_TEST_ROOT="$ROOT" FM_BACKEND_HERDR_EVENT_READER=fake-reader \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 5 \
+    >"$out" 2>"$err" || status=$?
+  expect_code 0 "$status" "large-schema checkpoint exit"
+  assert_contains "$(cat "$out")" "signal: large-schema capability wake" "checkpoint dropped the successful wake"
+  [ ! -s "$err" ] || fail "successful large-schema checkpoint wrote stderr: $(cat "$err")"
+  pass "Herdr large-schema capability and successful checkpoint complete without stderr"
+}
+
 test_wait_transition_reconcile_blocked_returns_record() {
   local dir state agent temp fb reader lines out rc marker
   dir="$TMP_ROOT/wt-reconcile"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
@@ -2166,6 +2210,7 @@ test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2
 test_wait_transition_not_capable_returns_2
+test_large_early_marker_schema_and_checkpoint_are_quiet
 test_wait_transition_reconcile_blocked_returns_record
 test_wait_transition_subscribes_before_reconcile
 test_wait_transition_reconcile_dedupes_when_marked

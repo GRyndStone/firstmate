@@ -511,10 +511,56 @@ SH
   log="$home/tasks.log"
   out=$(cd "$hostile" && PATH="$fakebin:$PATH" HOME="$hostile" FM_HOME="$home" FM_HANDOFF_ARGS_LOG="$log" \
     "$ROOT/bin/fm-backlog-handoff.sh" design contained-item 2>&1) || fail "contained handoff failed: $out"
-  assert_contains "$(cat "$log")" "pwd=$home_phys home=$home_phys args=mv contained-item --backend markdown --file $home/data/backlog.md --to $sub_phys/data/backlog.md" \
+  assert_contains "$(cat "$log")" "pwd=$home_phys home=$home_phys args=mv contained-item --backend markdown --file $home_phys/data/backlog.md --to $sub_phys/data/backlog.md" \
     "handoff tasks-axi mv inherited ambient cwd, HOME, backend, or file"
   assert_not_contains "$(cat "$log")" "$hostile" "ambient handoff configuration reached tasks-axi"
   pass "handoff tasks-axi execution is contained to the selected Firstmate home"
+}
+
+test_active_home_data_symlink_escape_is_rejected() {
+  local home="$TMP_ROOT/data-symlink-main" sub="$TMP_ROOT/data-symlink-sub"
+  local outside="$TMP_ROOT/data-symlink-outside" before out status
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] escaped-item - must remain in source (repo: alpha)
+EOF
+  mv "$home/data" "$outside"
+  ln -s "$outside" "$home/data"
+  before=$(cat "$outside/backlog.md")
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design escaped-item 2>&1) || status=$?
+  expect_code 1 "$status" "active data symlink escape"
+  assert_contains "$out" "data directory must resolve inside the active home" \
+    "active data symlink escape did not fail home containment"
+  [ "$before" = "$(cat "$outside/backlog.md")" ] \
+    || fail "rejected active data symlink escape changed the external backlog"
+  if [ -f "$sub/data/backlog.md" ]; then
+    assert_no_grep 'escaped-item' "$sub/data/backlog.md" \
+      "rejected active data symlink escape moved work into the secondmate backlog"
+  fi
+  pass "active home data symlink cannot escape handoff containment"
+}
+
+test_handoff_invalidates_interrupted_completion_claims() {
+  local home="$TMP_ROOT/receipt-main" sub="$TMP_ROOT/receipt-sub" claim
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] claimed-item - must receive a new lifecycle (repo: alpha)
+EOF
+  for claim in "$home/state/.claimed-item.teardown-complete.claimed.source" \
+    "$sub/state/.claimed-item.teardown-complete.claimed.destination"; do
+    mkdir -p "$claim"
+    printf 'stale\n' > "$claim/proof"
+  done
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design claimed-item >/dev/null \
+    || fail "handoff with stale interrupted claims failed"
+  assert_absent "$home/state/.claimed-item.teardown-complete.claimed.source" \
+    "handoff left the source interrupted completion claim"
+  assert_absent "$sub/state/.claimed-item.teardown-complete.claimed.destination" \
+    "handoff left the destination interrupted completion claim"
+  pass "handoff invalidates interrupted completion claims in both homes"
 }
 
 test_body_moves_when_followed_by_another_item
@@ -527,5 +573,7 @@ test_body_handoff_is_idempotent
 test_noncanonical_indented_continuations_refuse_without_changes
 test_indented_heading_is_not_section_boundary
 test_handoff_tasks_axi_is_contained_to_selected_home
+test_active_home_data_symlink_escape_is_rejected
+test_handoff_invalidates_interrupted_completion_claims
 
 echo "ALL TESTS PASSED"
