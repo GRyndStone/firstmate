@@ -11,11 +11,11 @@
 # A scout report completion must name the owned data/<id>/report.md, which must
 # be a regular non-symlink file canonically contained by this home.
 # fm-teardown.sh calls this command only after successful endpoint/worktree
-# cleanup from its retained finalizing stage, after duplicate-endpoint preflight,
+# cleanup from its retained backlog-done-started stage, after duplicate-endpoint preflight,
 # which makes the supported completion order fail-closed.
 #
-# Manual backlog mode keeps routine edits operator-owned, but lifecycle show
-# and Done still use this serialized wrapper and the same teardown receipt.
+# Manual backlog mode suppresses automatic availability reporting, but every
+# read and mutation still uses this serialized wrapper.
 # Usage: fm-backlog.sh <tasks-axi-command> [args...]
 set -u
 
@@ -27,6 +27,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
 
 usage() {
   cat <<'EOF'
@@ -54,7 +56,6 @@ FM_HOME=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || {
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
-CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 BACKLOG_SOURCE="$DATA/backlog.md"
 BACKLOG_LOCK="$STATE/.backlog.lock"
 
@@ -121,8 +122,6 @@ case "$1" in
   delete) shift; set -- "rm" "$@" ;;
 esac
 
-MANUAL_BACKEND=0
-fm_backlog_backend_manual "$CONFIG" && MANUAL_BACKEND=1
 (cd "$FM_HOME" && HOME="$FM_HOME" fm_tasks_axi_compatible) || {
   echo "error: compatible tasks-axi is required for fm-backlog.sh" >&2
   exit 1
@@ -149,16 +148,6 @@ case "$COMMAND" in
     exit 2
     ;;
 esac
-
-if [ "$MANUAL_BACKEND" -eq 1 ]; then
-  case "$COMMAND" in
-    show|done) ;;
-    *)
-      echo "error: config/backlog-backend=manual; use manual edits for routine operations, but use fm-backlog.sh done after teardown" >&2
-      exit 1
-      ;;
-  esac
-fi
 
 run_tasks_axi() {
   (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
@@ -262,7 +251,7 @@ recover_existing_completion_claim() {
 }
 
 finalizing_stage_is_owned() {  # <stage-path> <task-id>
-  local stage=$1 id=$2 meta meta_cksum
+  local stage=$1 id=$2 meta meta_cksum aux aux_cksum owner kind target backend endpoint endpoint_state
   [ ! -L "$stage" ] && [ -f "$stage" ] || return 1
   meta="$STATE/$id.meta"
   [ ! -L "$meta" ] && [ -f "$meta" ] || return 1
@@ -273,13 +262,55 @@ finalizing_stage_is_owned() {  # <stage-path> <task-id>
     $1 == "phase" { phases++; phase = substr($0, index($0, "=") + 1) }
     $1 == "meta-cksum" { metas++; meta_cksum = substr($0, index($0, "=") + 1) }
     $1 == "record-cksum" { records++; record_cksum = substr($0, index($0, "=") + 1) }
+    $1 == "owner-identity" { identities++; identity = substr($0, index($0, "=") + 1) }
+    $1 == "owner-marker" { markers++; marker = substr($0, index($0, "=") + 1) }
+    $1 == "owner-token" { tokens++; token = substr($0, index($0, "=") + 1) }
+    $1 == "force" { forces++; force = substr($0, index($0, "=") + 1) }
+    $1 == "outcome" { outcomes++; outcome = substr($0, index($0, "=") + 1) }
+    $1 == "aux-cksum" { auxes++; aux = substr($0, index($0, "=") + 1) }
+    { lines++ }
     END {
       exit !(versions == 1 && version == "3" && tasks == 1 && task == id \
-        && phases == 1 && phase == "finalizing" \
+        && phases == 1 && phase == "backlog-done-started" \
         && metas == 1 && meta_cksum == want_meta_cksum \
-        && records == 1 && record_cksum != "")
+        && records == 1 && record_cksum != "" \
+        && identities == 1 && identity != "" \
+        && markers == 1 && marker != "" \
+        && tokens == 1 && token != "" \
+        && forces == 1 && force == "0" \
+        && outcomes == 1 && outcome ~ /^delivered-(report|local|pr|default)$/ \
+        && auxes == 1 && aux != "" && lines == 11 \
+        && ((identity == "absent" && marker == "none" && token == "none") \
+          || (identity != "absent" && marker != "none" && token != "none")))
     }
-  ' "$stage"
+  ' "$stage" || return 1
+  owner=$(sed -n 's/^owner-marker=//p' "$stage")
+  [ "$owner" = none ] || { [ ! -e "$owner" ] && [ ! -L "$owner" ]; } || return 1
+  aux="$STATE/$id.teardown-owners"
+  [ -f "$aux" ] && [ ! -L "$aux" ] || return 1
+  aux_cksum=$(sed -n 's/^aux-cksum=//p' "$stage")
+  [ "$(cksum < "$aux" | awk '{print $1 ":" $2}')" = "$aux_cksum" ] || return 1
+  awk -F '\t' '
+    NF != 5 || $1 !~ /^(child-home|child-worktree|tasktmp)$/ || $2 == "" \
+      || $3 == "" || $4 == "" || $5 == "" || seen[$2]++ { exit 1 }
+  ' "$aux" || return 1
+  while IFS=$'\t' read -r kind target _; do
+    [ -n "$kind" ] && [ -n "$target" ] || return 1
+    [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+  done < "$aux"
+  kind=$(sed -n 's/^kind=//p' "$meta" | tail -1)
+  if [ "$kind" = secondmate ]; then
+    target=$(sed -n 's/^home=//p' "$meta" | tail -1)
+    [ -n "$target" ] || target=$(sed -n 's/^worktree=//p' "$meta" | tail -1)
+  else
+    target=$(sed -n 's/^worktree=//p' "$meta" | tail -1)
+  fi
+  [ -z "$target" ] || { [ ! -e "$target" ] && [ ! -L "$target" ]; } || return 1
+  backend=$(fm_backend_of_meta "$meta")
+  endpoint=$(fm_backend_target_of_meta "$meta")
+  [ -n "$endpoint" ] || return 1
+  endpoint_state=$(fm_backend_target_state "$backend" "$endpoint" "fm-$id" "$(fm_meta_get "$meta" zellij_tab_id)") || return 1
+  [ "$endpoint_state" = absent ]
 }
 
 if [ "$COMMAND" = "done" ]; then
@@ -339,8 +370,12 @@ LOCKED=1
 if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   COMPLETION_PROOF="$STATE/$ID.teardown-complete"
   FINALIZING_STAGE=0
+  FINALIZING_OUTCOME=
+  FINALIZING_RECORD_CKSUM=
   if finalizing_stage_is_owned "$STATE/$ID.teardown-stage" "$ID"; then
     FINALIZING_STAGE=1
+    FINALIZING_OUTCOME=$(sed -n 's/^outcome=//p' "$STATE/$ID.teardown-stage")
+    FINALIZING_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$STATE/$ID.teardown-stage")
   fi
   if [ "$FINALIZING_STAGE" -ne 1 ] && { [ -e "$STATE/$ID.tearing-down" ] \
      || [ -e "$STATE/$ID.meta" ] \
@@ -381,6 +416,12 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   PROOF_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)
   if [ "$PROOF_VERSION" != 1 ] || [ "$PROOF_TASK" != "$ID" ]; then
     echo "REFUSED: teardown proof is not bound to task $ID." >&2
+    exit 1
+  fi
+  if [ "$FINALIZING_STAGE" -eq 1 ] \
+     && { [ "$PROOF_OUTCOME" != "$FINALIZING_OUTCOME" ] \
+       || [ "$PROOF_RECORD_CKSUM" != "$FINALIZING_RECORD_CKSUM" ]; }; then
+    echo "REFUSED: teardown proof does not match the complete finalization stage for $ID." >&2
     exit 1
   fi
   TASK_INFO=$(run_tasks_axi show "$ID" --full) || exit $?

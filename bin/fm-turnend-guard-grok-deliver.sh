@@ -9,15 +9,14 @@ ROOT=${2:-}
 . "$ROOT/bin/fm-wake-lib.sh" || exit 1
 
 DELAY=${FM_GROK_TURNEND_DELAY:-1}
-RETRIES=${FM_GROK_TURNEND_RETRIES:-2}
+RETRY_DELAY=${FM_GROK_TURNEND_RETRY_DELAY:-5}
 TIMEOUT=${FM_GROK_TURNEND_DELIVERY_TIMEOUT:-120}
 case "$DELAY" in ''|*[!0-9]*) DELAY=1 ;; esac
-case "$RETRIES" in ''|*[!0-9]*|0) RETRIES=2 ;; esac
+case "$RETRY_DELAY" in ''|*[!0-9]*|0) RETRY_DELAY=5 ;; esac
 case "$TIMEOUT" in ''|*[!0-9]*|0) TIMEOUT=120 ;; esac
-[ "$RETRIES" -le 3 ] || RETRIES=3
+[ "$RETRY_DELAY" -le 60 ] || RETRY_DELAY=60
 [ "$TIMEOUT" -le 300 ] || TIMEOUT=300
 
-sleep "$DELAY"
 DELIVERY_LOCK="$PENDING.delivery"
 LOCK_PID=${BASHPID:-$$}
 LOCK_IDENTITY=$(fm_pid_identity "$LOCK_PID") || exit 1
@@ -47,15 +46,6 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup; exit 1' TERM INT
 
-[ -f "$PENDING" ] && [ ! -L "$PENDING" ] || exit 0
-SESSION_ID=$(sed -n '1p' "$PENDING" 2>/dev/null || true)
-REASON=$(sed '1d' "$PENDING" 2>/dev/null || true)
-[ -n "$SESSION_ID" ] || exit 1
-
-MESSAGE="TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
-
-$REASON"
-
 run_delivery() {
   local delivery_pid timer_pid rc
   GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
@@ -77,14 +67,34 @@ run_delivery() {
   return "$rc"
 }
 
-attempt=1
-while [ "$attempt" -le "$RETRIES" ]; do
+wait_for_originating_hook() {
+  local hook_pid=$1 hook_identity=$2 current_identity
+  while fm_pid_alive "$hook_pid"; do
+    current_identity=$(fm_pid_identity "$hook_pid" 2>/dev/null || true)
+    [ "$current_identity" = "$hook_identity" ] || return 0
+    sleep 0.05
+  done
+}
+
+while [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; do
+  RECORD=$(cat "$PENDING" 2>/dev/null || true)
+  TOKEN=$(printf '%s\n' "$RECORD" | sed -n '1p')
+  HOOK_PID=$(printf '%s\n' "$RECORD" | sed -n '2p')
+  HOOK_IDENTITY=$(printf '%s\n' "$RECORD" | sed -n '3p')
+  SESSION_ID=$(printf '%s\n' "$RECORD" | sed -n '4p')
+  REASON=$(printf '%s\n' "$RECORD" | sed '1,4d')
+  [ -n "$TOKEN" ] && [ -n "$HOOK_PID" ] && [ -n "$HOOK_IDENTITY" ] && [ -n "$SESSION_ID" ] || exit 1
+  wait_for_originating_hook "$HOOK_PID" "$HOOK_IDENTITY"
+  sleep "$DELAY"
+  [ "$(cat "$PENDING" 2>/dev/null || true)" = "$RECORD" ] || continue
+  MESSAGE="TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
+
+$REASON"
   if run_delivery; then
-    rm -f "$PENDING"
-    exit 0
+    [ "$(cat "$PENDING" 2>/dev/null || true)" = "$RECORD" ] && rm -f "$PENDING"
+    continue
   fi
-  attempt=$((attempt + 1))
-  [ "$attempt" -le "$RETRIES" ] && sleep 1
+  sleep "$RETRY_DELAY"
 done
 
-exit 1
+exit 0

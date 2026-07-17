@@ -269,10 +269,22 @@ test_hook_accepts_only_active_away_inject_daemon() {
 fm_backend_target_exists() {
   [ "$1" = tmux ] && [ "$2" = '%99' ] && [ -f "$FM_HOME/state/.test-supervisor-target-live" ]
 }
+fm_backend_agent_alive() {
+  if [ "$1" = tmux ] && [ "$2" = '%99' ] && [ -f "$FM_HOME/state/.test-supervisor-agent-live" ]; then
+    printf 'alive'
+  else
+    printf 'dead'
+  fi
+}
 SH
   : > "$dir/state/.test-supervisor-target-live"
   out=$(run_hook "$dir" false); status=$?
-  expect_code 0 "$status" "active away-inject daemon ownership with a live injection target must authorize stop"
+  expect_code 2 "$status" "away-inject daemon with a live bare-shell pane must not authorize stop"
+  assert_contains "$out" "daemon owner or its injection target is not active" "bare-shell daemon target rejection was not explained"
+
+  : > "$dir/state/.test-supervisor-agent-live"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "active away-inject daemon ownership with a live agent injection target must authorize stop"
   [ -z "$out" ] || fail "active away-inject daemon produced output: $out"
 
   rm -f "$dir/state/.test-supervisor-target-live"
@@ -281,7 +293,7 @@ SH
   wait "$pid" "$owner_pid" 2>/dev/null || true
   expect_code 2 "$status" "away-inject daemon with a dead injection target must not authorize stop"
   assert_contains "$out" "daemon owner or its injection target is not active" "dead daemon injection target rejection was not explained"
-  pass "fm-turnend-guard: daemon ownership is bound to active away-inject mode and a live injection target"
+  pass "fm-turnend-guard: daemon ownership is bound to active away-inject mode and a live agent injection target"
 }
 
 test_hook_blocks_live_foreground_checkpoint_then_blocks_retry() {
@@ -516,7 +528,7 @@ test_grok_adapter_forces_one_resume_when_unhealthy() {
 } >> "$log"
 EOF
   chmod +x "$fakebin/grok"
-  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=1 FM_GROK_TURNEND_RETRIES=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must durably queue a forced resume"
   [ -z "$out" ] || fail "grok adapter printed output: $out"
   [ ! -e "$log" ] || fail "Grok continuation ran recursively before the Stop hook returned"
@@ -560,7 +572,7 @@ printf 'guard\n' >> "$guard_log"
 exit 2
 EOF
   chmod +x "$dir/bin/fm-turnend-guard.sh"
-  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" GROK_TURNEND_GUARD_ACTIVE=1 FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRIES=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" GROK_TURNEND_GUARD_ACTIVE=1 FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must queue another continuation after a still-blind forced turn"
   [ -z "$out" ] || fail "grok adapter printed output on repeated continuation: $out"
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -573,7 +585,7 @@ EOF
 }
 
 test_grok_adapter_preserves_failed_delivery_handoff() {
-  local dir fakebin attempts out status i pending
+  local dir fakebin attempts out status i pending attempt_count
   dir=$(make_primary_dir "$TMP_ROOT/grok-adapter-delivery-failure")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/grok-adapter-delivery-failure-fakebin")
@@ -581,10 +593,10 @@ test_grok_adapter_preserves_failed_delivery_handoff() {
   cat > "$fakebin/grok" <<EOF
 #!/usr/bin/env bash
 printf 'attempt\n' >> "$attempts"
-exit 1
+[ "\$(wc -l < "$attempts" | tr -d ' ')" -ge 2 ]
 EOF
   chmod +x "$fakebin/grok"
-  out=$(printf '{"sessionId":"session-failure","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRIES=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  out=$(printf '{"sessionId":"session-failure","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must return after durably scheduling delivery"
   [ -z "$out" ] || fail "grok adapter printed output while scheduling failed delivery: $out"
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -592,14 +604,177 @@ EOF
     sleep 0.1
   done
   [ -s "$attempts" ] || fail "failed Grok continuation was never attempted"
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  pending=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)
+  [ -n "$pending" ] || fail "failed Grok continuation did not retain its durable pending handoff"
+  assert_contains "$(cat "$pending")" "session-failure" "Grok pending handoff lost its exact session id"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    attempt_count=$(wc -l < "$attempts" | tr -d ' ')
     pending=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)
-    [ -n "$pending" ] && break
+    [ "$attempt_count" -ge 2 ] && [ -z "$pending" ] && break
     sleep 0.1
   done
-  [ -n "$pending" ] || fail "failed Grok continuation did not restore its durable pending handoff"
-  assert_contains "$(cat "$pending")" "session-failure" "Grok pending handoff lost its exact session id"
-  pass "fm-turnend-guard-grok: failed deferred delivery remains durably retryable"
+  [ "$attempt_count" -ge 2 ] || fail "Grok failed delivery lost its live retry owner"
+  [ -z "$pending" ] || fail "successful Grok retry did not clear the acknowledged handoff"
+  pass "fm-turnend-guard-grok: failed deferred delivery retains retry ownership"
+}
+
+test_grok_worker_waits_for_originating_hook_exit() {
+  local dir fakebin log pending origin_pid origin_identity worker_pid i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-origin-barrier")
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-origin-barrier-fakebin")
+  log="$TMP_ROOT/grok-origin-barrier.log"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$log"
+EOF
+  chmod +x "$fakebin/grok"
+  sleep 1 &
+  origin_pid=$!
+  origin_identity=$(. "$dir/bin/fm-wake-lib.sh"; fm_pid_identity "$origin_pid")
+  mkdir -p "$dir/state/.turnend-handoffs"
+  pending="$dir/state/.turnend-handoffs/grok-origin.pending"
+  {
+    printf 'origin-token\n%s\n%s\nsession-origin\norigin barrier\n' "$origin_pid" "$origin_identity"
+  } > "$pending"
+  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" &
+  worker_pid=$!
+  sleep 0.2
+  [ ! -e "$log" ] || fail "Grok resume began while the originating Stop hook identity was alive"
+  wait "$origin_pid"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$log" ] && break
+    sleep 0.1
+  done
+  wait "$worker_pid"
+  [ -s "$log" ] || fail "Grok resume did not start after the originating hook exited"
+  pass "fm-turnend-guard-grok: resume waits for originating Stop-hook process exit"
+}
+
+test_grok_session_delivery_is_singleton() {
+  local dir fakebin calls active overlap out status i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-session-singleton")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-session-singleton-fakebin")
+  calls="$TMP_ROOT/grok-session-singleton-calls"
+  active="$TMP_ROOT/grok-session-singleton-active"
+  overlap="$TMP_ROOT/grok-session-singleton-overlap"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+if ! mkdir "$active" 2>/dev/null; then
+  : > "$overlap"
+  exit 1
+fi
+printf 'called\n' >> "$calls"
+sleep 0.4
+rmdir "$active"
+EOF
+  chmod +x "$fakebin/grok"
+  out=$(printf '{"sessionId":"session-singleton","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "first Grok Stop must queue singleton delivery"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -d "$active" ] && break
+    sleep 0.1
+  done
+  [ -d "$active" ] || fail "first Grok singleton delivery did not start"
+  out=$(printf '{"sessionId":"session-singleton","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "second Grok Stop must update the singleton handoff"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ "$(wc -l < "$calls" 2>/dev/null | tr -d ' ')" -ge 2 ] && break
+    sleep 0.1
+  done
+  [ ! -e "$overlap" ] || fail "same-session Grok resumes overlapped"
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 2 ] || fail "same-session Grok handoff did not serialize both records"
+  pass "fm-turnend-guard-grok: one per-session owner serializes resumed continuations"
+}
+
+test_grok_healthy_stop_invalidates_stale_pending() {
+  local dir fakebin started release out status i pending delivery
+  dir=$(make_primary_dir "$TMP_ROOT/grok-stale-pending")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-stale-pending-fakebin")
+  started="$TMP_ROOT/grok-stale-pending-started"
+  release="$TMP_ROOT/grok-stale-pending-release"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+: > "$started"
+while [ ! -f "$release" ]; do sleep 0.05; done
+exit 1
+EOF
+  chmod +x "$fakebin/grok"
+  out=$(printf '{"sessionId":"session-recovered","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "blind Grok Stop must queue retained work"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$started" ] && break
+    sleep 0.1
+  done
+  [ -f "$started" ] || fail "stale-pending setup never entered delivery"
+  cat > "$dir/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+SH
+  chmod +x "$dir/bin/fm-turnend-guard.sh"
+  out=$(printf '{"sessionId":"session-recovered","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "healthy Grok Stop must invalidate retained work"
+  pending=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)
+  [ -z "$pending" ] || fail "healthy Grok Stop retained an obsolete handoff"
+  : > "$release"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    delivery=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.delivery' -print -quit 2>/dev/null)
+    [ -z "$delivery" ] && break
+    sleep 0.1
+  done
+  [ -z "$delivery" ] || fail "stale Grok retry owner did not stop after recovery"
+  pass "fm-turnend-guard-grok: healthy Stop invalidates stale pending delivery"
+}
+
+test_grok_missing_guard_fails_closed_through_retry_owner() {
+  local dir fakebin log out status i pending delivery
+  dir=$(make_primary_dir "$TMP_ROOT/grok-missing-guard")
+  : > "$dir/state/task1.meta"
+  rm -f "$dir/bin/fm-turnend-guard.sh"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-missing-guard-fakebin")
+  log="$TMP_ROOT/grok-missing-guard.log"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'args:' >> "$log"
+for arg in "\$@"; do printf ' <%s>' "\$arg" >> "$log"; done
+printf '\n' >> "$log"
+EOF
+  chmod +x "$fakebin/grok"
+  out=$(printf '{"sessionId":"session-missing-guard","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "known Grok primary with a missing shared guard must queue fail-closed delivery"
+  [ -z "$out" ] || fail "missing-guard Grok adapter printed output: $out"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$log" ] && break
+    sleep 0.1
+  done
+  [ -s "$log" ] || fail "missing shared guard did not start Grok's retry owner"
+  assert_contains "$(cat "$log")" "shared turn-end guard is unavailable" "Grok missing-guard continuation lost its fail-closed reason"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    pending=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)
+    delivery=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.delivery' -print -quit 2>/dev/null)
+    [ -z "$pending" ] && [ -z "$delivery" ] && break
+    sleep 0.1
+  done
+  [ -z "$pending" ] && [ -z "$delivery" ] || fail "acknowledged missing-guard Grok handoff retained state"
+  pass "fm-turnend-guard-grok: missing shared guard enters durable fail-closed delivery"
+}
+
+test_grok_handoff_preparation_failure_is_nonzero() {
+  local dir fakebin out status
+  dir=$(make_primary_dir "$TMP_ROOT/grok-handoff-preparation")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-handoff-preparation-fakebin")
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/mktemp"
+  out=$(printf '{"sessionId":"session-preparation-failure","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Grok handoff preparation failure exited healthy"
+  pass "fm-turnend-guard-grok: handoff preparation failure is conservatively nonzero"
 }
 
 test_settings_hook_uses_claude_project_dir() {
@@ -777,58 +952,151 @@ EOF
 }
 
 test_opencode_plugin_preserves_failed_delivery_handoff() {
-  local plugin worktree_dir home out status
+  local plugin worktree_dir home healthy out status
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   worktree_dir="$TMP_ROOT/opencode-delivery-failure-root"
   home="$TMP_ROOT/opencode-delivery-failure-home"
+  healthy="$TMP_ROOT/opencode-delivery-failure-healthy"
   mkdir -p "$worktree_dir/bin" "$home/state"
   cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
+if [ -f "${FM_GUARD_HEALTHY:?}" ]; then
+  exit 0
+fi
 printf 'OpenCode delivery failure guard\n' >&2
 exit 2
 SH
   chmod +x "$worktree_dir/bin/fm-turnend-guard.sh"
-  out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_HOME="$home" node 2>&1 <<'EOF'
-import { existsSync, readdirSync } from "node:fs";
+  out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_HOME="$home" FM_GUARD_HEALTHY="$healthy" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 let attempts = 0;
-let failing = true;
 const client = {
   session: {
     promptAsync: async () => {
       attempts += 1;
-      if (failing) throw new Error("synthetic OpenCode delivery failure");
+      if (attempts < 3) throw new Error("synthetic OpenCode delivery failure");
     },
   },
 };
 const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
 const idle = { event: { type: "session.idle", properties: { sessionID: "session-failure" } } };
-let failed = false;
-try {
-  await hooks.event(idle);
-} catch {
-  failed = true;
-}
-if (!failed) throw new Error("failed delivery was swallowed");
+await hooks.event(idle);
 const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
 if (!existsSync(handoffDir) || !readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.endsWith(".pending"))) {
   throw new Error("failed delivery did not leave a durable handoff");
 }
-failing = false;
+for (let i = 0; i < 50 && attempts < 3; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (attempts < 3) throw new Error(`retry owner stopped after ${attempts} delivery attempts`);
+if (readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.endsWith(".pending"))) {
+  throw new Error("acknowledged OpenCode delivery did not clear the durable handoff");
+}
+writeFileSync(process.env.FM_GUARD_HEALTHY, "healthy\n");
 await hooks.event(idle);
 if (readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.endsWith(".pending"))) {
-  throw new Error("successful retry did not clear the durable handoff");
+  throw new Error("acknowledged OpenCode continuation did not clear the durable handoff");
 }
-if (attempts !== 3) throw new Error(`expected two failed attempts and one successful retry, saw ${attempts}`);
 EOF
 )
   status=$?
   expect_code 0 "$status" "OpenCode guard must persist and retry failed continuation delivery"
   [ -z "$out" ] || fail "OpenCode delivery-failure test printed output: $out"
-  pass ".opencode primary plugin: failed continuation delivery remains durably retryable"
+  pass ".opencode primary plugin: retry owner retains handoff until SDK acknowledgement"
+}
+
+test_opencode_plugin_fails_closed_when_guard_cannot_launch() {
+  local plugin worktree_dir home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  worktree_dir="$TMP_ROOT/opencode-guard-launch-root"
+  home="$TMP_ROOT/opencode-guard-launch-home"
+  mkdir -p "$worktree_dir/bin" "$home/state"
+  out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_HOME="$home" node 2>&1 <<'EOF'
+import { existsSync, readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let body = "";
+const client = { session: { promptAsync: async (request) => { body = request.body.parts[0].text; } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "launch-failure" } } });
+if (!body.includes("failed with exit 125")) throw new Error(`guard launch failure was not delivered: ${body}`);
+const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
+if (!existsSync(handoffDir)) throw new Error("guard launch failure did not create its handoff directory");
+if (readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
+  throw new Error("acknowledged guard-launch continuation retained a pending handoff");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode guard launch failure must force a fail-closed handoff"
+  [ -z "$out" ] || fail "OpenCode guard-launch test printed output: $out"
+  pass ".opencode primary plugin: shared-guard launch failure is fail closed"
+}
+
+test_opencode_retry_owner_is_referenced_until_healthy() {
+  local plugin worktree_dir home healthy out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  worktree_dir="$TMP_ROOT/opencode-retry-owner-root"
+  home="$TMP_ROOT/opencode-retry-owner-home"
+  healthy="$TMP_ROOT/opencode-retry-owner-healthy"
+  mkdir -p "$worktree_dir/bin" "$home/state"
+  cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+[ -f "${FM_GUARD_HEALTHY:?}" ] && exit 0
+printf 'OpenCode retry owner guard\n' >&2
+exit 2
+SH
+  chmod +x "$worktree_dir/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_HOME="$home" FM_GUARD_HEALTHY="$healthy" FM_TURNEND_HANDOFF_RETRY_MS=300000 node 2>&1 <<'EOF'
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => {
+    activeTimers.delete(timer);
+    callback(...args);
+  }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+globalThis.clearTimeout = (timer) => {
+  activeTimers.delete(timer);
+  nativeClearTimeout(timer);
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => { throw new Error("synthetic rejection"); } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+const idle = { event: { type: "session.idle", properties: { sessionID: "retry-owner" } } };
+await hooks.event(idle);
+const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
+if (!existsSync(handoffDir) || !readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
+  throw new Error("rejected OpenCode delivery did not retain its handoff");
+}
+if (![...activeTimers].some((timer) => timer.hasRef?.())) {
+  throw new Error("OpenCode retry owner timer was not process-retaining");
+}
+writeFileSync(process.env.FM_GUARD_HEALTHY, "healthy\n");
+await hooks.event(idle);
+if (activeTimers.size !== 0) throw new Error("healthy invalidation left the OpenCode retry owner active");
+if (readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
+  throw new Error("healthy invalidation retained an obsolete OpenCode handoff");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode retry timer must retain the process until healthy invalidation"
+  [ -z "$out" ] || fail "OpenCode referenced-retry-owner test printed output: $out"
+  pass ".opencode primary plugin: retry ownership ends only on healthy invalidation"
 }
 
 test_pi_extension_forces_followup() {
@@ -837,6 +1105,7 @@ test_pi_extension_forces_followup() {
   [ -f "$ext" ] || fail "tracked pi primary extension is missing"
   content=$(cat "$ext")
   assert_contains "$content" 'agent_settled' "pi extension must run after one logical agent run settles"
+  assert_contains "$content" 'agent_start' "pi extension must acknowledge only a real ensuing assistant run"
   assert_contains "$content" 'fm-turnend-guard.sh' "pi extension must invoke the shared guard"
   assert_contains "$content" 'sendUserMessage' "pi extension must force a follow-up turn"
   assert_contains "$content" 'deliverAs: "followUp"' "pi extension must queue the follow-up safely"
@@ -875,26 +1144,35 @@ exit 0
 SH
   chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-arm-pretool-check.sh"
   out=$(PLUGIN="$ext" FM_HOME="$home" FM_GUARD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
 let prompts = 0;
-let releaseFirst;
-let markFirstStarted;
-const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => {
+    activeTimers.delete(timer);
+    callback(...args);
+  }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+globalThis.clearTimeout = (timer) => {
+  activeTimers.delete(timer);
+  nativeClearTimeout(timer);
+};
 const pi = {
   on(event, handler) {
     handlers.set(event, handler);
   },
-  async sendUserMessage(message, options) {
+  sendUserMessage(message, options) {
     prompts += 1;
     if (!message.includes("TURN WOULD END BLIND")) throw new Error(`unexpected prompt: ${message}`);
     if (options?.deliverAs !== "followUp") throw new Error("guard prompt was not a follow-up");
-    if (prompts === 1) {
-      markFirstStarted();
-      await new Promise((resolve) => { releaseFirst = resolve; });
-    }
   },
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -902,22 +1180,28 @@ mod.default(pi);
 if (handlers.has("turn_end")) throw new Error("guard still treats internal Pi turns as logical runs");
 const settled = handlers.get("agent_settled");
 if (!settled) throw new Error("agent_settled handler was not registered");
+const started = handlers.get("agent_start");
+if (!started) throw new Error("agent_start acknowledgement handler was not registered");
 
-const firstSettled = settled({ type: "agent_settled" }, {});
-await firstStarted;
 await settled({ type: "agent_settled" }, {});
-if (prompts !== 1) throw new Error(`overlapping settlement injected ${prompts} follow-ups`);
-releaseFirst();
-await firstSettled;
+if (prompts !== 1) throw new Error(`one logical run injected ${prompts} follow-ups`);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`;
+if (!existsSync(pending)) throw new Error("void sendUserMessage falsely acknowledged and cleared the handoff");
+if (![...activeTimers].some((timer) => timer.hasRef?.())) throw new Error("Pi retry owner timer was not process-retaining");
+await started({ type: "agent_start" }, {});
+if (existsSync(pending)) throw new Error("agent_start did not acknowledge the delivered handoff");
+if (activeTimers.size !== 0) throw new Error("agent_start acknowledgement left the Pi retry owner active");
 
 for (let i = 0; i < 3; i += 1) {
   await handlers.get("turn_end")?.({ type: "turn_end", turnIndex: i }, {});
 }
 await settled({ type: "agent_settled" }, {});
-if (prompts !== 2) throw new Error(`later settled event produced ${prompts - 1} new follow-ups`);
+if (prompts !== 2) throw new Error(`later logical run produced ${prompts - 1} new follow-ups`);
+await started({ type: "agent_start" }, {});
+if (activeTimers.size !== 0) throw new Error("later agent_start acknowledgement left the Pi retry owner active");
 
 const guardRuns = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
-if (guardRuns !== 3) throw new Error(`guard predicate ran ${guardRuns} times for three logical runs`);
+if (guardRuns !== 2) throw new Error(`guard predicate ran ${guardRuns} times for two logical runs`);
 EOF
 )
   status=$?
@@ -944,44 +1228,106 @@ SH
 exit 0
 SH
   chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-arm-pretool-check.sh"
-  out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
 import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
 let attempts = 0;
-let failing = true;
 const pi = {
   on(event, handler) {
     handlers.set(event, handler);
   },
-  async sendUserMessage() {
+  sendUserMessage() {
     attempts += 1;
-    if (failing) throw new Error("synthetic delivery failure");
   },
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
 const settled = handlers.get("agent_settled");
-let failed = false;
-try {
-  await settled({ type: "agent_settled" }, {});
-} catch {
-  failed = true;
-}
-if (!failed) throw new Error("failed Pi delivery was swallowed");
-const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`;
-if (!existsSync(pending)) throw new Error("failed Pi delivery did not leave a durable handoff");
-failing = false;
 await settled({ type: "agent_settled" }, {});
-if (existsSync(pending)) throw new Error("successful Pi delivery retry did not clear the durable handoff");
-if (attempts !== 3) throw new Error(`expected two failed attempts and one successful retry, saw ${attempts}`);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`;
+if (!existsSync(pending)) throw new Error("void Pi delivery did not leave a durable handoff");
+for (let i = 0; i < 50 && attempts < 2; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (attempts < 2) throw new Error("Pi handoff had no live retry owner");
+if (!existsSync(pending)) throw new Error("retry attempt falsely acknowledged the Pi handoff");
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+if (existsSync(pending)) throw new Error("agent_start did not acknowledge the retried Pi handoff");
 EOF
 )
   status=$?
   expect_code 0 "$status" "Pi guard must persist and retry delivery after a failure"
   [ -z "$out" ] || fail "Pi delivery-failure guard test printed output: $out"
-  pass ".pi primary extension: failed continuation delivery remains durably retryable"
+  pass ".pi primary extension: void delivery remains owned until agent-start acknowledgement"
+}
+
+test_pi_extension_recovers_retained_handoff() {
+  local repo home ext out status
+  repo="$TMP_ROOT/pi-recovery-root"
+  home="$TMP_ROOT/pi-recovery-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state/.turnend-handoffs"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  printf '{"token":"retained-token","message":"retained continuation"}\n' > "$home/state/.turnend-handoffs/pi.pending"
+  out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let message = "";
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  sendUserMessage(value) { message = value; },
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+for (let i = 0; i < 50 && !message; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (message !== "retained continuation") throw new Error(`retained handoff was not recovered: ${message}`);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`;
+if (!existsSync(pending)) throw new Error("recovered void delivery cleared before acknowledgement");
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+if (existsSync(pending)) throw new Error("recovered handoff was not acknowledged by agent_start");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi extension must recover retained passive handoffs on load"
+  [ -z "$out" ] || fail "Pi retained-handoff recovery test printed output: $out"
+  pass ".pi primary extension: retained handoff regains retry ownership after reload"
+}
+
+test_pi_extension_fails_closed_when_guard_cannot_launch() {
+  local repo home ext out status
+  repo="$TMP_ROOT/pi-guard-launch-root"
+  home="$TMP_ROOT/pi-guard-launch-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let message = "";
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  sendUserMessage(value) { message = value; },
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+if (!message.includes("failed with exit 125")) throw new Error(`guard launch failure was not delivered: ${message}`);
+if (!existsSync(`${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`)) {
+  throw new Error("guard launch failure did not retain a Pi handoff");
+}
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi guard launch failure must force a fail-closed handoff"
+  [ -z "$out" ] || fail "Pi guard-launch test printed output: $out"
+  pass ".pi primary extension: shared-guard launch failure is fail closed"
 }
 
 test_grok_hook_invokes_adapter() {
@@ -1023,6 +1369,11 @@ test_hook_runs_fast
 test_grok_adapter_forces_one_resume_when_unhealthy
 test_grok_adapter_repeats_resume_when_still_blind
 test_grok_adapter_preserves_failed_delivery_handoff
+test_grok_worker_waits_for_originating_hook_exit
+test_grok_session_delivery_is_singleton
+test_grok_healthy_stop_invalidates_stale_pending
+test_grok_missing_guard_fails_closed_through_retry_owner
+test_grok_handoff_preparation_failure_is_nonzero
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
@@ -1030,7 +1381,11 @@ test_codex_hook_ignores_nested_git_root_guard
 test_opencode_plugin_forces_followup
 test_opencode_plugin_anchors_guard_to_worktree
 test_opencode_plugin_preserves_failed_delivery_handoff
+test_opencode_plugin_fails_closed_when_guard_cannot_launch
+test_opencode_retry_owner_is_referenced_until_healthy
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
+test_pi_extension_recovers_retained_handoff
+test_pi_extension_fails_closed_when_guard_cannot_launch
 test_grok_hook_invokes_adapter

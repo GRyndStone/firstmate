@@ -31,7 +31,7 @@ A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity
 Watcher health is necessary but not sufficient at turn end.
 The watcher lock also records its launch owner kind, pid, and process identity.
 Process liveness requires both a successful signal probe and a non-zombie process state.
-An away-mode daemon owner is durable only while `state/.afk` is a regular file, its recorded owner mode is `away-inject`, its pid and identity match both `state/.supervise-daemon.pid` and the live portable daemon lock, and the exact supervisor backend and target recorded in that lock still resolve to a live injection endpoint.
+An away-mode daemon owner is durable only while `state/.afk` is a regular file, its recorded owner mode is `away-inject`, its pid and identity match both `state/.supervise-daemon.pid` and the live portable daemon lock, and the exact supervisor backend and target recorded in that lock still resolve to a confidently live harness-agent process.
 An arm owner is accepted only for the verified Claude, Grok, Pi, and OpenCode tracked-background mechanisms.
 A bounded foreground checkpoint, a Codex arm process, missing provenance, an unknown owner kind, a dead owner, or a reused owner pid all fail closed even while the watcher itself is live and its beacon is fresh.
 This distinction matters because a foreground execution session can be alive while the Stop hook runs and then be torn down as the assistant turn yields.
@@ -53,10 +53,10 @@ All verified primary harnesses have a tracked integration:
 
 - `claude`: `.claude/settings.json` registers a `Stop` hook command anchored through `"$CLAUDE_PROJECT_DIR"/bin/fm-turnend-guard.sh`.
 - `codex`: `.codex/hooks.json` registers a dependency-free `Stop` hook that reads the hook payload once, anchors the executable to the hook command process working directory, verifies that root is firstmate-shaped and hook-bearing, and pipes the original payload to that checkout's `bin/fm-turnend-guard.sh`.
-- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, then runs the shared guard, durably records the required continuation under `state/.turnend-handoffs/`, and uses `client.session.promptAsync` to deliver it when the guard returns 2.
-- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard for every logical agent run including a generated guard follow-up, durably records the required continuation under `state/.turnend-handoffs/`, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to deliver it when the guard returns 2.
+- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, then runs the shared guard, durably records the required continuation under `state/.turnend-handoffs/`, and uses `client.session.promptAsync` to deliver it when the guard blocks or cannot run.
+- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard for every logical agent run including a generated guard follow-up, durably records the required continuation under `state/.turnend-handoffs/`, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to attempt delivery when the guard blocks or cannot run.
 - `grok`: `.grok/hooks/fm-primary-turnend-guard.json` registers a `Stop` hook that invokes `bin/fm-turnend-guard-grok.sh`.
-  The adapter runs the shared guard and, when it returns 2, atomically records an exact-session continuation under `state/.turnend-handoffs/` and starts `bin/fm-turnend-guard-grok-deliver.sh` to invoke a bounded `grok --resume <sessionId> -p <guard-reason>` only after the Stop hook returns.
+  The adapter runs the shared guard and, when it blocks or cannot run, atomically records one deterministic exact-session continuation under `state/.turnend-handoffs/` and starts `bin/fm-turnend-guard-grok-deliver.sh` to invoke bounded `grok --resume <sessionId> -p <guard-reason>` attempts only after the originating Stop-hook process identity is gone.
   It does not pass `--permission-mode`, so the passive Stop hook cannot grant stronger tool permissions than Grok's resumed-session default.
 
 Claude and Codex support a direct blocking Stop hook.
@@ -68,9 +68,15 @@ Their adapters cannot block the lifecycle callback directly, so they persist the
 Every forced follow-up produces a later lifecycle event that reruns the shared predicate.
 If it still returns 2, the adapter schedules another continuation instead of discarding the result, so each settled or idle transition has at most one delivery while continued blindness always guarantees a future turn.
 Pi and OpenCode keep a transient latch only around an SDK delivery call already in flight; every callback runs the predicate before that latch, and `finally` clears it for the next settled or idle event.
-Pi and OpenCode make two bounded SDK attempts, clear the handoff only after confirmed success, and propagate the final delivery error while retaining the durable record for the next lifecycle retry.
-Grok returns from the Stop hook before its detached worker resumes the session, so a resumed turn's later Stop schedules a new bounded worker instead of nesting another resume inside the still-running hook process.
-The Grok worker makes at most three bounded delivery attempts and atomically restores the pending record if they fail; a missing session id is recorded and reported as an adapter failure rather than silently discarded.
+Pi's real `ExtensionAPI.sendUserMessage` returns `void`, so calling it is never treated as delivery acknowledgement.
+Pi retains the handoff, keeps one process-retaining retry timer alive, recovers the record when the extension loads, and clears both record and timer only when the ensuing `agent_start` proves an assistant continuation began or the predicate becomes healthy.
+OpenCode treats the resolved `promptAsync` promise as explicit queue acknowledgement, while a process-retaining per-session retry timer owns rejected delivery until acknowledgement or healthy invalidation and plugin startup recovers retained records.
+A shared-guard launch failure follows the same fail-closed delivery path instead of being converted into a healthy result.
+Grok stores the originating hook pid and process identity in its deterministic per-session handoff.
+One per-session worker lock serializes resumes, the worker waits for the recorded hook identity to disappear before every attempt, and it retains retry ownership until a bounded resume succeeds.
+A healthy later Stop removes that session's stale pending record, and a missing session id is recorded and reported as an adapter failure rather than silently discarded.
+After independently confirming the same primary-checkout scope, a missing shared guard enters that durable delivery path with an explicit adapter-failure reason.
+If exact session identity or durable handoff preparation is unavailable, the Grok wrapper exits nonzero instead of reporting a healthy Stop.
 
 ## Empirical Validation
 
@@ -110,6 +116,7 @@ Command used to fire the watcher: `printf 'done: pi e2e watcher fire\n' > "$FM_H
 Observed output after the wake: Pi ran `bin/fm-wake-drain.sh`, read the terminal status, called `fm_watch_arm_pi`, and rendered `watcher: started Pi extension arm child 2`.
 The complete pane contained one guard message and zero foreground `bin/fm-watch-arm.sh` bash calls.
 `/quit` printed `PI_EXIT=0`, and the second arm process plus its watcher child were both gone afterward.
+The installed Pi 0.80.5 `ExtensionAPI` declaration and runtime implementation were also inspected: `sendUserMessage` returns `void` and catches its internal asynchronous send rejection, while `agent_start` is emitted when the resulting assistant continuation actually begins.
 
 On 2026-07-17, a Codex foreground checkpoint was still live at Stop-hook evaluation under exec session 30732, but its process did not survive the turn yield and the next fleet command found the watcher beacon 763 seconds stale.
 That evidence invalidated watcher-process liveness as a durable-ownership proxy.
@@ -135,6 +142,6 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, active away-mode daemon provenance plus exact live injection-target validation, a foreground checkpoint that is live at the first Stop and dead at the retry, exact bounded-detail omission disclosure, repeated Pi, OpenCode, and Grok continuation delivery while blindness persists, durable retry records after passive delivery failure, dependency-free fail-closed behavior without `jq` or valid input, tracked hook registration for all five harnesses, and the Grok adapter's permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, active away-mode daemon provenance plus exact live agent-process validation including a surviving bare-shell pane, a foreground checkpoint that is live at the first Stop and dead at the retry, exact bounded-detail omission disclosure, repeated Pi, OpenCode, and Grok continuation delivery while blindness persists, real Pi void-return acknowledgement, passive startup recovery and retry ownership, fail-closed guard-launch and handoff-preparation errors, Grok hook-exit and per-session serialization barriers, dependency-free fail-closed behavior without `jq` or valid input, tracked hook registration for all five harnesses, and the Grok adapter's permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

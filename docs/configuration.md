@@ -11,9 +11,9 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses `bin/fm-backlog.sh` for routine backlog operations.
 That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
-The wrapper refuses `done` while owned task meta or unresolved teardown state exists, except for the exact version-3 `finalizing` stage that proves cleanup completed and retains retry authority until backlog recording succeeds.
+The wrapper refuses `done` while owned task meta or unresolved teardown state exists, except for a complete version-3 `backlog-done-started` stage whose exact endpoint plus parent and auxiliary cleanup targets are verified absent and whose ownership, force, outcome, record, and proof bindings are internally consistent.
 It refuses a scout report completion unless the exact owned report is a regular non-symlink file canonically contained beneath the selected home.
-`fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, entering the durable `finalizing` phase, and only then asking the wrapper to record Done.
+`fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, verifying every cleanup target absent, and only then entering the durable backlog mutation subphases.
 It persists the completion proof and exact-backlog-record phase in canonically external state before destructive cleanup.
 Cleanup ownership combines canonical path identity with a random task-owned marker outside worktree contents, so filesystem identity reuse cannot authorize removal of a replacement target.
 An interrupted retry refuses a changed backlog record and cannot inspect or remove a path after either ownership binding no longer matches.
@@ -22,17 +22,17 @@ Before automatic endpoint closure, teardown runs the same-home duplicate audit f
 cmux exposes no exact-home inventory source, so its read-only audit emits a structured `inventory_unavailable` finding without issuing an app-global inventory command, and teardown refuses that finding before endpoint closure.
 Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
 If the Done mutation fails after teardown, the lifecycle is safely closed, finalization remains retryable, and the command fails loudly with the backlog outside Done.
-Manual backend mode keeps routine edits operator-owned, but lifecycle `show` and `done` still run through this wrapper with the same home-scoped lock and single-use teardown receipt.
-Direct hand-editing must never record Done in manual mode.
+Manual backend mode suppresses the `TASKS_AXI: available` capability notice, but every read and mutation still runs through this wrapper with the same home-scoped lock and completion receipt.
+Direct hand-editing must never mutate backlog state in manual mode.
 Secondmate handoffs are separate and unconditional: `fm-backlog-handoff.sh` keeps only its own fleet-level validation and always delegates the item move to `tasks-axi mv`, the single owner of the backlog format.
 It acquires both homes' backlog locks in sorted absolute-path order before classification and holds them through the atomic move, preventing races on either file without deadlocking opposite handoffs.
 It moves in-scope `## Queued` items only and refuses `## In flight` and historical `## Done` records, which stay with their home for pruning or archiving.
 Handoff item bodies must use at least two leading spaces, and the helper refuses a selected item with a single-space or tab-indented continuation rather than risk orphaning it.
-Because bootstrap requires `tasks-axi` on `PATH` on every profile, that delegation and receipt-gated manual completion work fleet-wide, while the `config/backlog-backend=manual` knob governs firstmate's routine backlog edits.
+Because bootstrap requires `tasks-axi` on `PATH` on every profile, serialized mutation and receipt-gated completion work fleet-wide, while `config/backlog-backend=manual` controls capability reporting only.
 Compatible means the shared bootstrap probe accepts `tasks-axi --version` as 0.1.1 or newer, `tasks-axi update --help` exposes `--archive-body`, and `tasks-axi mv --help` exposes `[<id>...]` for the atomic multi-ID move introduced in 0.2.2 and required by handoff delegation.
 That sentence is the single owner of the tasks-axi compatibility definition; every other document points here instead of restating the version gates.
 Bootstrap requires compatible `tasks-axi` on every profile; see "Toolchain" below for missing-tool reporting and `TASKS_AXI: available` behavior.
-Set the local, gitignored `config/backlog-backend` file to `manual` to force manual routine backlog editing and suppress `TASKS_AXI: available`, not missing-tool reporting.
+Set the local, gitignored `config/backlog-backend` file to `manual` to suppress `TASKS_AXI: available`, not missing-tool reporting or wrapper serialization.
 Absent or `tasks-axi` selects the default tasks-axi backend.
 The file format is unchanged in both modes; tasks-axi and manual edits produce the same `## In flight`, `## Queued`, and `## Done` sections.
 `bin/fm-program-lib.sh` owns the convention that `data/program.md`, `data/*-program.md`, and `data/programs/*.md` are durable program-source pointers.
@@ -236,7 +236,7 @@ When bootstrap resolves `backend=orca` from `FM_BACKEND` or `config/backend`, it
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.
-An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available` and firstmate uses its verbs for routine backlog mutations, otherwise it hand-edits `data/backlog.md` until installation is approved and completed.
+An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available`, while every mode keeps routine mutations behind the scoped wrapper.
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still degrades to the first profile at runtime when quota data is unavailable.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.

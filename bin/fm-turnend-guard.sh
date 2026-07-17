@@ -76,17 +76,17 @@ fm_supervision_status "$STATE" "$GRACE"
 HARNESS=${FM_TURNEND_HARNESS:-}
 [ -n "$HARNESS" ] || HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
-supervisor_target_live() {
+supervisor_target_injectable() {
   local backend=$1 target=$2 probe="$SCRIPT_DIR/fm-backend.sh"
   [ -r "$probe" ] || return 1
   case "$backend" in tmux|herdr) ;; *) return 1 ;; esac
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+    timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+    gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
   elif command -v perl >/dev/null 2>&1; then
     perl -e '$seconds=shift; alarm $seconds; exec @ARGV' "$TARGET_PROBE_TIMEOUT" \
-      bash -c '. "$1"; fm_backend_target_exists "$2" "$3"' _ "$probe" "$backend" "$target"
+      bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
   else
     return 1
   fi
@@ -123,7 +123,7 @@ daemon_owner_active() {
   [ "$lock_pid" = "$pid" ] || return 1
   [ "$lock_identity" = "$identity" ] || return 1
   fm_pid_alive "$pid" || return 1
-  supervisor_target_live "$backend" "$target"
+  supervisor_target_injectable "$backend" "$target"
 }
 
 WATCH_OWNER_DESC="no healthy watcher"

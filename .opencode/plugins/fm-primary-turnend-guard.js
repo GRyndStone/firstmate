@@ -1,14 +1,19 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
-const followupDeliveryActive = new Set();
 let handoffSequence = 0;
 
 function runProcess(command, args, input = "") {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -20,8 +25,9 @@ function runProcess(command, args, input = "") {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
-    child.on("error", () => resolve({ code: 0, stdout: "", stderr: "" }));
-    child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
+    child.stdin.on("error", () => {});
+    child.on("error", (error) => finish({ code: 125, stdout: "", stderr: error.message }));
+    child.on("close", (code) => finish({ code: code ?? 125, stdout, stderr }));
     child.stdin.end(input);
   });
 }
@@ -43,7 +49,7 @@ function resolvePath(anchor) {
 }
 
 function runGuard(root) {
-  if (!root) return Promise.resolve({ code: 0, stderr: "" });
+  if (!root) return Promise.resolve({ code: 125, stderr: "firstmate root is unavailable" });
   return runProcess(`${root}/bin/fm-turnend-guard.sh`, [], '{"stop_hook_active":false}');
 }
 
@@ -63,7 +69,19 @@ function persistHandoff(root, sessionID, message) {
   const temp = `${handoff.path}.tmp.${token}`;
   writeFileSync(temp, `${record}\n`, { mode: 0o600 });
   renameSync(temp, handoff.path);
-  return { ...handoff, record };
+  return { ...handoff, record, token, sessionID, message };
+}
+
+function readHandoff(root, sessionID) {
+  const handoff = handoffPath(root, sessionID);
+  try {
+    const record = readFileSync(handoff.path, "utf8").trim();
+    const parsed = JSON.parse(record);
+    if (parsed?.sessionID !== sessionID || typeof parsed.token !== "string" || typeof parsed.message !== "string") return undefined;
+    return { ...handoff, record, token: parsed.token, sessionID, message: parsed.message };
+  } catch {
+    return undefined;
+  }
 }
 
 function clearHandoff(root, sessionID, record) {
@@ -75,25 +93,10 @@ function clearHandoff(root, sessionID, record) {
   }
 }
 
-async function deliverHandoff(client, sessionID, message, handoff) {
-  let failure;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await client.session.promptAsync({
-        path: { id: sessionID },
-        body: { parts: [{ type: "text", text: message }] },
-      });
-      try {
-        if (readFileSync(handoff.path, "utf8").trim() === handoff.record) unlinkSync(handoff.path);
-      } catch {
-      }
-      return;
-    } catch (error) {
-      failure = error;
-      if (attempt === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-    }
-  }
-  throw failure instanceof Error ? failure : new Error("turn-end continuation delivery failed");
+function retryDelay() {
+  const configured = Number(process.env.FM_TURNEND_HANDOFF_RETRY_MS ?? 30000);
+  if (!Number.isFinite(configured)) return 30000;
+  return Math.max(10, Math.min(300000, Math.trunc(configured)));
 }
 
 async function letWatchArmRun(sessionID, client) {
@@ -105,6 +108,55 @@ async function letWatchArmRun(sessionID, client) {
 
 export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => {
   const root = worktree ? resolvePath(worktree) : await resolveRoot(directory);
+  const followupDeliveryActive = new Set();
+  const retryTimers = new Map();
+
+  const cancelRetryOwner = (sessionID) => {
+    const timer = retryTimers.get(sessionID);
+    if (timer) clearTimeout(timer);
+    retryTimers.delete(sessionID);
+  };
+
+  const scheduleDelivery = (sessionID, delay = retryDelay()) => {
+    if (retryTimers.has(sessionID) || !readHandoff(root, sessionID)) return;
+    const timer = setTimeout(() => {
+      retryTimers.delete(sessionID);
+      void deliverHandoff(sessionID);
+    }, delay);
+    retryTimers.set(sessionID, timer);
+  };
+
+  const deliverHandoff = async (sessionID) => {
+    if (followupDeliveryActive.has(sessionID)) return;
+    const handoff = readHandoff(root, sessionID);
+    if (!handoff) return;
+    followupDeliveryActive.add(sessionID);
+    try {
+      await client.session.promptAsync({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: handoff.message }] },
+      });
+      clearHandoff(root, sessionID, handoff.record);
+      cancelRetryOwner(sessionID);
+    } catch {
+    } finally {
+      followupDeliveryActive.delete(sessionID);
+      scheduleDelivery(sessionID);
+    }
+  };
+
+  const handoff = handoffPath(root, "recovery");
+  try {
+    for (const name of readdirSync(handoff.dir)) {
+      if (!name.startsWith("opencode-") || !name.endsWith(".pending")) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(`${handoff.dir}/${name}`, "utf8"));
+        if (typeof parsed?.sessionID === "string") scheduleDelivery(parsed.sessionID, 0);
+      } catch {
+      }
+    }
+  } catch {
+  }
 
   return {
     event: async ({ event }) => {
@@ -116,23 +168,22 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       await letWatchArmRun(sessionID, client);
 
       const result = await runGuard(root);
-      if (result.code !== 2) {
+      if (result.code === 0) {
         clearHandoff(root, sessionID);
+        cancelRetryOwner(sessionID);
         return;
       }
+      const detail = result.stderr.trim();
+      const reason = result.code === 2
+        ? detail || "shared turn-end guard blocked"
+        : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
       const message =
         "TURN WOULD END BLIND - supervision is off. " +
         "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
-        result.stderr;
-      const handoff = persistHandoff(root, sessionID, message);
-      if (followupDeliveryActive.has(sessionID)) return;
-      followupDeliveryActive.add(sessionID);
-
-      try {
-        await deliverHandoff(client, sessionID, message, handoff);
-      } finally {
-        followupDeliveryActive.delete(sessionID);
-      }
+        reason;
+      persistHandoff(root, sessionID, message);
+      cancelRetryOwner(sessionID);
+      await deliverHandoff(sessionID);
     },
   };
 };

@@ -6,11 +6,8 @@
 # `tasks-axi update --help` exposes --archive-body for recoverable note rewrites,
 # and `tasks-axi mv --help` exposes [<id>...] for atomic multi-ID moves required
 # by secondmate handoffs (introduced in tasks-axi 0.2.2).
-# `config/backlog-backend=manual` opts out of tasks-axi for routine firstmate
-# backlog mutations, while lifecycle show/Done and validated secondmate
-# handoffs still use their serialized tasks-axi paths.
-# Absent or any other value keeps the default tasks-axi backend path, falling
-# back to manual mutation when the tool is not compatible.
+# `config/backlog-backend=manual` suppresses the tasks-axi availability notice;
+# every mutation still uses the serialized home-scoped wrapper.
 
 fm_tasks_axi_version_parts() {
   local output

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 let guardFollowupDeliveryActive = false;
+let guardFollowupAwaitingAck = "";
+let guardFollowupRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
 type LockOwnership = "owned" | "missing" | "other";
 
@@ -60,6 +62,12 @@ function markLoaded(): void {
 
 function runGuard(): Promise<{ code: number; stderr: string }> {
   return new Promise((resolveResult) => {
+    let settled = false;
+    const finish = (result: { code: number; stderr: string }) => {
+      if (settled) return;
+      settled = true;
+      resolveResult(result);
+    };
     const child = spawn(`${root}/bin/fm-turnend-guard.sh`, {
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -67,13 +75,27 @@ function runGuard(): Promise<{ code: number; stderr: string }> {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
-    child.on("error", () => resolveResult({ code: 0, stderr: "" }));
-    child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
+    child.stdin.on("error", () => {});
+    child.on("error", (error) => finish({ code: 125, stderr: error.message }));
+    child.on("close", (code) => finish({ code: code ?? 125, stderr }));
     child.stdin.end('{"stop_hook_active":false}');
   });
 }
 
-function persistHandoff(message: string): string {
+type Handoff = { record: string; token: string; message: string };
+
+function readHandoff(): Handoff | undefined {
+  try {
+    const record = readFileSync(handoffPath, "utf8").trim();
+    const parsed = JSON.parse(record) as { token?: unknown; message?: unknown };
+    if (typeof parsed.token !== "string" || typeof parsed.message !== "string") return undefined;
+    return { record, token: parsed.token, message: parsed.message };
+  } catch {
+    return undefined;
+  }
+}
+
+function persistHandoff(message: string): Handoff {
   mkdirSync(handoffDir, { recursive: true });
   handoffSequence += 1;
   const token = `${process.pid}-${Date.now()}-${handoffSequence}`;
@@ -81,7 +103,7 @@ function persistHandoff(message: string): string {
   const temp = `${handoffPath}.tmp.${token}`;
   writeFileSync(temp, `${record}\n`, { mode: 0o600 });
   renameSync(temp, handoffPath);
-  return record;
+  return { record, token, message };
 }
 
 function clearHandoff(record?: string): void {
@@ -92,19 +114,47 @@ function clearHandoff(record?: string): void {
   }
 }
 
-async function deliverHandoff(pi: ExtensionAPI, record: string, message: string): Promise<void> {
-  let failure: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await pi.sendUserMessage(message, { deliverAs: "followUp" });
-      clearHandoff(record);
-      return;
-    } catch (error) {
-      failure = error;
-      if (attempt === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-    }
+function retryDelay(): number {
+  const configured = Number(process.env.FM_TURNEND_HANDOFF_RETRY_MS ?? 30000);
+  if (!Number.isFinite(configured)) return 30000;
+  return Math.max(10, Math.min(300000, Math.trunc(configured)));
+}
+
+function cancelRetryOwner(): void {
+  if (guardFollowupRetryTimer !== undefined) clearTimeout(guardFollowupRetryTimer);
+  guardFollowupRetryTimer = undefined;
+}
+
+function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
+  if (guardFollowupRetryTimer !== undefined || !readHandoff()) return;
+  guardFollowupRetryTimer = setTimeout(() => {
+    guardFollowupRetryTimer = undefined;
+    deliverHandoff(pi);
+  }, delay);
+}
+
+function deliverHandoff(pi: ExtensionAPI): void {
+  if (guardFollowupDeliveryActive) return;
+  const handoff = readHandoff();
+  if (!handoff) return;
+  guardFollowupDeliveryActive = true;
+  try {
+    pi.sendUserMessage(handoff.message, { deliverAs: "followUp" });
+    guardFollowupAwaitingAck = handoff.token;
+  } catch {
+    guardFollowupAwaitingAck = "";
+  } finally {
+    guardFollowupDeliveryActive = false;
+    scheduleDelivery(pi);
   }
-  throw failure instanceof Error ? failure : new Error("turn-end continuation delivery failed");
+}
+
+function acknowledgeHandoff(): void {
+  const handoff = readHandoff();
+  if (!handoff || handoff.token !== guardFollowupAwaitingAck) return;
+  clearHandoff(handoff.record);
+  guardFollowupAwaitingAck = "";
+  cancelRetryOwner();
 }
 
 // PreToolUse seatbelts (bin/fm-arm-pretool-check.sh, docs/arm-pretool-check.md;
@@ -139,6 +189,11 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
 export default function (pi: ExtensionAPI) {
   pi.on?.("session_start", () => {
     markLoaded();
+    scheduleDelivery(pi, 0);
+  });
+
+  pi.on?.("agent_start", () => {
+    acknowledgeHandoff();
   });
 
   pi.on("tool_call", async (event) => {
@@ -156,23 +211,26 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", async () => {
     const result = await runGuard();
-    if (result.code !== 2) {
+    if (result.code === 0) {
       clearHandoff();
+      guardFollowupAwaitingAck = "";
+      cancelRetryOwner();
       return;
     }
+    const detail = result.stderr.trim();
+    const reason = result.code === 2
+      ? detail || "shared turn-end guard blocked"
+      : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
     const message =
       "TURN WOULD END BLIND - supervision is off. " +
       "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
-      result.stderr;
-    const record = persistHandoff(message);
-    if (guardFollowupDeliveryActive) return;
-    guardFollowupDeliveryActive = true;
-    try {
-      await deliverHandoff(pi, record, message);
-    } finally {
-      guardFollowupDeliveryActive = false;
-    }
+      reason;
+    persistHandoff(message);
+    guardFollowupAwaitingAck = "";
+    cancelRetryOwner();
+    deliverHandoff(pi);
   });
 
   markLoaded();
+  scheduleDelivery(pi, 0);
 }

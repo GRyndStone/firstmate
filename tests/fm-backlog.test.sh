@@ -98,7 +98,16 @@ fi
 [ "${FM_FAKE_FAIL_MUTATION:-0}" != 1 ] || exit 9
 exit 0
 SH
-  chmod +x "$home/fakebin/tasks-axi"
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_FAKE_ENDPOINT_PRESENT:-0}" = 1 ]; then
+  printf '%s\n' 'fm-task-a fm-task-a'
+  exit 0
+fi
+printf '%s\n' 'no server running on /tmp/fake' >&2
+exit 1
+SH
+  chmod +x "$home/fakebin/tasks-axi" "$home/fakebin/tmux"
   printf '%s\n' "$home"
 }
 
@@ -113,6 +122,14 @@ write_completion_proof() {
     printf 'outcome=%s\n' "$outcome"
     printf 'record-cksum=%s\n' "$checksum"
   } > "$home/state/$id.teardown-complete"
+}
+
+write_done_started_stage() {
+  local home=$1 id=$2 meta_cksum=$3 record_cksum=$4 aux_cksum
+  : > "$home/state/$id.teardown-owners"
+  aux_cksum=$(cksum < "$home/state/$id.teardown-owners" | awk '{print $1 ":" $2}')
+  printf 'version=3\ntask=%s\nmeta-cksum=%s\nphase=backlog-done-started\nowner-identity=absent\nowner-marker=none\nowner-token=none\nforce=0\noutcome=delivered-local\nrecord-cksum=%s\naux-cksum=%s\n' \
+    "$id" "$meta_cksum" "$record_cksum" "$aux_cksum" > "$home/state/$id.teardown-stage"
 }
 
 test_same_file_mutations_are_serialized() {
@@ -304,16 +321,14 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
   : > "$home/state/task-a.tearing-down"
-  printf 'version=3\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=%s\nphase=finalizing\n' \
-    "$meta_cksum" "$record_cksum" > "$home/state/task-a.teardown-stage"
+  write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" "finalizing Done did not consume its receipt"
   home=$(make_home finalizing-idempotent)
   printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   : > "$home/state/task-a.tearing-down"
-  printf 'version=3\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=staged\nphase=finalizing\n' \
-    "$meta_cksum" > "$home/state/task-a.teardown-stage"
+  write_done_started_stage "$home" task-a "$meta_cksum" staged
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
     "$BACKLOG" done task-a 2>&1) || status=$?
@@ -329,18 +344,29 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 1 "$status" "invalid finalizing stage"
   assert_contains "$out" "unresolved owned lifecycle" "non-v3 finalizing stage bypassed lifecycle guard"
+  home=$(make_home finalizing-live-endpoint)
+  write_completion_proof "$home" task-a ship delivered-local
+  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
+  write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ENDPOINT_PRESENT=1 \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "finalizing stage with live endpoint"
+  assert_contains "$out" "unresolved owned lifecycle" "live endpoint bypassed complete finalization validation"
   pass "only an exact finalizing teardown stage supports guarded idempotent Done"
 }
 
-test_manual_backend_done_stays_serialized_and_receipt_gated() {
+test_manual_backend_mutations_stay_serialized_and_receipt_gated() {
   local home log out status
   home=$(make_home manual-completion)
   log="$home/args.log"
   printf 'manual\n' > "$home/config/backlog-backend"
-  status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" update task-a --title changed 2>&1) || status=$?
-  expect_code 1 "$status" "manual routine wrapper mutation"
-  assert_contains "$out" "use manual edits for routine operations" "manual routine mutation was not kept operator-owned"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" update task-a --title changed
+  assert_contains "$(cat "$log")" "args=update task-a --title changed --backend markdown --file $home/data/backlog.md" \
+    "manual routine mutation bypassed the serialized scoped backend"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 1 "$status" "manual Done without teardown proof"
@@ -351,7 +377,7 @@ test_manual_backend_done_stays_serialized_and_receipt_gated() {
   assert_contains "$(cat "$log")" "args=done task-a --note local main --backend markdown --file $home/data/backlog.md" \
     "manual completion did not pass through the serialized scoped backend"
   assert_absent "$home/state/task-a.teardown-complete" "manual Done did not consume its lifecycle receipt"
-  pass "manual completion uses the serialized lifecycle receipt path"
+  pass "manual mutations use the serialized lifecycle receipt path"
 }
 
 test_all_mutation_verbs_and_aliases_invalidate_proofs() {
@@ -674,7 +700,7 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs
 test_interrupted_completion_claim_reconciles_from_backlog_state
 test_empty_completion_claim_reconciles_completed_state
 test_empty_completion_claim_reconciles_restored_proof
-test_manual_backend_done_stays_serialized_and_receipt_gated
+test_manual_backend_mutations_stay_serialized_and_receipt_gated
 test_finalizing_stage_allows_guarded_and_idempotent_done
 test_default_tasks_kind_matches_legacy_ship_lifecycle
 test_done_rejects_noncanonical_id_before_proof_access

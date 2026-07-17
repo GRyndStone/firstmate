@@ -89,8 +89,9 @@ EOF
   # run; the ALLOW cases need them so the script can complete cleanly.
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-# `treehouse return --force <wt>`: succeed silently.
-exit 0
+# `treehouse return --force <wt>`: remove the exact worktree on success.
+target=${!#}
+git -C "$target" worktree remove --force "$target"
 SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -116,6 +117,10 @@ if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   exit 0
 fi
 if [ "${1:-}" = show ]; then
+  if [ -n "${FM_TASKS_SHOW_READY:-}" ] && [ ! -e "${FM_TASKS_SHOW_RELEASE:-}" ]; then
+    : > "$FM_TASKS_SHOW_READY"
+    while [ ! -e "$FM_TASKS_SHOW_RELEASE" ]; do sleep 0.05; done
+  fi
   printf '%s\n' 'code: NOT_FOUND'
   exit 1
 fi
@@ -182,20 +187,38 @@ if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   exit 0
 fi
 if [ "${1:-}" = show ]; then
-  if [ -n "${FM_TASKS_DONE_STATE:-}" ] && [ -e "$FM_TASKS_DONE_STATE" ]; then
-    printf 'task:\n  id: %s\n  state: done\n  kind: ship\n  body: finalized\n' "${2:-task-x1}"
-  elif [ -n "${FM_TASKS_HELD_STATE:-}" ] && [ -e "$FM_TASKS_HELD_STATE" ]; then
-    printf 'task:\n  id: %s\n  state: queued\n  kind: ship\n  held: discarded\n  body: stable\n' "${2:-task-x1}"
-  else
-    printf 'task:\n  id: %s\n  kind: ship\n  body: %s\n' "${2:-task-x1}" "${FM_TASKS_SHOW_SUFFIX:-stable}"
+  if [ -n "${FM_TASKS_SHOW_READY:-}" ] && [ ! -e "${FM_TASKS_SHOW_RELEASE:-}" ]; then
+    : > "$FM_TASKS_SHOW_READY"
+    while [ ! -e "$FM_TASKS_SHOW_RELEASE" ]; do sleep 0.05; done
   fi
+  if [ -n "${FM_TASKS_DONE_STATE:-}" ] && [ -e "$FM_TASKS_DONE_STATE" ]; then
+    task_state=done
+    held=no
+    hold_reason=-
+    hold_kind=-
+    body=finalized
+  elif [ -n "${FM_TASKS_HELD_STATE:-}" ] && [ -e "$FM_TASKS_HELD_STATE" ]; then
+    if [ -e "$FM_TASKS_HELD_STATE.reopened" ]; then task_state=queued; else task_state=in_flight; fi
+    held=yes
+    hold_reason=$(cat "$FM_TASKS_HELD_STATE")
+    hold_kind=parked
+    body=${FM_TASKS_SHOW_SUFFIX:-stable}
+  else
+    task_state=in_flight
+    held=no
+    hold_reason=-
+    hold_kind=-
+    body=${FM_TASKS_SHOW_SUFFIX:-stable}
+  fi
+  printf 'task:\n  id: %s\n  title: stable task\n  state: %s\n  blocked: no\n  blocked_by: none\n  held: %s\n  hold_reason: %s\n  hold_kind: %s\n  hold_until: -\n  kind: ship\n  repo: project\n  priority: -\n  created: 2026-07-17\n  closed: -\n  deps: none\n  links: none\n  body: %s\n' \
+    "${2:-task-x1}" "$task_state" "$held" "$hold_reason" "$hold_kind" "$body"
   exit 0
 fi
 if [ "${1:-}" = done ]; then
   state=${FM_STATE_OVERRIDE:-/nonexistent}
   stage="$state/${2:-}.teardown-stage"
   if [ -e "$state/${2:-}.meta" ] || [ -e "$state/${2:-}.tearing-down" ]; then
-    if [ ! -f "$stage" ] || ! grep -q '^version=3$' "$stage" || ! grep -q '^phase=finalizing$' "$stage"; then
+    if [ ! -f "$stage" ] || ! grep -q '^version=3$' "$stage" || ! grep -q '^phase=backlog-done-started$' "$stage"; then
       echo 'tasks-axi done ran outside durable finalization' >&2
       exit 8
     fi
@@ -206,11 +229,22 @@ if [ "${1:-}" = done ]; then
   fi
   [ -z "${FM_TASKS_DONE_STATE:-}" ] || touch "$FM_TASKS_DONE_STATE"
 fi
-[ "${1:-}" != hold ] || [ -z "${FM_TASKS_HELD_STATE:-}" ] || touch "$FM_TASKS_HELD_STATE"
+if [ "${1:-}" = hold ] && [ -n "${FM_TASKS_HELD_STATE:-}" ]; then
+  reason=
+  previous=
+  for arg in "$@"; do
+    if [ "$previous" = reason ]; then reason=$arg; previous=; continue; fi
+    [ "$arg" != --reason ] || previous=reason
+  done
+  printf '%s\n' "$reason" > "$FM_TASKS_HELD_STATE"
+fi
 if [ "${1:-}" = reopen ] && [ -n "${FM_TASKS_REOPEN_FAIL_FLAG:-}" ] \
    && [ ! -e "$FM_TASKS_REOPEN_FAIL_FLAG" ]; then
   touch "$FM_TASKS_REOPEN_FAIL_FLAG"
   exit 10
+fi
+if [ "${1:-}" = reopen ] && [ -n "${FM_TASKS_HELD_STATE:-}" ]; then
+  touch "$FM_TASKS_HELD_STATE.reopened"
 fi
 case "${1:-}" in
   done|hold|reopen) [ -z "${FM_TASKS_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TASKS_LOG" ;;
@@ -380,7 +414,10 @@ if [ "${1:-}" = return ]; then
     echo "fatal: Unable to create '$lock': File exists." >&2
     exit 128
   fi
-  exit 0
+  if "${REAL_GIT_FOR_TEST:?}" -C "$wt" worktree remove --force "$wt" 2>/dev/null; then
+    exit 0
+  fi
+  /bin/rm -rf -- "$wt"
 fi
 exit 0
 SH
@@ -428,7 +465,10 @@ if [ "${1:-}" = return ]; then
     fi
     exit 128
   fi
-  exit 0
+  if "${REAL_GIT_FOR_TEST:?}" -C "$wt" worktree remove --force "$wt" 2>/dev/null; then
+    exit 0
+  fi
+  /bin/rm -rf -- "$wt"
 fi
 exit 0
 SH
@@ -1443,6 +1483,60 @@ SH
   pass "forced secondmate retirement audits child-home duplicates before any closure"
 }
 
+test_secondmate_child_endpoint_close_requires_confirmed_absence() {
+  local case_dir home log rc
+  case_dir=$(make_case secondmate-child-close-noop)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  fm_write_meta "$home/state/child-a1.meta" \
+    'backend=herdr' 'window=default:childw:p2' 'herdr_session=default' \
+    'herdr_workspace_id=childw' 'herdr_pane_id=childw:p2' \
+    "worktree=$case_dir/missing-child-worktree" "project=$case_dir/project" 'kind=scout'
+  log="$case_dir/herdr-child.log"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"child"}}}\n' "${3:-}" ;;
+  "tab list") printf '%s\n' '{"result":{"tabs":[{"tab_id":"childw:t2","label":"fm-child-a1"}]}}' ;;
+  "pane list") printf '%s\n' '{"result":{"panes":[{"pane_id":"childw:p2","tab_id":"childw:t2"}]}}' ;;
+  "pane get") printf '%s\n' '{"result":{"pane":{"pane_id":"childw:p2","tab_id":"childw:t2"}}}' ;;
+  "pane close") exit 0 ;;
+  *) exit 99 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+  rc=0
+  FM_HERDR_LOG="$log" run_teardown "$case_dir" --force \
+    >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "secondmate child close no-op"
+  assert_contains "$(cat "$case_dir/stderr")" 'still exists after close' \
+    "forced child retirement accepted an unverified endpoint close"
+  [ -f "$home/state/child-a1.meta" ] || fail "failed child close removed child metadata"
+  [ -d "$home" ] || fail "failed child close removed the secondmate home"
+  case_dir=$(make_case secondmate-child-missing-endpoint)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  fm_write_meta "$home/state/child-a1.meta" \
+    "worktree=$case_dir/missing-child-worktree" "project=$case_dir/project" 'kind=scout'
+  rc=0
+  run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "secondmate child missing endpoint"
+  assert_contains "$(cat "$case_dir/stderr")" 'has no exact recorded endpoint' \
+    "forced child retirement treated a missing endpoint target as absent"
+  [ -f "$home/state/child-a1.meta" ] || fail "missing child endpoint removed child metadata"
+  pass "forced child retirement verifies endpoint absence before cleanup"
+}
+
 test_zellij_duplicate_endpoints_refuse_teardown_without_closure() {
   local case_dir log rc title
   case_dir=$(make_case zellij-duplicate-refusal)
@@ -1588,14 +1682,16 @@ SH
 }
 
 test_non_delivery_outcomes_never_record_done() {
-  local case_dir log hold_line reopen_line
+  local case_dir log held_state hold_line reopen_line
 
   case_dir=$(make_case force-truth)
   log="$case_dir/tasks.log"
+  held_state="$case_dir/held-state"
   write_meta "$case_dir" local-only ship
   wt_commit "$case_dir" "discarded work"
   add_compatible_tasks_axi "$case_dir"
-  FM_TASKS_LOG="$log" run_teardown "$case_dir" --force >/dev/null || fail "forced truthful teardown failed"
+  FM_TASKS_LOG="$log" FM_TASKS_HELD_STATE="$held_state" \
+    run_teardown "$case_dir" --force >/dev/null || fail "forced truthful teardown failed"
   assert_contains "$(cat "$log")" "hold task-x1 --reason discarded during explicitly forced teardown" \
     "forced discard did not persist a truthful structured hold"
   assert_contains "$(cat "$log")" "reopen task-x1" "forced discard did not return the held item to Queued"
@@ -1604,13 +1700,32 @@ test_non_delivery_outcomes_never_record_done() {
   [ "$hold_line" -lt "$reopen_line" ] || fail "forced discard reopened before its hold was durable"
   assert_not_contains "$(cat "$log")" "done task-x1" "forced discard was recorded Done"
 
+  case_dir=$(make_case manual-force-truth)
+  log="$case_dir/tasks.log"
+  held_state="$case_dir/held-state"
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' manual > "$case_dir/config/backlog-backend"
+  wt_commit "$case_dir" "manually configured discarded work"
+  add_compatible_tasks_axi "$case_dir"
+  FM_TASKS_LOG="$log" FM_TASKS_HELD_STATE="$held_state" \
+    run_teardown "$case_dir" --force >/dev/null \
+    || fail "manual-mode forced truthful teardown failed"
+  assert_contains "$(cat "$log")" "hold task-x1 --reason discarded during explicitly forced teardown" \
+    "manual-mode discard did not persist through the serialized wrapper"
+  assert_contains "$(cat "$log")" "reopen task-x1" \
+    "manual-mode discard did not finish its truthful queued outcome"
+  assert_not_contains "$(cat "$log")" "done task-x1" \
+    "manual-mode discard was recorded Done"
+
   case_dir=$(make_case pushed-local-only-truth)
   log="$case_dir/tasks.log"
+  held_state="$case_dir/held-state"
   write_meta "$case_dir" local-only ship
   wt_commit "$case_dir" "pushed but not local main"
   add_fork_with_pushed_branch "$case_dir"
   add_compatible_tasks_axi "$case_dir"
-  FM_TASKS_LOG="$log" run_teardown "$case_dir" >/dev/null || fail "remote-recoverable local-only teardown failed"
+  FM_TASKS_LOG="$log" FM_TASKS_HELD_STATE="$held_state" \
+    run_teardown "$case_dir" >/dev/null || fail "remote-recoverable local-only teardown failed"
   assert_contains "$(cat "$log")" "hold task-x1 --reason teardown complete but work is recoverable only outside the delivered default branch" \
     "remote-only local work did not remain explicitly unlanded"
   assert_contains "$(cat "$log")" "reopen task-x1" "remote-only work did not return to Queued after its hold"
@@ -1621,13 +1736,15 @@ test_non_delivery_outcomes_never_record_done() {
 
   case_dir=$(make_case unmerged-pr-truth)
   log="$case_dir/tasks.log"
+  held_state="$case_dir/held-state"
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   wt_commit "$case_dir" "open PR work"
   git -C "$case_dir/wt" push -q origin fm/task-x1
   git -C "$case_dir/project" fetch -q origin
   add_compatible_tasks_axi "$case_dir"
-  FM_TASKS_LOG="$log" run_teardown "$case_dir" >/dev/null || fail "unmerged PR teardown failed"
+  FM_TASKS_LOG="$log" FM_TASKS_HELD_STATE="$held_state" \
+    run_teardown "$case_dir" >/dev/null || fail "unmerged PR teardown failed"
   assert_contains "$(cat "$log")" "hold task-x1 --reason teardown complete but work is recoverable only outside the delivered default branch" \
     "unmerged PR did not remain explicitly unlanded"
   assert_contains "$(cat "$log")" "reopen task-x1" "unmerged PR work did not return to Queued after its hold"
@@ -1712,7 +1829,8 @@ test_completion_proof_write_failure_preserves_lifecycle() {
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_TREEHOUSE_LOG:?}"
-exit 0
+target=${!#}
+"${REAL_GIT_FOR_TEST:?}" -C "$target" worktree remove --force "$target"
 SH
   chmod +x "$case_dir/fakebin/treehouse"
   cat > "$case_dir/fakebin/mv" <<'SH'
@@ -1752,14 +1870,13 @@ SH
   pass "completion proof persistence is staged before endpoint and worktree destruction"
 }
 
-test_interrupted_cleanup_never_reuses_returned_worktree_path() {
-  local case_dir rc log return_log stage_fail
-  case_dir=$(make_case interrupted-cleanup-stage)
+test_cleanup_reuse_never_reuses_returned_worktree_path() {
+  local case_dir rc log return_log
+  case_dir=$(make_case cleanup-reused-path)
   write_meta "$case_dir" local-only ship
   add_compatible_tasks_axi "$case_dir"
   log="$case_dir/tasks.log"
   return_log="$case_dir/treehouse.log"
-  stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -1770,37 +1887,22 @@ mkdir -p "$wt"
 touch "$wt/reused-by-another-task"
 exit 0
 SH
-  cat > "$case_dir/fakebin/mv" <<'SH'
-#!/usr/bin/env bash
-set -u
-src=${1:-}
-dst=${2:-}
-if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
-   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
-   && grep -q '^phase=worktree-cleaned$' "$src" 2>/dev/null; then
-  touch "$FM_STAGE_FAIL_FLAG"
-  exit 1
-fi
-exec /bin/mv "$@"
-SH
-  chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/mv"
+  chmod +x "$case_dir/fakebin/treehouse"
 
   rc=0
   FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" \
-    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
-  expect_code 1 "$rc" "interrupted cleanup phase persistence"
-  assert_contains "$(cat "$case_dir/stderr")" "durable teardown phase could not be advanced" \
-    "cleanup phase persistence failure was not reported"
-  [ -f "$case_dir/state/task-x1.meta" ] || fail "cleanup phase failure removed task meta"
+  expect_code 1 "$rc" "cleanup path reuse absence verification"
+  assert_contains "$(cat "$case_dir/stderr")" "not confirmed absent" \
+    "cleanup path reuse was not refused before finalization"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "cleanup absence refusal removed task meta"
   [ -f "$case_dir/wt/reused-by-another-task" ] || fail "fixture did not model immediate worktree-path reuse"
   [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] || fail "first cleanup did not return the worktree exactly once"
 
   rc=0
   FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" \
-    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
-  expect_code 1 "$rc" "interrupted cleanup retry with lost ownership"
+  expect_code 1 "$rc" "cleanup reuse retry with lost ownership"
   [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] \
     || fail "retry re-ran destructive cleanup against a reused worktree path"
   [ -f "$case_dir/wt/reused-by-another-task" ] || fail "retry modified the reused worktree path"
@@ -1812,7 +1914,7 @@ SH
   if [ -f "$log" ]; then
     assert_not_contains "$(cat "$log")" "done task-x1" "ownership-lost retry recorded false completion"
   fi
-  pass "durable cleanup phase blocks finalization after worktree ownership is lost"
+  pass "cleanup reuse blocks finalization and preserves lost-ownership safety"
 }
 
 test_teardown_stage_does_not_dirty_retry_target() {
@@ -1853,7 +1955,7 @@ SH
 }
 
 test_absent_staged_target_retries_only_while_still_absent() {
-  local case_dir rc stage_fail mode
+  local case_dir rc stage_fail held_state mode
   for mode in absent reused registered; do
     case_dir=$(make_case "stage-absent-$mode")
     write_meta "$case_dir" local-only ship
@@ -1864,6 +1966,7 @@ test_absent_staged_target_retries_only_while_still_absent() {
       git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
     fi
     stage_fail="$case_dir/stage-failed"
+    held_state="$case_dir/held-state"
     cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -1880,7 +1983,8 @@ SH
     chmod +x "$case_dir/fakebin/mv"
 
     rc=0
-    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    FM_TASKS_HELD_STATE="$held_state" \
+      FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
       run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
     expect_code 1 "$rc" "$mode absent-target staging interruption"
     assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" "owner-identity=absent" \
@@ -1892,7 +1996,8 @@ SH
     fi
 
     rc=0
-    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    FM_TASKS_HELD_STATE="$held_state" \
+      FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
       run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
     if [ "$mode" = absent ]; then
       expect_code 0 "$rc" "still-absent staged target retry"
@@ -2262,13 +2367,14 @@ SH
 }
 
 test_forced_staged_retry_cannot_reuse_delivery_proof() {
-  local case_dir stage_fail log rc
+  local case_dir stage_fail held_state log rc
   case_dir=$(make_case forced-staged-retry)
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   add_compatible_tasks_axi "$case_dir"
   add_gh_pr_merged_for_head "$case_dir" "$(git -C "$case_dir/wt" rev-parse HEAD)"
   stage_fail="$case_dir/stage-failed"
+  held_state="$case_dir/held-state"
   log="$case_dir/tasks.log"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
@@ -2284,11 +2390,13 @@ SH
   chmod +x "$case_dir/fakebin/mv"
 
   rc=0
-  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+  FM_TASKS_HELD_STATE="$held_state" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     FM_TASKS_LOG="$log" run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "delivered staged interruption"
   rc=0
-  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+  FM_TASKS_HELD_STATE="$held_state" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     FM_TASKS_LOG="$log" run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
   expect_code 0 "$rc" "forced staged retry"
   assert_not_contains "$(cat "$log")" 'done task-x1' "forced retry reused delivered proof"
@@ -2553,8 +2661,8 @@ test_backlog_failure_retains_finalization_state() {
     >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "serialized backlog failure"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "backlog failure removed retained meta"
-  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=finalizing' \
-    "backlog failure did not retain finalizing stage"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=backlog-done-started' \
+    "backlog failure did not retain its explicit Done subphase"
   rc=0
   FM_TASKS_DONE_FAIL_FLAG="$fail_flag" FM_TASKS_LOG="$log" run_teardown "$case_dir" \
     >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
@@ -2590,8 +2698,8 @@ SH
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "post-Done phase interruption"
   [ -e "$done_state" ] || fail "fixture did not record Done before phase failure"
-  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=finalizing' \
-    "post-Done interruption did not retain finalizing phase"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=backlog-done-started' \
+    "post-Done interruption did not retain its explicit Done subphase"
   rc=0
   FM_TASKS_DONE_STATE="$done_state" FM_TASKS_LOG="$log" \
     FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
@@ -2599,6 +2707,27 @@ SH
   expect_code 0 "$rc" "truthfully Done finalization retry"
   assert_absent "$case_dir/state/task-x1.meta" "Done retry retained lifecycle meta"
   pass "truthfully Done records survive finalization phase interruption"
+}
+
+test_teardown_stage_requires_exact_schema_on_retry() {
+  local case_dir fail_flag rc
+  case_dir=$(make_case exact-stage-schema)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  fail_flag="$case_dir/done-failed"
+  rc=0
+  FM_TASKS_DONE_FAIL_FLAG="$fail_flag" run_teardown "$case_dir" \
+    >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "exact stage fixture"
+  printf 'phase=backlog-recorded\n' >> "$case_dir/state/task-x1.teardown-stage"
+  rc=0
+  FM_TASKS_DONE_FAIL_FLAG="$fail_flag" run_teardown "$case_dir" \
+    >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "duplicate stage field retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'invalid or stale teardown stage' \
+    "duplicate phase field bypassed exact stage validation"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "invalid stage retry removed lifecycle metadata"
+  pass "every teardown retry phase requires an exact stage schema"
 }
 
 test_force_posture_cannot_change_after_backlog_recorded() {
@@ -2647,8 +2776,8 @@ test_partial_truthful_finalization_retries_idempotently() {
     FM_TASKS_LOG="$log" run_teardown "$case_dir" --force \
     >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "partial discarded backlog finalization"
-  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=finalizing' \
-    "partial discarded finalization did not retain stage"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=backlog-reopen-started' \
+    "partial discarded finalization did not retain its explicit reopen subphase"
   assert_contains "$(cat "$log")" 'hold task-x1' "discarded finalization did not persist hold first"
   [ -e "$held_state" ] || fail "fixture did not expose the partial held backlog state"
   rc=0
@@ -2659,6 +2788,261 @@ test_partial_truthful_finalization_retries_idempotently() {
   assert_contains "$(cat "$log")" 'reopen task-x1' "discarded finalization retry did not finish reopen"
   assert_absent "$case_dir/state/task-x1.teardown-stage" "successful truthful retry retained stage"
   pass "partial truthful finalization retries from durable finalizing state"
+}
+
+test_interrupted_truthful_hold_binds_exact_result() {
+  local case_dir held_state stage_fail log rc hold_count
+  case_dir=$(make_case interrupted-truthful-hold)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  held_state="$case_dir/held-state"
+  stage_fail="$case_dir/stage-failed"
+  log="$case_dir/tasks.log"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=backlog-held$' "$src"; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_TASKS_LOG="$log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "interrupted truthful hold"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=backlog-hold-started' \
+    "interrupted hold did not retain its pre-mutation phase"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_TASKS_LOG="$log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "exact interrupted truthful hold retry"
+  hold_count=$(grep -c '^hold task-x1 ' "$log")
+  [ "$hold_count" -eq 1 ] || fail "exact interrupted hold was applied more than once"
+
+  case_dir=$(make_case mutated-truthful-hold)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  held_state="$case_dir/held-state"
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=backlog-held$' "$src"; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" \
+    FM_STAGE_FAIL_FLAG="$stage_fail" run_teardown "$case_dir" --force \
+    >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "mutated truthful hold fixture"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_TASKS_SHOW_SUFFIX=concurrent-change \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "mutated interrupted truthful hold retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'changed during the staged hold transition' \
+    "arbitrary mutation was accepted as the interrupted hold result"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "mutated interrupted hold removed lifecycle metadata"
+  pass "truthful hold retries accept only their exact staged result"
+}
+
+test_postcleanup_retry_rechecks_endpoint_absence() {
+  local case_dir held_state fail_flag rc
+  case_dir=$(make_case postcleanup-endpoint-reappeared)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  held_state="$case_dir/held-state"
+  fail_flag="$case_dir/reopen-failed"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_TASKS_REOPEN_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "post-cleanup endpoint fixture"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  rc=0
+  FM_TASKS_HELD_STATE="$held_state" FM_TASKS_REOPEN_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "reappeared endpoint retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'no longer has confirmed endpoint and cleanup absence' \
+    "post-cleanup retry ignored a reappeared endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "reappeared endpoint removed lifecycle metadata"
+  pass "post-cleanup phases re-confirm endpoint absence"
+}
+
+test_cleanup_success_requires_confirmed_absence() {
+  local case_dir rc
+  case_dir=$(make_case cleanup-noop-refusal)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  rc=0
+  run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "successful no-op cleanup"
+  assert_contains "$(cat "$case_dir/stderr")" 'not confirmed absent' \
+    "successful no-op cleanup advanced without an absence proof"
+  assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=worktree-cleanup-started' \
+    "successful no-op cleanup lost its retryable phase"
+  [ -d "$case_dir/wt" ] || fail "successful no-op cleanup unexpectedly removed the worktree"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "successful no-op cleanup removed lifecycle metadata"
+  pass "cleanup success remains retryable until every target is absent"
+}
+
+test_tasktmp_replacement_loses_auxiliary_cleanup_authority() {
+  local case_dir tasktmp stage_fail rc
+  case_dir=$(make_case tasktmp-replacement-refusal)
+  tasktmp="$case_dir/tasktmp"
+  mkdir "$tasktmp"
+  write_meta "$case_dir" local-only ship
+  printf 'tasktmp=%s\n' "$tasktmp" >> "$case_dir/state/task-x1.meta"
+  add_compatible_tasks_axi "$case_dir"
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=worktree-cleanup-started$' "$src"; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "tasktmp staged interruption"
+  rm -rf "$tasktmp"
+  mkdir "$tasktmp"
+  printf 'replacement\n' > "$tasktmp/owned"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "replaced tasktmp retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'auxiliary cleanup target no longer has its staged ownership token' \
+    "replaced tasktmp retained cleanup authority"
+  assert_contains "$(cat "$tasktmp/owned")" replacement "replaced tasktmp was deleted"
+  pass "tasktmp cleanup authority cannot transfer to a replacement path"
+}
+
+test_child_worktree_replacement_loses_auxiliary_cleanup_authority() {
+  local case_dir home child_wt stage_fail rc
+  case_dir=$(make_case child-worktree-replacement-refusal)
+  home="$case_dir/secondmate-home"
+  child_wt="$case_dir/child-wt"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  fm_write_meta "$home/state/child-a1.meta" \
+    'window=fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+    'kind=ship' 'mode=local-only'
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=worktree-cleanup-started$' "$src"; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "child worktree staged interruption"
+  git -C "$case_dir/project" worktree remove --force "$child_wt"
+  git -C "$case_dir/project" branch -D fm/child-a1 >/dev/null
+  git -C "$case_dir/project" worktree add -q -b fm/child-a1-replacement "$child_wt" main
+  printf 'replacement\n' > "$child_wt/replacement"
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "replaced child worktree retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'auxiliary cleanup target no longer has its staged ownership token' \
+    "replaced child worktree retained cleanup authority"
+  assert_contains "$(cat "$child_wt/replacement")" replacement "replaced child worktree was deleted"
+  pass "child worktree cleanup authority cannot transfer to a replacement path"
+}
+
+test_finalizing_retry_rechecks_current_record() {
+  local case_dir fail_flag rc
+  case_dir=$(make_case finalizing-record-change)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  fail_flag="$case_dir/done-failed"
+  rc=0
+  FM_TASKS_DONE_FAIL_FLAG="$fail_flag" run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "initial finalizing failure"
+  rc=0
+  FM_TASKS_DONE_FAIL_FLAG="$fail_flag" FM_TASKS_SHOW_SUFFIX=changed \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "changed finalizing record"
+  assert_contains "$(cat "$case_dir/retry-stderr")" \
+    'teardown proof does not match the current backlog record' \
+    "finalizing retry ignored the current backlog fingerprint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "changed finalizing record removed lifecycle metadata"
+  pass "finalizing retries remain bound to the current backlog record"
+}
+
+test_concurrent_force_retry_cannot_replace_staged_outcome() {
+  local case_dir ready release log first_rc second_rc waited=0 first_pid second_pid
+  case_dir=$(make_case serialized-teardown-retry)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  ready="$case_dir/show-ready"
+  release="$case_dir/show-release"
+  log="$case_dir/tasks.log"
+  FM_TASKS_SHOW_READY="$ready" FM_TASKS_SHOW_RELEASE="$release" FM_TASKS_LOG="$log" \
+    run_teardown "$case_dir" >"$case_dir/first-out" 2>"$case_dir/first-err" &
+  first_pid=$!
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || fail "serialized teardown fixture never entered its critical section"
+  FM_TASKS_LOG="$log" run_teardown "$case_dir" --force \
+    >"$case_dir/second-out" 2>"$case_dir/second-err" &
+  second_pid=$!
+  : > "$release"
+  first_rc=0
+  wait "$first_pid" || first_rc=$?
+  second_rc=0
+  wait "$second_pid" || second_rc=$?
+  expect_code 0 "$first_rc" "first serialized teardown"
+  expect_code 1 "$second_rc" "concurrent forced retry"
+  assert_not_contains "$(cat "$log")" 'hold task-x1' \
+    "concurrent forced retry replaced a delivered outcome"
+  assert_contains "$(cat "$log")" 'done task-x1' \
+    "serialized teardown did not finish its original delivered outcome"
+  pass "concurrent forced retries cannot replace an in-memory staged outcome"
 }
 
 test_local_only_fork_remote_allows
@@ -2672,6 +3056,7 @@ test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_secondmate_retirement_preflights_child_duplicates
+test_secondmate_child_endpoint_close_requires_confirmed_absence
 test_zellij_duplicate_endpoints_refuse_teardown_without_closure
 test_zellij_replacement_endpoint_refuses_teardown_without_closure
 test_cmux_duplicate_endpoints_refuse_teardown_without_closure
@@ -2680,7 +3065,7 @@ test_non_delivery_outcomes_never_record_done
 test_endpoint_close_must_succeed_and_be_absent
 test_unknown_endpoint_state_preserves_lifecycle
 test_completion_proof_write_failure_preserves_lifecycle
-test_interrupted_cleanup_never_reuses_returned_worktree_path
+test_cleanup_reuse_never_reuses_returned_worktree_path
 test_teardown_stage_does_not_dirty_retry_target
 test_absent_staged_target_retries_only_while_still_absent
 test_secondmate_registry_cleanup_retries_after_home_removal
@@ -2700,8 +3085,16 @@ test_confirmed_cleanup_retries_after_phase_write_failure
 test_verified_owner_marker_removal_retries_after_cleanup
 test_backlog_failure_retains_finalization_state
 test_done_record_retries_after_finalization_phase_failure
+test_teardown_stage_requires_exact_schema_on_retry
 test_force_posture_cannot_change_after_backlog_recorded
 test_partial_truthful_finalization_retries_idempotently
+test_interrupted_truthful_hold_binds_exact_result
+test_postcleanup_retry_rechecks_endpoint_absence
+test_cleanup_success_requires_confirmed_absence
+test_tasktmp_replacement_loses_auxiliary_cleanup_authority
+test_child_worktree_replacement_loses_auxiliary_cleanup_authority
+test_finalizing_retry_rechecks_current_record
+test_concurrent_force_retry_cannot_replace_staged_outcome
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

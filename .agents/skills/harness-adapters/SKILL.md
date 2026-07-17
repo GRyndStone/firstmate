@@ -179,6 +179,7 @@ If a pane shows the exit banner, relaunch with `--continue` to resume the sessio
 **Primary-session guard fact (verified 2026-07-08, OpenCode 1.17.6).**
 The firstmate PRIMARY's own `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`.
 Throwing from `session.idle` does not block `opencode run`, so the primary adapter treats the event as passive, durably records the required continuation, and uses `client.session.promptAsync` to deliver it when `bin/fm-turnend-guard.sh` returns 2.
+The record remains owned by a process-retaining per-session retry timer until `promptAsync` explicitly acknowledges the queued continuation or the predicate becomes healthy.
 The companion `.opencode/plugins/fm-primary-watch-arm.js` owns normal TUI watcher wake supervision and coordinates with the guard plugin before the guard tries a blind-turn follow-up.
 The follow-up was verified in the interactive TUI; `opencode run` can exit before displaying a queued follow-up, so the adapter is supported only in the persistent primary TUI.
 
@@ -205,6 +206,7 @@ Pi sets `PI_CODING_AGENT=true` for its children; this is its harness-detection e
 **Primary-session guard fact (verified 2026-07-09, Pi 0.80.5).**
 The firstmate PRIMARY's own `.pi/extensions/fm-primary-turnend-guard.ts` listens for logical-run `agent_settled`, not per-tool-loop `turn_end`, durably records a blocked continuation, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to deliver it when `bin/fm-turnend-guard.sh` returns 2.
 Without `deliverAs: "followUp"`, Pi rejects the send while the agent is still processing.
+Pi's API returns `void`, so the adapter retains the process with its retry timer until the ensuing `agent_start` acknowledges a real assistant continuation or the predicate becomes healthy.
 Pi's primary watcher protocol also requires the tracked `.pi/extensions/fm-primary-pi-watch.ts` extension, same trust-once discovery as the turn-end guard.
 The model arms through `fm_watch_arm_pi`, never a foreground bash arm; the watcher tool result and clean-exit fallback are owned by `docs/supervision-protocols/pi.md`.
 `bin/fm-session-start.sh` reports when the live Pi session has not loaded both the turn-end guard and watcher extensions, and points at plain `pi` after project trust as the fix, with `-e` as a trust-free fallback.
@@ -262,6 +264,7 @@ Secondmate spawns skip the pointer (idle panes are healthy, no stale-pane detect
 The firstmate PRIMARY's own `.grok/hooks/fm-primary-turnend-guard.json` invokes `bin/fm-turnend-guard-grok.sh`.
 Grok Stop hooks are passive for this purpose: exit 2 does not make the model continue.
 The adapter therefore runs the shared predicate and, when it returns 2, durably records one same-session follow-up and schedules bounded delivery after the current Stop hook returns; every later Stop event reruns the predicate and schedules again if blindness persists.
+The deterministic per-session worker waits for the originating hook process identity to disappear, serializes delivery with one session lock, retries until resume succeeds, and discards retained pending work when a healthy Stop proves supervision recovered.
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.
