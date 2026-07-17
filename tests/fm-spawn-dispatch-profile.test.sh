@@ -27,6 +27,9 @@ case "${1:-}" in
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
   send-keys)
+    if [ -n "${FM_FAKE_SHELL_LOG:-}" ] && [ "${4:-}" != "-l" ]; then
+      printf '%s\n' "${4:-}" >> "$FM_FAKE_SHELL_LOG"
+    fi
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
       prev=
       for a in "$@"; do
@@ -81,14 +84,17 @@ make_seeded_secondmate_home() {
 }
 
 run_spawn() {
-  local home=$1 wt=$2 fakebin=$3 launchlog=$4
+  local home=$1 wt=$2 fakebin=$3 launchlog=$4 shelllog
   shift 4
+  shelllog="${launchlog%.log}.shell.log"
   : > "$launchlog"
+  : > "$shelllog"
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
-    FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
+    FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_SHELL_LOG="$shelllog" \
+    GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
 
@@ -106,7 +112,7 @@ assert_meta_profile() {
 }
 
 test_no_profile_keeps_claude_launch_unchanged() {
-  local rec id out status expected launch
+  local rec id out status expected launch shelllog
   id=profile-off-z1
   rec=$(make_spawn_case profile-off claude "$id")
   read_case_record "$rec"
@@ -118,8 +124,11 @@ test_no_profile_keeps_claude_launch_unchanged() {
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
   expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
   [ "$launch" = "$expected" ] || fail "no-profile claude launch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='claude'" "$shelllog" \
+    "static crew-harness resolution did not export claude to no-mistakes"
   pass "no --model/--effort records defaults and keeps the claude launch byte-identical"
 }
 
@@ -156,7 +165,7 @@ test_active_dispatch_profile_requires_explicit_harness_for_scout() {
 }
 
 test_active_dispatch_profile_allows_explicit_harness() {
-  local rec id out status launch
+  local rec id out status launch shelllog
   id=profile-explicit-z13
   rec=$(make_spawn_case profile-explicit claude "$id")
   read_case_record "$rec"
@@ -169,8 +178,11 @@ test_active_dispatch_profile_allows_explicit_harness() {
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report explicit codex harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
   launch=$(cat "$LAUNCH_LOG")
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
     "explicit harness launch did not thread model and effort"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='codex'" "$shelllog" \
+    "dispatch-resolved harness did not export codex to no-mistakes"
   pass "active crew-dispatch profile allows an explicit resolved harness"
 }
 
@@ -191,7 +203,7 @@ test_active_dispatch_profile_allows_positional_harness() {
 }
 
 test_active_dispatch_profile_allows_raw_launch_command() {
-  local rec id out status launch
+  local rec id out status launch shelllog
   id=profile-raw-z15
   rec=$(make_spawn_case profile-raw claude "$id")
   read_case_record "$rec"
@@ -204,7 +216,12 @@ test_active_dispatch_profile_allows_raw_launch_command() {
   assert_contains "$out" "spawned $id harness=custom-agent" "spawn did not report raw command harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" custom-agent default default
   launch=$(cat "$LAUNCH_LOG")
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
   [ "$launch" = "custom-agent --flag" ] || fail "raw launch command changed"$'\n'"actual: $launch"
+  assert_contains "$out" "harness 'custom-agent' is not supported by private no-mistakes run agents" \
+    "raw unsupported harness did not warn that validation will fail closed"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='custom-agent'" "$shelllog" \
+    "raw unsupported harness was not exported literally for fail-closed validation"
   pass "active crew-dispatch profile allows the raw launch-command escape hatch"
 }
 
@@ -258,7 +275,7 @@ test_codex_omits_invalid_max_effort() {
 }
 
 test_grok_threads_model_and_reasoning_effort() {
-  local rec id out status launch
+  local rec id out status launch shelllog
   id=profile-grok-z5
   rec=$(make_spawn_case profile-grok grok "$id")
   read_case_record "$rec"
@@ -268,9 +285,14 @@ test_grok_threads_model_and_reasoning_effort() {
   expect_code 0 "$status" "grok spawn with profile flags should succeed"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 high
   launch=$(cat "$LAUNCH_LOG")
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
   assert_contains "$launch" "grok --always-approve --model 'grok-4' --reasoning-effort 'high'" \
     "grok launch did not thread model and reasoning-effort flags"
   assert_not_contains "$launch" "--effort" "grok launch must use --reasoning-effort, not --effort"
+  assert_contains "$out" "harness 'grok' is not supported by private no-mistakes run agents" \
+    "grok did not warn that no-mistakes validation will fail closed"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='grok'" "$shelllog" \
+    "grok was not exported literally for fail-closed validation"
   pass "grok receives --model and --reasoning-effort profile flags"
 }
 
@@ -328,7 +350,7 @@ test_pi_omits_invalid_max_effort() {
 }
 
 test_batch_forwards_shared_profile_flags() {
-  local rec id1 id2 out status
+  local rec id1 id2 out status shelllog count
   id1=profile-batch-a-z9
   id2=profile-batch-b-z10
   rec=$(make_spawn_case profile-batch claude "$id1" "$id2")
@@ -343,7 +365,49 @@ test_batch_forwards_shared_profile_flags() {
   assert_contains "$out" "spawned $id2 harness=codex" "second batch task did not use shared harness"
   assert_meta_profile "$HOME_DIR/state/$id1.meta" codex gpt-5 high
   assert_meta_profile "$HOME_DIR/state/$id2.meta" codex gpt-5 high
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
+  count=$(grep -cFx "export NO_MISTAKES_RUN_AGENTS='codex'" "$shelllog" || true)
+  [ "$count" -eq 2 ] || fail "batch exported codex validation assignment $count times, want 2"
   pass "batch dispatch forwards shared --harness, --model, and --effort to every pair"
+}
+
+test_concurrent_static_and_dispatch_assignments_do_not_cross_talk() {
+  local static_rec dispatch_rec sid did sout dout spid dpid src=0 drc=0
+  local shome swt sfake slog dhome dwt dfake dlog sshell dshell
+  sid=profile-concurrent-static-z17
+  did=profile-concurrent-dispatch-z18
+
+  static_rec=$(make_spawn_case profile-concurrent-static claude "$sid")
+  read_case_record "$static_rec"
+  shome=$HOME_DIR; swt=$WT_DIR; sfake=$FAKEBIN_DIR; slog=$LAUNCH_LOG
+
+  dispatch_rec=$(make_spawn_case profile-concurrent-dispatch claude "$did")
+  read_case_record "$dispatch_rec"
+  enable_dispatch_profile "$HOME_DIR"
+  dhome=$HOME_DIR; dwt=$WT_DIR; dfake=$FAKEBIN_DIR; dlog=$LAUNCH_LOG
+
+  sout="$TMP_ROOT/static.out"
+  dout="$TMP_ROOT/dispatch.out"
+  run_spawn "$shome" "$swt" "$sfake" "$slog" "$sid" "$shome/../project" > "$sout" &
+  spid=$!
+  run_spawn "$dhome" "$dwt" "$dfake" "$dlog" "$did" "$dhome/../project" --harness codex > "$dout" &
+  dpid=$!
+  wait "$spid" || src=$?
+  wait "$dpid" || drc=$?
+  expect_code 0 "$src" "concurrent static claude spawn should succeed"
+  expect_code 0 "$drc" "concurrent dispatch codex spawn should succeed"
+
+  sshell="${slog%.log}.shell.log"
+  dshell="${dlog%.log}.shell.log"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='claude'" "$sshell" \
+    "concurrent static worker did not receive claude"
+  assert_not_contains "$(cat "$sshell")" "NO_MISTAKES_RUN_AGENTS='codex'" \
+    "dispatch worker assignment crossed into the static worker pane"
+  assert_grep "export NO_MISTAKES_RUN_AGENTS='codex'" "$dshell" \
+    "concurrent dispatch worker did not receive codex"
+  assert_not_contains "$(cat "$dshell")" "NO_MISTAKES_RUN_AGENTS='claude'" \
+    "static worker assignment crossed into the dispatch worker pane"
+  pass "concurrent static and dispatch workers receive distinct no-mistakes assignments without cross-talk"
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
@@ -378,6 +442,7 @@ test_grok_omits_invalid_max_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
 test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
+test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

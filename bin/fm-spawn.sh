@@ -73,6 +73,10 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
+#   The resolved HARNESS is also exported into the worker pane as the one-item
+#   NO_MISTAKES_RUN_AGENTS order before launch. claude, codex, opencode, and pi
+#   are supported by the private runner. Any other literal value is exported
+#   unchanged so validation fails closed instead of selecting an `auto` agent.
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -378,6 +382,13 @@ case "$ARG3" in
     HARNESS=$ARG3
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
+esac
+
+[ -n "$HARNESS" ] || { echo "error: could not derive a harness from the raw launch command; refusing an empty no-mistakes assignment" >&2; exit 1; }
+NM_RUN_AGENTS=$HARNESS
+case "$HARNESS" in
+  claude|codex|opencode|pi) : ;;
+  *) echo "warning: harness '$HARNESS' is not supported by private no-mistakes run agents; exporting it literally so validation fails closed instead of selecting another agent" >&2 ;;
 esac
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
@@ -1030,6 +1041,7 @@ sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
+sq_nm_run_agents=$(shell_quote "$NM_RUN_AGENTS")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
@@ -1047,6 +1059,7 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+spawn_send_text_line "$T" "export NO_MISTAKES_RUN_AGENTS=$sq_nm_run_agents"
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
