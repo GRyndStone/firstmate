@@ -197,8 +197,8 @@ SH
 
 # make_liveness_tmux <dir>: a tmux stub whose #{pane_current_command} answer is
 # read fresh from $FM_TEST_PANE_CMD on every query (so a test can flip it
-# between bootstrap runs), and which logs every new-window/kill-window call
-# (the only two operations a respawn performs) to $FM_TMUX_CALL_LOG.
+# between bootstrap runs), and which logs every new-window, kill-window, and
+# spawn-time send-keys call to $FM_TMUX_CALL_LOG.
 make_liveness_tmux() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -209,7 +209,7 @@ case "${1:-}" in
   display-message)
     for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
     exit 0 ;;
-  new-window|kill-window)
+  new-window|kill-window|send-keys)
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
     exit 0 ;;
   list-windows|has-session) exit 0 ;;
@@ -279,6 +279,8 @@ test_sweep_respawns_confirmed_dead_secondmate() {
     "the stale endpoint must be killed before respawn (tmux refuses a same-named window over a live one)"
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"
+  assert_contains "$(cat "$log")" "export NO_MISTAKES_RUN_AGENTS='codex'" \
+    "the recovery respawn did not reconstruct the resolved codex validation assignment"
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
 }
 
