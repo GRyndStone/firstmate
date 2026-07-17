@@ -87,8 +87,8 @@ capture_watch_identity() {
     sleep 0.01
     i=$((i + 1))
   done
-  WATCH_IDENTITY="direct-child:$CHECKPOINT_PID:$WATCH_PID"
-  return 0
+  WATCH_IDENTITY=
+  return 1
 }
 
 watch_child_matches() {
@@ -97,9 +97,6 @@ watch_child_matches() {
   fm_pid_alive "$WATCH_PID" || return 1
   current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]') || return 1
   [ "$current_parent" = "$CHECKPOINT_PID" ] || return 1
-  if [ "$WATCH_IDENTITY" = "direct-child:$CHECKPOINT_PID:$WATCH_PID" ]; then
-    return 0
-  fi
   current_identity=$(watch_birth_identity "$WATCH_PID") || return 1
   [ "$current_identity" = "$WATCH_IDENTITY" ]
 }
@@ -158,7 +155,7 @@ trap cleanup_owned_children EXIT
 FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
   FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
 WATCH_PID=$!
-capture_watch_identity
+capture_watch_identity || true
 (
   sleep "$SECONDS_ARG"
   : > "$TIMEOUT_MARKER"

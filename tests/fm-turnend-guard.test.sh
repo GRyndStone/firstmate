@@ -690,13 +690,15 @@ EOF
   chmod +x "$fakebin/grok"
   (
     printf '{"sessionId":"session-singleton","hookEventName":"stop"}' \
-      | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" >/dev/null 2>&1
+      | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" \
+        >"$TMP_ROOT/grok-session-singleton-first.out" 2>"$TMP_ROOT/grok-session-singleton-first.err"
     printf '%s\n' "$?" > "$TMP_ROOT/grok-session-singleton-first.status"
   ) &
   first_pid=$!
   (
     printf '{"sessionId":"session-singleton","hookEventName":"stop"}' \
-      | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" >/dev/null 2>&1
+      | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" \
+        >"$TMP_ROOT/grok-session-singleton-second.out" 2>"$TMP_ROOT/grok-session-singleton-second.err"
     printf '%s\n' "$?" > "$TMP_ROOT/grok-session-singleton-second.status"
   ) &
   second_pid=$!
@@ -704,8 +706,10 @@ EOF
   wait "$second_pid"
   first_status=$(cat "$TMP_ROOT/grok-session-singleton-first.status")
   second_status=$(cat "$TMP_ROOT/grok-session-singleton-second.status")
-  expect_code 0 "$first_status" "first concurrent Grok Stop must acquire or observe singleton ownership"
-  expect_code 0 "$second_status" "second concurrent Grok Stop must acquire or observe singleton ownership"
+  expect_code 0 "$first_status" \
+    "first concurrent Grok Stop must acquire or observe singleton ownership: $(cat "$TMP_ROOT/grok-session-singleton-first.err")"
+  expect_code 0 "$second_status" \
+    "second concurrent Grok Stop must acquire or observe singleton ownership: $(cat "$TMP_ROOT/grok-session-singleton-second.err")"
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     [ -s "$calls" ] && [ ! -d "$active" ] && break
     sleep 0.1
@@ -1185,13 +1189,14 @@ if (!promptBody.includes("guard-fired")) {
   console.error(`missing prompt body: ${promptBody}`);
   process.exit(1);
 }
-if (prompts !== 2) throw new Error(`expected one follow-up per still-blind idle, saw ${prompts}`);
+if (prompts !== 3) throw new Error(`expected one follow-up per still-blind idle, saw ${prompts}`);
 const guardRuns = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
 if (guardRuns !== 3) throw new Error(`three idle events ran predicate ${guardRuns} times`);
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode plugin must run the guard from worktree even when directory is elsewhere"
+  expect_code 0 "$status" \
+    "OpenCode plugin must run the guard from worktree even when directory is elsewhere: $out"
   [ -z "$out" ] || fail "OpenCode plugin worktree-root test printed output: $out"
   pass ".opencode primary plugin: forced follow-up reruns the worktree-anchored predicate"
 }
@@ -1236,7 +1241,9 @@ const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
 if (!existsSync(handoffDir) || !readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.endsWith(".pending"))) {
   throw new Error("failed delivery did not leave a durable handoff");
 }
-for (let i = 0; i < 50 && attempts < 3; i += 1) {
+for (let i = 0; i < 50; i += 1) {
+  const pending = readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.endsWith(".pending"));
+  if (attempts >= 3 && !pending) break;
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 if (attempts < 3) throw new Error(`retry owner stopped after ${attempts} delivery attempts`);
@@ -1251,7 +1258,8 @@ if (readdirSync(handoffDir).some((name) => name.startsWith("opencode-") && name.
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode guard must persist and retry failed continuation delivery"
+  expect_code 0 "$status" \
+    "OpenCode guard must persist and retry failed continuation delivery: $out"
   [ -z "$out" ] || fail "OpenCode delivery-failure test printed output: $out"
   pass ".opencode primary plugin: retry owner retains handoff until SDK acknowledgement"
 }
@@ -1415,11 +1423,12 @@ writeFileSync(process.env.FM_GUARD_MODE, "blind\n");
 const newer = hooks.event(idle);
 writeFileSync(process.env.FM_GUARD_RELEASE, "release\n");
 await Promise.all([older, newer]);
-if (promptBody !== "retained newer handoff") throw new Error(`stale healthy handler cleared newer handoff: ${promptBody}`);
+if (!promptBody.includes("newer blind generation")) throw new Error(`stale healthy handler cleared newer handoff: ${promptBody}`);
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode stale healthy handler must not clear a newer invocation handoff"
+  expect_code 0 "$status" \
+    "OpenCode stale healthy handler must not clear a newer invocation handoff: $out"
   [ -z "$out" ] || fail "OpenCode handler-generation test printed output: $out"
   pass ".opencode primary plugin: invocation generations protect newer handoffs from stale healthy results"
 }
@@ -1629,7 +1638,8 @@ if (prompts !== 1) throw new Error(`persistence recovery delivered ${prompts} co
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode persistence failure must retain retry ownership"
+  expect_code 0 "$status" \
+    "OpenCode persistence failure must retain retry ownership: $out"
   [ -z "$out" ] || fail "OpenCode persistence-retry test printed output: $out"
   pass ".opencode primary plugin: synchronous persistence failure retains a retry owner"
 }
@@ -1675,6 +1685,145 @@ EOF
   expect_code 0 "$status" "OpenCode acknowledged cleanup failure must retain retry ownership"
   [ -z "$out" ] || fail "OpenCode cleanup-retry test printed output: $out"
   pass ".opencode primary plugin: acknowledged owner persists until cleanup is confirmed"
+}
+
+test_opencode_unresolved_flight_is_durably_quarantined() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-flight-quarantine-root"
+  home="$TMP_ROOT/opencode-flight-quarantine-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.turnend-handoffs"
+  record_opencode_test_lock "$home/state"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'quarantined flight guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" node 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const sessionID = "quarantined-flight";
+const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/opencode-${key}.pending`;
+const pendingRecord = JSON.stringify({ token: "old-token", sessionID, message: "old continuation", generation: 4 });
+writeFileSync(pending, `${pendingRecord}\n`);
+writeFileSync(`${pending}.flight`, `${JSON.stringify({
+  kind: "unresolved-flight",
+  token: "old-token",
+  sessionID,
+  generation: 4,
+  pendingRecord,
+  ownerPid: 999999,
+})}\n`);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+await new Promise((resolve) => setTimeout(resolve, 40));
+if (prompts !== 0) throw new Error("startup redelivered an unresolved cross-process flight");
+if (!existsSync(`${pending}.flight`)) throw new Error("unresolved flight lost its durable quarantine marker");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode unresolved delivery flights must remain quarantined across process handoff"
+  [ -z "$out" ] || fail "OpenCode flight-quarantine test printed output: $out"
+  pass ".opencode primary plugin: unresolved cross-process flights are generation-bound and never redelivered"
+}
+
+test_opencode_durable_acknowledgement_only_retries_cleanup() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-durable-ack-root"
+  home="$TMP_ROOT/opencode-durable-ack-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.turnend-handoffs"
+  record_opencode_test_lock "$home/state"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const sessionID = "durable-ack";
+const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/opencode-${key}.pending`;
+const pendingRecord = JSON.stringify({ token: "ack-token", sessionID, message: "already queued", generation: 7 });
+writeFileSync(pending, `${pendingRecord}\n`);
+writeFileSync(`${pending}.flight`, `${JSON.stringify({
+  kind: "unresolved-flight",
+  token: "ack-token",
+  sessionID,
+  generation: 7,
+  pendingRecord,
+  ownerPid: 999999,
+})}\n`);
+writeFileSync(`${pending}.acknowledged`, `${JSON.stringify({
+  kind: "acknowledged-cleanup",
+  token: "ack-token",
+  sessionID,
+  generation: 7,
+  pendingRecord,
+})}\n`);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+for (let i = 0; i < 50 && (existsSync(pending) || existsSync(`${pending}.flight`) || existsSync(`${pending}.acknowledged`)); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (prompts !== 0) throw new Error("durably acknowledged handoff was delivered again");
+if (existsSync(pending) || existsSync(`${pending}.flight`) || existsSync(`${pending}.acknowledged`)) {
+  throw new Error("durably acknowledged handoff did not finish cleanup");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode durable acknowledgement must survive restart and suppress redelivery"
+  [ -z "$out" ] || fail "OpenCode durable-acknowledgement test printed output: $out"
+  pass ".opencode primary plugin: durable acknowledgement survives restart until cleanup completes"
+}
+
+test_opencode_unknown_lock_probe_retains_in_process_retry() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-lock-unknown-root"
+  home="$TMP_ROOT/opencode-lock-unknown-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.lock"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'unknown lock probe guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { existsSync, rmdirSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "unknown-lock" } } });
+if (existsSync(`${process.env.FM_HOME}/state/.turnend-handoffs`)) {
+  throw new Error("unknown lock ownership mutated shared handoff state");
+}
+rmdirSync(`${process.env.FM_HOME}/state/.lock`);
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+for (let i = 0; i < 100 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`unknown ownership retry delivered ${prompts} continuations after recovery`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode unknown lock probes must retain a bounded in-process retry owner"
+  [ -z "$out" ] || fail "OpenCode unknown-lock test printed output: $out"
+  pass ".opencode primary plugin: unknown lock ownership retries in process without shared mutation"
 }
 
 test_pi_extension_forces_followup() {
@@ -2072,6 +2221,201 @@ EOF
   pass ".pi primary extension: synchronous persistence failure retains a retry owner"
 }
 
+test_passive_handoff_adapters_reject_symlinked_state() {
+  local plugin repo home outside out status ext grok_repo grok_home grok_outside
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-symlink-root"
+  home="$TMP_ROOT/opencode-symlink-home"
+  outside="$TMP_ROOT/opencode-symlink-outside"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state" "$outside"
+  record_opencode_test_lock "$home/state"
+  ln -s "$outside" "$home/state/.turnend-handoffs"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'symlink scope guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" OUTSIDE="$outside" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "symlink-scope" } } });
+if (readdirSync(process.env.OUTSIDE).length !== 0) throw new Error("OpenCode wrote through the symlinked handoff directory");
+unlinkSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+mkdirSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+for (let i = 0; i < 100 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`OpenCode symlink recovery delivered ${prompts} continuations`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode must reject a symlinked passive-handoff directory"
+  [ -z "$out" ] || fail "OpenCode symlink-scope test printed output: $out"
+
+  repo="$TMP_ROOT/pi-symlink-root"
+  home="$TMP_ROOT/pi-symlink-home"
+  outside="$TMP_ROOT/pi-symlink-outside"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state" "$outside"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  ln -s "$outside" "$home/state/.turnend-handoffs"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'symlink scope guard\n' >&2
+exit 2
+SH
+  cat > "$repo/bin/fm-arm-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$repo/bin/fm-cd-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$repo/bin/"*.sh
+  out=$(PLUGIN="$ext" FM_HOME="$home" OUTSIDE="$outside" FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let prompts = 0;
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+mod.default(pi);
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+if (readdirSync(process.env.OUTSIDE).length !== 0) throw new Error("Pi wrote through the symlinked handoff directory");
+unlinkSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+mkdirSync(`${process.env.FM_HOME}/state/.turnend-handoffs`);
+for (let i = 0; i < 100 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`Pi symlink recovery delivered ${prompts} continuations`);
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi must reject a symlinked passive-handoff directory"
+  [ -z "$out" ] || fail "Pi symlink-scope test printed output: $out"
+
+  grok_repo="$TMP_ROOT/grok-symlink-root"
+  grok_home="$TMP_ROOT/grok-symlink-home"
+  grok_outside="$TMP_ROOT/grok-symlink-outside"
+  make_adapter_primary_repo "$grok_repo"
+  mkdir -p "$grok_repo/bin" "$grok_home/state" "$grok_outside"
+  : > "$grok_repo/AGENTS.md"
+  ln -s "$grok_outside" "$grok_home/state/.turnend-handoffs"
+  out=$(printf '{"sessionId":"symlink-scope"}' | GROK_WORKSPACE_ROOT="$grok_repo" FM_HOME="$grok_home" "$ROOT/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "Grok accepted a symlinked passive-handoff directory"
+  [ -z "$(find "$grok_outside" -mindepth 1 -print -quit)" ] || fail "Grok wrote through the symlinked handoff directory"
+
+  pass "passive primary adapters reject symlinked handoff state without escaping the selected home"
+}
+
+test_passive_handoff_adapters_reject_symlinked_state_ancestor() {
+  local plugin repo home outside state_override out status ext grok_repo grok_home grok_outside grok_state
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-symlink-ancestor-root"
+  home="$TMP_ROOT/opencode-symlink-ancestor-home"
+  outside="$TMP_ROOT/opencode-symlink-ancestor-outside"
+  state_override="$home/scoped/link/active"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/scoped" "$outside/active"
+  ln -s "$outside" "$home/scoped/link"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'symlink ancestor guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_STATE_OVERRIDE="$state_override" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+writeFileSync(`${process.env.FM_STATE_OVERRIDE}/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "symlink-ancestor" } } });
+if (prompts !== 0) throw new Error("OpenCode delivered through a symlinked state ancestor");
+if (existsSync(`${process.env.FM_STATE_OVERRIDE}/.turnend-handoffs`)) throw new Error("OpenCode wrote through a symlinked state ancestor");
+writeFileSync(`${process.env.FM_STATE_OVERRIDE}/.lock`, "1\n");
+await new Promise((resolve) => setTimeout(resolve, 40));
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode must reject a symlinked ancestor of effective handoff state"
+  [ -z "$out" ] || fail "OpenCode symlink-ancestor test printed output: $out"
+
+  repo="$TMP_ROOT/pi-symlink-ancestor-root"
+  home="$TMP_ROOT/pi-symlink-ancestor-home"
+  outside="$TMP_ROOT/pi-symlink-ancestor-outside"
+  state_override="$home/scoped/link/active"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/scoped" "$outside/active"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  ln -s "$outside" "$home/scoped/link"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'symlink ancestor guard\n' >&2
+exit 2
+SH
+  cat > "$repo/bin/fm-arm-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$repo/bin/fm-cd-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$repo/bin/"*.sh
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_STATE_OVERRIDE="$state_override" FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+writeFileSync(`${process.env.FM_STATE_OVERRIDE}/.lock`, `${process.pid}\n`);
+const handlers = new Map();
+let prompts = 0;
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+if (prompts !== 0) throw new Error("Pi delivered through a symlinked state ancestor");
+if (existsSync(`${process.env.FM_STATE_OVERRIDE}/.turnend-handoffs`)) throw new Error("Pi wrote through a symlinked state ancestor");
+if (existsSync(`${process.env.FM_STATE_OVERRIDE}/.pi-turnend-extension-loaded`)) throw new Error("Pi wrote its loaded marker through a symlinked state ancestor");
+writeFileSync(`${process.env.FM_STATE_OVERRIDE}/.lock`, "1\n");
+await new Promise((resolve) => setTimeout(resolve, 40));
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi must reject a symlinked ancestor of effective handoff state"
+  [ -z "$out" ] || fail "Pi symlink-ancestor test printed output: $out"
+
+  grok_repo="$TMP_ROOT/grok-symlink-ancestor-root"
+  grok_home="$TMP_ROOT/grok-symlink-ancestor-home"
+  grok_outside="$TMP_ROOT/grok-symlink-ancestor-outside"
+  grok_state="$grok_home/scoped/link/active"
+  make_adapter_primary_repo "$grok_repo"
+  mkdir -p "$grok_repo/bin" "$grok_home/scoped" "$grok_outside/active"
+  : > "$grok_repo/AGENTS.md"
+  ln -s "$grok_outside" "$grok_home/scoped/link"
+  out=$(printf '{"sessionId":"symlink-ancestor"}' | GROK_WORKSPACE_ROOT="$grok_repo" FM_HOME="$grok_home" FM_STATE_OVERRIDE="$grok_state" "$ROOT/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "Grok accepted a symlinked ancestor of effective handoff state"
+  [ ! -e "$grok_outside/active/.turnend-handoffs" ] || fail "Grok wrote through a symlinked state ancestor"
+
+  pass "passive primary adapters reject symlinked ancestor components in effective handoff state"
+}
+
 test_grok_hook_invokes_adapter() {
   local settings command
   settings="$ROOT/.grok/hooks/fm-primary-turnend-guard.json"
@@ -2138,6 +2482,9 @@ test_opencode_crewmate_does_not_recover_primary_handoff
 test_opencode_readonly_session_does_not_recover_owner_handoff
 test_opencode_persistence_failure_retains_retry_owner
 test_opencode_cleanup_failure_retains_acknowledged_owner
+test_opencode_unresolved_flight_is_durably_quarantined
+test_opencode_durable_acknowledgement_only_retries_cleanup
+test_opencode_unknown_lock_probe_retains_in_process_retry
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
@@ -2147,4 +2494,6 @@ test_pi_crewmate_does_not_consume_primary_handoff
 test_pi_readonly_session_does_not_recover_or_acknowledge_handoff
 test_pi_cleanup_failure_retains_acknowledged_owner
 test_pi_persistence_failure_retains_retry_owner
+test_passive_handoff_adapters_reject_symlinked_state
+test_passive_handoff_adapters_reject_symlinked_state_ancestor
 test_grok_hook_invokes_adapter

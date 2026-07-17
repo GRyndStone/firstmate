@@ -359,8 +359,10 @@ recover_existing_completion_claim() {
 }
 
 finalizing_stage_is_owned() {  # <stage-path> <task-id>
-  local stage=$1 id=$2 meta meta_cksum aux aux_cksum owner kind target backend endpoint endpoint_state
+  local stage=$1 id=$2 meta meta_cksum aux aux_cksum owner kind target backend endpoint endpoint_state audit
   [ ! -L "$stage" ] && [ -f "$stage" ] || return 1
+  [ ! -e "$STATE/$id.teardown-final-cleanup" ] \
+    && [ ! -L "$STATE/$id.teardown-final-cleanup" ] || return 1
   meta="$STATE/$id.meta"
   [ ! -L "$meta" ] && [ -f "$meta" ] || return 1
   meta_cksum=$(cksum < "$meta" | awk '{print $1 ":" $2}') || return 1
@@ -419,7 +421,17 @@ finalizing_stage_is_owned() {  # <stage-path> <task-id>
   backend=$(fm_backend_of_meta "$meta")
   endpoint=$(fm_backend_target_of_meta "$meta")
   [ -n "$endpoint" ] || return 1
-  endpoint_state=$(fm_backend_target_state "$backend" "$endpoint" "fm-$id" "$(fm_meta_get "$meta" zellij_tab_id)") || return 1
+  audit=$(
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+      FM_HOME="$FM_HOME" \
+      FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$id"
+  ) || return 1
+  printf '%s' "$audit" | jq -e --arg id "$id" \
+    '[.[] | select(.task == $id)] | length == 0' >/dev/null || return 1
+  endpoint_state=$(fm_backend_target_state "$backend" "$endpoint" "fm-$id" \
+    "$(fm_backend_target_identity_of_meta "$meta")" "$(fm_meta_get "$meta" worktree)" \
+    "$(fm_backend_target_container_of_meta "$meta")") || return 1
   [ "$endpoint_state" = absent ]
 }
 
@@ -848,8 +860,14 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     FINALIZING_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$STATE/$ID.teardown-stage")
     FINALIZING_DONE_ACK=$(sed -n 's/^done-ack=//p' "$STATE/$ID.teardown-stage")
   fi
-  if [ "$FINALIZING_STAGE" -ne 1 ] && { [ -e "$STATE/$ID.tearing-down" ] \
+  if [ "$FINALIZING_STAGE" -ne 1 ] && { [ -e "$STATE/$ID.spawning" ] \
+     || [ -L "$STATE/$ID.spawning" ] \
+     || [ -e "$STATE/$ID.tearing-down" ] \
+     || [ -L "$STATE/$ID.tearing-down" ] \
      || [ -e "$STATE/$ID.meta" ] \
+     || [ -L "$STATE/$ID.meta" ] \
+     || [ -e "$STATE/$ID.teardown-final-cleanup" ] \
+     || [ -L "$STATE/$ID.teardown-final-cleanup" ] \
      || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ]; }; then
     echo "REFUSED: task $ID still has unresolved owned lifecycle state." >&2
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2

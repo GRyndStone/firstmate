@@ -27,9 +27,35 @@ if [ -z "$SESSION_ID" ]; then
   exit 0
 fi
 STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
+SCOPE_HOME=${FM_HOME:-$ROOT}
+SCOPE_HOME=${SCOPE_HOME%/}
+case "$STATE" in
+  "$SCOPE_HOME"|"$SCOPE_HOME"/*)
+    COMPONENT_PATH=$SCOPE_HOME
+    [ -d "$COMPONENT_PATH" ] && [ ! -L "$COMPONENT_PATH" ] || exit 1
+    COMPONENT_SUFFIX=${STATE#"$SCOPE_HOME"}
+    COMPONENT_SUFFIX=${COMPONENT_SUFFIX#/}
+    while [ -n "$COMPONENT_SUFFIX" ]; do
+      COMPONENT=${COMPONENT_SUFFIX%%/*}
+      if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
+      [ -n "$COMPONENT" ] || continue
+      case "$COMPONENT" in .|..) exit 1 ;; esac
+      COMPONENT_PATH="$COMPONENT_PATH/$COMPONENT"
+      [ ! -L "$COMPONENT_PATH" ] || exit 1
+    done
+    ;;
+esac
 [ ! -e "$STATE" ] && exit 0
-[ -d "$STATE" ] || exit 1
+[ -d "$STATE" ] && [ ! -L "$STATE" ] || exit 1
 HANDOFF_DIR="$STATE/.turnend-handoffs"
+if [ -e "$HANDOFF_DIR" ]; then
+  [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
+else
+  mkdir "$HANDOFF_DIR" 2>/dev/null \
+    || { [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ]; } \
+    || exit 1
+  [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
+fi
 if command -v shasum >/dev/null 2>&1; then
   KEY=$(printf '%s' "${SESSION_ID:-missing}" | shasum -a 256 | awk '{print substr($1,1,24)}')
 elif command -v sha256sum >/dev/null 2>&1; then
@@ -138,7 +164,6 @@ wait_for_delivery_owner_release() {
   return 1
 }
 
-mkdir -p "$HANDOFF_DIR" || exit 1
 acquire_preparation || exit 1
 if [ -x "$ROOT/bin/fm-turnend-guard.sh" ]; then
   REASON=$(printf '%s' "$PAYLOAD" | "$ROOT/bin/fm-turnend-guard.sh" 2>&1 >/dev/null)

@@ -127,7 +127,6 @@ case "$REQUESTED_FORCE" in
 esac
 
 META="$STATE/$ID.meta"
-[ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 TEARDOWN_LOCK="$STATE/.$ID.teardown.lock"
 TEARDOWN_LOCKED=0
 release_teardown_lock() {
@@ -151,6 +150,122 @@ COMPLETION_PROOF="$STATE/$ID.teardown-complete"
 TEARDOWN_STAGE="$STATE/$ID.teardown-stage"
 AUX_OWNERS="$STATE/$ID.teardown-owners"
 BACKLOG_MUTATION_INTENT="$STATE/$ID.backlog-mutation-intent"
+FINAL_CLEANUP="$STATE/$ID.teardown-final-cleanup"
+
+final_cleanup_schema_valid() {
+  awk -F= -v id="$ID" '
+    $1 == "version" { versions++; version = $2 }
+    $1 == "task" { tasks++; task = $2 }
+    $1 == "meta-cksum" { metas++; meta = $2 }
+    $1 == "stage-cksum" { stages++; stage = $2 }
+    $1 == "done-ack" { acks++; ack = $2 }
+    $1 == "force" { forces++; force = $2 }
+    { lines++ }
+    END {
+      exit !(versions == 1 && version == "1" && tasks == 1 && task == id \
+        && metas == 1 && meta ~ /^[0-9]+:[0-9]+$/ \
+        && stages == 1 && stage ~ /^[0-9]+:[0-9]+$/ \
+        && acks == 1 && ack ~ /^[0-9a-f]{32}$/ \
+        && forces == 1 && force ~ /^[01]$/ && lines == 6)
+    }
+  ' "$FINAL_CLEANUP"
+}
+
+final_cleanup_value() {
+  sed -n "s/^$1=//p" "$FINAL_CLEANUP" | tail -1
+}
+
+remove_final_state_paths() {
+  local path
+  for path in \
+    "$STATE/$ID.status" \
+    "$STATE/$ID.turn-ended" \
+    "$STATE/$ID.check.sh" \
+    "$STATE/$ID.pi-ext.ts" \
+    "$STATE/$ID.grok-turnend-token" \
+    "$STATE/$ID.tearing-down" \
+    "$STATE/$ID.spawning" \
+    "$COMPLETION_PROOF" \
+    "$BACKLOG_MUTATION_INTENT" \
+    "$AUX_OWNERS" \
+    "$TEARDOWN_STAGE" \
+    "$META"; do
+    rm -f "$path" || return 1
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  done
+}
+
+finish_final_state_cleanup() {
+  remove_final_state_paths || {
+    echo "REFUSED: final lifecycle files for $ID were only partially removed; preserving $FINAL_CLEANUP for retry." >&2
+    return 1
+  }
+  rm -f "$FINAL_CLEANUP" || {
+    echo "REFUSED: final lifecycle files for $ID are absent, but retry authority could not be consumed." >&2
+    return 1
+  }
+  [ ! -e "$FINAL_CLEANUP" ] && [ ! -L "$FINAL_CLEANUP" ] || {
+    echo "REFUSED: final lifecycle cleanup authority remains for $ID." >&2
+    return 1
+  }
+}
+
+prepare_final_state_cleanup() {
+  local marker_tmp meta_cksum stage_cksum done_ack stage_force
+  [ ! -e "$FINAL_CLEANUP" ] && [ ! -L "$FINAL_CLEANUP" ] || return 1
+  [ -f "$META" ] && [ ! -L "$META" ] \
+    && [ -f "$TEARDOWN_STAGE" ] && [ ! -L "$TEARDOWN_STAGE" ] \
+    && grep -q '^phase=backlog-recorded$' "$TEARDOWN_STAGE" || return 1
+  meta_cksum=$(cksum < "$META" | awk '{print $1 ":" $2}') || return 1
+  stage_cksum=$(cksum < "$TEARDOWN_STAGE" | awk '{print $1 ":" $2}') || return 1
+  done_ack=$(sed -n 's/^done-ack=//p' "$TEARDOWN_STAGE" | tail -1)
+  stage_force=$(sed -n 's/^force=//p' "$TEARDOWN_STAGE" | tail -1)
+  [[ "$done_ack" =~ ^[0-9a-f]{32}$ ]] || return 1
+  case "$stage_force" in 0|1) ;; *) return 1 ;; esac
+  marker_tmp=$(mktemp "$STATE/.$ID.teardown-final-cleanup.tmp.XXXXXXXX") || return 1
+  if ! {
+    printf 'version=1\n'
+    printf 'task=%s\n' "$ID"
+    printf 'meta-cksum=%s\n' "$meta_cksum"
+    printf 'stage-cksum=%s\n' "$stage_cksum"
+    printf 'done-ack=%s\n' "$done_ack"
+    printf 'force=%s\n' "$stage_force"
+  } > "$marker_tmp" || ! mv "$marker_tmp" "$FINAL_CLEANUP"; then
+    rm -f "$marker_tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+if [ -e "$FINAL_CLEANUP" ] || [ -L "$FINAL_CLEANUP" ]; then
+  if [ ! -f "$FINAL_CLEANUP" ] || [ -L "$FINAL_CLEANUP" ] || ! final_cleanup_schema_valid; then
+    echo "REFUSED: invalid final lifecycle cleanup authority at $FINAL_CLEANUP." >&2
+    exit 1
+  fi
+  if [ "$REQUESTED_FORCE" = --force ] && [ "$(final_cleanup_value force)" != 1 ]; then
+    echo "REFUSED: cannot change teardown force posture after cleanup completed for $ID." >&2
+    exit 1
+  fi
+  if [ -e "$META" ] || [ -L "$META" ]; then
+    [ -f "$META" ] && [ ! -L "$META" ] \
+      && [ "$(cksum < "$META" | awk '{print $1 ":" $2}')" = "$(final_cleanup_value meta-cksum)" ] || {
+      echo "REFUSED: final lifecycle cleanup authority no longer matches task metadata for $ID." >&2
+      exit 1
+    }
+  fi
+  if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
+    [ -f "$TEARDOWN_STAGE" ] && [ ! -L "$TEARDOWN_STAGE" ] \
+      && [ "$(cksum < "$TEARDOWN_STAGE" | awk '{print $1 ":" $2}')" = "$(final_cleanup_value stage-cksum)" ] \
+      && grep -q '^phase=backlog-recorded$' "$TEARDOWN_STAGE" || {
+      echo "REFUSED: final lifecycle cleanup authority no longer matches the completed teardown stage for $ID." >&2
+      exit 1
+    }
+  fi
+  finish_final_state_cleanup || exit 1
+  echo "teardown $ID final lifecycle cleanup resumed and completed"
+  exit 0
+fi
+
+[ -f "$META" ] && [ ! -L "$META" ] || { echo "error: no regular meta for task $ID at $META" >&2; exit 1; }
 META_CKSUM=$(cksum < "$META" | awk '{print $1 ":" $2}') || exit 1
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -284,7 +399,7 @@ T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 BACKEND=$(fm_backend_of_meta "$META")
 case "$BACKEND" in
-  tmux|herdr|zellij|cmux)
+  tmux|herdr|zellij|orca|cmux)
   DUPLICATE_AUDIT=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -1550,13 +1665,39 @@ delivery_outcome_before_teardown() {
   fi
 }
 
+endpoint_audit_clean_for_close() {
+  local audit anomalies live reasons
+  audit=$(
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+      FM_HOME="$FM_HOME" \
+      FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$ID"
+  ) || {
+    echo "REFUSED: could not refresh the same-home endpoint audit immediately before closing $ID." >&2
+    return 1
+  }
+  anomalies=$(printf '%s' "$audit" | jq -r --arg id "$ID" \
+    '[.[] | select(.task == $id) | .kind] | unique | join(",")') || return 1
+  [ -z "$anomalies" ] || {
+    live=$(printf '%s' "$audit" | jq -r --arg id "$ID" \
+      '[.[] | select(.task == $id) | .live_endpoints[]?] | unique | join(",")') || return 1
+    reasons=$(printf '%s' "$audit" | jq -r --arg id "$ID" \
+      '[.[] | select(.task == $id) | .reason // empty] | unique | join("; ")') || return 1
+    echo "REFUSED: task $ID has a same-home endpoint ownership anomaly immediately before close: kind=$anomalies live=${live:-unknown} reason=${reasons:-unspecified}" >&2
+    return 1
+  }
+}
+
 close_endpoint_before_lifecycle_cleanup() {
   local attempt=0 endpoint_state
   [ -n "$T" ] || {
     echo "REFUSED: task $ID has no exact recorded endpoint to close." >&2
     return 1
   }
-  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" "$(meta_value "$META" zellij_tab_id)")
+  endpoint_audit_clean_for_close || return 1
+  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
+    "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
+    "$(fm_backend_target_container_of_meta "$META")")
   case "$endpoint_state" in
     present)
       FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
@@ -1571,7 +1712,9 @@ close_endpoint_before_lifecycle_cleanup() {
       ;;
   esac
   while [ "$attempt" -lt 10 ]; do
-    endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" "$(meta_value "$META" zellij_tab_id)")
+    endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
+      "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
+      "$(fm_backend_target_container_of_meta "$META")")
     case "$endpoint_state" in
       absent) return 0 ;;
       unknown)
@@ -1964,7 +2107,7 @@ audit_firstmate_home_children_endpoints() {
     child_id=$(basename "$child_meta" .meta)
     child_backend=$(fm_backend_of_meta "$child_meta")
     case "$child_backend" in
-      tmux|herdr|zellij|cmux)
+      tmux|herdr|zellij|orca|cmux)
         audit=$(
           FM_ROOT_OVERRIDE="$home" \
             FM_HOME="$home" \
@@ -2004,12 +2147,15 @@ child_endpoint_state() {
     unset FM_ROOT_OVERRIDE
     FM_HOME=$home
     FM_ROOT=$home
-    fm_backend_target_state "$child_backend" "$child_target" "fm-$child_id" "$(meta_value "$child_meta" zellij_tab_id)"
+    fm_backend_target_state "$child_backend" "$child_target" "fm-$child_id" \
+      "$(fm_backend_target_identity_of_meta "$child_meta")" "$(meta_value "$child_meta" worktree)" \
+      "$(fm_backend_target_container_of_meta "$child_meta")"
   )
 }
 
 close_child_endpoint() {
   local home=$1 child_meta=$2 child_id=$3 child_backend=$4 child_target=$5 state attempt=0
+  audit_firstmate_home_children_endpoints "$home" || return 1
   state=$(child_endpoint_state "$home" "$child_meta" "$child_id" "$child_backend" "$child_target") || return 1
   case "$state" in
     absent) return 0 ;;
@@ -2380,7 +2526,9 @@ cleanup_backend_absence_confirmed() {
 endpoint_absence_confirmed() {
   local endpoint_state
   [ -n "$T" ] || return 1
-  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" "$(meta_value "$META" zellij_tab_id)") || return 1
+  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
+    "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
+    "$(fm_backend_target_container_of_meta "$META")") || return 1
   [ "$endpoint_state" = absent ]
 }
 
@@ -2544,7 +2692,11 @@ post_cleanup_absence_confirmed || {
 }
 remove_grok_turnend_auth "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$COMPLETION_PROOF" "$TEARDOWN_STAGE" "$AUX_OWNERS" "$BACKLOG_MUTATION_INTENT"
+prepare_final_state_cleanup || {
+  echo "REFUSED: could not persist final lifecycle cleanup authority for $ID; preserving task state." >&2
+  exit 1
+}
+finish_final_state_cleanup || exit 1
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

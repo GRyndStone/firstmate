@@ -24,12 +24,21 @@ case "$*" in
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
-  has-session|new-session|kill-window) exit 0 ;;
+  list-windows)
+    [ -z "${FM_FAKE_INVENTORY_UNKNOWN:-}" ] || { echo 'inventory failed' >&2; exit 2; }
+    exit 0
+    ;;
+  has-session|new-session|kill-window|set-window-option) exit 0 ;;
   new-window)
     if [ -n "${FM_FAKE_ENDPOINT_LOG:-}" ]; then
       printf '%s\n' "$*" >> "$FM_FAKE_ENDPOINT_LOG"
     fi
+    [ -z "${FM_FAKE_ENDPOINT_READY:-}" ] || : > "$FM_FAKE_ENDPOINT_READY"
+    while [ -n "${FM_FAKE_ENDPOINT_RELEASE:-}" ] && [ ! -e "$FM_FAKE_ENDPOINT_RELEASE" ]; do
+      sleep 0.05
+    done
+    [ -z "${FM_FAKE_ENDPOINT_FAIL:-}" ] || exit 1
+    printf '@1\n'
     exit 0
     ;;
   send-keys)
@@ -66,12 +75,15 @@ make_spawn_case() {
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
+  printf '## In flight\n\n' > "$home/data/backlog.md"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf -- '- [ ] %s - test task\n' "$id" >> "$home/data/backlog.md"
   done
+  printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$launchlog"
 }
 
@@ -101,6 +113,10 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_SHELL_LOG="$shelllog" \
     FM_FAKE_ENDPOINT_LOG="${FM_FAKE_ENDPOINT_LOG:-}" \
+    FM_FAKE_ENDPOINT_READY="${FM_FAKE_ENDPOINT_READY:-}" \
+    FM_FAKE_ENDPOINT_RELEASE="${FM_FAKE_ENDPOINT_RELEASE:-}" \
+    FM_FAKE_ENDPOINT_FAIL="${FM_FAKE_ENDPOINT_FAIL:-}" \
+    FM_FAKE_INVENTORY_UNKNOWN="${FM_FAKE_INVENTORY_UNKNOWN:-}" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -453,6 +469,7 @@ test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint() {
   assert_absent "$HOME_DIR/state/$id.teardown-complete" \
     "spawn left a reusable canonical completion proof"
   assert_absent "$claim" "spawn left a reusable interrupted completion claim"
+  assert_absent "$HOME_DIR/state/$id.spawning" "successful spawn retained lifecycle ownership"
   assert_present "$endpoint_log" "spawn did not create its endpoint after safe receipt invalidation"
 
   id=profile-receipt-failure-z20
@@ -469,9 +486,109 @@ test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint() {
   expect_code 1 "$status" "spawn with an unsafe completion claim"
   assert_contains "$out" "could not invalidate completion receipts safely before spawning $id" \
     "spawn did not report unsafe receipt invalidation"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "receipt invalidation refusal retained ownership despite no endpoint attempt"
   assert_absent "$endpoint_log" "spawn created an endpoint after receipt invalidation failed"
   assert_absent "$HOME_DIR/state/$id.meta" "spawn wrote lifecycle meta after receipt invalidation failed"
   pass "spawn invalidates canonical and claimed receipts before endpoint creation"
+}
+
+test_spawn_lifecycle_claim_covers_endpoint_creation() {
+  local rec id ready release endpoint_log out_file pid status out
+  id=profile-spawn-claim-z21
+  rec=$(make_spawn_case profile-spawn-claim claude "$id")
+  read_case_record "$rec"
+  ready="$CASE_DIR/endpoint-ready"
+  release="$CASE_DIR/endpoint-release"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  out_file="$CASE_DIR/spawn.out"
+  FM_FAKE_ENDPOINT_LOG="$endpoint_log" FM_FAKE_ENDPOINT_READY="$ready" \
+    FM_FAKE_ENDPOINT_RELEASE="$release" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    > "$out_file" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [ ! -e "$ready" ] || break
+    sleep 0.05
+  done
+  assert_present "$ready" "spawn did not reach the blocked endpoint creation"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "spawn did not retain durable ownership during endpoint creation"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "spawn published metadata before endpoint creation completed"
+  : > "$release"
+  status=0
+  wait "$pid" || status=$?
+  expect_code 0 "$status" "spawn lifecycle claim release"
+  assert_present "$HOME_DIR/state/$id.meta" "spawn did not atomically publish lifecycle metadata"
+  assert_absent "$HOME_DIR/state/$id.spawning" "spawn did not release ownership after metadata publication"
+
+  id=profile-done-first-z22
+  rec=$(make_spawn_case profile-done-first claude "$id")
+  read_case_record "$rec"
+  printf '## In flight\n\n## Queued\n\n## Done\n\n- [x] %s - completed task\n' "$id" \
+    > "$HOME_DIR/data/backlog.md"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn after backlog completion"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn did not reject a task completed before lifecycle ownership"
+  assert_absent "$endpoint_log" "spawn created an endpoint after backlog completion won the lock"
+  assert_absent "$HOME_DIR/state/$id.spawning" "Done-first refusal retained spawn ownership"
+
+  id=profile-final-cleanup-z22b
+  rec=$(make_spawn_case profile-final-cleanup claude "$id")
+  read_case_record "$rec"
+  : > "$HOME_DIR/state/$id.teardown-final-cleanup"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn during partial final lifecycle cleanup"
+  assert_contains "$out" "unresolved owned lifecycle state" \
+    "spawn did not reject existing final cleanup authority"
+  assert_absent "$endpoint_log" "spawn created an endpoint during partial final lifecycle cleanup"
+
+  id=profile-endpoint-fail-z23
+  rec=$(make_spawn_case profile-endpoint-fail claude "$id")
+  read_case_record "$rec"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_FAIL=1 \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "endpoint creation failure"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "endpoint failure without an exact returned identity erased lifecycle ownership"
+  assert_absent "$HOME_DIR/state/$id.meta" "failed endpoint creation published lifecycle metadata"
+
+  id=profile-endpoint-unknown-z24
+  rec=$(make_spawn_case profile-endpoint-unknown claude "$id")
+  read_case_record "$rec"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_FAIL=1 FM_FAKE_INVENTORY_UNKNOWN=1 \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "endpoint creation failure with unknown rollback state"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "unknown endpoint rollback erased the lifecycle claim and could authorize Done"
+  assert_absent "$HOME_DIR/state/$id.meta" "unknown endpoint rollback published lifecycle metadata"
+
+  id=profile-worktree-recovery-z25
+  rec=$(make_spawn_case profile-worktree-recovery pi "$id")
+  read_case_record "$rec"
+  mkdir "$HOME_DIR/state/$id.pi-ext.ts"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn failure after entering a worktree"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "failed worktree spawn lost its durable lifecycle claim"
+  assert_present "$HOME_DIR/state/$id.meta" \
+    "failed worktree spawn did not publish teardown-recoverable metadata"
+  assert_grep "window=@1" "$HOME_DIR/state/$id.meta" \
+    "recovery metadata did not retain the exact tmux window id"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
+    "recovery metadata did not retain the observed worktree"
+  pass "spawn lifecycle ownership covers endpoint creation and Done-first ordering"
 }
 
 test_no_profile_keeps_claude_launch_unchanged
@@ -491,5 +608,6 @@ test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
 test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint
+test_spawn_lifecycle_claim_covers_endpoint_creation
 
 echo "# all fm-spawn-dispatch-profile tests passed"

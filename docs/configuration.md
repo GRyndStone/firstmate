@@ -62,6 +62,7 @@ A zellij spawn additionally version-gates against the installed `zellij` binary'
 A cmux spawn additionally version-gates against the installed `cmux` binary's version, requires `jq`, and requires the control socket to be reachable and accessible (see [`docs/cmux-backend.md`](cmux-backend.md) "Setup" for the one-time socket-access configuration this needs; Automation mode is the recommended socket control mode, with Password mode supported via `config/cmux-socket-password`), refusing loudly and non-retryably on a `cmuxOnly`/unauthenticated socket.
 A backend spawn refusal from a missing dependency, version gate, or unauthenticated socket is terminal for that selected backend; firstmate surfaces it as a blocker instead of silently retrying another backend.
 Task meta records `backend=` only for a non-default backend; an absent `backend=` means `tmux`, preserving existing default-path meta files.
+A tmux task records its stable `window=@<window-id>` lifecycle target together with `tmux_window_id=`, `tmux_session=`, and `tmux_home_identity=`, the canonical-home digest also stored on its window for exact-home inventory filtering.
 A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
 A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
 An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
@@ -77,9 +78,9 @@ Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, 
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
 `bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate endpoints on backends with an exact-home inventory boundary.
 For Herdr it queries only sessions and exact workspace ids named by the active home's own meta.
-For tmux it queries only the exact session and task window label named by each meta, then reads panes only from those matching windows.
+For tmux it queries only windows matching both the recorded task label and the active home's recorded identity inside the exact named session, while lifecycle operations target the recorded stable window id.
 It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
-For Zellij and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global window namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
+For Zellij, Orca, and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global endpoint namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
 Zellij lifecycle finalization follows the fail-closed exact-home boundary in [`docs/zellij-backend.md`](zellij-backend.md#teardown-absence-boundary).
 Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.

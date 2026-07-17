@@ -164,7 +164,8 @@ esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys) exit 0 ;;
+  new-window) printf '%s\n' '@spawnwid'; exit 0 ;;
+  has-session|new-session|send-keys|set-window-option) exit 0 ;;
 esac
 exit 0
 SH
@@ -199,7 +200,8 @@ test_spawn_isolation_abort() {
   out=$(run_spawn "$home" abort-notgit-dd4 "$proj" "$TMP_ROOT/spawn-notgit" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn into a non-worktree dir should abort"
   assert_contains "$out" "did not yield an isolated worktree" "non-worktree spawn lacked the isolation error"
-  assert_absent "$home/state/abort-notgit-dd4.meta" "aborted spawn must not record meta"
+  assert_present "$home/state/abort-notgit-dd4.meta" \
+    "aborted spawn after worktree acquisition lost recoverable lifecycle metadata"
 
   # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS).
   out=$(run_spawn "$home" abort-primary-ee5 "$proj" "$proj/sub" "$fakebin"); status=$?
@@ -289,6 +291,8 @@ test_spawn_tmux_window_construction() {
   # Bug 2 fix (a): pin the window name against automatic-rename / allow-rename.
   assert_grep "set-window-option -t @spawnwid automatic-rename off" "$rec" \
     "must disable automatic-rename on the spawned window"
+  assert_grep "set-window-option -t @spawnwid @firstmate_home fmh-" "$rec" \
+    "must bind the spawned window to its exact Firstmate-home identity"
   assert_grep "set-window-option -t @spawnwid allow-rename off" "$rec" \
     "must disable allow-rename on the spawned window"
 
@@ -297,6 +301,12 @@ test_spawn_tmux_window_construction() {
     "treehouse get must be sent to the stable window id"
   assert_grep "display-message -p -t @spawnwid #{pane_current_path}" "$rec" \
     "the worktree wait loop must query the stable window id, not the name"
+  assert_grep "window=@spawnwid" "$home/state/rec-win-gg7.meta" \
+    "task metadata must persist the stable tmux window id as its lifecycle target"
+  assert_grep "tmux_window_id=@spawnwid" "$home/state/rec-win-gg7.meta" \
+    "task metadata must retain the exact tmux window identity"
+  assert_grep "tmux_session=firstmate" "$home/state/rec-win-gg7.meta" \
+    "task metadata must retain its exact tmux session container"
 
   pass "fm-spawn: appends windows by session-colon, pins the name, and targets the window id"
 }

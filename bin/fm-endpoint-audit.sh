@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Read-only duplicate recovery-endpoint audit.
 #
-# The audit examines exact Herdr workspaces and tmux sessions named by this
-# home's own task meta.
-# Zellij and cmux do not expose exact-home inventories, so their audits emit
-# structured unavailable findings instead of enumerating shared namespaces.
+# The audit examines exact Herdr workspaces and home-identified tmux windows
+# named by this home's own task meta.
+# Zellij, Orca, and cmux do not expose verified exact-home inventories, so
+# their audits emit structured unavailable findings instead of enumerating
+# shared namespaces.
 # It never closes or mutates an endpoint.
 #
 # A task label with more than one live endpoint, or one live endpoint that does
@@ -220,28 +221,39 @@ audit_zellij_meta() {
 }
 
 audit_tmux_meta() {
-  local meta=$1 id label recorded session inventory wid panes pane live_json count
+  local meta=$1 id label recorded session window_id inventory live_json identity current_identity filter
   id=$(basename "$meta" .meta)
   label="fm-$id"
   recorded=$(fm_backend_target_of_meta "$meta")
-  case "$recorded" in
-    *:*)
-      session=${recorded%%:*}
-      ;;
-    *)
-      append_inventory_unavailable tmux "$meta" "tmux meta lacks an exact recorded session; cross-session sweep refused"
-      return
-      ;;
-  esac
-  if [ -z "$session" ] || [ "$session" = "$recorded" ]; then
-    append_inventory_unavailable tmux "$meta" "tmux meta lacks an exact recorded session; cross-session sweep refused"
+  identity=$(fm_meta_get "$meta" tmux_home_identity)
+  session=$(fm_meta_get "$meta" tmux_session)
+  window_id=$(fm_meta_get "$meta" tmux_window_id)
+  current_identity=$(fm_backend_home_identity 2>/dev/null || true)
+  if [ -z "$identity" ] || [ -z "$current_identity" ] || [ "$identity" != "$current_identity" ]; then
+    append_inventory_unavailable tmux "$meta" "tmux meta lacks this home's recorded endpoint identity; shared-session sweep refused"
     return
   fi
+  if [ -z "$session" ] || [ -z "$window_id" ] || [ "$recorded" != "$window_id" ]; then
+    append_inventory_unavailable tmux "$meta" "tmux meta lacks a consistent exact session/window identity; shared-session sweep refused"
+    return
+  fi
+  case "$window_id" in
+    @*)
+      case "${window_id#@}" in
+        ''|*[!0-9]*)
+          append_inventory_unavailable tmux "$meta" "tmux meta has an invalid exact window identity"
+          return
+          ;;
+      esac
+      ;;
+    *) append_inventory_unavailable tmux "$meta" "tmux meta has an invalid exact window identity"; return ;;
+  esac
   if ! command -v tmux >/dev/null 2>&1; then
     echo "fm-endpoint-audit: tmux not found" >&2
     return 1
   fi
-  if ! inventory=$(tmux list-windows -t "=$session" -f "#{==:#{window_name},$label}" -F $'#{window_id}\t#{window_name}' 2>&1); then
+  filter="#{&&:#{==:#{window_name},$label},#{==:#{@firstmate_home},$identity}}"
+  if ! inventory=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
     if printf '%s\n' "$inventory" | grep -Eqi "can't find session|no server running|(failed to connect|error connecting).*(no such file|connection refused)|no sessions"; then
       inventory=
     else
@@ -249,37 +261,15 @@ audit_tmux_meta() {
       return 1
     fi
   fi
-  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$label" '
-    NF != 2 || $1 !~ /^@[0-9]+$/ || $2 != label { bad=1 }
+  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$label" -v owner="$identity" '
+    NF != 3 || $1 !~ /^@[0-9]+$/ || $2 != label || $3 != owner { bad=1 }
     END { exit bad ? 1 : 0 }
   '; then
-    echo "fm-endpoint-audit: invalid exact tmux window inventory for $session:$label" >&2
+    echo "fm-endpoint-audit: invalid exact-home tmux window inventory for $session:$label" >&2
     return 1
   fi
-  live_json='[]'
-  while IFS=$'\t' read -r wid _; do
-    [ -n "$wid" ] || continue
-    if ! panes=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>&1); then
-      echo "fm-endpoint-audit: cannot read exact tmux window $wid for $session:$label" >&2
-      return 1
-    fi
-    if [ -z "$panes" ] || ! printf '%s\n' "$panes" | awk '/^%[0-9]+$/ { next } { bad=1 } END { exit bad ? 1 : 0 }'; then
-      echo "fm-endpoint-audit: invalid exact tmux pane inventory for $wid" >&2
-      return 1
-    fi
-    while IFS= read -r pane; do
-      live_json=$(printf '%s' "$live_json" | jq --arg pane "$pane" '. + [$pane]') || return 1
-    done <<EOF
-$panes
-EOF
-  done <<EOF
-$inventory
-EOF
-  live_json=$(printf '%s' "$live_json" | jq 'unique | sort') || return 1
-  count=$(printf '%s' "$live_json" | jq 'length') || return 1
-  if [ "$count" -eq 1 ]; then
-    live_json=$(jq -n --arg recorded "$recorded" '[$recorded]') || return 1
-  fi
+  live_json=$(printf '%s\n' "$inventory" | awk -F '\t' 'NF { print $1 }' \
+    | jq -R -s '[splits("\\n") | select(length > 0)] | unique | sort') || return 1
   append_anomaly tmux "$meta" "$live_json" "$recorded"
 }
 
@@ -289,12 +279,18 @@ audit_cmux_meta() {
   append_inventory_unavailable cmux "$meta" "cmux has no exact-home duplicate inventory; app-global sweep refused"
 }
 
+audit_orca_meta() {
+  local meta=$1
+  append_inventory_unavailable orca "$meta" "orca has no verified exact-worktree terminal inventory; app-global sweep refused"
+}
+
 for meta in "$STATE"/*.meta; do
   [ -e "$meta" ] || continue
   meta_selected "$meta" || continue
   case "$(fm_backend_of_meta "$meta")" in
     tmux) audit_tmux_meta "$meta" || exit 1 ;;
     zellij) audit_zellij_meta "$meta" || exit 1 ;;
+    orca) audit_orca_meta "$meta" || exit 1 ;;
     cmux) audit_cmux_meta "$meta" || exit 1 ;;
   esac
 done
@@ -313,4 +309,4 @@ if [ "$RESULT" = '[]' ]; then
   printf 'endpoint-audit: no same-home endpoint ownership anomalies found\n'
   exit 0
 fi
-printf '%s' "$RESULT" | jq -r '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) action=inspect-only"'
+printf '%s' "$RESULT" | jq -r '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"'

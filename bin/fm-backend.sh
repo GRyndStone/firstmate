@@ -69,6 +69,16 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
 FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
 
+fm_backend_home_identity() {
+  local home digest
+  home=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+  digest=$(printf '%s\0' "$home" | git hash-object --stdin 2>/dev/null) || return 1
+  case "$digest" in
+    [0-9a-f][0-9a-f]*) printf 'fmh-%s' "$digest" ;;
+    *) return 1 ;;
+  esac
+}
+
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
 # zsh diagnostics can source it too, so backend-name matching must stay portable.
@@ -309,6 +319,30 @@ fm_backend_of_meta() {  # <meta-file>
   local v
   v=$(fm_meta_get "$1" backend)
   printf '%s' "${v:-tmux}"
+}
+
+fm_backend_target_identity_of_meta() {  # <meta-file>
+  local meta=$1 backend
+  backend=$(fm_backend_of_meta "$meta")
+  case "$backend" in
+    tmux) fm_meta_get "$meta" tmux_home_identity ;;
+    herdr) fm_meta_get "$meta" herdr_workspace_id ;;
+    zellij) fm_meta_get "$meta" zellij_tab_id ;;
+    orca) fm_meta_get "$meta" orca_worktree_id ;;
+    cmux) fm_meta_get "$meta" cmux_workspace_id ;;
+  esac
+}
+
+fm_backend_target_container_of_meta() {  # <meta-file>
+  local meta=$1 backend
+  backend=$(fm_backend_of_meta "$meta")
+  case "$backend" in
+    tmux) fm_meta_get "$meta" tmux_session ;;
+    herdr) fm_meta_get "$meta" herdr_session ;;
+    zellij) fm_meta_get "$meta" zellij_session ;;
+    orca) fm_meta_get "$meta" orca_worktree_id ;;
+    cmux) fm_meta_get "$meta" cmux_workspace_id ;;
+  esac
 }
 
 fm_backend_target_of_meta() {  # <meta-file>
@@ -665,72 +699,110 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # fm_backend_target_state: teardown-grade endpoint existence probe.
 # Prints present, absent, or unknown; backend inventory/read failures are
 # unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
-fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
-  local backend=$1 target=$2 expected_label=${3:-} out code session pane state
+fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-identity] [expected-worktree] [backend-container]
+  local backend=$1 target=$2 expected_label=${3:-} backend_identity=${4:-} expected_worktree=${5:-}
+  local backend_container=${6:-} out code session pane state workspace tabs panes verdict home_identity filter count
+  : "$expected_worktree"
   if [ "$backend" = herdr ]; then
     fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
     session=${target%%:*}
     pane=${target#*:}
-    if [ -z "$session" ] || [ -z "$pane" ] || [ "$pane" = "$target" ]; then
+    workspace=$backend_identity
+    if [ -z "$session" ] || [ -z "$pane" ] || [ "$pane" = "$target" ] \
+       || [ -z "$workspace" ] || [ -z "$expected_label" ]; then
       printf 'unknown'
       return 0
     fi
-    if out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>&1); then
-      if printf '%s' "$out" | jq -e --arg pane "$pane" '.result.pane.pane_id == $pane' >/dev/null 2>&1; then
-        printf 'present'
-      else
-        printf 'unknown'
-      fi
+    if ! out=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1); then
+      code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+      case "$code" in
+        workspace_not_found) printf 'absent' ;;
+        *) printf 'unknown' ;;
+      esac
       return 0
     fi
-    code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
-    case "$code" in
-      pane_not_found|tab_not_found|workspace_not_found) printf 'absent' ;;
+    printf '%s' "$out" | jq -e --arg workspace "$workspace" \
+      '.result.workspace.workspace_id == $workspace' >/dev/null 2>&1 \
+      || { printf 'unknown'; return 0; }
+    tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>&1) \
+      || { printf 'unknown'; return 0; }
+    panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$workspace" 2>&1) \
+      || { printf 'unknown'; return 0; }
+    verdict=$(jq -ren \
+      --arg pane "$pane" \
+      --arg label "$expected_label" \
+      --argjson tabs "$tabs" \
+      --argjson panes "$panes" '
+        if (($tabs.result.tabs | type) != "array")
+           or (($panes.result.panes | type) != "array")
+           or (all($tabs.result.tabs[]?;
+                 ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+                 and ((.label | type) == "string")) | not)
+           or (all($panes.result.panes[]?;
+                 ((.pane_id | type) == "string") and ((.pane_id | length) > 0)
+                 and ((.tab_id | type) == "string") and ((.tab_id | length) > 0)) | not)
+        then "unknown"
+        else
+          [$panes.result.panes[]? | select(.pane_id == $pane)] as $owned
+          | if ($owned | length) == 0 then "absent"
+            elif ($owned | length) != 1 then "unknown"
+            else $owned[0].tab_id as $tab_id
+              | [$tabs.result.tabs[]? | select(.tab_id == $tab_id)] as $owners
+              | if (($owners | length) == 1 and $owners[0].label == $label)
+                then "present" else "unknown" end
+            end
+        end
+      ' 2>/dev/null) || verdict=unknown
+    case "$verdict" in
+      present|absent) printf '%s' "$verdict" ;;
       *) printf 'unknown' ;;
     esac
     return 0
   fi
   case "$backend" in
-    zellij|cmux) ;;
-    *)
-      if fm_backend_target_exists "$backend" "$target" "$expected_label" >/dev/null 2>&1; then
-        printf 'present'
-        return 0
-      fi
-      ;;
-  esac
-  case "$backend" in
     tmux)
       fm_backend_source tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
       command -v tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      home_identity=$(fm_backend_home_identity 2>/dev/null) || { printf 'unknown'; return 0; }
+      [ -n "$backend_identity" ] && [ "$backend_identity" = "$home_identity" ] \
+        || { printf 'unknown'; return 0; }
       case "$target" in
-        @*) if out=$(tmux list-windows -a -F '#{window_id} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
-        %*) if out=$(tmux list-panes -a -F '#{pane_id} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
-        *:*.*|*:%*) printf 'unknown'; return 0 ;;
-        *:*) if out=$(tmux list-windows -a -F '#{session_name}:#{window_name} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
-        *) if out=$(tmux list-windows -a -F '#{window_name} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
+        @*)
+          case "${target#@}" in
+            ''|*[!0-9]*) printf 'unknown'; return 0 ;;
+          esac
+          ;;
+        *) printf 'unknown'; return 0 ;;
       esac
+      session=$backend_container
+      [ -n "$session" ] && [ -n "$expected_label" ] || { printf 'unknown'; return 0; }
+      filter="#{&&:#{==:#{window_id},$target},#{&&:#{==:#{window_name},$expected_label},#{==:#{@firstmate_home},$home_identity}}}"
+      if out=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
+        state=0
+      else
+        state=$?
+      fi
       if [ "$state" -ne 0 ]; then
-        if printf '%s\n' "$out" | grep -Eqi 'no server running|failed to connect.*(no such file|connection refused)|no sessions'; then
+        if printf '%s\n' "$out" | grep -Eqi "can't find session|no server running|failed to connect.*(no such file|connection refused)|no sessions"; then
           printf 'absent'
         else
           printf 'unknown'
         fi
         return 0
       fi
-      if [ -z "$out" ] || printf '%s\n' "$out" | awk 'NF < 2 { bad=1 } END { exit bad ? 0 : 1 }'; then
+      if [ -n "$out" ] && ! printf '%s\n' "$out" | awk -F '\t' -v label="$expected_label" -v owner="$home_identity" '
+        NF != 3 || $1 !~ /^@[0-9]+$/ || $2 != label || $3 != owner { bad=1 }
+        END { exit bad ? 1 : 0 }
+      '; then
         printf 'unknown'
         return 0
       fi
-      if printf '%s\n' "$out" | awk -v target="$target" '$1 == target { found=1 } END { exit found ? 0 : 1 }'; then
-        if [ -z "$expected_label" ] || printf '%s\n' "$out" | awk -v target="$target" -v label="$expected_label" '$1 == target && $2 == label { found=1 } END { exit found ? 0 : 1 }'; then
-          printf 'present'
-        else
-          printf 'unknown'
-        fi
-      else
-        printf 'absent'
-      fi
+      count=$(printf '%s\n' "$out" | awk 'NF { count++ } END { print count+0 }')
+      case "$count" in
+        0) printf 'absent' ;;
+        1) printf 'present' ;;
+        *) printf 'unknown' ;;
+      esac
       ;;
     herdr) printf 'unknown' ;;
     zellij)

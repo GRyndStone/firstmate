@@ -145,7 +145,27 @@ fi
 printf '%s\n' 'no server running on /tmp/fake' >&2
 exit 1
 SH
-  chmod +x "$home/fakebin/tasks-axi" "$home/fakebin/tmux"
+  cat > "$home/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "workspace get")
+    if [ "${FM_FAKE_ENDPOINT_PRESENT:-0}" = 1 ]; then
+      printf '%s\n' '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"}}}'
+      exit 0
+    fi
+    printf '%s\n' '{"error":{"code":"workspace_not_found","message":"gone"}}' >&2
+    exit 1
+    ;;
+  "tab list")
+    printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task-a"}]}}'
+    ;;
+  "pane list")
+    printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}'
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$home/fakebin/tasks-axi" "$home/fakebin/tmux" "$home/fakebin/herdr"
   printf '%s\n' "$home"
 }
 
@@ -180,6 +200,17 @@ write_done_started_stage() {
   aux_cksum=$(cksum < "$home/state/$id.teardown-owners" | awk '{print $1 ":" $2}')
   printf 'version=4\ntask=%s\nmeta-cksum=%s\nphase=backlog-done-started\nowner-identity=absent\nowner-marker=none\nowner-token=none\nforce=0\noutcome=delivered-local\nrecord-cksum=%s\ndone-ack=%s\naux-cksum=%s\n' \
     "$id" "$meta_cksum" "$record_cksum" "$done_ack" "$aux_cksum" > "$home/state/$id.teardown-stage"
+}
+
+write_absent_finalizing_meta() {
+  local home=$1
+  fm_write_meta "$home/state/task-a.meta" \
+    'backend=herdr' \
+    'window=default:w1:p1' \
+    'herdr_session=default' \
+    'herdr_workspace_id=w1' \
+    'herdr_tab_id=w1:t1' \
+    'herdr_pane_id=w1:p1'
 }
 
 test_same_file_mutations_are_serialized() {
@@ -229,6 +260,24 @@ test_done_refuses_unresolved_meta() {
   assert_contains "$out" "unresolved owned lifecycle" "teardown tombstone did not block completion"
   assert_absent "$log" "tasks-axi mutation ran despite teardown tombstone"
   rm -f "$home/state/scout-a.tearing-down"
+  printf 'version=1\ntask=task-a\ntoken=0123456789abcdef0123456789abcdef\nbackend=tmux\n' \
+    > "$home/state/task-a.spawning"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" task-a --note local 2>&1) || status=$?
+  expect_code 1 "$status" "completion during spawn"
+  assert_contains "$out" "unresolved owned lifecycle" "spawn claim did not block completion"
+  assert_absent "$log" "tasks-axi mutation ran despite a durable spawn claim"
+  rm -f "$home/state/task-a.spawning"
+  : > "$home/state/task-a.teardown-final-cleanup"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" "done" task-a --note local 2>&1) || status=$?
+  expect_code 1 "$status" "completion during partial final lifecycle cleanup"
+  assert_contains "$out" "unresolved owned lifecycle" \
+    "final lifecycle cleanup authority did not block completion"
+  assert_absent "$log" "tasks-axi mutation ran despite final cleanup authority"
+  rm -f "$home/state/task-a.teardown-final-cleanup"
   write_completion_proof "$home" task-a ship delivered-local
   : > "$home/state/task-a.teardown-stage"
   status=0
@@ -238,7 +287,7 @@ test_done_refuses_unresolved_meta() {
   assert_contains "$out" "unresolved owned lifecycle" "teardown stage did not block completion"
   assert_present "$home/state/task-a.teardown-complete" "teardown stage consumed the completion proof"
   assert_absent "$log" "tasks-axi mutation ran despite a durable teardown stage"
-  pass "Done cannot be recorded while meta, tombstone, or durable teardown stage remains"
+  pass "Done cannot be recorded while spawn, teardown, or endpoint lifecycle state remains"
 }
 
 test_scout_done_requires_owned_report() {
@@ -371,7 +420,7 @@ test_empty_completion_claim_reconciles_restored_proof() {
 test_empty_completion_claim_reconciles_exact_finalizing_done() {
   local home claim out status meta_cksum ack=0123456789abcdef0123456789abcdef
   home=$(make_home empty-finalizing-done-claim)
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   : > "$home/state/task-a.tearing-down"
   write_done_started_stage "$home" task-a "$meta_cksum" staged "$ack"
@@ -390,7 +439,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   local home out status meta_cksum record_cksum ack=0123456789abcdef0123456789abcdef
   home=$(make_home finalizing-new-done)
   write_completion_proof "$home" task-a ship delivered-local
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
   : > "$home/state/task-a.tearing-down"
@@ -398,7 +447,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" "finalizing Done did not consume its receipt"
   home=$(make_home finalizing-idempotent)
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   : > "$home/state/task-a.tearing-down"
   write_done_started_stage "$home" task-a "$meta_cksum" staged
@@ -410,7 +459,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   assert_contains "$out" "already recorded" "finalizing retry did not recognize recorded Done"
   home=$(make_home invalid-finalizing)
   write_completion_proof "$home" task-a ship delivered-local
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   printf 'version=2\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=staged\nphase=finalizing\n' \
     "$meta_cksum" > "$home/state/task-a.teardown-stage"
@@ -420,7 +469,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   assert_contains "$out" "unresolved owned lifecycle" "non-v4 finalizing stage bypassed lifecycle guard"
   home=$(make_home finalizing-live-endpoint)
   write_completion_proof "$home" task-a ship delivered-local
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
   write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
@@ -429,6 +478,30 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
     "$BACKLOG" done task-a 2>&1) || status=$?
   expect_code 1 "$status" "finalizing stage with live endpoint"
   assert_contains "$out" "unresolved owned lifecycle" "live endpoint bypassed complete finalization validation"
+  home=$(make_home finalizing-inventory-unavailable)
+  write_completion_proof "$home" task-a ship delivered-local
+  fm_write_meta "$home/state/task-a.meta" \
+    'backend=orca' 'window=fm-task-a' 'terminal=terminal-a' 'orca_worktree_id=worktree-a'
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
+  write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "finalizing stage with unavailable exact endpoint inventory"
+  assert_contains "$out" "unresolved owned lifecycle" \
+    "unavailable endpoint audit bypassed complete finalization validation"
+  home=$(make_home finalizing-partial-cleanup)
+  write_completion_proof "$home" task-a ship delivered-local
+  write_absent_finalizing_meta "$home"
+  meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
+  record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
+  write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
+  : > "$home/state/task-a.teardown-final-cleanup"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "finalizing stage during partial final cleanup"
+  assert_contains "$out" "unresolved owned lifecycle" \
+    "partial final cleanup authority bypassed finalizing lifecycle validation"
   pass "only an exact finalizing teardown stage supports guarded idempotent Done"
 }
 
@@ -438,7 +511,7 @@ test_completion_recovery_requires_exact_done_ack() {
   old_ack=fedcba9876543210fedcba9876543210
 
   home=$(make_home finalizing-archive-reuse)
-  printf 'window=fm-task-a\n' > "$home/state/task-a.meta"
+  write_absent_finalizing_meta "$home"
   meta_cksum=$(cksum < "$home/state/task-a.meta" | awk '{print $1 ":" $2}')
   : > "$home/state/task-a.tearing-down"
   write_done_started_stage "$home" task-a "$meta_cksum" staged "$current_ack"

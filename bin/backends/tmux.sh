@@ -82,13 +82,21 @@ fm_backend_tmux_container_ensure() {
 #     treehouse cd's into the worktree, which would break name-based targeting.
 # The returned window id lets callers target the window even if its name is ever
 # lost, so worktree discovery cannot fall back to the active client's window.
-fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints window id
-  local ses=$1 wname=$2 proj_abs=$3 wid
-  if tmux list-windows -t "$ses" -F '#{window_name}' | grep -qx "$wname"; then
+fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> [home-identity] -> prints window id
+  local ses=$1 wname=$2 proj_abs=$3 home_identity=${4:-} wid filter
+  if [ -z "$home_identity" ]; then
+    home_identity=$(fm_backend_home_identity) || return 1
+  fi
+  filter="#{&&:#{==:#{window_name},$wname},#{==:#{@firstmate_home},$home_identity}}"
+  if tmux list-windows -t "=$ses" -f "$filter" -F '#{window_id}' | grep -q .; then
     echo "error: window $ses:$wname already exists" >&2
     return 1
   fi
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1
+  if ! tmux set-window-option -t "$wid" @firstmate_home "$home_identity" 2>/dev/null; then
+    tmux kill-window -t "$wid" 2>/dev/null || true
+    return 1
+  fi
   tmux set-window-option -t "$wid" automatic-rename off 2>/dev/null || true
   tmux set-window-option -t "$wid" allow-rename off 2>/dev/null || true
   printf '%s\n' "$wid"

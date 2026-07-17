@@ -7,6 +7,29 @@ ROOT=${2:-}
 EXPECTED_TOKEN=${3:-}
 [ -n "$PENDING" ] && [ -n "$ROOT" ] || exit 1
 [ -L "$PENDING" ] && exit 1
+HANDOFF_DIR=${PENDING%/*}
+STATE_DIR=${HANDOFF_DIR%/*}
+SCOPE_HOME=${FM_HOME:-$ROOT}
+SCOPE_HOME=${SCOPE_HOME%/}
+case "$STATE_DIR" in
+  "$SCOPE_HOME"|"$SCOPE_HOME"/*)
+    COMPONENT_PATH=$SCOPE_HOME
+    [ -d "$COMPONENT_PATH" ] && [ ! -L "$COMPONENT_PATH" ] || exit 1
+    COMPONENT_SUFFIX=${STATE_DIR#"$SCOPE_HOME"}
+    COMPONENT_SUFFIX=${COMPONENT_SUFFIX#/}
+    while [ -n "$COMPONENT_SUFFIX" ]; do
+      COMPONENT=${COMPONENT_SUFFIX%%/*}
+      if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
+      [ -n "$COMPONENT" ] || continue
+      case "$COMPONENT" in .|..) exit 1 ;; esac
+      COMPONENT_PATH="$COMPONENT_PATH/$COMPONENT"
+      [ ! -L "$COMPONENT_PATH" ] || exit 1
+    done
+    ;;
+esac
+[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || exit 1
+[ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
+case "$PENDING" in "$HANDOFF_DIR"/grok-*.pending) ;; *) exit 1 ;; esac
 ACKNOWLEDGED="$PENDING.acknowledged"
 if [ ! -f "$PENDING" ]; then
   if [ -f "$ACKNOWLEDGED" ] && [ ! -L "$ACKNOWLEDGED" ]; then

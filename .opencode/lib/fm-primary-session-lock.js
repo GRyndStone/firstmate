@@ -16,8 +16,13 @@ function parentPid(pid) {
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
-    child.on("error", () => finish(""));
-    child.on("close", (code) => finish(code === 0 ? stdout.trim() : ""));
+    child.on("error", () => finish({ status: "unknown", pid: "" }));
+    child.on("close", (code) => {
+      const parent = stdout.trim();
+      finish(code === 0 && /^[0-9]+$/.test(parent)
+        ? { status: "known", pid: parent }
+        : { status: "unknown", pid: "" });
+    });
   });
 }
 
@@ -29,19 +34,26 @@ export function effectivePrimaryPaths(root) {
   return { root: fmRoot, home, state, config };
 }
 
-export async function sessionOwnsLock(paths) {
+export async function sessionLockOwnership(paths) {
   let lockPid = "";
   try {
     lockPid = readFileSync(`${paths.state}/.lock`, "utf8").trim();
-  } catch {
-    return false;
+  } catch (error) {
+    return error?.code === "ENOENT" ? "other" : "unknown";
   }
-  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return false;
+  if (lockPid === "1") return "other";
+  if (!/^[0-9]+$/.test(lockPid)) return "unknown";
   let pid = String(process.pid);
   for (let i = 0; i < 8; i += 1) {
-    if (pid === lockPid) return true;
-    pid = await parentPid(pid);
-    if (!pid || pid === "1") return false;
+    if (pid === lockPid) return "owned";
+    const parent = await parentPid(pid);
+    if (parent.status !== "known") return "unknown";
+    pid = parent.pid;
+    if (pid === "1") return "other";
   }
-  return false;
+  return "other";
+}
+
+export async function sessionOwnsLock(paths) {
+  return await sessionLockOwnership(paths) === "owned";
 }

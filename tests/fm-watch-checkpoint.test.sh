@@ -190,6 +190,40 @@ SH
   pass "timeout escalation revalidates stable watcher birth identity before every later signal"
 }
 
+test_identity_capture_failure_never_signals_pid_fallback() {
+  local home out err watcher fakebin signaled checkpoint_pid status
+  home=$(make_home identity-unavailable)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/short-watch.sh"
+  fakebin="$home/fakebin"
+  signaled="$home/watcher-signaled"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap ': > "$WATCH_SIGNAL_MARKER"' TERM INT HUP
+sleep 2
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]]; then
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  PATH="$fakebin:$PATH" WATCH_SIGNAL_MARKER="$signaled" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" &
+  checkpoint_pid=$!
+  sleep 0.6
+  kill -TERM "$checkpoint_pid"
+  status=0
+  wait "$checkpoint_pid" || status=$?
+  expect_code 143 "$status" "identity-unavailable checkpoint exit"
+  assert_absent "$signaled" "checkpoint signaled its watcher after birth identity capture failed"
+  pass "birth-identity capture failure skips watcher signaling instead of falling back to PID ancestry"
+}
+
 test_checkpoint_polls_process_identity_coarsely() {
   local home out err fakebin probe_log status probe_count
   home=$(make_home coarse-identity-poll)
@@ -224,4 +258,5 @@ test_existing_singleton_watcher_is_not_success
 test_interrupted_checkpoint_reaps_only_its_watcher
 test_timeout_marks_then_kills_only_term_resistant_watcher
 test_timeout_revalidates_watcher_birth_identity_before_escalation
+test_identity_capture_failure_never_signals_pid_fallback
 test_checkpoint_polls_process_identity_coarsely

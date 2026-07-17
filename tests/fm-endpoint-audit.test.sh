@@ -214,11 +214,15 @@ test_unresolved_herdr_pane_tab_fails_closed() {
 }
 
 test_tmux_duplicates_use_exact_recorded_session_and_task() {
-  local home log out
+  local home log out identity
   home=$(make_fixture tmux-exact-session)
   log="$home/tmux.log"
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   fm_write_meta "$home/state/dup-task.meta" \
-    'window=owned-session:fm-dup-task' \
+    'window=@12' \
+    "tmux_home_identity=$identity" \
+    'tmux_session=owned-session' \
+    'tmux_window_id=@12' \
     'worktree=/owned/worktree'
   cat > "$home/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -226,36 +230,29 @@ set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
-    printf '%s\n' $'@11\tfm-dup-task' $'@12\tfm-dup-task'
-    ;;
-  list-panes)
-    case "$*" in
-      *' -t @11 '*) printf '%s\n' '%21' ;;
-      *' -t @12 '*) printf '%s\n' '%22' ;;
-      *) exit 7 ;;
-    esac
+    printf '@11\tfm-dup-task\t%s\n@12\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
     ;;
   *) exit 8 ;;
 esac
 SH
   chmod +x "$home/fakebin/tmux"
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_LOG="$log" "$AUDIT" --json)
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_LOG="$log" FM_TMUX_OWNER="$identity" "$AUDIT" --json)
   printf '%s' "$out" | jq -e '
     . == [{
       kind:"duplicate_recovery_endpoints",
       backend:"tmux",
       task:"dup-task",
       worktree:"/owned/worktree",
-      recorded_endpoint:"owned-session:fm-dup-task",
-      live_endpoints:["%21","%22"],
+      recorded_endpoint:"@12",
+      live_endpoints:["@11","@12"],
       action:"inspect; do not auto-close"
     }]
   ' >/dev/null || fail "tmux duplicate endpoint JSON was incomplete: $out"
-  assert_contains "$(cat "$log")" 'list-windows -t =owned-session -f #{==:#{window_name},fm-dup-task}' \
-    "tmux audit did not query the exact recorded session and task label"
+  assert_contains "$(cat "$log")" 'list-windows -t =owned-session -f #{&&:#{==:#{window_name},fm-dup-task},#{==:#{@firstmate_home},' \
+    "tmux audit did not query the exact recorded home identity and task label"
   assert_not_contains "$(cat "$log")" ' -a ' "tmux audit enumerated other sessions"
   assert_not_contains "$(cat "$log")" 'kill' "tmux audit attempted automatic closure"
-  pass "tmux duplicate audit stays inside the exact recorded session and task label"
+  pass "tmux duplicate audit returns only exact-home identified task windows"
 }
 
 test_tmux_unscoped_meta_reports_inventory_unavailable() {
@@ -276,10 +273,51 @@ SH
     length == 1
       and .[0].kind == "inventory_unavailable"
       and .[0].backend == "tmux"
-      and .[0].reason == "tmux meta lacks an exact recorded session; cross-session sweep refused"
+      and (.[0].reason | contains("recorded endpoint identity; shared-session sweep refused"))
   ' >/dev/null || fail "unscoped tmux meta did not fail closed: $out"
   [ ! -s "$log" ] || fail "unscoped tmux audit enumerated shared inventory: $(cat "$log")"
   pass "tmux metadata without an exact session fails closed without a cross-session sweep"
+}
+
+test_orca_reports_unavailable_without_app_global_inventory() {
+  local home log out
+  home=$(make_fixture orca-no-sweep)
+  log="$home/orca.log"
+  fm_write_meta "$home/state/orca-task.meta" \
+    'backend=orca' \
+    'window=term-a' \
+    'terminal=term-a' \
+    'orca_worktree_id=wt-a' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ORCA_LOG:?}"
+exit 99
+SH
+  chmod +x "$home/fakebin/orca"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_ORCA_LOG="$log" "$AUDIT" --json)
+  printf '%s\n' "$out" | jq -e '
+    length == 1 and
+    .[0].kind == "inventory_unavailable" and
+    .[0].backend == "orca" and
+    .[0].recorded_endpoint == "term-a" and
+    .[0].reason == "orca has no verified exact-worktree terminal inventory; app-global sweep refused"
+  ' >/dev/null || fail "Orca audit did not emit its structured unavailable finding: $out"
+  [ ! -s "$log" ] || fail "Orca audit enumerated app-global terminal inventory: $(cat "$log")"
+  pass "Orca duplicate audit reports unavailable without app-global enumeration"
+}
+
+test_text_output_includes_inventory_unavailable_reason() {
+  local home out
+  home=$(make_fixture text-reason)
+  fm_write_meta "$home/state/cmux-task.meta" \
+    'backend=cmux' \
+    'window=ws-a:sf-a' \
+    'worktree=/owned/worktree'
+  out=$(FM_HOME="$home" "$AUDIT")
+  assert_contains "$out" 'reason=cmux has no exact-home duplicate inventory; app-global sweep refused' \
+    "text endpoint audit dropped the structured inventory-unavailable reason"
+  pass "text endpoint audit preserves the operator-facing anomaly reason"
 }
 
 test_zellij_reports_unavailable_without_cross_home_inventory() {
@@ -350,15 +388,19 @@ SH
 }
 
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable() {
-  local home log state actual
+  local home log actual
   home=$(make_fixture herdr-tristate)
   log="$home/herdr.log"
-  for state in present absent unknown; do
-    actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" FM_HERDR_PANE_STATE="$state" \
-      bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-dup-task' _ "$ROOT/bin/fm-backend.sh")
-    [ "$actual" = "$state" ] || fail "$state Herdr endpoint read $actual"
-  done
-  pass "Herdr endpoint probe treats structured absence differently from inventory failure"
+  actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
+    bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-dup-task subw' _ "$ROOT/bin/fm-backend.sh")
+  [ "$actual" = present ] || fail "present Herdr endpoint read $actual"
+  actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" FM_HERDR_SINGLETON=1 \
+    bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-dup-task subw' _ "$ROOT/bin/fm-backend.sh")
+  [ "$actual" = absent ] || fail "absent Herdr endpoint read $actual"
+  actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
+    bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-wrong-task subw' _ "$ROOT/bin/fm-backend.sh")
+  [ "$actual" = unknown ] || fail "mismatched-owner Herdr endpoint read $actual"
+  pass "Herdr endpoint probe binds the recorded pane to its exact workspace and task label"
 }
 
 test_duplicate_is_reported_inside_owned_workspace_only
@@ -371,4 +413,6 @@ test_tmux_duplicates_use_exact_recorded_session_and_task
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
+test_orca_reports_unavailable_without_app_global_inventory
+test_text_output_includes_inventory_unavailable_reason
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

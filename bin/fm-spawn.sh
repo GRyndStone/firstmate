@@ -57,8 +57,10 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
-#   Backend endpoint creation invalidates every same-id completion receipt first,
-#   so a new lifecycle can never reuse a prior delivery proof or interrupted claim.
+#   Backend endpoint creation claims state/<id>.spawning under the backlog lock
+#   before invalidating every same-id completion receipt.
+#   The claim remains until metadata is atomically published, so Done cannot race
+#   a new endpoint or reuse a prior delivery proof or interrupted claim.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -112,6 +114,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -193,6 +197,18 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+SPAWN_LIFECYCLE_LOCK=
+SPAWN_LIFECYCLE_LOCKED=0
+SPAWN_MARKER=
+SPAWN_MARKER_TOKEN=
+SPAWN_WORKTREE_REQUESTED=0
+
+release_spawn_lifecycle_lock() {
+  if [ "$SPAWN_LIFECYCLE_LOCKED" -eq 1 ]; then
+    fm_lock_release "$SPAWN_LIFECYCLE_LOCK"
+    SPAWN_LIFECYCLE_LOCKED=0
+  fi
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -213,33 +229,38 @@ parse_orca_worktree_result() {
 
 orca_spawn_abort_cleanup() {
   local status=$?
-  [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
-  ORCA_ABORT_CLEANUP=0
-  if [ -n "${ORCA_TERMINAL:-}" ]; then
-    fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
-  fi
-  if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-    if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        {
-          echo "window=$W"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          echo "mode=${MODE:-no-mistakes}"
-          echo "yolo=${YOLO:-off}"
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=orca"
-          echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-          [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
+  if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
+    ORCA_ABORT_CLEANUP=0
+    if [ -n "${ORCA_TERMINAL:-}" ]; then
+      fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+    fi
+    if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+        mkdir -p "$STATE" 2>/dev/null || true
+        if [ -d "$STATE" ]; then
+          {
+            echo "window=$W"
+            echo "worktree=${WT:-}"
+            echo "project=$PROJ_ABS"
+            echo "harness=$HARNESS"
+            echo "kind=$KIND"
+            echo "mode=${MODE:-no-mistakes}"
+            echo "yolo=${YOLO:-off}"
+            echo "tasktmp=${TASK_TMP:-}"
+            echo "model=${MODEL:-default}"
+            echo "effort=${EFFORT:-default}"
+            echo "backend=orca"
+            echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+            [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+          } > "$STATE/$ID.meta" 2>/dev/null || true
+        fi
       fi
     fi
   fi
+  if [ "$status" -ne 0 ] && declare -F rollback_failed_spawn >/dev/null 2>&1; then
+    rollback_failed_spawn
+  fi
+  release_spawn_lifecycle_lock
   return "$status"
 }
 trap orca_spawn_abort_cleanup EXIT
@@ -701,22 +722,282 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+spawn_marker_is_owned() {
+  [ -f "$SPAWN_MARKER" ] && [ ! -L "$SPAWN_MARKER" ] || return 1
+  awk -F= -v id="$ID" -v token="$SPAWN_MARKER_TOKEN" -v backend="$BACKEND" '
+    $1 == "version" { versions++; version = $2 }
+    $1 == "task" { tasks++; task = $2 }
+    $1 == "token" { tokens++; owned = $2 }
+    $1 == "backend" { backends++; selected = $2 }
+    $1 == "target" { targets++; target = substr($0, index($0, "=") + 1) }
+    $1 == "backend-identity" { identities++; identity = substr($0, index($0, "=") + 1) }
+    $1 == "backend-container" { containers++; container = substr($0, index($0, "=") + 1) }
+    $1 == "worktree" { worktrees++; worktree = substr($0, index($0, "=") + 1) }
+    { lines++ }
+    END {
+      base = (versions == 1 && tasks == 1 && task == id \
+        && tokens == 1 && owned == token && backends == 1 && selected == backend)
+      if (version == "1")
+        exit !(base && lines == 4 && targets == 0 && identities == 0 \
+          && containers == 0 && worktrees == 0)
+      if (version == "3")
+        exit !(base && lines == 8 && targets == 1 && target != "" \
+          && identities == 1 && identity != "" \
+          && containers == 1 && container != "" \
+          && worktrees == 1 && worktree != "")
+      exit 1
+    }
+  ' "$SPAWN_MARKER"
+}
+
+remove_owned_spawn_marker() {
+  spawn_marker_is_owned || return 1
+  rm -f "$SPAWN_MARKER" || return 1
+  [ ! -e "$SPAWN_MARKER" ] && [ ! -L "$SPAWN_MARKER" ]
+}
+
+spawn_backend_identity() {
+  case "$BACKEND" in
+    tmux) printf '%s\n' "${TMUX_HOME_ID:-}" ;;
+    herdr) printf '%s\n' "${HERDR_WORKSPACE_ID:-}" ;;
+    zellij) printf '%s\n' "${ZELLIJ_TAB_ID:-}" ;;
+    orca) printf '%s\n' "${ORCA_WORKTREE_ID:-}" ;;
+    cmux) printf '%s\n' "${CMUX_WORKSPACE_ID:-}" ;;
+  esac
+}
+
+spawn_backend_container() {
+  case "$BACKEND" in
+    tmux) printf '%s\n' "${SES:-}" ;;
+    herdr) printf '%s\n' "${HERDR_SES:-}" ;;
+    zellij) printf '%s\n' "${ZELLIJ_SES:-}" ;;
+    orca) printf '%s\n' "${ORCA_WORKTREE_ID:-}" ;;
+    cmux) printf '%s\n' "${CMUX_WORKSPACE_ID:-}" ;;
+  esac
+}
+
+update_spawn_marker_endpoint() {
+  local expected_worktree=$1 identity container marker_tmp
+  spawn_marker_is_owned || return 1
+  identity=$(spawn_backend_identity)
+  container=$(spawn_backend_container)
+  [ -n "${T:-}" ] && [ -n "$identity" ] && [ -n "$container" ] \
+    && [ -n "$expected_worktree" ] || return 1
+  marker_tmp=$(mktemp "$STATE/.$ID.spawning.tmp.XXXXXXXX") || return 1
+  if ! {
+    printf 'version=3\n'
+    printf 'task=%s\n' "$ID"
+    printf 'token=%s\n' "$SPAWN_MARKER_TOKEN"
+    printf 'backend=%s\n' "$BACKEND"
+    printf 'target=%s\n' "$T"
+    printf 'backend-identity=%s\n' "$identity"
+    printf 'backend-container=%s\n' "$container"
+    printf 'worktree=%s\n' "$expected_worktree"
+  } > "$marker_tmp" || ! mv "$marker_tmp" "$SPAWN_MARKER"; then
+    rm -f "$marker_tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+ensure_spawn_delivery_mode() {
+  [ -n "${MODE:-}" ] && [ -n "${YOLO:-}" ] && return 0
+  PROJ_NAME=$(basename "$PROJ_ABS")
+  read -r MODE YOLO <<EOF
+$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
+EOF
+  [ -n "$MODE" ] && [ -n "$YOLO" ]
+}
+
+persist_failed_spawn_meta() {
+  local recovery_worktree=$1 meta_tmp
+  [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] || return 1
+  [ -n "${T:-}" ] && [ -n "$recovery_worktree" ] || return 1
+  [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ] || return 0
+  ensure_spawn_delivery_mode || return 1
+  meta_tmp=$(mktemp "$STATE/.$ID.meta.tmp.XXXXXXXX") || return 1
+  if ! {
+    printf 'window=%s\n' "$T"
+    printf 'worktree=%s\n' "$recovery_worktree"
+    printf 'project=%s\n' "$PROJ_ABS"
+    printf 'harness=%s\n' "$HARNESS"
+    printf 'kind=%s\n' "$KIND"
+    printf 'mode=%s\n' "$MODE"
+    printf 'yolo=%s\n' "$YOLO"
+    printf 'tasktmp=%s\n' "${TASK_TMP:-}"
+    printf 'model=%s\n' "${MODEL:-default}"
+    printf 'effort=%s\n' "${EFFORT:-default}"
+    [ "$BACKEND" = tmux ] || printf 'backend=%s\n' "$BACKEND"
+    case "$BACKEND" in
+      tmux)
+        printf 'tmux_home_identity=%s\n' "$TMUX_HOME_ID"
+        printf 'tmux_session=%s\n' "$SES"
+        printf 'tmux_window_id=%s\n' "$WID"
+        ;;
+      herdr)
+        printf 'herdr_session=%s\n' "$HERDR_SES"
+        printf 'herdr_workspace_id=%s\n' "$HERDR_WORKSPACE_ID"
+        printf 'herdr_tab_id=%s\n' "$HERDR_TAB_ID"
+        printf 'herdr_pane_id=%s\n' "$HERDR_PANE_ID"
+        ;;
+      zellij)
+        printf 'zellij_session=%s\n' "$ZELLIJ_SES"
+        printf 'zellij_tab_id=%s\n' "$ZELLIJ_TAB_ID"
+        printf 'zellij_pane_id=%s\n' "$ZELLIJ_PANE_ID"
+        ;;
+      cmux)
+        printf 'cmux_workspace_id=%s\n' "$CMUX_WORKSPACE_ID"
+        printf 'cmux_surface_id=%s\n' "$CMUX_SURFACE_ID"
+        ;;
+    esac
+  } > "$meta_tmp" || ! mv "$meta_tmp" "$STATE/$ID.meta"; then
+    rm -f "$meta_tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+rollback_failed_spawn() {
+  local target identity container expected_worktree endpoint_state backlog_lock observed attempt=0
+  [ "$KIND" != secondmate ] || return 0
+  spawn_marker_is_owned || return 0
+  target=${T:-}
+  identity=$(spawn_backend_identity)
+  container=$(spawn_backend_container)
+  expected_worktree=${WT:-$PROJ_ABS}
+  [ -n "$target" ] && [ -n "$identity" ] && [ -n "$container" ] || return 0
+  if [ "$SPAWN_WORKTREE_REQUESTED" -eq 1 ]; then
+    while [ "$attempt" -lt 20 ]; do
+      observed=$(spawn_current_path "${WT_TARGET:-$target}" 2>/dev/null || true)
+      if [ -n "$observed" ] && [ "$(real_path_or_raw "$observed")" != "$PROJ_ABS_REAL" ]; then
+        WT=$observed
+        update_spawn_marker_endpoint "$WT" || return 0
+        persist_failed_spawn_meta "$WT" || true
+        return 0
+      fi
+      sleep 0.1
+      attempt=$((attempt + 1))
+    done
+    return 0
+  fi
+  if [ -n "${WT:-}" ] && [ "$(real_path_or_raw "$WT")" != "$PROJ_ABS_REAL" ]; then
+    update_spawn_marker_endpoint "$WT" || return 0
+    persist_failed_spawn_meta "$WT" || true
+    return 0
+  fi
+  endpoint_state=$(fm_backend_target_state "$BACKEND" "$target" "$W" "$identity" "$expected_worktree" "$container")
+  case "$endpoint_state" in
+    present)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$target" "${ZELLIJ_TAB_ID:-}" "$W" \
+        >/dev/null 2>&1 || return 0
+      ;;
+    absent) ;;
+    *) return 0 ;;
+  esac
+  while [ "$attempt" -lt 10 ]; do
+    endpoint_state=$(fm_backend_target_state "$BACKEND" "$target" "$W" "$identity" "$expected_worktree" "$container")
+    [ "$endpoint_state" != absent ] || break
+    [ "$endpoint_state" != unknown ] || return 0
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  [ "$endpoint_state" = absent ] || return 0
+  backlog_lock="$STATE/.backlog.lock"
+  fm_lock_acquire_wait "$backlog_lock"
+  endpoint_state=$(fm_backend_target_state "$BACKEND" "$target" "$W" "$identity" "$expected_worktree" "$container")
+  if [ "$endpoint_state" = absent ]; then
+    remove_owned_spawn_marker || true
+  fi
+  fm_lock_release "$backlog_lock"
+}
+
+backlog_allows_spawn_task() {
+  local backlog="$DATA/backlog.md"
+  [ ! -L "$backlog" ] || return 1
+  [ -f "$backlog" ] || return 0
+  awk -v id="$ID" '
+    /^## / { section = $0; next }
+    index($0, "- [ ] " id " - ") == 1 || index($0, "- [x] " id " - ") == 1 {
+      found = 1
+      if (section == "## In flight" && index($0, "- [ ] " id " - ") == 1)
+        in_flight = 1
+    }
+    END { exit (in_flight || !found) ? 0 : 1 }
+  ' "$backlog"
+}
+
+prepare_spawn_lifecycle() {
+  local backlog_lock marker_tmp
+  mkdir -p "$STATE" || return 1
+  SPAWN_LIFECYCLE_LOCK="$STATE/.$ID.teardown.lock"
+  fm_lock_acquire_wait "$SPAWN_LIFECYCLE_LOCK"
+  SPAWN_LIFECYCLE_LOCKED=1
+  [ "$KIND" != secondmate ] || return 0
+
+  backlog_lock="$STATE/.backlog.lock"
+  fm_lock_acquire_wait "$backlog_lock"
+  if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ] \
+     || [ -e "$STATE/$ID.tearing-down" ] || [ -L "$STATE/$ID.tearing-down" ] \
+     || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ] \
+     || [ -e "$STATE/$ID.teardown-final-cleanup" ] || [ -L "$STATE/$ID.teardown-final-cleanup" ] \
+     || [ -e "$STATE/$ID.spawning" ] || [ -L "$STATE/$ID.spawning" ]; then
+    echo "error: task $ID already has unresolved owned lifecycle state; refusing to spawn" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  if ! backlog_allows_spawn_task; then
+    echo "error: task $ID is not a canonical In flight backlog record; refusing to spawn" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  SPAWN_MARKER="$STATE/$ID.spawning"
+  SPAWN_MARKER_TOKEN=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')
+  if ! [[ "$SPAWN_MARKER_TOKEN" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "error: could not mint lifecycle ownership for spawn $ID" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  marker_tmp=$(mktemp "$STATE/.$ID.spawning.tmp.XXXXXXXX") || {
+    fm_lock_release "$backlog_lock"
+    return 1
+  }
+  if ! {
+    printf 'version=1\n'
+    printf 'task=%s\n' "$ID"
+    printf 'token=%s\n' "$SPAWN_MARKER_TOKEN"
+    printf 'backend=%s\n' "$BACKEND"
+  } > "$marker_tmp" || ! mv "$marker_tmp" "$SPAWN_MARKER"; then
+    rm -f "$marker_tmp" 2>/dev/null || true
+    echo "error: could not persist lifecycle ownership for spawn $ID" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  if ! fm_tasks_axi_invalidate_completion_receipt "$STATE" "$ID"; then
+    if ! remove_owned_spawn_marker; then
+      echo "error: spawn $ID could not roll back its lifecycle ownership after receipt invalidation failed" >&2
+    fi
+    echo "error: could not invalidate completion receipts safely before spawning $ID" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  fm_lock_release "$backlog_lock"
+}
+
 W="fm-$ID"
-if ! fm_tasks_axi_invalidate_completion_receipt "$STATE" "$ID"; then
-  echo "error: could not invalidate completion receipts safely before spawning $ID" >&2
-  exit 1
-fi
+prepare_spawn_lifecycle || exit 1
 case "$BACKEND" in
   tmux)
+    TMUX_HOME_ID=$(fm_backend_home_identity) || {
+      echo "error: could not derive the selected Firstmate home's endpoint identity" >&2
+      exit 1
+    }
     SES=$(fm_backend_tmux_container_ensure)
     T="$SES:$W"
     # #134 robustness (tmux): fm_backend_tmux_create_task captures a stable window
     # id and pins the window name (automatic-rename/allow-rename off) so a captain's
     # non-default tmux config cannot rename the window away from fm-<id> once
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
-    # rename-critical worktree-detection steps below; the persisted window= handle
-    # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    # rename-critical worktree-detection and lifecycle operations below.
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS" "$TMUX_HOME_ID") || exit 1
+    T=$WID
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -806,6 +1087,10 @@ EOF
     T="$ORCA_TERMINAL"
     ;;
 esac
+if [ "$KIND" != secondmate ] && ! update_spawn_marker_endpoint "${WT:-$PROJ_ABS}"; then
+  echo "error: could not bind spawn ownership to endpoint $T for $ID" >&2
+  exit 1
+fi
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
 # its rename-safe stable window id, set as WT_TARGET=$WID in the tmux branch above.
 # Every other backend addresses its pane/surface by the id already in $T, so default
@@ -848,6 +1133,7 @@ spawn_send_key() {  # <target> <key>
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  SPAWN_WORKTREE_REQUESTED=1
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -872,6 +1158,10 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
+  if ! update_spawn_marker_endpoint "$WT"; then
+    echo "error: could not bind spawn ownership to worktree $WT for $ID" >&2
+    exit 1
+  fi
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -1003,7 +1293,8 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
-{
+META_TMP=$(mktemp "$STATE/.$ID.meta.tmp.XXXXXXXX") || exit 1
+if ! {
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
@@ -1018,6 +1309,11 @@ META_WINDOW=$T
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  if [ "$BACKEND" = tmux ]; then
+    echo "tmux_home_identity=$TMUX_HOME_ID"
+    echo "tmux_session=$SES"
+    echo "tmux_window_id=$WID"
+  fi
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
@@ -1041,8 +1337,17 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-} > "$STATE/$ID.meta"
+  true
+} > "$META_TMP" || ! mv "$META_TMP" "$STATE/$ID.meta"; then
+  rm -f "$META_TMP" 2>/dev/null || true
+  echo "error: could not atomically publish lifecycle metadata for $ID" >&2
+  exit 1
+fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+if [ "$KIND" != secondmate ] && ! remove_owned_spawn_marker; then
+  echo "error: lifecycle metadata was published, but spawn ownership could not be released for $ID" >&2
+  exit 1
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

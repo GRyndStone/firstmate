@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -65,6 +65,11 @@ function lockOwnership(): LockOwnership {
 
 function markLoaded(): void {
   if (lockOwnership() === "other") return;
+  try {
+    rejectSymlinkedComponents(fmHome, state);
+  } catch {
+    return;
+  }
   mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
@@ -93,9 +98,46 @@ function runGuard(): Promise<{ code: number; stderr: string }> {
 
 type Handoff = { record: string; token: string; message: string };
 
+function rejectSymlinkedComponents(base: string, target: string): void {
+  const scopedBase = resolve(base);
+  const scopedTarget = resolve(target);
+  const suffix = relative(scopedBase, scopedTarget);
+  if (suffix.startsWith("..") || isAbsolute(suffix)) return;
+  let cursor = scopedBase;
+  const baseInfo = lstatSync(cursor);
+  if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) throw new Error("unsafe Firstmate home directory");
+  for (const component of suffix.split(/[\\/]/).filter(Boolean)) {
+    cursor = resolve(cursor, component);
+    const info = lstatSync(cursor);
+    if (info.isSymbolicLink()) throw new Error("symlinked Firstmate state path component");
+  }
+}
+
+function safeHandoffDirectory(create = false): void {
+  rejectSymlinkedComponents(fmHome, state);
+  const stateInfo = lstatSync(state);
+  if (stateInfo.isSymbolicLink() || !stateInfo.isDirectory()) throw new Error("unsafe Firstmate state directory");
+  try {
+    const dirInfo = lstatSync(handoffDir);
+    if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) throw new Error("unsafe Firstmate handoff directory");
+  } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT" || !create) throw error;
+    mkdirSync(handoffDir, { mode: 0o700 });
+    const dirInfo = lstatSync(handoffDir);
+    if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) throw new Error("unsafe Firstmate handoff directory");
+  }
+}
+
+function readHandoffRecord(): string {
+  safeHandoffDirectory();
+  const info = lstatSync(handoffPath);
+  if (info.isSymbolicLink() || !info.isFile()) throw new Error("unsafe Firstmate handoff record");
+  return readFileSync(handoffPath, "utf8").trim();
+}
+
 function readHandoff(): Handoff | undefined {
   try {
-    const record = readFileSync(handoffPath, "utf8").trim();
+    const record = readHandoffRecord();
     const parsed = JSON.parse(record) as { token?: unknown; message?: unknown };
     if (typeof parsed.token !== "string" || typeof parsed.message !== "string") return undefined;
     return { record, token: parsed.token, message: parsed.message };
@@ -106,12 +148,18 @@ function readHandoff(): Handoff | undefined {
 
 function persistHandoff(message: string): Handoff {
   if (lockOwnership() !== "owned") throw new Error("Firstmate session lock is not owned");
-  mkdirSync(handoffDir, { recursive: true });
+  safeHandoffDirectory(true);
+  try {
+    const info = lstatSync(handoffPath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error("unsafe Firstmate handoff record");
+  } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+  }
   handoffSequence += 1;
   const token = `${process.pid}-${Date.now()}-${handoffSequence}`;
   const record = JSON.stringify({ token, message });
   const temp = `${handoffPath}.tmp.${token}`;
-  writeFileSync(temp, `${record}\n`, { mode: 0o600 });
+  writeFileSync(temp, `${record}\n`, { mode: 0o600, flag: "wx" });
   renameSync(temp, handoffPath);
   return { record, token, message };
 }
@@ -119,7 +167,7 @@ function persistHandoff(message: string): Handoff {
 function clearHandoff(record?: string): boolean {
   if (lockOwnership() !== "owned") return false;
   try {
-    if (record !== undefined && readFileSync(handoffPath, "utf8").trim() !== record) return false;
+    if (record !== undefined && readHandoffRecord() !== record) return false;
     unlinkSync(handoffPath);
   } catch (error) {
     if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") return false;
@@ -134,7 +182,8 @@ function clearHandoff(record?: string): boolean {
 
 function handoffAbsent(): boolean {
   try {
-    readFileSync(handoffPath, "utf8");
+    safeHandoffDirectory();
+    lstatSync(handoffPath);
     return false;
   } catch (error) {
     return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";

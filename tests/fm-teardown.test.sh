@@ -270,13 +270,29 @@ SH
 
 # Write a meta file for the task. Args: case_dir mode kind
 write_meta() {
-  local case_dir=$1 mode=$2 kind=$3
+  local case_dir=$1 mode=$2 kind=$3 identity
+  identity=$(FM_HOME="$case_dir/fm-home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=firstmate:fm-task-x1" \
+    "window=@42" \
+    "tmux_home_identity=$identity" \
+    "tmux_session=firstmate" \
+    "tmux_window_id=@42" \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode"
+}
+
+write_tmux_meta_at() {
+  local meta=$1 home=$2 window_id=$3 identity
+  shift 3
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  fm_write_meta "$meta" \
+    "window=$window_id" \
+    "tmux_home_identity=$identity" \
+    "tmux_session=firstmate" \
+    "tmux_window_id=$window_id" \
+    "$@"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -1385,7 +1401,11 @@ test_herdr_teardown_clears_escalation_marker() {
   write_meta "$case_dir" local-only ship
   sed -i.bak 's/^window=.*/window=default:wG:pQ/' "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
-  printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' \
+    'backend=herdr' \
+    'herdr_session=default' \
+    'herdr_workspace_id=wG' \
+    'herdr_pane_id=wG:pQ' >> "$case_dir/state/task-x1.meta"
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
   if [ "${1:-} ${2:-}" = "pane get" ]; then
@@ -1449,14 +1469,67 @@ SH
   pass "Herdr duplicate endpoints block teardown and remain inspect-only"
 }
 
+test_endpoint_duplicate_created_after_preflight_blocks_close() {
+  local case_dir log count rc
+  case_dir=$(make_case herdr-duplicate-after-preflight)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:w1:p2/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=herdr' 'herdr_session=default' 'herdr_workspace_id=w1' \
+    'herdr_pane_id=w1:p2' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/herdr.log"
+  count="$case_dir/tab-list-count"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace get")
+    printf '%s\n' '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"}}}'
+    ;;
+  "tab list")
+    current=0
+    [ ! -f "${FM_HERDR_COUNT:?}" ] || current=$(cat "$FM_HERDR_COUNT")
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FM_HERDR_COUNT"
+    if [ "$current" -eq 1 ]; then
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-task-x1"}]}}'
+    else
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task-x1"},{"tab_id":"w1:t2","label":"fm-task-x1"}]}}'
+    fi
+    ;;
+  "pane list")
+    if [ "$(cat "${FM_HERDR_COUNT:?}")" -eq 1 ]; then
+      printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'
+    else
+      printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"},{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'
+    fi
+    ;;
+  "pane close") exit 0 ;;
+  *) exit 99 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+
+  rc=0
+  FM_HERDR_LOG="$log" FM_HERDR_COUNT="$count" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "duplicate created after teardown preflight"
+  assert_contains "$(cat "$case_dir/stderr")" "immediately before close" \
+    "teardown did not report its just-in-time duplicate refusal"
+  assert_not_contains "$(cat "$log")" "pane close" \
+    "teardown closed an endpoint after its duplicate audit became stale"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "just-in-time duplicate refusal removed lifecycle metadata"
+  pass "teardown repeats duplicate auditing immediately before endpoint closure"
+}
+
 test_secondmate_retirement_preflights_child_duplicates() {
   local case_dir home log rc
   case_dir=$(make_case secondmate-child-duplicate-refusal)
   home="$case_dir/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
     "worktree=$home" \
     "project=$home" \
     'kind=secondmate' \
@@ -1503,8 +1576,8 @@ test_secondmate_child_endpoint_close_requires_confirmed_absence() {
   home="$case_dir/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     'backend=herdr' 'window=default:childw:p2' 'herdr_session=default' \
@@ -1537,8 +1610,8 @@ SH
   home="$case_dir/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     "worktree=$case_dir/missing-child-worktree" "project=$case_dir/project" 'kind=scout'
@@ -1552,9 +1625,10 @@ SH
 }
 
 test_tmux_duplicate_endpoints_refuse_teardown_without_closure() {
-  local case_dir log rc
+  local case_dir log rc identity
   case_dir=$(make_case tmux-duplicate-refusal)
   write_meta "$case_dir" local-only ship
+  identity=$(FM_HOME="$case_dir/fm-home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   log="$case_dir/tmux.log"
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -1562,14 +1636,7 @@ set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
-    printf '%s\n' $'@7\tfm-task-x1' $'@8\tfm-task-x1'
-    ;;
-  list-panes)
-    case "$*" in
-      *' -t @7 '*) printf '%s\n' '%17' ;;
-      *' -t @8 '*) printf '%s\n' '%18' ;;
-      *) exit 7 ;;
-    esac
+    printf '@7\tfm-task-x1\t%s\n@8\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
     ;;
   kill-window) exit 0 ;;
   *) exit 8 ;;
@@ -1578,13 +1645,13 @@ SH
   chmod +x "$case_dir/fakebin/tmux"
 
   rc=0
-  FM_TMUX_LOG="$log" run_teardown "$case_dir" --force \
+  FM_TMUX_LOG="$log" FM_TMUX_OWNER="$identity" run_teardown "$case_dir" --force \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "tmux duplicate endpoint teardown"
   assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
     "tmux teardown did not refuse the endpoint ownership anomaly"
-  assert_contains "$(cat "$case_dir/stderr")" "%17,%18" \
-    "tmux teardown refusal did not identify both exact duplicate panes"
+  assert_contains "$(cat "$case_dir/stderr")" "@7,@8" \
+    "tmux teardown refusal did not identify both exact duplicate windows"
   assert_not_contains "$(cat "$log")" "kill-window" "tmux duplicate refusal automatically closed an endpoint"
   assert_not_contains "$(cat "$log")" " -a " "tmux duplicate preflight enumerated other sessions"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "tmux duplicate refusal removed task meta"
@@ -1744,11 +1811,12 @@ test_non_delivery_outcomes_never_record_done() {
 }
 
 test_endpoint_close_must_succeed_and_be_absent() {
-  local case_dir log rc mode
+  local case_dir log rc mode identity
   for mode in close-fails close-noop; do
     case_dir=$(make_case "endpoint-$mode")
     log="$case_dir/tmux.log"
     write_meta "$case_dir" local-only ship
+    identity=$(FM_HOME="$case_dir/fm-home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
     cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 [ -z "${FM_TREEHOUSE_WT:-}" ] || rm -rf "$FM_TREEHOUSE_WT"
@@ -1760,7 +1828,7 @@ printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
     case "$*" in
-      *' -f '*) printf '%s\n' $'@42\tfm-task-x1' ;;
+      *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
       *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
       *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
     esac
@@ -1773,6 +1841,7 @@ SH
     chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/tmux"
     rc=0
     FM_TREEHOUSE_WT="$case_dir/wt" FM_TMUX_LOG="$log" FM_TMUX_CLOSE_MODE="$mode" \
+      FM_TMUX_OWNER="$identity" \
       run_teardown "$case_dir" --force \
       > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
     expect_code 1 "$rc" "$mode endpoint close verification"
@@ -1784,15 +1853,17 @@ SH
 }
 
 test_unknown_endpoint_state_preserves_lifecycle() {
-  local case_dir rc
+  local case_dir rc identity
   case_dir=$(make_case endpoint-unknown)
   write_meta "$case_dir" local-only ship
+  identity=$(FM_HOME="$case_dir/fm-home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
   list-windows)
     case "$*" in
-      *' -f '*) printf '%s\n' $'@42\tfm-task-x1'; exit 0 ;;
+      *'#{window_id},@42'*) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
+      *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
     esac
     echo 'permission denied while reading tmux inventory' >&2
     exit 2
@@ -1811,9 +1882,9 @@ exit 0
 SH
   chmod +x "$case_dir/fakebin/tmux"
   rc=0
-  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  FM_TMUX_OWNER="$identity" run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "unknown endpoint inventory"
-  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for firstmate:fm-task-x1 is unknown" \
+  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for @42 is unknown" \
     "unreadable endpoint inventory was treated as confirmed absence"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "unknown endpoint state removed lifecycle metadata"
   [ -d "$case_dir/wt" ] || fail "unknown endpoint state removed worktree"
@@ -2037,8 +2108,8 @@ test_secondmate_registry_cleanup_retries_after_home_removal() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf -- '- task-x1 (home: %s; scope: test; projects: none)\n' "$home" > "$registry"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" 'kind=secondmate' \
     'mode=secondmate' "home=$home"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
@@ -2135,7 +2206,7 @@ SH
   pass "staged destructive retries recheck dirtiness and landing before cleanup"
 }
 
-test_staged_orca_retry_rechecks_backend_worktree_identity() {
+test_orca_staged_cleanup_refuses_without_exact_duplicate_inventory() {
   local case_dir rc stage_fail remove_log other
   case_dir=$(make_case staged-orca-identity)
   write_meta "$case_dir" local-only ship
@@ -2188,18 +2259,18 @@ SH
   FM_ORCA_PATH="$case_dir/wt" FM_ORCA_REMOVE_LOG="$remove_log" \
     FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
-  expect_code 1 "$rc" "staged Orca cleanup interruption"
+  expect_code 1 "$rc" "Orca cleanup without exact duplicate inventory"
 
   rc=0
   FM_ORCA_PATH="$other" FM_ORCA_REMOVE_LOG="$remove_log" \
     FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
     run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
-  expect_code 1 "$rc" "staged Orca identity mismatch retry"
-  assert_contains "$(cat "$case_dir/retry-stderr")" "not inspected worktree" \
-    "staged Orca retry did not re-resolve its exact backend worktree id"
-  [ ! -s "$remove_log" ] || fail "staged Orca retry removed a worktree after path identity changed"
-  [ -f "$case_dir/state/task-x1.meta" ] || fail "staged Orca mismatch removed lifecycle metadata"
-  pass "staged Orca retries re-resolve exact backend worktree identity before removal"
+  expect_code 1 "$rc" "Orca cleanup retry without exact duplicate inventory"
+  assert_contains "$(cat "$case_dir/retry-stderr")" "kind=inventory_unavailable" \
+    "Orca cleanup did not fail closed before backend worktree inspection"
+  [ ! -s "$remove_log" ] || fail "Orca cleanup removed a worktree without exact duplicate inventory"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "Orca inventory refusal removed lifecycle metadata"
+  pass "Orca cleanup stays blocked without exact duplicate inventory"
 }
 
 test_staged_teardown_refuses_changed_backlog_record() {
@@ -2243,31 +2314,34 @@ SH
 }
 
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
-  local case_dir fakebin state actual
+  local case_dir fakebin state actual identity
   case_dir="$TMP_ROOT/endpoint-state-unit"
   fakebin="$case_dir/fakebin"
   mkdir -p "$fakebin"
+  identity=$(FM_HOME="$case_dir" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${FM_TMUX_STATE:?}" in
-  present) printf '%s\n' '@42 fm-task-x1'; exit 0 ;;
-  absent) printf '%s\n' '@99 fm-other'; exit 0 ;;
-  mismatch) printf '%s\n' '@42 fm-other'; exit 0 ;;
+  present) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
+  absent) exit 0 ;;
+  duplicate) printf '@42\tfm-task-x1\t%s\n@43\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"; exit 0 ;;
   no-server) echo 'no server running on /tmp/tmux-test/default' >&2; exit 1 ;;
   unknown) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
 esac
 SH
   chmod +x "$fakebin/tmux"
-  for state in present absent mismatch no-server unknown; do
-    actual=$(PATH="$fakebin:$PATH" FM_TMUX_STATE="$state" FM_ROOT_OVERRIDE="$ROOT" \
-      bash -c '. "$1"; fm_backend_target_state tmux @42 fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  for state in present absent duplicate no-server unknown; do
+    actual=$(PATH="$fakebin:$PATH" FM_TMUX_STATE="$state" FM_TMUX_OWNER="$identity" \
+      FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '. "$1"; fm_backend_target_state tmux @42 fm-task-x1 "$2" /owned/worktree owned-session' \
+        _ "$ROOT/bin/fm-backend.sh" "$identity")
     case "$state" in
       present) [ "$actual" = present ] || fail "present tmux endpoint read $actual" ;;
       absent|no-server) [ "$actual" = absent ] || fail "$state tmux endpoint read $actual" ;;
-      mismatch|unknown) [ "$actual" = unknown ] || fail "$state tmux endpoint read $actual" ;;
+      duplicate|unknown) [ "$actual" = unknown ] || fail "$state tmux endpoint read $actual" ;;
     esac
   done
-  pass "tmux endpoint probe separates confirmed absence from ownership mismatch and unreadability"
+  pass "tmux endpoint probe uses exact-home identity and rejects duplicates or unreadability"
 }
 
 test_orca_endpoint_probe_rejects_success_shaped_errors() {
@@ -2443,10 +2517,10 @@ SH
   FM_ORCA_OTHER="$other" FM_ORCA_REMOVE_LOG="$remove_log" run_teardown "$case_dir" --force \
     >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "absent Orca path with reused id"
-  assert_contains "$(cat "$case_dir/stderr")" 'recorded Orca id may have been reused' \
-    "reused Orca id was not surfaced"
+  assert_contains "$(cat "$case_dir/stderr")" 'kind=inventory_unavailable' \
+    "Orca teardown did not fail closed without exact-worktree terminal inventory"
   [ ! -s "$remove_log" ] || fail "reused Orca id was removed"
-  pass "absent Orca paths still require the recorded id to be absent"
+  pass "Orca cleanup refuses absent paths without exact duplicate inventory"
 }
 
 test_secondmate_child_absent_orca_path_requires_absent_id() {
@@ -2455,8 +2529,8 @@ test_secondmate_child_absent_orca_path_requires_absent_id() {
   home="$case_dir/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" 'kind=secondmate' \
     'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     'backend=orca' 'window=fm-child-a1' 'terminal=terminal-child' \
@@ -2477,11 +2551,11 @@ SH
   FM_ORCA_OTHER="$other" FM_ORCA_REMOVE_LOG="$remove_log" run_teardown "$case_dir" --force \
     >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "secondmate child absent Orca path with reused id"
-  assert_contains "$(cat "$case_dir/stderr")" 'recorded Orca id may have been reused' \
-    "child reused Orca id was not surfaced"
+  assert_contains "$(cat "$case_dir/stderr")" 'may have been reused' \
+    "child Orca teardown did not reject the reused backend worktree id"
   [ ! -s "$remove_log" ] || fail "child reused Orca id was removed"
   [ -f "$home/state/child-a1.meta" ] || fail "child Orca mismatch removed metadata"
-  pass "forced child retirement verifies Orca ids even when paths are absent"
+  pass "forced child retirement rejects reused Orca worktree identity"
 }
 
 test_teardown_state_must_be_external_to_cleanup_target() {
@@ -2489,8 +2563,8 @@ test_teardown_state_must_be_external_to_cleanup_target() {
   case_dir=$(make_case internal-stage-state)
   nested="$case_dir/wt/state"
   mkdir -p "$nested"
-  fm_write_meta "$nested/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
+  write_tmux_meta_at "$nested/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$case_dir/wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   rc=0
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir/fm-home" FM_STATE_OVERRIDE="$nested" \
@@ -2505,8 +2579,8 @@ test_teardown_state_must_be_external_to_cleanup_target() {
   tasktmp="$case_dir/tasktmp"
   nested="$tasktmp/state"
   mkdir -p "$nested"
-  fm_write_meta "$nested/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
+  write_tmux_meta_at "$nested/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$case_dir/wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only' "tasktmp=$tasktmp"
   rc=0
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir/fm-home" FM_STATE_OVERRIDE="$nested" \
@@ -2557,35 +2631,20 @@ SH
 }
 
 test_verified_owner_marker_removal_retries_after_cleanup() {
-  local case_dir removed marker_fail rc
+  local case_dir marker_fail rc
   case_dir=$(make_case owner-marker-removal-retry)
   write_meta "$case_dir" local-only ship
-  printf '%s\n' 'backend=orca' 'terminal=terminal-1' 'orca_worktree_id=orca-wt-1' \
-    >> "$case_dir/state/task-x1.meta"
   add_compatible_tasks_axi "$case_dir"
-  removed="$case_dir/orca-removed"
   marker_fail="$case_dir/marker-failed"
-  cat > "$case_dir/fakebin/orca" <<'SH'
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
-set -u
-case "${1:-} ${2:-}" in
-  'terminal read')
-    printf '%s\n' '{"ok":false,"error":{"code":"terminal_not_found"}}'
-    exit 1
-    ;;
-  'worktree show')
-    if [ -e "${FM_ORCA_REMOVED:?}" ]; then
-      printf '%s\n' '{"ok":false,"error":{"code":"worktree_not_found"}}'
-      exit 1
-    fi
-    printf '{"ok":true,"result":{"worktree":{"id":"orca-wt-1","path":"%s"}}}\n' "${FM_ORCA_WT:?}"
-    ;;
-  'worktree rm')
-    /bin/rm -rf -- "${FM_ORCA_WT:?}"
-    touch "${FM_ORCA_REMOVED:?}"
-    printf '%s\n' '{"ok":true,"result":{}}'
-    ;;
-esac
+target=${!#}
+git_dir=$(git -C "$target" rev-parse --absolute-git-dir)
+marker="$git_dir/.fm-teardown-owner-task-x1"
+token=$(cat "$marker")
+git -C "$target" worktree remove --force "$target"
+mkdir -p "$git_dir"
+printf '%s\n' "$token" > "$marker"
 SH
   cat > "$case_dir/fakebin/rm" <<'SH'
 #!/usr/bin/env bash
@@ -2600,10 +2659,10 @@ case " $* " in
 esac
 exec /bin/rm "$@"
 SH
-  chmod +x "$case_dir/fakebin/orca" "$case_dir/fakebin/rm"
+  chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/rm"
 
   rc=0
-  FM_ORCA_WT="$case_dir/wt" FM_ORCA_REMOVED="$removed" FM_MARKER_FAIL_FLAG="$marker_fail" \
+  FM_MARKER_FAIL_FLAG="$marker_fail" \
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "owner marker removal interruption"
   [ ! -e "$case_dir/wt" ] || fail "owner marker retry fixture did not remove the worktree"
@@ -2611,15 +2670,16 @@ SH
     "owner marker removal failure did not retain cleanup stage"
   rm -f "$marker_fail"
   rc=0
-  FM_ORCA_WT="$case_dir/wt" FM_ORCA_REMOVED="$removed" FM_MARKER_FAIL_FLAG="$marker_fail" \
+  FM_MARKER_FAIL_FLAG="$marker_fail" \
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
   expect_code 1 "$rc" "repeated verified owner marker removal interruption"
   assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" 'phase=worktree-cleanup-started' \
     "repeated marker interruption lost retry authority"
   rc=0
-  FM_ORCA_WT="$case_dir/wt" FM_ORCA_REMOVED="$removed" FM_MARKER_FAIL_FLAG="$marker_fail" \
+  FM_MARKER_FAIL_FLAG="$marker_fail" \
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/final-retry-stderr" || rc=$?
-  expect_code 0 "$rc" "verified owner marker removal retry"
+  expect_code 0 "$rc" \
+    "verified owner marker removal retry: $(cat "$case_dir/final-retry-stderr")"
   assert_absent "$case_dir/state/task-x1.teardown-stage" \
     "verified marker removal retry retained teardown stage"
   pass "verified owner marker removal remains retryable after cleanup"
@@ -2739,6 +2799,43 @@ SH
   pass "force posture cannot change after backlog finalization"
 }
 
+test_partial_final_state_removal_retains_retry_authority() {
+  local case_dir fail_flag rc
+  case_dir=$(make_case partial-final-state-removal)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  fail_flag="$case_dir/meta-remove-failed"
+  cat > "$case_dir/fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = "${FM_META_PATH:?}" ] && [ ! -e "${FM_REMOVE_FAIL_FLAG:?}" ]; then
+    : > "$FM_REMOVE_FAIL_FLAG"
+    exit 1
+  fi
+done
+exec /bin/rm "$@"
+SH
+  chmod +x "$case_dir/fakebin/rm"
+  rc=0
+  FM_META_PATH="$case_dir/state/task-x1.meta" FM_REMOVE_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "partial final state removal"
+  assert_present "$case_dir/state/task-x1.teardown-final-cleanup" \
+    "partial final removal lost its retry authority"
+  assert_absent "$case_dir/state/task-x1.teardown-stage" \
+    "fixture did not remove the ordinary teardown stage before failing on meta"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "fixture did not retain metadata after the selected removal failure"
+  rc=0
+  FM_META_PATH="$case_dir/state/task-x1.meta" FM_REMOVE_FAIL_FLAG="$fail_flag" \
+    run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "partial final state removal retry"
+  assert_absent "$case_dir/state/task-x1.meta" "final cleanup retry retained metadata"
+  assert_absent "$case_dir/state/task-x1.teardown-final-cleanup" \
+    "final cleanup retry retained its consumed authority"
+  pass "partial final lifecycle removal remains deterministically retryable"
+}
+
 test_partial_truthful_finalization_retries_idempotently() {
   local case_dir fail_flag held_state log rc
   case_dir=$(make_case partial-truthful-finalization)
@@ -2835,9 +2932,10 @@ SH
 }
 
 test_postcleanup_retry_rechecks_endpoint_absence() {
-  local case_dir held_state fail_flag rc
+  local case_dir held_state fail_flag rc identity
   case_dir=$(make_case postcleanup-endpoint-reappeared)
   write_meta "$case_dir" local-only ship
+  identity=$(FM_HOME="$case_dir/fm-home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
   add_compatible_tasks_axi "$case_dir"
   held_state="$case_dir/held-state"
   fail_flag="$case_dir/reopen-failed"
@@ -2850,7 +2948,7 @@ test_postcleanup_retry_rechecks_endpoint_absence() {
 case "${1:-}" in
   list-windows)
     case "$*" in
-      *' -f '*) printf '%s\n' $'@42\tfm-task-x1' ;;
+      *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
       *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
       *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
     esac
@@ -2862,6 +2960,7 @@ SH
   chmod +x "$case_dir/fakebin/tmux"
   rc=0
   FM_TASKS_HELD_STATE="$held_state" FM_TASKS_REOPEN_FAIL_FLAG="$fail_flag" \
+    FM_TMUX_OWNER="$identity" \
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
   expect_code 1 "$rc" "reappeared endpoint retry"
   assert_contains "$(cat "$case_dir/retry-stderr")" 'no longer has confirmed endpoint and cleanup absence' \
@@ -2938,11 +3037,11 @@ test_child_worktree_replacement_loses_auxiliary_cleanup_authority() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
-  fm_write_meta "$home/state/child-a1.meta" \
-    'window=firstmate:fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+  write_tmux_meta_at "$home/state/child-a1.meta" "$home" @43 \
+    "worktree=$child_wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
@@ -3127,8 +3226,8 @@ test_plain_secondmate_home_rechecks_exact_owner_before_removal() {
   home="$case_dir/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   cat > "$case_dir/fakebin/git" <<'SH'
 #!/usr/bin/env bash
@@ -3189,12 +3288,12 @@ test_symlinked_auxiliary_targets_are_refused() {
   mkdir -p "$case_dir/secondmate-home/state" "$case_dir/secondmate-home/data" \
     "$case_dir/secondmate-home/config" "$case_dir/secondmate-home/projects"
   printf 'task-x1\n' > "$case_dir/secondmate-home/.fm-secondmate-home"
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$case_dir/secondmate-home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$case_dir/secondmate-home" \
     "project=$case_dir/secondmate-home" 'kind=secondmate' 'mode=secondmate' \
     "home=$case_dir/secondmate-home"
-  fm_write_meta "$case_dir/secondmate-home/state/child-a1.meta" \
-    'window=firstmate:fm-child-a1' "worktree=$case_dir/child-wt-link" \
+  write_tmux_meta_at "$case_dir/secondmate-home/state/child-a1.meta" "$case_dir/secondmate-home" @43 \
+    "worktree=$case_dir/child-wt-link" \
     "project=$case_dir/project" 'kind=ship' 'mode=local-only'
   rc=0
   run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
@@ -3212,11 +3311,11 @@ test_child_treehouse_retry_revalidates_auxiliary_authority() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
-  fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
-  fm_write_meta "$home/state/child-a1.meta" \
-    'window=firstmate:fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+  write_tmux_meta_at "$home/state/child-a1.meta" "$home" @43 \
+    "worktree=$child_wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
@@ -3306,6 +3405,7 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
+test_endpoint_duplicate_created_after_preflight_blocks_close
 test_secondmate_retirement_preflights_child_duplicates
 test_secondmate_child_endpoint_close_requires_confirmed_absence
 test_tmux_duplicate_endpoints_refuse_teardown_without_closure
@@ -3321,7 +3421,7 @@ test_teardown_stage_does_not_dirty_retry_target
 test_absent_staged_target_retries_only_while_still_absent
 test_secondmate_registry_cleanup_retries_after_home_removal
 test_staged_retry_rechecks_dirty_and_unlanded_work
-test_staged_orca_retry_rechecks_backend_worktree_identity
+test_orca_staged_cleanup_refuses_without_exact_duplicate_inventory
 test_staged_teardown_refuses_changed_backlog_record
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
 test_orca_endpoint_probe_rejects_success_shaped_errors
@@ -3338,6 +3438,7 @@ test_backlog_failure_retains_finalization_state
 test_done_record_retries_after_finalization_phase_failure
 test_teardown_stage_requires_exact_schema_on_retry
 test_force_posture_cannot_change_after_backlog_recorded
+test_partial_final_state_removal_retains_retry_authority
 test_partial_truthful_finalization_retries_idempotently
 test_interrupted_truthful_hold_binds_exact_result
 test_postcleanup_retry_rechecks_endpoint_absence
