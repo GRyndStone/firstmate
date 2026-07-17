@@ -36,7 +36,7 @@ The goal is a session that is safe to reset or destroy because everything durabl
      Route it through a normal ship task so a crewmate records it via `bin/fm-ensure-agents-md.sh` and commits it through that project's delivery pipeline, exactly as section 6 describes.
      If the fleet is live, delegate this to a crewmate rather than doing it inline.
    - Knowledge generalizable to every firstmate user: this repo's own `AGENTS.md` (or other shared, tracked material), shipped through the normal branch -> no-mistakes -> PR -> captain-merge pipeline for this repo (section 1), never hand-committed straight to `main`.
-   - Task-scoped notes: inspect the relevant backlog item with `tasks-axi show <id> --full`, judge whether the new note is new, duplicate, superseding, or obsolete, then write a considered replacement body with `tasks-axi update <id> --body-file <path>`.
+   - Task-scoped notes: inspect the relevant backlog item with `bin/fm-backlog.sh show <id> --full`, judge whether the new note is new, duplicate, superseding, or obsolete, then write a considered replacement body with `bin/fm-backlog.sh update <id> --body-file <path>`.
      When the replacement intentionally supersedes prior state that should remain recoverable, add `--archive-body` to that update command so the prior body stays recoverable without copying it into the replacement.
      Never append.
      If hand-editing `data/backlog.md` per the active backend, make the same inspect-then-update edit in place.

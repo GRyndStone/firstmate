@@ -15,6 +15,7 @@
 #   - orphan status logs whose task meta has already disappeared
 #   - per-task endpoint-liveness lines for a live and a dead recorded target,
 #     tmux and herdr both
+#   - durable program sources remain visible beside an empty runnable queue
 #   - composition: the script invokes the real fm-lock.sh/fm-bootstrap.sh/
 #     fm-wake-drain.sh (their real, distinctive output appears verbatim), it
 #     does not reimplement their logic
@@ -480,8 +481,10 @@ EOF
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" "live herdr endpoint not reported alive"
   assert_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" "dead herdr endpoint not reported dead"
+  assert_contains "$out" "ALERT: same-home endpoint inventory could not be audited" \
+    "session start silently treated an unreadable Herdr inventory as duplicate-free"
 
-  pass "herdr endpoint liveness is reported per task: alive for a live pane, dead for a gone one"
+  pass "herdr endpoint liveness is reported and an unreadable duplicate inventory stays loud"
 }
 
 # --- composition: real scripts run, not reimplemented ------------------------
@@ -526,6 +529,27 @@ EOF
   assert_contains "$out" "absent" "empty fleet's AFK section did not report absent"
 
   pass "an empty fleet reports (none) for in-flight tasks and an absent AFK flag"
+}
+
+test_durable_program_source_warns_beside_empty_queue() {
+  local rec root home fakebin out
+  rec=$(new_world durable-program)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$home/data/backlog.md"
+  printf '# Durable program\n\nUnmaterialized obligations remain.\n' > "$home/data/alpha-program.md"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Durable program sources" "session start omitted the durable-program section"
+  assert_contains "$out" "alpha-program.md: $home/data/alpha-program.md" "session start omitted the durable program pointer"
+  assert_contains "$out" "runnable queue is dispatch state, not proof of durable-program completion" \
+    "session start treated the empty queue as complete program accounting"
+  assert_contains "$out" "decomposition completeness requires supervisor judgment" \
+    "session start omitted the supervisor-judgment boundary"
+  pass "session-start recovery distinguishes an empty queue from durable program obligations"
 }
 
 test_next_step_sources_x_mode_cadence() {
@@ -710,6 +734,7 @@ test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
+test_durable_program_source_warns_beside_empty_queue
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic

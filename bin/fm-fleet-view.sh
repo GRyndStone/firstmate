@@ -56,13 +56,33 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
     if ($r.blocked_by // "") == "" then "-"
     elif ($r.blocked_reason // "") == "" then $r.blocked_by
     else "\($r.blocked_by) - \($r.blocked_reason)" end;
+  def hold($r):
+    if ($r.hold // "") == "" then "-"
+    elif ($r.hold_kind // "") == "" then $r.hold
+    else "\($r.hold_kind) - \($r.hold)" end;
   def backlog_row($r):
-    "| \($r.id // "-") | \(dash($r.title // $r.raw)) | \(dash($r.repo)) | \(dash($r.kind)) | \(blocker($r)) | \(dash($r.pr_url // $r.report_path // $r.local_note)) |";
+    "| \($r.id // "-") | \(dash($r.title // $r.raw)) | \(dash($r.repo)) | \(dash($r.kind)) | \(hold($r)) | \(blocker($r)) | \(dash($r.pr_url // $r.report_path // $r.local_note)) |";
 
   "# Fleet View",
   "",
   "Schema: \(.schema)",
   "Home: \(.fm_home)",
+  "",
+  "## Queue / Durable Program",
+  "Runnable candidates: \(.queue_accounting.runnable_candidates)",
+  "Held queued tasks: \(.queue_accounting.held)",
+  "Blocked queued tasks: \(.queue_accounting.blocked)",
+  "Durable program sources: \(.queue_accounting.durable_program_source_count)",
+  "Program decomposition: \(.queue_accounting.decomposition_status)",
+  .queue_accounting.supervisor_boundary,
+  (if (.program_sources | length) == 0 then empty else (.program_sources[] | "- \(.relative_path): \(.path)") end),
+  "",
+  "## Endpoint Ownership Anomalies",
+  (if (.endpoint_anomalies | length) == 0 then
+    "No same-home duplicate recovery endpoints found."
+   else
+    (.endpoint_anomalies[] | "ALERT \(.task): recorded \(.recorded_endpoint); live \(.live_endpoints | join(", ")); worktree \(.worktree); inspect only, do not auto-close.")
+   end),
   "",
   "## In Flight",
   (if (.tasks | length) == 0 then
@@ -77,8 +97,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if ([.backlog.records[]? | select(.state == "queued")] | length) == 0 then
     "No queued backlog records found."
    else
-    "| ID | Title | Repo | Kind | Blocked By | Artifact |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| ID | Title | Repo | Kind | Hold | Blocked By | Artifact |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
     (.backlog.records[] | select(.state == "queued") | backlog_row(.))
    end),
   "",
@@ -86,8 +106,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if ([.backlog.records[]? | select(.state == "done")] | length) == 0 then
     "No done backlog records found."
    else
-    "| ID | Title | Repo | Kind | Blocked By | Artifact |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| ID | Title | Repo | Kind | Hold | Blocked By | Artifact |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
     (.backlog.records[] | select(.state == "done") | backlog_row(.))
    end),
   "",

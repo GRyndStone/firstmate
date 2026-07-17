@@ -2,8 +2,11 @@
 # Tear down a finished task: return the treehouse worktree, release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
 # clear volatile state, refresh/prune the project's clone for PR-based ship
-# tasks, then print a backlog-refresh reminder for ship and scout teardowns
-# (a secondmate teardown prints none, since secondmates are not backlog items).
+# tasks, then record backlog completion through the serialized backlog wrapper
+# for ship and scout teardowns when the tasks-axi backend is active.
+# Completion happens only after owned meta and teardown state are gone.
+# A secondmate teardown records no backlog completion because secondmates are
+# not backlog items.
 # Touches a state/<task-id>.tearing-down tombstone before the endpoint-affecting
 # cleanup and removes it with the task's other state files, so the watcher absorbs
 # the teardown's own gone endpoint while the tombstone is fresh
@@ -103,6 +106,25 @@ WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 BACKEND=$(fm_backend_of_meta "$META")
+if [ "$BACKEND" = herdr ]; then
+  DUPLICATE_AUDIT=$(
+    FM_ROOT_OVERRIDE="$FM_ROOT" \
+      FM_HOME="$FM_HOME" \
+      FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
+  ) || {
+    echo "REFUSED: could not complete the same-home duplicate endpoint audit for $ID." >&2
+    echo "Restore read-only Herdr inventory access and retry; teardown will not guess which endpoint is owned." >&2
+    exit 1
+  }
+  DUPLICATE_LIVE=$(printf '%s' "$DUPLICATE_AUDIT" | jq -r --arg id "$ID" \
+    '[.[] | select(.task == $id) | .live_endpoints[]] | unique | join(",")') || exit 1
+  if [ -n "$DUPLICATE_LIVE" ]; then
+    echo "REFUSED: task $ID has duplicate same-home recovery endpoints: $DUPLICATE_LIVE" >&2
+    echo "Inspect and reconcile exact endpoints without a broad sweep or automatic closure, then retry teardown." >&2
+    exit 1
+  fi
+fi
 if [ "$BACKEND" = orca ]; then
   T_ORCA=$(grep '^terminal=' "$META" | tail -1 | cut -d= -f2- || true)
   [ -n "$T_ORCA" ] && T=$T_ORCA
@@ -119,6 +141,10 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+BACKLOG_TRACKED=0
+if fm_tasks_axi_backend_available "$CONFIG" && "$SCRIPT_DIR/fm-backlog.sh" show "$ID" >/dev/null 2>&1; then
+  BACKLOG_TRACKED=1
+fi
 
 default_branch() {
   local ref branch
@@ -309,31 +335,49 @@ work_is_landed() {
   content_in_default
 }
 
-backlog_refresh_reminder() {
-  local pr done_cmd report_path
+backlog_complete_after_teardown() {
+  local pr report_path
   [ "$KIND" = secondmate ] && return 0
   if fm_tasks_axi_backend_available "$CONFIG"; then
+    if [ "$BACKLOG_TRACKED" -ne 1 ]; then
+      printf '%s\n' "Backlog: $ID was not present in this home's tasks-axi backlog before teardown; no Done mutation was attempted. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+      return 0
+    fi
     case "$KIND" in
       scout)
         report_path="data/$ID/report.md"
-        done_cmd="tasks-axi done $ID --report $report_path"
+        if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --report "$report_path" >/dev/null; then
+          printf '%s\n' "Backlog: $ID recorded Done with $report_path after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+        else
+          echo "error: teardown completed, but serialized backlog completion failed for scout $ID; it remains outside Done" >&2
+          return 1
+        fi
         ;;
       *)
         if [ "$MODE" = local-only ]; then
-          done_cmd="tasks-axi done $ID --note \"local main\""
+          if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --note "local main" >/dev/null; then
+            printf '%s\n' "Backlog: $ID recorded Done with local main after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+          else
+            echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
+            return 1
+          fi
         else
           pr=$PR_URL
           if [ -n "$pr" ]; then
-            done_cmd="tasks-axi done $ID --pr $pr"
+            if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --pr "$pr" >/dev/null; then
+              printf '%s\n' "Backlog: $ID recorded Done with $pr after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+            else
+              echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
+              return 1
+            fi
           else
-            done_cmd="tasks-axi done $ID --pr PR_URL"
+            printf '%s\n' "Backlog: $ID teardown succeeded, but no PR URL was recorded. It remains outside Done; run bin/fm-backlog.sh done $ID --pr PR_URL, then bin/fm-backlog.sh ready."
           fi
         fi
         ;;
     esac
-    printf '%s\n' "Backlog: $ID just finished. Run $done_cmd, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
   else
-    printf '%s\n' "Backlog: $ID just finished. Update data/backlog.md - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
+    printf '%s\n' "Backlog: $ID teardown succeeded. In manual backend mode only, update data/backlog.md now - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
   fi
 }
 
@@ -1059,4 +1103,4 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
-backlog_refresh_reminder
+backlog_complete_after_teardown

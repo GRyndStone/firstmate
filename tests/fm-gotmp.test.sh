@@ -70,7 +70,7 @@ exit 0
 SH
   chmod +x "$fake/bin/fm-fleet-sync.sh"
   # fm-tasks-axi-lib.sh: stub (teardown sources it). Report not-compatible so
-  # backlog_refresh_reminder takes the plain-message path; no tasks-axi here.
+  # post-teardown backlog completion takes the plain-message path; no tasks-axi here.
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
 fm_tasks_axi_compatible() { return 1; }
 SH

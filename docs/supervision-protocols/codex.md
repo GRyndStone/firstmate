@@ -12,3 +12,5 @@ When this session owns supervision and away mode is not active:
 
 Codex cannot reason while a foreground tool call is running.
 The bounded checkpoint returns control regularly so user messages and queued wakes can be handled without relying on background-task wake semantics.
+The checkpoint captures the exact watcher child it creates and reaps only that child on HUP, INT, TERM, timeout, or normal exit.
+An interrupted Codex tool call therefore cannot leave that watcher reparented to PID 1, and cleanup never targets another checkpoint or Firstmate home's watcher.

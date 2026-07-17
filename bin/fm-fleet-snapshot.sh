@@ -27,6 +27,11 @@
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
 #   scout_reports[]: present data/<id>/report.md pointers.
+#   endpoint_anomalies[]: deterministic same-home duplicate endpoint findings.
+#   program_sources[]: durable data/program.md, data/*-program.md, and
+#     data/programs/*.md pointers.
+#   queue_accounting: runnable candidates, held/blocked queued work, and the
+#     explicit supervisor-judgment boundary for program decomposition.
 #   secondmate_guidance: return-channel action note for renderers and bearings.
 #
 # Compatibility: JSON is the primary machine-readable surface.
@@ -48,6 +53,9 @@ BACKLOG="$DATA/backlog.md"
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-program-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-program-lib.sh"
 
 usage() {
   cat <<'EOF'
@@ -165,7 +173,7 @@ backlog_json() {
     def links($rest): [$rest | scan(url_pattern)];
     def strip_trailing_metadata:
       reduce range(0; 20) as $_ (.;
-        sub("[[:space:]]*\\([[:space:]]*(?:(?:repo|kind|priority):[[:space:]]*[^)]*|(?:since|merged|reported|done)[[:space:]]+[^)]*)[[:space:]]*\\)[[:space:]]*$"; ""));
+        sub("[[:space:]]*\\([[:space:]]*(?:(?:repo|kind|priority|hold|hold-kind):[[:space:]]*[^)]*|(?:since|merged|reported|done)[[:space:]]+[^)]*)[[:space:]]*\\)[[:space:]]*$"; ""));
     def strip_title_artifacts:
       sub("[[:space:]]+-[[:space:]]+data/[^[:space:])]+/report\\.md$"; "")
       | sub("[[:space:]]+data/[^[:space:])]+/report\\.md$"; "")
@@ -220,6 +228,8 @@ backlog_json() {
              repo:metadata($rest; "repo"),
              kind:metadata($rest; "kind"),
              priority:metadata($rest; "priority"),
+             hold:metadata($rest; "hold"),
+             hold_kind:metadata($rest; "hold-kind"),
              blocked_by:cap($rest; ".*blocked-by:[[:space:]]*(?<v>[^[:space:])]+).*"),
              blocked_reason:blocked_reason($rest),
              since:metadata_word($rest; "since"),
@@ -432,9 +442,24 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
+program_source_lines() {
+  local relative source
+  while IFS=$'\t' read -r relative source; do
+    [ -n "$source" ] || continue
+    jq -n --arg path "$source" --arg relative "$relative" '{path:$path,relative_path:$relative}'
+  done < <(fm_program_source_lines "$DATA") | jq -s 'sort_by(.relative_path)'
+}
+
 BACKLOG_JSON=$(backlog_json)
 TASKS_JSON=$(task_json_lines)
 SCOUT_REPORTS_JSON=$(scout_report_lines)
+PROGRAM_SOURCES_JSON=$(program_source_lines)
+ENDPOINT_ANOMALIES_JSON=$(
+  FM_ROOT_OVERRIDE="$FM_ROOT" \
+    FM_HOME="$FM_HOME" \
+    FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
+) || exit 1
 
 jq -n \
   --arg fm_home "$FM_HOME" \
@@ -446,6 +471,8 @@ jq -n \
   --argjson backlog "$BACKLOG_JSON" \
   --argjson tasks "$TASKS_JSON" \
   --argjson scout_reports "$SCOUT_REPORTS_JSON" \
+  --argjson program_sources "$PROGRAM_SOURCES_JSON" \
+  --argjson endpoint_anomalies "$ENDPOINT_ANOMALIES_JSON" \
   'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
@@ -456,6 +483,20 @@ jq -n \
      backlog:$backlog,
      tasks:($tasks | map(. + {backlog:backlog_by_id(.id)})),
      scout_reports:($scout_reports | map(. + {kind:report_kind(.id)})),
+     endpoint_anomalies:$endpoint_anomalies,
+     program_sources:$program_sources,
+     queue_accounting:{
+       queued_total:([$backlog.records[]? | select(.state == "queued")] | length),
+       structured_queued:([$backlog.records[]? | select(.state == "queued" and .structured == true)] | length),
+       unstructured_queued:([$backlog.records[]? | select(.state == "queued" and .structured != true)] | length),
+       held:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") != "")] | length),
+       blocked:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.blocked_by // "") != "")] | length),
+       runnable_candidates:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") == "" and (.blocked_by // "") == "")] | length),
+       empty_runnable_queue:(([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") == "" and (.blocked_by // "") == "")] | length) == 0),
+       durable_program_source_count:($program_sources | length),
+       decomposition_status:(if ($program_sources | length) > 0 then "requires_supervisor_judgment" else "no_declared_program_sources" end),
+       supervisor_boundary:(if ($program_sources | length) > 0 then "An empty runnable queue does not prove the durable program is complete; audit each program source for obligations that were never materialized as backlog tasks." else "No convention-named durable program source was found; absence does not prove that no plan exists elsewhere." end)
+     },
      secondmate_guidance:{
        note:"For kind=secondmate, send marked supervisor requests with fm-send and read the status/doc return channel; do not routinely fm-peek the secondmate chat for answers."
      }

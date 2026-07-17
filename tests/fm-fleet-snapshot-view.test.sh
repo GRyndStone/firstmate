@@ -363,11 +363,11 @@ EOF
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$VIEW")
   assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | present | $data/bold-task/report.md" \
     "view should render bold in-flight row from snapshot"
-  assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | queued-comma - waits on queued-comma | - |" \
+  assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | - | queued-comma - waits on queued-comma | - |" \
     "view should render blocked reason without title metadata"
-  assert_contains "$view" "| done-bracket-pr | Done Bracket PR | gamma | ship | - | https://github.com/kunchenguid/firstmate/pull/43 |" \
+  assert_contains "$view" "| done-bracket-pr | Done Bracket PR | gamma | ship | - | - | https://github.com/kunchenguid/firstmate/pull/43 |" \
     "view should render bracketed PR artifact outside the title"
-  assert_contains "$view" "| done-note | Done Note | delta | ship | - | local main |" \
+  assert_contains "$view" "| done-note | Done Note | delta | ship | - | - | local main |" \
     "view should render local-only done artifact outside the title"
   pass "snapshot parses tasks-axi rows and respects operational overrides"
 }
@@ -380,9 +380,9 @@ test_view_renders_snapshot() {
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
   assert_contains "$view" "| ship-task | working / pane | ship | alpha | tmux | present | https://github.com/kunchenguid/firstmate/pull/9" \
     "view should render ship row from snapshot"
-  assert_contains "$view" "| queued-task | Queued Task | alpha | ship | ship-task | -" \
+  assert_contains "$view" "| queued-task | Queued Task | alpha | ship | - | ship-task | -" \
     "view should render queued backlog row"
-  assert_contains "$view" "| done-task | Done Task | alpha | ship | - | https://github.com/kunchenguid/firstmate/pull/7 |" \
+  assert_contains "$view" "| done-task | Done Task | alpha | ship | - | - | https://github.com/kunchenguid/firstmate/pull/7 |" \
     "view should render done backlog row"
   assert_contains "$view" "bin/fm-send.sh fm-secondmate-task" \
     "view should show secondmate send guidance"
@@ -391,6 +391,38 @@ test_view_renders_snapshot() {
   assert_not_contains "$view" "fm-peek.sh fm-secondmate-task" \
     "view must not tell firstmate to routinely peek secondmates"
   pass "fleet view renders the snapshot without secondmate peek guidance"
+}
+
+test_queue_accounting_surfaces_holds_and_durable_program_boundary() {
+  local home out view
+  home=$(make_home program-boundary)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] held-task - Held Task (repo: alpha) (kind: ship) (hold: captain decision pending) (hold-kind: captain)
+- [ ] blocked-task - Blocked Task (repo: alpha) (kind: ship) blocked-by: dependency - waiting for dependency
+
+## Done
+EOF
+  printf '# Durable program\n\nThis plan still has undecomposed obligations.\n' > "$home/data/alpha-program.md"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e --arg path "$home/data/alpha-program.md" '
+    .queue_accounting.runnable_candidates == 0
+      and .queue_accounting.empty_runnable_queue == true
+      and .queue_accounting.held == 1
+      and .queue_accounting.blocked == 1
+      and .queue_accounting.durable_program_source_count == 1
+      and .queue_accounting.decomposition_status == "requires_supervisor_judgment"
+      and .program_sources == [{path:$path,relative_path:"alpha-program.md"}]
+      and (.queue_accounting.supervisor_boundary | contains("does not prove the durable program is complete"))
+  ' >/dev/null || fail "queue/program accounting did not distinguish an empty runnable queue from durable obligations: $out"
+  view=$(FM_HOME="$home" "$VIEW")
+  assert_contains "$view" "Runnable candidates: 0" "view omitted the empty runnable queue"
+  assert_contains "$view" "Durable program sources: 1" "view omitted durable program sources"
+  assert_contains "$view" "| held-task | Held Task | alpha | ship | captain - captain decision pending |" \
+    "view omitted structured held work"
+  pass "status reporting distinguishes an empty runnable queue from held work and durable program obligations"
 }
 
 test_view_renders_dead_secondmate_agent_status() {
@@ -573,4 +605,5 @@ test_parked_scout_decision_stays_pending
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
+test_queue_accounting_surfaces_holds_and_durable_program_boundary
 test_view_renders_dead_secondmate_agent_status

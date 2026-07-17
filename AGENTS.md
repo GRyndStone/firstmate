@@ -243,6 +243,7 @@ Reconcile reality with your records before doing anything else, working from the
    If older wake-event history matters, read the individual full status log named in the digest instead of bulk-reading every status file.
 4. Use the `window=` values from the digest's `state/*.meta` entries as the live direct-report set, and read the digest's per-task `endpoint: alive|dead` line for each - that cheap check is already done; do not re-probe it yourself.
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
+   Treat any `Endpoint ownership anomalies` alert as duplicate same-home accounting to inspect explicitly; the audit is read-only and never licenses automatic closure.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
 6. For meta with no window, or an endpoint the digest reported dead, reconcile by kind.
    For ordinary crewmates, check the recorded backend metadata first; use `treehouse status` for treehouse-backed tasks, and the recorded `orca_worktree_id=`/`terminal=` for Orca tasks.
@@ -327,7 +328,7 @@ Route each piece of durable knowledge to its most specific home:
 | Project-intrinsic knowledge | that project's own `AGENTS.md`, via normal crewmate delivery, never hand-written by firstmate |
 | Fleet-local operational facts and gotchas | `data/learnings.md`, inspected first and rewritten or pruned in place |
 | Knowledge generalizable to every firstmate user | the shared `AGENTS.md`, shipped via PR through the pipeline |
-| Task-scoped notes | backlog item notes, inspect first with `tasks-axi show <id> --full`, then replace the body with `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when superseded prior state should remain recoverable, or hand-edit per the active backend |
+| Task-scoped notes | backlog item notes, inspect first with `bin/fm-backlog.sh show <id> --full`, then replace the body with `bin/fm-backlog.sh update <id> --body-file <path>`, adding `--archive-body` when superseded prior state should remain recoverable, or hand-edit per the active backend |
 | Investigation findings | scout reports at `data/<id>/report.md` |
 
 When the captain invokes `/stow`, load the `stow` skill.
@@ -513,7 +514,9 @@ The script refuses if the worktree holds uncommitted changes or committed work t
 `bin/fm-teardown.sh`'s header owns the full landed-work definition (remote-reachable, merged-PR-head containment for the squash-merge-then-delete-branch flow, content already in the default branch, local-only merges) and the `pr=` discovery fallback for merges that skipped `bin/fm-pr-check.sh`.
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 A successful PR-based teardown also refreshes that project's clone through `bin/fm-fleet-sync.sh`, best-effort.
-Then update the backlog using the teardown reminder: run `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise move the task to Done in `data/backlog.md` manually with the full `https://...` PR URL or local merge note and date and keep Done to the 10 most recent.
+Successful teardown records Done through `bin/fm-backlog.sh` after owned endpoint, worktree, meta, and teardown state are resolved when the compatible tasks-axi backend is active.
+If teardown says the task was untracked or lacked a recorded PR, follow its serialized backlog instruction only after teardown has succeeded.
+With the manual backend, move the task to Done in `data/backlog.md` only after successful teardown, using the full `https://...` PR URL or local merge note and date and keeping Done to the 10 most recent.
 Re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 ### Secondmate teardown (explicit only)
@@ -532,7 +535,8 @@ A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold th
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
 - Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
 - Tear down immediately - no merge gate. `bin/fm-teardown.sh` allows a scout worktree's scratch commits and dirty files once the report exists; if the report is missing, it refuses, because the findings are the work product.
-- Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
+- Successful teardown records the scout in Done with its report path through `bin/fm-backlog.sh`; the wrapper and teardown both refuse a missing report, and manual-backend completion happens only after teardown succeeds.
+- Then re-evaluate the queue and dispatch only queued work whose blockers and holds are gone and whose time/date gate, if any, has arrived.
 
 **Promotion.** When a scout's findings reveal shippable work (a reproduced bug with a clear fix) and the captain wants it shipped, promote the task in place instead of respawning: run `bin/fm-promote.sh <id>` (flips `kind=` to ship in meta, restoring teardown's full protection), then from an active firstmate session send the crewmate its ship instructions with `FM_HOME=<this-firstmate-home> bin/fm-send.sh` unless `FM_HOME` is already set to the active firstmate home - inventory scratch state, reset to a clean default-branch base, carry over only intended fix changes, create branch `fm/<id>`, implement, and report `done` according to the project's delivery mode.
 The crewmate keeps its worktree, loaded context, and repro, but the ship branch must start from a clean base with only intended changes; scratch commits and debug edits from the scout phase never ride along.
@@ -673,7 +677,7 @@ As a courtesy, mention cost when unusually much work is running (more than ~8 co
 `data/backlog.md` is the durable queue.
 It tracks work items only, never agents; persistent secondmates never appear as backlog items.
 Work routed to a secondmate is recorded in that secondmate home's own backlog, not the main backlog.
-When a main-side thread such as a pending captain decision or relay reminder is worth durable tracking, file it as its own work item; use `tasks-axi hold <id> --reason "<reason>" --kind captain` for a captain-gated thread.
+When a main-side thread such as a pending captain decision or relay reminder is worth durable tracking, file it as its own work item; use `bin/fm-backlog.sh hold <id> --reason "<reason>" --kind captain` for a captain-gated thread.
 Update the backlog on every dispatch, completion, and decision for a work item.
 
 ```markdown
@@ -690,38 +694,39 @@ Update the backlog on every dispatch, completion, and decision for a work item.
 ```
 
 Re-evaluate Queued on every teardown and every heartbeat: anything whose blocker is gone and whose time/date gate, if any, has arrived gets dispatched.
+An empty runnable queue is not proof that a durable program is complete: read `bin/fm-fleet-view.sh`'s program-source warning and audit convention-named program documents for obligations that were never materialized as tasks.
 
 A tracked `.tasks.toml` at this repo root pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 The local, gitignored `config/backlog-backend` file is the explicit opt-out knob.
 Absent or `tasks-axi` means use the default tasks-axi backend; `manual` means force routine backlog updates to hand-editing even when `tasks-axi` is installed.
 Compatible means the shared bootstrap probe accepts `tasks-axi --version` as 0.1.1 or newer, `tasks-axi update --help` exposes `--archive-body`, and `tasks-axi mv --help` exposes `[<id>...]` for atomic multi-ID moves.
-When the default backend is selected and compatible `tasks-axi` is on PATH, firstmate mutates the backlog through its verbs instead of hand-editing, with secondmate handoffs still going through the validated helper described in section 6.
+When the default backend is selected and compatible `tasks-axi` is on PATH, firstmate runs every routine backlog mutation through `bin/fm-backlog.sh` instead of invoking mutating `tasks-axi` verbs directly or hand-editing, with secondmate handoffs still going through the validated helper described in section 6.
 When the default backend is selected but `tasks-axi` is missing or incompatible, bootstrap reports it through the normal `MISSING:` consent flow in `docs/configuration.md` "Toolchain", and every firstmate home falls back to hand-editing routine `data/backlog.md` updates exactly as this section describes until it is installed.
 When `config/backlog-backend=manual`, every firstmate home hand-edits routine backlog updates; bootstrap still requires compatible `tasks-axi` on `PATH` but does not print `TASKS_AXI: available`.
 The `## In flight` / `## Queued` / `## Done` format above stays the contract: the verbs edit `data/backlog.md` in place, byte-exact, preserving whatever item forms the file already uses - the bold in-flight `- **<id>**` form, the `- [ ]`/`- [x]` queued and done forms, and `blocked-by: <id> - <reason>` - rather than reformatting them.
 Secondmates inherit `config/backlog-backend` from the primary.
 If the primary leaves the file absent, each home uses the default tasks-axi backend path with its own `.tasks.toml`; if the primary opts out with `manual`, secondmate homes hand-edit routine backlog updates too.
 Keep Done to the 10 most recent entries.
-With the active compatible tasks-axi backend, `tasks-axi done` auto-prunes Done and archives pruned entries to `data/done-archive.md`, so do not hand-prune.
+With the active compatible tasks-axi backend, the wrapper's delegated `done` auto-prunes Done and archives pruned entries to `data/done-archive.md`, so do not hand-prune.
 When hand-editing, prune older Done entries manually whenever you add to the section.
 Pruning loses nothing: finished PR-based ship tasks live on as GitHub PRs, local-only ship tasks live on in local `main`, and scout tasks live on as report files.
 Map firstmate's real backlog operations to the approved commands:
 
-- File an item: `tasks-axi add <id> "<one line>" --kind <ship|scout> --repo <name>`, plus `--start` for immediate dispatch (In flight) or the default queue placement, and `--blocked-by <id>` (repeatable) when it waits on another task.
-- Start an existing queued item: `tasks-axi start <id>` before dispatching work from Queued, after checking that blockers are gone and any time/date gate has arrived.
-- Move a finished task to Done: `tasks-axi done <id> --pr <url>` for a PR-based ship, `--report <path>` for a scout, or `--note "local main"` for a local-only merge.
-- Update task notes: inspect first with `tasks-axi show <id> --full`, then replace the considered body with `tasks-axi update <id> --body-file <path>`.
+- File an item: `bin/fm-backlog.sh add <id> "<one line>" --kind <ship|scout> --repo <name>`, plus `--start` for immediate dispatch (In flight) or the default queue placement, and `--blocked-by <id>` (repeatable) when it waits on another task.
+- Start an existing queued item: `bin/fm-backlog.sh start <id>` before dispatching work from Queued, after checking that blockers and holds are gone and any time/date gate has arrived.
+- Move a finished task to Done: let successful `bin/fm-teardown.sh <id>` record it after lifecycle cleanup; only use its printed `bin/fm-backlog.sh done` recovery command when teardown succeeded but a required artifact link was not yet recorded.
+- Update task notes: inspect first with `bin/fm-backlog.sh show <id> --full`, then replace the considered body with `bin/fm-backlog.sh update <id> --body-file <path>`.
   Add `--archive-body` to that update command when superseding prior state should remain recoverable.
-- Manage dependencies: `tasks-axi block <id> --by <other>` and `tasks-axi unblock <id> --by <other>`, then `tasks-axi ready` to list queued work with no unresolved blockers.
+- Manage dependencies: `bin/fm-backlog.sh block <id> --by <other>` and `bin/fm-backlog.sh unblock <id> --by <other>`, then `bin/fm-backlog.sh ready` to list queued work with no unresolved blockers.
   This is a dependency check only; future-dated items still stay queued until their date arrives.
-- Read an item's full notes: `tasks-axi show <id> --full`.
+- Read an item's full notes: `bin/fm-backlog.sh show <id> --full`.
 - Hand a task off to a secondmate home: load `secondmate-provisioning`, then keep using `bin/fm-backlog-handoff.sh <secondmate-id> <item-key>...`; do not call bare `tasks-axi mv` for this path, because the helper resolves and validates the secondmate home before moving anything.
-- Normalize the file: `tasks-axi render` rewrites every id'd task in canonical form and leaves free-form lines untouched.
+- Normalize the file: `bin/fm-backlog.sh render` rewrites every id'd task in canonical form and leaves free-form lines untouched.
 
 **Note hygiene:** Keep free-form backlog and task note/status prose free of volatile incidental specifics that rot: temp paths, in-flight versions, moving state locations, and ephemeral IDs.
 Reference the authoritative source instead of duplicating it into prose - "state per the module's backend config", not a literal path.
 Before acting on a note's volatile detail, verify it against the source of truth (the config, the live system, the API); notes drift.
-The backlog format's structured fields are different: task IDs, blocked-by IDs, and Done-entry PR URLs or report paths from `tasks-axi done --pr <url>` or `--report <path>` are the durable record required by this schema.
+The backlog format's structured fields are different: task IDs, blocked-by IDs, and Done-entry PR URLs or report paths from the serialized completion path are the durable record required by this schema.
 Correct or delete stale free-form notes the moment you catch them, and put durable facts in curated memory (section 6's knowledge-routing homes), not scattered across one-off task notes.
 
 ## 11. Crewmate briefs

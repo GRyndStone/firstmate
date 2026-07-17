@@ -79,7 +79,44 @@ test_existing_singleton_watcher_is_not_success() {
   pass "checkpoint rejects an existing watcher singleton as unowned"
 }
 
+test_interrupted_checkpoint_reaps_only_its_watcher() {
+  local home out err checkpoint_pid watcher_pid unrelated i status
+  home=$(make_home interrupted)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  sleep 30 &
+  unrelated=$!
+  FM_HOME="$home" FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" &
+  checkpoint_pid=$!
+  watcher_pid=
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$home/state/.watch.lock/pid" 2>/dev/null || true)
+    [ -n "$watcher_pid" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -n "$watcher_pid" ] || fail "interrupted checkpoint never recorded its watcher child"
+  [ "$(ps -p "$watcher_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')" = "$checkpoint_pid" ] \
+    || fail "watcher $watcher_pid was not the checkpoint's direct child"
+
+  kill -TERM "$checkpoint_pid"
+  status=0
+  wait "$checkpoint_pid" || status=$?
+  expect_code 143 "$status" "interrupted checkpoint exit"
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    fail "watcher child $watcher_pid survived its interrupted checkpoint"
+  fi
+  assert_absent "$home/state/.watch.lock/pid" "interrupted checkpoint left a watcher lock"
+  kill -0 "$unrelated" 2>/dev/null || fail "checkpoint cleanup killed an unrelated process"
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+  pass "interrupted checkpoint reaps only its exact watcher child instead of orphaning it"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success
+test_interrupted_checkpoint_reaps_only_its_watcher

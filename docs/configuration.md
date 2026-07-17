@@ -9,8 +9,15 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
-When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses its verbs for routine backlog mutations.
+When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses `bin/fm-backlog.sh` for routine backlog operations.
+That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
+The wrapper refuses `done` while owned task meta or teardown state exists, and it refuses a scout report completion unless the exact owned report exists.
+`fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, clearing owned lifecycle state, and only then asking the wrapper to record Done.
+For a Herdr task, teardown first runs the same-home duplicate audit and refuses when more than one live task endpoint exists, leaving exact reconciliation to the supervisor rather than closing anything automatically.
+If the Done mutation fails after teardown, the lifecycle is safely closed but the command fails loudly and the backlog remains outside Done for explicit reconciliation.
+Manual backend edits cannot be mechanically serialized by this wrapper, so the operating contract requires completion edits only after successful teardown and requires operators not to write the same backlog concurrently.
 Secondmate handoffs are separate and unconditional: `fm-backlog-handoff.sh` keeps only its own fleet-level validation and always delegates the item move to `tasks-axi mv`, the single owner of the backlog format.
+It acquires both homes' backlog locks in sorted absolute-path order before classification and holds them through the atomic move, preventing races on either file without deadlocking opposite handoffs.
 It moves in-scope `## Queued` items only and refuses `## In flight` and historical `## Done` records, which stay with their home for pruning or archiving.
 Handoff item bodies must use at least two leading spaces, and the helper refuses a selected item with a single-space or tab-indented continuation rather than risk orphaning it.
 Because bootstrap requires `tasks-axi` on `PATH` on every profile, that delegation works fleet-wide, and the `config/backlog-backend=manual` knob governs firstmate's own hand-editing of its backlog, not this validated helper.
@@ -20,6 +27,9 @@ Bootstrap requires compatible `tasks-axi` on every profile; see "Toolchain" belo
 Set the local, gitignored `config/backlog-backend` file to `manual` to force manual backlog editing and suppress `TASKS_AXI: available`, not missing-tool reporting.
 Absent or `tasks-axi` selects the default tasks-axi backend.
 The file format is unchanged in both modes; tasks-axi and manual edits produce the same `## In flight`, `## Queued`, and `## Done` sections.
+`bin/fm-program-lib.sh` owns the convention that `data/program.md`, `data/*-program.md`, and `data/programs/*.md` are durable program-source pointers.
+Session-start recovery and the canonical fleet snapshot report them beside the backlog or structured runnable, held, and blocked queue counts.
+It deliberately does not interpret prose plans into obligations: when any source exists, decomposition status remains `requires_supervisor_judgment`, and an empty runnable queue is never reported as proof that the program is complete.
 
 ## Runtime backend (config/backend / FM_BACKEND)
 
@@ -54,6 +64,9 @@ These five sentences are the single owner of the task-selector vocabulary; backe
 `fm-teardown.sh <id>` takes a task id directly and uses the same recorded backend target fields after loading `state/<id>.meta`.
 Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
+`bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate Herdr endpoints.
+It queries only sessions and exact workspace ids named by the active home's own meta, groups duplicate `fm-<id>` labels deterministically, and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
+Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.
 For normal zellij operations, `FM_ZELLIJ_SESSION` selects the named session and defaults to `firstmate`.

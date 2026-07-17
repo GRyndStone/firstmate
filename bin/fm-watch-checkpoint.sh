@@ -49,42 +49,82 @@ ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
   exit 1
 }
-trap 'rm -f "$OUT" "$ERR"' EXIT
+TIMEOUT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.timeout.XXXXXX") || {
+  rm -f "$OUT" "$ERR"
+  exit 1
+}
+rm -f "$TIMEOUT_MARKER"
+WATCH_PID=
+TIMER_PID=
+CLEANED=0
 
-run_with_perl_timeout() {
-  perl -e '
-    my $seconds = shift;
-    my $pid = fork;
-    die "fork failed\n" unless defined $pid;
-    if (!$pid) {
-      setpgrp(0, 0);
-      exec @ARGV;
-      die "exec failed: $!\n";
-    }
-    local $SIG{ALRM} = sub {
-      kill "TERM", -$pid;
-      select undef, undef, undef, 0.2;
-      kill "KILL", -$pid;
-      exit 124;
-    };
-    alarm $seconds;
-    waitpid $pid, 0;
-    exit($? >> 8);
-  ' "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh"
+# shellcheck disable=SC2329 # Invoked by EXIT and signal traps below.
+cleanup_owned_children() {
+  local i
+  [ "$CLEANED" -eq 0 ] || return 0
+  CLEANED=1
+  if [ -n "$TIMER_PID" ] && kill -0 "$TIMER_PID" 2>/dev/null; then
+    kill -TERM "$TIMER_PID" 2>/dev/null || true
+  fi
+  [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
+  TIMER_PID=
+  if [ -n "$WATCH_PID" ] && kill -0 "$WATCH_PID" 2>/dev/null; then
+    kill -TERM "$WATCH_PID" 2>/dev/null || true
+    i=0
+    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 20 ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    if kill -0 "$WATCH_PID" 2>/dev/null; then
+      kill -KILL "$WATCH_PID" 2>/dev/null || true
+    fi
+  fi
+  [ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null || true
+  WATCH_PID=
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER"
 }
 
+# shellcheck disable=SC2329 # Invoked by HUP, INT, and TERM traps below.
+checkpoint_interrupted() {
+  local code=$1
+  trap - HUP INT TERM
+  cleanup_owned_children
+  exit "$code"
+}
+
+trap 'checkpoint_interrupted 129' HUP
+trap 'checkpoint_interrupted 130' INT
+trap 'checkpoint_interrupted 143' TERM
+trap cleanup_owned_children EXIT
+
+# The checkpoint owns one exact watcher child and one exact timer child.
+# Signal traps terminate and reap only those captured PIDs, so an interrupted
+# foreground tool call cannot reparent fm-watch.sh to PID 1 or touch a watcher
+# belonging to another checkpoint or Firstmate home.
+"$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR" &
+WATCH_PID=$!
+(
+  sleep "$SECONDS_ARG"
+  if kill -TERM "$WATCH_PID" 2>/dev/null; then
+    : > "$TIMEOUT_MARKER"
+  fi
+) &
+TIMER_PID=$!
+
 set +e
-if command -v timeout >/dev/null 2>&1; then
-  timeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
-  RC=$?
-elif command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
-  RC=$?
-else
-  run_with_perl_timeout >"$OUT" 2>"$ERR"
-  RC=$?
-fi
+wait "$WATCH_PID"
+RC=$?
 set -e
+WATCH_PID=
+if kill -0 "$TIMER_PID" 2>/dev/null; then
+  kill -TERM "$TIMER_PID" 2>/dev/null || true
+fi
+wait "$TIMER_PID" 2>/dev/null || true
+TIMER_PID=
+
+if [ -e "$TIMEOUT_MARKER" ]; then
+  RC=124
+fi
 
 if grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" >/dev/null 2>&1; then
   cat "$OUT"

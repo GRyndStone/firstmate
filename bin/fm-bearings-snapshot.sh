@@ -30,7 +30,7 @@
 #   --all-in-flight  include every in-flight task
 #   --all-decisions  include every open decision
 #   --all-reports    include the full scout-report inventory (default: relevant only)
-#   --all-queued     include superseded/held queued items (default: dropped)
+#   --all-queued     include superseded queued items (default: dropped)
 #   --all-recorded-prs include every locally recorded PR
 #   --all-unhealthy  include every unhealthy endpoint
 #   --all-pr-repos   query every discovered repository under --include-prs
@@ -80,7 +80,8 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,blocked_by,reason}, reports{id,path}, recorded_prs{id,url},
+  gates{id,title,hold,blocked_by,reason}, program{...}, reports{id,path},
+  recorded_prs{id,url}, duplicate_endpoints{...},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
   --all-decisions, --all-reports, --all-queued, --all-recorded-prs,
@@ -273,8 +274,10 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(.state == "queued" and .structured)
        | select(($all_queued == 1)
                 or (((.body_excerpt // "") | test("SUPERSEDED|NOT REQUIRED|NOT-REQUIRED|DEFERRED"; "i")) | not))
-       | {id, title:(.title | trunc(60)), blocked_by:(.blocked_by // "-"),
-          reason:((.blocked_reason // "-") | trunc(40))} ]) as $gates_all
+       | {id, title:(.title | trunc(60)),
+          hold:(if (.hold // "") == "" then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
+          blocked_by:(.blocked_by // "-"),
+          reason:((if (.hold // "") != "" then .hold else (.blocked_reason // "-") end) | trunc(60))} ]) as $gates_all
   | ([ .scout_reports[]
        | . as $r
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))
@@ -291,8 +294,17 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       landed: ($done | map({id, what:(.title | trunc(70)),
                             artifact:(.pr_url // .report_path // .local_note // "-")})),
       gates: (if $all_queued == 1 then $gates_all else $gates_all[:$gates_n] end),
+      program:[{
+        runnable_candidates:$snap.queue_accounting.runnable_candidates,
+        held:$snap.queue_accounting.held,
+        blocked:$snap.queue_accounting.blocked,
+        durable_sources:$snap.queue_accounting.durable_program_source_count,
+        decomposition:$snap.queue_accounting.decomposition_status,
+        boundary:$snap.queue_accounting.supervisor_boundary
+      }],
       reports: (if $all_reports == 1 then $reports_all else $reports_all[:$reports_n] end),
-      recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end)
+      recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end),
+      duplicate_endpoints:($snap.endpoint_anomalies | map({id:.task,backend,recorded:.recorded_endpoint,live:(.live_endpoints | join("|")),worktree,action}))
     }
   | . + (if ($unhealthy_all | length) > 0 then
            {unhealthy_endpoints:(if $all_unhealthy == 1 then $unhealthy_all else $unhealthy_all[:$unhealthy_n] end)}
@@ -308,7 +320,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $f_actions then empty else {surface:"watch/steer actions", reveal:"--fields actions"} end),
         (if $f_endpoints then empty else {surface:"healthy endpoint detail", reveal:"--fields endpoints"} end),
         (if $all_reports == 1 then empty else {surface:"full scout-report inventory", reveal:"--all-reports"} end),
-        (if $all_queued == 1 then empty else {surface:"superseded/held queued items", reveal:"--all-queued"} end),
+        (if $all_queued == 1 then empty else {surface:"superseded queued items", reveal:"--all-queued"} end),
         (if $all_in_flight == 0 and ($in_flight_all | length) > $in_flight_n then {surface:("in_flight showing \($in_flight_n) of \($in_flight_all | length)"), reveal:"--all-in-flight"} else empty end),
         (if $all_decisions == 0 and ($decisions_all | length) > $decisions_n then {surface:("decisions_open showing \($decisions_n) of \($decisions_all | length)"), reveal:"--all-decisions"} else empty end),
         (if $all_queued == 0 and ($gates_all | length) > $gates_n then {surface:("gates showing \($gates_n) of \($gates_all | length)"), reveal:"--all-queued"} else empty end),

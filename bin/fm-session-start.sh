@@ -34,9 +34,11 @@
 #                       when locked.
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
-#   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
-#                       state/*.status tail, state/.afk, and a cheap
-#                       per-task endpoint-liveness read: read-only, always runs.
+#   5. fleet digest   - data/backlog.md, durable program-source pointers,
+#                       every state/*.meta, a bounded state/*.status tail,
+#                       same-home endpoint ownership anomalies, state/.afk,
+#                       and a cheap per-task endpoint-liveness read: read-only,
+#                       always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
@@ -81,6 +83,8 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-program-lib.sh
+. "$SCRIPT_DIR/fm-program-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -236,6 +240,20 @@ print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 section "FLEET STATE"
 print_file_or_absent "$DATA/backlog.md" "data/backlog.md"
 
+subsection "Durable program sources"
+PROGRAM_FOUND=0
+while IFS=$'\t' read -r relative source; do
+  [ -n "$source" ] || continue
+  PROGRAM_FOUND=1
+  printf '%s: %s\n' "$relative" "$source"
+done < <(fm_program_source_lines "$DATA")
+if [ "$PROGRAM_FOUND" -eq 1 ]; then
+  printf 'WARNING: the runnable queue is dispatch state, not proof of durable-program completion; audit each source for obligations that were never materialized as tasks.\n'
+  printf 'Boundary: decomposition completeness requires supervisor judgment; use bin/fm-fleet-view.sh for structured runnable, held, and blocked counts.\n'
+else
+  printf '(none found by the documented naming convention; absence does not prove no plan exists elsewhere)\n'
+fi
+
 subsection "In-flight tasks (state/*.meta)"
 META_FOUND=0
 for meta in "$STATE"/*.meta; do
@@ -266,6 +284,14 @@ for meta in "$STATE"/*.meta; do
   fi
 done
 [ "$META_FOUND" -eq 1 ] || printf '(none)\n'
+
+subsection "Endpoint ownership anomalies"
+if ! FM_ROOT_OVERRIDE="$FM_ROOT" \
+  FM_HOME="$FM_HOME" \
+  FM_STATE_OVERRIDE="$STATE" \
+  "$SCRIPT_DIR/fm-endpoint-audit.sh"; then
+  printf 'ALERT: same-home endpoint inventory could not be audited; duplicate recovery endpoints cannot be ruled out.\n'
+fi
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
 ORPHAN_STATUS_FOUND=0

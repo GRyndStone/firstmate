@@ -146,6 +146,13 @@ if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'
   exit 0
 fi
+if [ "${1:-}" = done ]; then
+  if [ -e "${FM_STATE_OVERRIDE:-/nonexistent}/${2:-}.meta" ] || [ -e "${FM_STATE_OVERRIDE:-/nonexistent}/${2:-}.tearing-down" ]; then
+    echo 'tasks-axi done ran before teardown state was cleared' >&2
+    exit 8
+  fi
+  [ -z "${FM_TASKS_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TASKS_LOG"
+fi
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tasks-axi"
@@ -514,23 +521,26 @@ test_local_only_fork_remote_allows() {
   pass "local-only worktree with HEAD on a fork remote is torn down (fix holds)"
 }
 
-test_teardown_prompts_tasks_axi_done_when_compatible() {
-  local case_dir out
+test_teardown_records_tasks_axi_done_after_cleanup_when_compatible() {
+  local case_dir out log
   case_dir=$(make_case tasks-axi-reminder)
+  log="$case_dir/tasks.log"
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   add_compatible_tasks_axi "$case_dir"
 
-  out=$(run_teardown "$case_dir") || fail "teardown failed with compatible tasks-axi"
-  printf '%s\n' "$out" | grep -F 'tasks-axi done task-x1 --pr https://github.com/example/repo/pull/7' >/dev/null \
-    || fail "teardown did not prompt tasks-axi done: $out"
-  printf '%s\n' "$out" | grep -F 'tasks-axi ready' >/dev/null \
-    || fail "teardown did not prompt tasks-axi ready: $out"
+  out=$(FM_TASKS_LOG="$log" run_teardown "$case_dir") || fail "teardown failed with compatible tasks-axi"
+  assert_contains "$(cat "$log")" 'done task-x1 --pr https://github.com/example/repo/pull/7' \
+    "teardown did not record Done after cleanup"
+  printf '%s\n' "$out" | grep -F 'recorded Done with https://github.com/example/repo/pull/7 after successful teardown' >/dev/null \
+    || fail "teardown did not confirm ordered backlog completion: $out"
+  printf '%s\n' "$out" | grep -F 'bin/fm-backlog.sh ready' >/dev/null \
+    || fail "teardown did not name the serialized ready workflow: $out"
   printf '%s\n' "$out" | grep -F 'check date gates' >/dev/null \
     || fail "teardown did not preserve date-gate check: $out"
   printf '%s\n' "$out" | grep -F 'keep Done to the 10 most recent' >/dev/null \
     && fail "teardown kept manual Done pruning in compatible tasks-axi prompt: $out"
-  pass "teardown prompts tasks-axi backlog refresh when compatible"
+  pass "teardown records serialized Done only after owned lifecycle cleanup"
 }
 
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present() {
@@ -542,7 +552,7 @@ test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present() {
   add_compatible_tasks_axi "$case_dir"
 
   out=$(run_teardown "$case_dir") || fail "teardown failed with manual backlog backend"
-  printf '%s\n' "$out" | grep -F 'Update data/backlog.md - move task-x1 to Done' >/dev/null \
+  printf '%s\n' "$out" | grep -F 'update data/backlog.md now - move task-x1 to Done' >/dev/null \
     || fail "teardown did not prompt manual backlog update under opt-out: $out"
   printf '%s\n' "$out" | grep -F 'tasks-axi done' >/dev/null \
     && fail "teardown prompted tasks-axi despite manual backend opt-out: $out"
@@ -1251,6 +1261,9 @@ test_herdr_teardown_clears_escalation_marker() {
   printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "workspace list" ]; then
+  printf '%s\n' '{"result":{"workspaces":[]}}'
+fi
 exit 0
 SH
   chmod +x "$case_dir/fakebin/herdr"
@@ -1263,8 +1276,47 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+test_herdr_duplicate_endpoints_refuse_teardown_without_closure() {
+  local case_dir log rc
+  case_dir=$(make_case herdr-duplicate-refusal)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:w1:p2/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=herdr' 'herdr_session=default' 'herdr_workspace_id=w1' 'herdr_pane_id=w1:p2' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/herdr.log"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace list")
+    printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n'
+    ;;
+  "tab list")
+    printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task-x1"},{"tab_id":"w1:t2","label":"fm-task-x1"}]}}\n'
+    ;;
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"},{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}\n'
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+
+  rc=0
+  FM_HERDR_LOG="$log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "duplicate endpoint teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "duplicate same-home recovery endpoints" \
+    "teardown did not refuse duplicate recovery endpoints"
+  assert_contains "$(cat "$case_dir/stderr")" "default:w1:p1,default:w1:p2" \
+    "teardown refusal did not identify the exact duplicates"
+  assert_not_contains "$(cat "$log")" "close" "duplicate refusal automatically closed an endpoint"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "duplicate refusal removed task meta"
+  pass "Herdr duplicate endpoints block teardown and remain inspect-only"
+}
+
 test_local_only_fork_remote_allows
-test_teardown_prompts_tasks_axi_done_when_compatible
+test_teardown_records_tasks_axi_done_after_cleanup_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
@@ -1272,6 +1324,7 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
+test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

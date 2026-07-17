@@ -216,6 +216,32 @@ test_superseded_queued_item_dropped_by_default() {
   pass "superseded queued items are dropped by default and restored with --all-queued"
 }
 
+test_held_work_and_program_boundary_are_never_omitted() {
+  local home fakebin json
+  home=$(make_home held-program)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] held-gate - Held work (repo: firstmate) (kind: ship) (hold: captain review pending) (hold-kind: captain)
+
+## Done
+EOF
+  printf '# Durable program\n\nMore obligations require decomposition.\n' > "$home/data/firstmate-program.md"
+  fakebin=$(make_fakebin "$home")
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.gates | any(.[]; .id == "held-gate" and .hold == "captain: captain review pending"))
+      and .program[0].runnable_candidates == 0
+      and .program[0].held == 1
+      and .program[0].durable_sources == 1
+      and .program[0].decomposition == "requires_supervisor_judgment"
+      and (.program[0].boundary | contains("does not prove the durable program is complete"))
+      and ([.omitted[].surface] | index("superseded/held queued items") == null)
+  ' >/dev/null || fail "bearings omitted held work or the durable-program boundary: $json"
+  pass "bearings includes held work and warns when an empty runnable queue still has durable program sources"
+}
+
 test_include_prs_is_the_only_fetch_path() {
   local home fakebin json
   home=$(make_home prs); write_fixture "$home"
@@ -253,7 +279,7 @@ test_perl_fallback_bounds_github_call() {
   fakebin=$(make_fakebin "$home")
   toolbin="$home/toolbin"
   mkdir -p "$toolbin"
-  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find; do
+  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mktemp rm rmdir awk; do
     ln -s "$(command -v "$cmd")" "$toolbin/$cmd"
   done
   started=$(date +%s)
@@ -415,6 +441,7 @@ test_completed_scout_report_not_pending
 test_open_decision_surfaces_end_to_end
 test_report_pointers_surface
 test_superseded_queued_item_dropped_by_default
+test_held_work_and_program_boundary_are_never_omitted
 test_include_prs_is_the_only_fetch_path
 test_partial_github_failure_degrades
 test_perl_fallback_bounds_github_call

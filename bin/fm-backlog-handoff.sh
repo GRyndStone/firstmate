@@ -39,8 +39,12 @@
 # The move needs compatible `tasks-axi` on PATH, including atomic multi-ID `mv`
 # (introduced in 0.2.2). Bootstrap requires it fleet-wide, so this works
 # everywhere; the `config/backlog-backend=manual` knob only governs firstmate's
-# own hand-editing of its own backlog, not this validated helper. Idempotent:
-# re-running converges. Atomic: on any move failure nothing moves.
+# own hand-editing of its own backlog, not this validated helper.
+# The helper acquires both homes' state/.backlog.lock files in sorted path order
+# before classification and holds them through the atomic move, so routine
+# mutations cannot race either side of the handoff and two opposite handoffs
+# cannot deadlock.
+# Idempotent: re-running converges. Atomic: on any move failure nothing moves.
 # See AGENTS.md project management and task lifecycle.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 set -eu
@@ -49,10 +53,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 REG="$DATA/secondmates.md"
 MAIN_BACKLOG="$DATA/backlog.md"
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh"
 
 [ $# -ge 2 ] || { echo "usage: fm-backlog-handoff.sh <secondmate-id> <item-key>..." >&2; exit 1; }
 ID=$1
@@ -231,6 +238,32 @@ SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
+
+MAIN_LOCK="$STATE/.backlog.lock"
+SUB_LOCK="$SUB_HOME/state/.backlog.lock"
+mkdir -p "$STATE" "$SUB_HOME/state"
+if [ "$MAIN_LOCK" = "$SUB_LOCK" ]; then
+  FIRST_LOCK=$MAIN_LOCK
+  SECOND_LOCK=
+elif [ "$(printf '%s\n' "$MAIN_LOCK" "$SUB_LOCK" | LC_ALL=C sort | head -n 1)" = "$MAIN_LOCK" ]; then
+  FIRST_LOCK=$MAIN_LOCK
+  SECOND_LOCK=$SUB_LOCK
+else
+  FIRST_LOCK=$SUB_LOCK
+  SECOND_LOCK=$MAIN_LOCK
+fi
+LOCKS_HELD=0
+release_backlog_locks() {
+  if [ "$LOCKS_HELD" -eq 1 ]; then
+    [ -z "$SECOND_LOCK" ] || fm_lock_release "$SECOND_LOCK"
+    fm_lock_release "$FIRST_LOCK"
+    LOCKS_HELD=0
+  fi
+}
+trap release_backlog_locks EXIT
+fm_lock_acquire_wait "$FIRST_LOCK"
+[ -z "$SECOND_LOCK" ] || fm_lock_acquire_wait "$SECOND_LOCK"
+LOCKS_HELD=1
 
 # Classify every key before changing anything: move-from-main, already-in-sub, or
 # missing. Abort with no changes if any key matches neither backlog.
