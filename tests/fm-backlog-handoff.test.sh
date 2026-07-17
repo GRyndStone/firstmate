@@ -563,6 +563,69 @@ EOF
   pass "handoff invalidates interrupted completion claims in both homes"
 }
 
+test_handoff_child_owns_both_homes_after_wrapper_death() {
+  local home="$TMP_ROOT/owned-mutation-main" sub="$TMP_ROOT/owned-mutation-sub"
+  local fakebin marker release wrapper status out main_owner sub_owner main_pid sub_pid i
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] owned-item - durable handoff ownership (repo: alpha)
+
+## Done
+EOF
+  fakebin="$home/fakebin"
+  marker="$home/mutation-started"
+  release="$home/mutation-release"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ] || { [ "${1:-}" = update ] && [ "${2:-}" = --help ]; } \
+   || { [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; }; then
+  exec "${REAL_TASKS_AXI:?}" "$@"
+fi
+: > "${FM_FAKE_HANDOFF_MARKER:?}"
+while [ ! -e "${FM_FAKE_HANDOFF_RELEASE:?}" ]; do sleep 0.05; done
+exit 9
+SH
+  chmod +x "$fakebin/tasks-axi"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_HANDOFF_MARKER="$marker" \
+    FM_FAKE_HANDOFF_RELEASE="$release" "$ROOT/bin/fm-backlog-handoff.sh" design owned-item \
+    > "$home/handoff.out" 2>&1 &
+  wrapper=$!
+  i=0
+  while [ ! -e "$marker" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+  [ -e "$marker" ] || fail "handoff mutation child never passed its durable start gate"
+  main_owner="$home/state/.backlog-mutation-owner"
+  sub_owner="$sub/state/.backlog-mutation-owner"
+  assert_present "$main_owner/record" "handoff did not publish active-home mutation ownership"
+  assert_present "$sub_owner/record" "handoff did not publish secondmate-home mutation ownership"
+  main_pid=$(sed -n 's/^pid=//p' "$main_owner/record")
+  sub_pid=$(sed -n 's/^pid=//p' "$sub_owner/record")
+  [ -n "$main_pid" ] && [ "$main_pid" = "$sub_pid" ] \
+    || fail "handoff homes did not record one exact backend child identity"
+  kill -KILL "$wrapper"
+  wait "$wrapper" 2>/dev/null || true
+  kill -0 "$main_pid" 2>/dev/null || fail "handoff backend child did not survive wrapper death"
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
+    FM_FAKE_HANDOFF_MARKER="$marker" FM_FAKE_HANDOFF_RELEASE="$release" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design owned-item 2>&1) || status=$?
+  expect_code 1 "$status" "handoff while orphaned child owns both homes"
+  assert_contains "$out" "durable backlog mutation ownership" \
+    "a second handoff did not fail closed behind the live child"
+  : > "$release"
+  i=0
+  while kill -0 "$main_pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+  kill -0 "$main_pid" 2>/dev/null && fail "released handoff child did not exit"
+  FM_HOME="$home" bash -c '. "$1"; fm_tasks_axi_reconcile_mutation_owner "$2"; fm_tasks_axi_reconcile_mutation_owner "$3"' \
+    _ "$ROOT/bin/fm-tasks-axi-lib.sh" "$home/state" "$sub/state" \
+    || fail "dead handoff child ownership did not reconcile in both homes"
+  pass "handoff mutation ownership survives wrapper death in both locked homes"
+}
+
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole
@@ -575,5 +638,6 @@ test_indented_heading_is_not_section_boundary
 test_handoff_tasks_axi_is_contained_to_selected_home
 test_active_home_data_symlink_escape_is_rejected
 test_handoff_invalidates_interrupted_completion_claims
+test_handoff_child_owns_both_homes_after_wrapper_death
 
 echo "ALL TESTS PASSED"

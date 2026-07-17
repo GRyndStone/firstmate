@@ -934,6 +934,16 @@ prepare_spawn_lifecycle() {
 
   backlog_lock="$STATE/.backlog.lock"
   fm_lock_acquire_wait "$backlog_lock"
+  if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
+    echo "error: task $ID cannot spawn while durable backlog mutation ownership is live or unreadable" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
+  if compgen -G "$STATE/.backlog-receipts.claimed.*" >/dev/null; then
+    echo "error: task $ID cannot spawn until interrupted backlog receipt claims are reconciled by bin/fm-backlog.sh" >&2
+    fm_lock_release "$backlog_lock"
+    return 1
+  fi
   if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ] \
      || [ -e "$STATE/$ID.tearing-down" ] || [ -L "$STATE/$ID.tearing-down" ] \
      || [ -e "$STATE/$ID.teardown-stage" ] || [ -L "$STATE/$ID.teardown-stage" ] \

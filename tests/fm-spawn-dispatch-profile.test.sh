@@ -591,6 +591,52 @@ test_spawn_lifecycle_claim_covers_endpoint_creation() {
   pass "spawn lifecycle ownership covers endpoint creation and Done-first ordering"
 }
 
+test_spawn_waits_for_durable_backlog_mutation_owner() {
+  local rec id endpoint_log out status worker identity owner claim
+  id=profile-mutation-owner-z26
+  rec=$(make_spawn_case profile-mutation-owner claude "$id")
+  read_case_record "$rec"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  sleep 30 &
+  worker=$!
+  identity=$(LC_ALL=C ps -p "$worker" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  owner="$HOME_DIR/state/.backlog-mutation-owner"
+  mkdir "$owner"
+  {
+    printf 'version=1\n'
+    printf 'pid=%s\n' "$worker"
+    printf 'identity=%s\n' "$identity"
+    printf 'token=0123456789abcdef0123456789abcdef\n'
+  } > "$owner/record"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn during orphaned backlog mutation"
+  assert_contains "$out" "durable backlog mutation ownership is live or unreadable" \
+    "spawn did not fail closed behind the orphaned backend child"
+  assert_absent "$endpoint_log" "spawn created an endpoint while backlog mutation ownership was live"
+  assert_absent "$HOME_DIR/state/$id.spawning" "blocked spawn created lifecycle authority"
+  kill -TERM "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+  claim="$HOME_DIR/state/.backlog-receipts.claimed.interrupted"
+  mkdir "$claim"
+  printf 'synthetic snapshot\n' > "$claim/snapshot-before"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with interrupted backlog receipt claim"
+  assert_contains "$out" "interrupted backlog receipt claims" \
+    "spawn did not fail closed behind the unreconciled receipt claim"
+  assert_absent "$endpoint_log" "spawn created an endpoint while a receipt claim was unresolved"
+  rm -f "$claim/snapshot-before"
+  rmdir "$claim"
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  assert_contains "$out" "spawned $id" "spawn did not reconcile the dead durable mutation owner"
+  assert_absent "$owner" "dead durable mutation owner was not reconciled"
+  pass "spawn admission shares durable backlog mutation ownership recovery"
+}
+
 test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
@@ -609,5 +655,6 @@ test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
 test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint
 test_spawn_lifecycle_claim_covers_endpoint_creation
+test_spawn_waits_for_durable_backlog_mutation_owner
 
 echo "# all fm-spawn-dispatch-profile tests passed"

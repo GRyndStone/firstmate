@@ -58,6 +58,15 @@ TIMEOUT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.timeout.XXXXXX") ||
   exit 1
 }
 rm -f "$TIMEOUT_MARKER"
+START_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.start.XXXXXX") || {
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER"
+  exit 1
+}
+ABORT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.abort.XXXXXX") || {
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER"
+  exit 1
+}
+rm -f "$START_MARKER" "$ABORT_MARKER"
 WATCH_PID=
 WATCH_IDENTITY=
 CHECKPOINT_PID=${BASHPID:-$$}
@@ -132,7 +141,7 @@ cleanup_owned_children() {
   stop_watch_child 20
   [ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null || true
   WATCH_PID=
-  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER"
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER" "$ABORT_MARKER"
 }
 
 # shellcheck disable=SC2329 # Invoked by HUP, INT, and TERM traps below.
@@ -152,10 +161,36 @@ trap cleanup_owned_children EXIT
 # Signal traps terminate and reap only those captured PIDs, so an interrupted
 # foreground tool call cannot reparent fm-watch.sh to PID 1 or touch a watcher
 # belonging to another checkpoint or Firstmate home.
-FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
-  FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
+(
+  wait_count=0
+  while [ ! -e "$START_MARKER" ]; do
+    [ ! -e "$ABORT_MARKER" ] || exit 125
+    fm_pid_alive "$CHECKPOINT_PID" || exit 125
+    [ "$wait_count" -lt 200 ] || exit 125
+    sleep 0.01
+    wait_count=$((wait_count + 1))
+  done
+  exec env FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="$CHECKPOINT_PID" \
+    FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER"
+) >"$OUT" 2>"$ERR" &
 WATCH_PID=$!
-capture_watch_identity || true
+if ! capture_watch_identity; then
+  : > "$ABORT_MARKER"
+  i=0
+  while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if kill -0 "$WATCH_PID" 2>/dev/null; then
+    WATCH_PID=
+  else
+    wait "$WATCH_PID" 2>/dev/null || true
+    WATCH_PID=
+  fi
+  echo "checkpoint: exact watcher child identity could not be captured; watcher was not started" >&2
+  exit 1
+fi
+: > "$START_MARKER"
 (
   sleep "$SECONDS_ARG"
   : > "$TIMEOUT_MARKER"

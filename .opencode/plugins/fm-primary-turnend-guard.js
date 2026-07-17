@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { parse, relative, resolve } from "node:path";
 import { effectivePrimaryPaths, sessionLockOwnership } from "../lib/fm-primary-session-lock.js";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
@@ -70,18 +70,23 @@ function handoffPath(root, sessionID) {
   return { home: fmHome, state, dir, path, flight: `${path}.flight`, acknowledged: `${path}.acknowledged` };
 }
 
-function rejectSymlinkedComponents(base, target) {
-  const scopedBase = resolve(base);
+function rejectSymlinkedComponents(_base, target) {
   const scopedTarget = resolve(target);
-  const suffix = relative(scopedBase, scopedTarget);
-  if (suffix.startsWith("..") || isAbsolute(suffix)) return;
-  let cursor = scopedBase;
-  const baseInfo = lstatSync(cursor);
-  if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) throw new Error("unsafe Firstmate home directory");
-  for (const component of suffix.split(/[\\/]/).filter(Boolean)) {
+  const root = parse(scopedTarget).root;
+  const components = relative(root, scopedTarget).split(/[\\/]/).filter(Boolean);
+  let cursor = root;
+  for (let index = 0; index < components.length; index += 1) {
+    const component = components[index];
     cursor = resolve(cursor, component);
-    const info = lstatSync(cursor);
+    let info;
+    try {
+      info = lstatSync(cursor);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
     if (info.isSymbolicLink()) throw new Error("symlinked Firstmate state path component");
+    if (index < components.length - 1 && !info.isDirectory()) throw new Error("non-directory Firstmate state path component");
   }
 }
 
@@ -241,7 +246,7 @@ function readAcknowledged(root, sessionID) {
   }
 }
 
-function persistAcknowledged(root, handoff) {
+function persistAcknowledged(root, handoff, coveredGeneration) {
   const paths = safeHandoffDirectory(root, handoff.sessionID, true);
   if (pathExists(paths.acknowledged)) throw new Error("an OpenCode acknowledgement is already pending cleanup");
   const record = JSON.stringify({
@@ -249,6 +254,7 @@ function persistAcknowledged(root, handoff) {
     token: handoff.token,
     sessionID: handoff.sessionID,
     generation: handoff.generation,
+    coveredGeneration,
     pendingRecord: handoff.record,
   });
   writeAtomic(paths.acknowledged, record, `${handoff.token}.acknowledged`);
@@ -260,8 +266,11 @@ function cleanupAcknowledged(root, sessionID, acknowledged) {
   try {
     handoff = safeHandoffDirectory(root, sessionID);
     const current = readHandoff(root, sessionID);
-    if (current && current.record === acknowledged.pendingRecord) {
-      if (!clearHandoff(root, sessionID, acknowledged.pendingRecord)) return false;
+    const coveredGeneration = Number.isSafeInteger(acknowledged.coveredGeneration)
+      ? acknowledged.coveredGeneration
+      : acknowledged.generation;
+    if (current && current.generation <= coveredGeneration) {
+      if (!clearHandoff(root, sessionID, current.record)) return false;
     }
     const flight = readFlight(root, sessionID);
     if (flight && flight.pendingRecord === acknowledged.pendingRecord) {
@@ -361,11 +370,18 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     return readHandoff(root, sessionID);
   };
 
-  const settleDelivery = async (sessionID, flight, acknowledged) => {
+  const settleDelivery = async (sessionID, flight, acknowledged, coveredGeneration = flight.coveredGeneration) => {
     if (deliveryFlights.get(sessionID) !== flight) return;
     if (flight.settling) return;
     flight.settling = true;
     flight.outcome = acknowledged;
+    if (acknowledged) {
+      const currentGeneration = invocationGenerations.get(sessionID) ?? flight.handoff.generation;
+      flight.coveredGeneration = Math.max(
+        flight.handoff.generation,
+        Number.isSafeInteger(coveredGeneration) ? coveredGeneration : currentGeneration,
+      );
+    }
     const ownership = await sessionLockOwnership(paths);
     if (ownership === "unknown") {
       flight.settling = false;
@@ -380,21 +396,27 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     if (acknowledged) {
       let durableAcknowledged;
       try {
-        durableAcknowledged = persistAcknowledged(root, flight.handoff);
+        durableAcknowledged = persistAcknowledged(root, flight.handoff, flight.coveredGeneration);
       } catch {
         flight.settling = false;
         scheduleDelivery(sessionID);
         return;
       }
-      satisfiedGenerations.set(sessionID, flight.handoff.generation);
+      satisfiedGenerations.set(
+        sessionID,
+        Math.max(satisfiedGenerations.get(sessionID) ?? 0, flight.coveredGeneration),
+      );
+      const pending = pendingMessages.get(sessionID);
+      if (pending && pending.generation <= flight.coveredGeneration) pendingMessages.delete(sessionID);
       deliveryFlights.delete(sessionID);
       cleanupAcknowledged(root, sessionID, durableAcknowledged);
     } else {
-      deliveryFlights.delete(sessionID);
       if (!clearFlight(root, sessionID, flight.durable.record)) {
-        cancelRetryOwner(sessionID);
+        flight.settling = false;
+        scheduleDelivery(sessionID);
         return;
       }
+      deliveryFlights.delete(sessionID);
     }
     if (readAcknowledged(root, sessionID) || pendingMessages.has(sessionID) || readHandoff(root, sessionID)) {
       scheduleDelivery(sessionID);
@@ -415,7 +437,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       else cancelRetryOwner(sessionID);
       return;
     }
-    const flight = { handoff, durable, settled, outcome: undefined, settling: false };
+    const flight = { handoff, durable, settled, outcome: undefined, settling: false, coveredGeneration: handoff.generation };
     deliveryFlights.set(sessionID, flight);
     Promise.resolve()
       .then(() => client.session.promptAsync({
@@ -423,7 +445,13 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
         body: { parts: [{ type: "text", text: handoff.message }] },
       }))
       .then(
-        () => settleDelivery(sessionID, flight, true),
+        () => {
+          flight.coveredGeneration = Math.max(
+            flight.handoff.generation,
+            invocationGenerations.get(sessionID) ?? flight.handoff.generation,
+          );
+          return settleDelivery(sessionID, flight, true, flight.coveredGeneration);
+        },
         () => settleDelivery(sessionID, flight, false),
       )
       .catch(() => {})

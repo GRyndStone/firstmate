@@ -547,11 +547,7 @@ mutation_backend_owner_is_live() {
 }
 
 mutation_backend_pid_identity() {
-  local identity
-  identity=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null) || return 1
-  identity=$(printf '%s\n' "$identity" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-  [ -n "$identity" ] || return 1
-  printf '%s\n' "$identity"
+  fm_tasks_axi_mutation_pid_identity "$1"
 }
 
 restore_mutation_receipts() {
@@ -726,12 +722,13 @@ settle_mutation_receipts() {
 
 run_mutation_tasks_axi() {
   local owner gate owner_tmp gate_tmp worker_pid worker_identity current_identity previous_identity=
-  local parent_pid i=0 status=0
+  local parent_pid mutation_token i=0 status=0
   owner="$MUTATION_RECEIPT_DIR/backend-owner"
   gate="$MUTATION_RECEIPT_DIR/backend-start"
   owner_tmp="$MUTATION_RECEIPT_DIR/.backend-owner.tmp"
   gate_tmp="$MUTATION_RECEIPT_DIR/.backend-start.tmp"
   parent_pid=${BASHPID:-$$}
+  mutation_token=$(fm_tasks_axi_mutation_owner_token) || return 1
   (
     local wait_count=0
     while [ ! -e "$gate" ]; do
@@ -767,16 +764,25 @@ run_mutation_tasks_axi() {
     rm -f "$owner_tmp"
     return 1
   fi
+  if ! fm_tasks_axi_publish_mutation_owner "$STATE" "$worker_pid" "$worker_identity" "$mutation_token"; then
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    rm -f "$owner" "$owner_tmp"
+    return 1
+  fi
   current_identity=$(mutation_backend_pid_identity "$worker_pid" 2>/dev/null || true)
   if ! fm_pid_alive "$worker_pid" || [ "$current_identity" != "$worker_identity" ] \
+     || ! fm_tasks_axi_start_mutation_owner "$STATE" "$mutation_token" \
      || ! : > "$gate_tmp" || ! mv "$gate_tmp" "$gate"; then
     kill -TERM "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
     rm -f "$owner" "$owner_tmp" "$gate" "$gate_tmp"
+    fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
     return 1
   fi
   wait "$worker_pid" || status=$?
   rm -f "$owner" "$gate" "$owner_tmp" "$gate_tmp" 2>/dev/null || true
+  fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || return 1
   return "$status"
 }
 
@@ -826,6 +832,9 @@ cleanup_backlog_wrapper() {
     release_backlog_lock
     exit "$status"
   fi
+  if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
+    [ "$status" -ne 0 ] || status=1
+  fi
   if [ -n "${CLAIM_DIR:-}" ] && ! completion_claim_settle; then
     [ "$status" -ne 0 ] || status=1
   fi
@@ -843,6 +852,10 @@ trap 'exit 143' TERM
 # half-completed mutation or cross-home move.
 fm_lock_acquire_wait "$BACKLOG_LOCK"
 LOCKED=1
+if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
+  echo "error: another durable backlog mutation still owns this home" >&2
+  exit 1
+fi
 if ! recover_mutation_receipt_claims; then
   echo "error: interrupted backlog mutation receipts could not be reconciled safely" >&2
   exit 1

@@ -191,17 +191,19 @@ SH
 }
 
 test_identity_capture_failure_never_signals_pid_fallback() {
-  local home out err watcher fakebin signaled checkpoint_pid status
+  local home out err watcher fakebin signaled launched status started elapsed
   home=$(make_home identity-unavailable)
   out="$home/out.txt"
   err="$home/err.txt"
   watcher="$home/short-watch.sh"
   fakebin="$home/fakebin"
   signaled="$home/watcher-signaled"
+  launched="$home/watcher-launched"
   mkdir -p "$fakebin"
   cat > "$watcher" <<'SH'
 #!/usr/bin/env bash
 trap ': > "$WATCH_SIGNAL_MARKER"' TERM INT HUP
+: > "$WATCH_LAUNCH_MARKER"
 sleep 2
 SH
   cat > "$fakebin/ps" <<'SH'
@@ -212,16 +214,17 @@ fi
 exec /bin/ps "$@"
 SH
   chmod +x "$watcher" "$fakebin/ps"
-  PATH="$fakebin:$PATH" WATCH_SIGNAL_MARKER="$signaled" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
-    "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" &
-  checkpoint_pid=$!
-  sleep 0.6
-  kill -TERM "$checkpoint_pid"
+  started=$SECONDS
   status=0
-  wait "$checkpoint_pid" || status=$?
-  expect_code 143 "$status" "identity-unavailable checkpoint exit"
+  PATH="$fakebin:$PATH" WATCH_SIGNAL_MARKER="$signaled" WATCH_LAUNCH_MARKER="$launched" \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 1 "$status" "identity-unavailable checkpoint exit"
   assert_absent "$signaled" "checkpoint signaled its watcher after birth identity capture failed"
-  pass "birth-identity capture failure skips watcher signaling instead of falling back to PID ancestry"
+  assert_absent "$launched" "checkpoint launched the real watcher without exact child identity"
+  [ "$elapsed" -lt 5 ] || fail "identity capture failure waited indefinitely (${elapsed}s)"
+  assert_contains "$(cat "$err")" "watcher was not started" "identity failure was not explained"
+  pass "birth-identity capture failure aborts before watcher launch without fallback signaling"
 }
 
 test_checkpoint_polls_process_identity_coarsely() {

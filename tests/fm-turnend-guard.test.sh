@@ -16,7 +16,8 @@ set -u
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$ROOT/bin/fm-supervision-lib.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-turnend-guard)
+TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+TMP_ROOT=$(TMPDIR="$TMP_BASE" fm_test_tmproot fm-turnend-guard)
 fm_git_identity fmtest fmtest@example.invalid
 
 REQUIRED_REASON='resume supervision with bin/fm-watch-arm.sh as its own Claude Code background task'
@@ -1189,7 +1190,7 @@ if (!promptBody.includes("guard-fired")) {
   console.error(`missing prompt body: ${promptBody}`);
   process.exit(1);
 }
-if (prompts !== 3) throw new Error(`expected one follow-up per still-blind idle, saw ${prompts}`);
+if (prompts !== 2) throw new Error(`expected one covered overlap plus one later follow-up, saw ${prompts}`);
 const guardRuns = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
 if (guardRuns !== 3) throw new Error(`three idle events ran predicate ${guardRuns} times`);
 EOF
@@ -1366,6 +1367,7 @@ const handoffDir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
 for (let i = 0; i < 50 && existsSync(handoffDir) && readdirSync(handoffDir).some((name) => name.endsWith(".pending")); i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+
 if (existsSync(handoffDir) && readdirSync(handoffDir).some((name) => name.endsWith(".pending"))) {
   throw new Error("new blind generation retained an acknowledged handoff");
 }
@@ -1375,6 +1377,105 @@ EOF
   expect_code 0 "$status" "OpenCode superseded hung flight must preserve the newer blind generation"
   [ -z "$out" ] || fail "OpenCode superseded-flight test printed output: $out"
   pass ".opencode primary plugin: rejected old flight promotes the queued blind generation"
+}
+
+test_opencode_success_covers_queued_generations_once() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-covered-generation-root"
+  home="$TMP_ROOT/opencode-covered-generation-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state"
+  record_opencode_test_lock "$home/state"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'covered generation guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 \
+    FM_TURNEND_HANDOFF_PROMPT_TIMEOUT_MS=10 node 2>&1 <<'EOF'
+import { existsSync, readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+let attempts = 0;
+let resolveFirst;
+const client = { session: { promptAsync: () => {
+  attempts += 1;
+  if (attempts === 1) return new Promise((resolve) => { resolveFirst = resolve; });
+  return Promise.resolve();
+} } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+const idle = { event: { type: "session.idle", properties: { sessionID: "covered-generation" } } };
+await hooks.event(idle);
+await hooks.event(idle);
+if (attempts !== 1) throw new Error(`queued generation overlapped ${attempts} prompts`);
+resolveFirst();
+const dir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
+for (let i = 0; i < 100 && existsSync(dir) && readdirSync(dir).length > 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (attempts !== 1) throw new Error(`successful continuation redelivered ${attempts} generations`);
+if (existsSync(dir) && readdirSync(dir).length > 0) throw new Error("covered generation retained durable handoff records");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode success must cover already queued generations"
+  [ -z "$out" ] || fail "OpenCode covered-generation test printed output: $out"
+  pass ".opencode primary plugin: one successful continuation consumes only covered generations"
+}
+
+test_opencode_rejected_flight_cleanup_keeps_retry_owner() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-rejected-cleanup-root"
+  home="$TMP_ROOT/opencode-rejected-cleanup-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state"
+  record_opencode_test_lock "$home/state"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'rejected cleanup guard\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { chmodSync, existsSync, readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const nativeSetTimeout = globalThis.setTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => { activeTimers.delete(timer); callback(...args); }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+let attempts = 0;
+const client = { session: { promptAsync: () => {
+  attempts += 1;
+  if (attempts === 1) {
+    chmodSync(`${process.env.FM_HOME}/state/.turnend-handoffs`, 0o500);
+    return Promise.reject(new Error("synthetic rejection"));
+  }
+  return Promise.resolve();
+} } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "rejected-cleanup" } } });
+const dir = `${process.env.FM_HOME}/state/.turnend-handoffs`;
+if (!readdirSync(dir).some((name) => name.endsWith(".flight"))) throw new Error("failed rejected-flight cleanup lost its durable flight");
+if (![...activeTimers].some((timer) => timer.hasRef?.())) throw new Error("failed rejected-flight cleanup cancelled retry ownership");
+chmodSync(dir, 0o700);
+for (let i = 0; i < 100 && attempts < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (attempts !== 2) throw new Error(`pending generation was not promoted after cleanup: ${attempts}`);
+for (let i = 0; i < 100 && existsSync(dir) && readdirSync(dir).length > 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (existsSync(dir) && readdirSync(dir).length > 0) throw new Error("rejected-flight recovery retained durable records");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode rejected-flight cleanup failure must retain retry ownership"
+  [ -z "$out" ] || fail "OpenCode rejected-cleanup test printed output: $out"
+  pass ".opencode primary plugin: rejected-flight cleanup remains owned until promotion is safe"
 }
 
 test_opencode_stale_healthy_handler_cannot_clear_newer_handoff() {
@@ -1934,7 +2035,7 @@ if (guardRuns !== 2) throw new Error(`guard predicate ran ${guardRuns} times for
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi guard must inject once for no-tool and multi-tool logical runs"
+  expect_code 0 "$status" "Pi guard must inject once for no-tool and multi-tool logical runs: $out"
   [ -z "$out" ] || fail "Pi logical-run guard test printed output: $out"
   pass ".pi primary extension: every still-blind logical run injects a future continuation"
 }
@@ -2221,6 +2322,70 @@ EOF
   pass ".pi primary extension: synchronous persistence failure retains a retry owner"
 }
 
+test_pi_unknown_lock_probe_retries_without_shared_mutation() {
+  local repo home ext fakebin release out status
+  repo="$TMP_ROOT/pi-lock-unknown-root"
+  home="$TMP_ROOT/pi-lock-unknown-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  fakebin="$TMP_ROOT/pi-lock-unknown-fakebin"
+  release="$TMP_ROOT/pi-lock-unknown-release"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state" "$fakebin"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'pi unknown lock guard\n' >&2
+exit 2
+SH
+  cat > "$repo/bin/fm-arm-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$repo/bin/fm-cd-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+[ -e "${FM_PS_RELEASE:?}" ] || exit 2
+exec /bin/ps "$@"
+SH
+  chmod +x "$repo/bin/"*.sh "$fakebin/ps"
+  out=$(PATH="$fakebin:$PATH" PLUGIN="$ext" FM_HOME="$home" FM_PS_RELEASE="$release" \
+    FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const nativeSetTimeout = globalThis.setTimeout;
+const activeTimers = new Set();
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let timer;
+  timer = nativeSetTimeout(() => { activeTimers.delete(timer); callback(...args); }, delay);
+  activeTimers.add(timer);
+  return timer;
+};
+const handlers = new Map();
+let prompts = 0;
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.ppid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+if (existsSync(`${process.env.FM_HOME}/state/.turnend-handoffs`)) throw new Error("unknown Pi lock probe mutated shared handoff state");
+if (![...activeTimers].some((timer) => timer.hasRef?.())) throw new Error("unknown Pi lock probe retained no bounded retry owner");
+writeFileSync(process.env.FM_PS_RELEASE, "ready\n");
+for (let i = 0; i < 100 && prompts === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`Pi lock-probe recovery delivered ${prompts} continuations`);
+await handlers.get("agent_start")?.({ type: "agent_start" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi unknown lock ownership must retain bounded retry ownership: $out"
+  [ -z "$out" ] || fail "Pi unknown-lock test printed output: $out"
+  pass ".pi primary extension: lock probe errors retry in process without shared mutation"
+}
+
 test_passive_handoff_adapters_reject_symlinked_state() {
   local plugin repo home outside out status ext grok_repo grok_home grok_outside
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
@@ -2319,15 +2484,16 @@ EOF
 }
 
 test_passive_handoff_adapters_reject_symlinked_state_ancestor() {
-  local plugin repo home outside state_override out status ext grok_repo grok_home grok_outside grok_state
+  local plugin repo home external outside state_override out status ext grok_repo grok_home grok_external grok_outside grok_state
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   repo="$TMP_ROOT/opencode-symlink-ancestor-root"
   home="$TMP_ROOT/opencode-symlink-ancestor-home"
+  external="$TMP_ROOT/opencode-external-state"
   outside="$TMP_ROOT/opencode-symlink-ancestor-outside"
-  state_override="$home/scoped/link/active"
+  state_override="$external/link/active"
   make_adapter_primary_repo "$repo"
-  mkdir -p "$repo/bin" "$home/scoped" "$outside/active"
-  ln -s "$outside" "$home/scoped/link"
+  mkdir -p "$repo/bin" "$home" "$external" "$outside/active"
+  ln -s "$outside" "$external/link"
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
@@ -2357,13 +2523,14 @@ EOF
 
   repo="$TMP_ROOT/pi-symlink-ancestor-root"
   home="$TMP_ROOT/pi-symlink-ancestor-home"
+  external="$TMP_ROOT/pi-external-state"
   outside="$TMP_ROOT/pi-symlink-ancestor-outside"
-  state_override="$home/scoped/link/active"
+  state_override="$external/link/active"
   ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
   make_adapter_primary_repo "$repo"
-  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/scoped" "$outside/active"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home" "$external" "$outside/active"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
-  ln -s "$outside" "$home/scoped/link"
+  ln -s "$outside" "$external/link"
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
@@ -2403,12 +2570,13 @@ EOF
 
   grok_repo="$TMP_ROOT/grok-symlink-ancestor-root"
   grok_home="$TMP_ROOT/grok-symlink-ancestor-home"
+  grok_external="$TMP_ROOT/grok-external-state"
   grok_outside="$TMP_ROOT/grok-symlink-ancestor-outside"
-  grok_state="$grok_home/scoped/link/active"
+  grok_state="$grok_external/link/active"
   make_adapter_primary_repo "$grok_repo"
-  mkdir -p "$grok_repo/bin" "$grok_home/scoped" "$grok_outside/active"
+  mkdir -p "$grok_repo/bin" "$grok_home" "$grok_external" "$grok_outside/active"
   : > "$grok_repo/AGENTS.md"
-  ln -s "$grok_outside" "$grok_home/scoped/link"
+  ln -s "$grok_outside" "$grok_external/link"
   out=$(printf '{"sessionId":"symlink-ancestor"}' | GROK_WORKSPACE_ROOT="$grok_repo" FM_HOME="$grok_home" FM_STATE_OVERRIDE="$grok_state" "$ROOT/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   [ "$status" -ne 0 ] || fail "Grok accepted a symlinked ancestor of effective handoff state"
   [ ! -e "$grok_outside/active/.turnend-handoffs" ] || fail "Grok wrote through a symlinked state ancestor"
@@ -2475,6 +2643,8 @@ test_opencode_plugin_anchors_guard_to_worktree
 test_opencode_plugin_preserves_failed_delivery_handoff
 test_opencode_plugin_retries_hung_prompt_delivery
 test_opencode_superseded_hung_flight_preserves_new_blind_need
+test_opencode_success_covers_queued_generations_once
+test_opencode_rejected_flight_cleanup_keeps_retry_owner
 test_opencode_stale_healthy_handler_cannot_clear_newer_handoff
 test_opencode_plugin_fails_closed_when_guard_cannot_launch
 test_opencode_retry_owner_is_referenced_until_healthy
@@ -2494,6 +2664,7 @@ test_pi_crewmate_does_not_consume_primary_handoff
 test_pi_readonly_session_does_not_recover_or_acknowledge_handoff
 test_pi_cleanup_failure_retains_acknowledged_owner
 test_pi_persistence_failure_retains_retry_owner
+test_pi_unknown_lock_probe_retries_without_shared_mutation
 test_passive_handoff_adapters_reject_symlinked_state
 test_passive_handoff_adapters_reject_symlinked_state_ancestor
 test_grok_hook_invokes_adapter

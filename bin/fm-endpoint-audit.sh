@@ -102,9 +102,30 @@ append_inventory_unavailable() {
     >> "$ROWS"
 }
 
+append_invalid_meta() {
+  local meta=$1 reason=$2 id
+  id=$(basename "$meta" .meta)
+  jq -n \
+    --arg task "$id" \
+    --arg reason "$reason" \
+    '{kind:"inventory_unavailable",backend:"unknown",task:$task,worktree:"",recorded_endpoint:"",live_endpoints:[],reason:$reason,action:"inspect; do not auto-close"}' \
+    >> "$ROWS"
+}
+
+meta_is_regular() {
+  [ -f "$1" ] && [ ! -L "$1" ]
+}
+
 for meta in "$STATE"/*.meta; do
-  [ -e "$meta" ] || continue
+  [ -e "$meta" ] || [ -L "$meta" ] || continue
   meta_selected "$meta" || continue
+  meta_is_regular "$meta" || append_invalid_meta "$meta" "task metadata is symlinked or non-regular; cross-home read refused"
+done
+
+for meta in "$STATE"/*.meta; do
+  [ -e "$meta" ] || [ -L "$meta" ] || continue
+  meta_selected "$meta" || continue
+  meta_is_regular "$meta" || continue
   [ "$(fm_backend_of_meta "$meta")" = herdr ] || continue
   fm_backend_source herdr || exit 1
   session=$(fm_meta_get "$meta" herdr_session)
@@ -203,8 +224,9 @@ done < "$TARGETS"
 LC_ALL=C sort -u "$LIVE" -o "$LIVE"
 
 for meta in "$STATE"/*.meta; do
-  [ -e "$meta" ] || continue
+  [ -e "$meta" ] || [ -L "$meta" ] || continue
   meta_selected "$meta" || continue
+  meta_is_regular "$meta" || continue
   [ "$(fm_backend_of_meta "$meta")" = herdr ] || continue
   id=$(basename "$meta" .meta)
   label="fm-$id"
@@ -252,8 +274,8 @@ audit_tmux_meta() {
     echo "fm-endpoint-audit: tmux not found" >&2
     return 1
   fi
-  filter="#{&&:#{==:#{window_name},$label},#{==:#{@firstmate_home},$identity}}"
-  if ! inventory=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
+  filter="#{==:#{window_name},$label}"
+  if ! inventory=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}\t_' 2>&1); then
     if printf '%s\n' "$inventory" | grep -Eqi "can't find session|no server running|(failed to connect|error connecting).*(no such file|connection refused)|no sessions"; then
       inventory=
     else
@@ -261,14 +283,18 @@ audit_tmux_meta() {
       return 1
     fi
   fi
-  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$label" -v owner="$identity" '
-    NF != 3 || $1 !~ /^@[0-9]+$/ || $2 != label || $3 != owner { bad=1 }
+  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$label" '
+    NF != 4 || $1 !~ /^@[0-9]+$/ || $2 != label || $4 != "_" { bad=1 }
     END { exit bad ? 1 : 0 }
   '; then
     echo "fm-endpoint-audit: invalid exact-home tmux window inventory for $session:$label" >&2
     return 1
   fi
-  live_json=$(printf '%s\n' "$inventory" | awk -F '\t' 'NF { print $1 }' \
+  if printf '%s\n' "$inventory" | awk -F '\t' 'NF == 4 && $3 == "" { found=1 } END { exit found ? 0 : 1 }'; then
+    append_inventory_unavailable tmux "$meta" "untagged legacy tmux window has ambiguous Firstmate-home ownership"
+    return
+  fi
+  live_json=$(printf '%s\n' "$inventory" | awk -F '\t' -v owner="$identity" 'NF == 4 && $3 == owner { print $1 }' \
     | jq -R -s '[splits("\\n") | select(length > 0)] | unique | sort') || return 1
   append_anomaly tmux "$meta" "$live_json" "$recorded"
 }
@@ -285,8 +311,9 @@ audit_orca_meta() {
 }
 
 for meta in "$STATE"/*.meta; do
-  [ -e "$meta" ] || continue
+  [ -e "$meta" ] || [ -L "$meta" ] || continue
   meta_selected "$meta" || continue
+  meta_is_regular "$meta" || continue
   case "$(fm_backend_of_meta "$meta")" in
     tmux) audit_tmux_meta "$meta" || exit 1 ;;
     zellij) audit_zellij_meta "$meta" || exit 1 ;;

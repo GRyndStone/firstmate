@@ -230,7 +230,7 @@ set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
-    printf '@11\tfm-dup-task\t%s\n@12\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
+    printf '@11\tfm-dup-task\t%s\t_\n@12\tfm-dup-task\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
     ;;
   *) exit 8 ;;
 esac
@@ -248,11 +248,59 @@ SH
       action:"inspect; do not auto-close"
     }]
   ' >/dev/null || fail "tmux duplicate endpoint JSON was incomplete: $out"
-  assert_contains "$(cat "$log")" 'list-windows -t =owned-session -f #{&&:#{==:#{window_name},fm-dup-task},#{==:#{@firstmate_home},' \
+  assert_contains "$(cat "$log")" 'list-windows -t =owned-session -f #{==:#{window_name},fm-dup-task}' \
     "tmux audit did not query the exact recorded home identity and task label"
   assert_not_contains "$(cat "$log")" ' -a ' "tmux audit enumerated other sessions"
   assert_not_contains "$(cat "$log")" 'kill' "tmux audit attempted automatic closure"
   pass "tmux duplicate audit returns only exact-home identified task windows"
+}
+
+test_tmux_untagged_legacy_window_is_ambiguous() {
+  local home out identity status
+  home=$(make_fixture tmux-legacy-untagged)
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  fm_write_meta "$home/state/dup-task.meta" \
+    'window=@12' \
+    "tmux_home_identity=$identity" \
+    'tmux_session=owned-session' \
+    'tmux_window_id=@12' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) printf '@11\tfm-dup-task\t\t_\n' ;;
+  new-window) printf 'unexpected endpoint creation\n' >&2; exit 91 ;;
+esac
+SH
+  chmod +x "$home/fakebin/tmux"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    length == 1 and .[0].kind == "inventory_unavailable" and
+    (.[0].reason | contains("untagged legacy tmux window"))
+  ' >/dev/null || fail "untagged tmux audit did not fail closed: $out"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" bash -c '
+    FM_BACKEND_LIB_DIR="$1/bin"; . "$1/bin/fm-backend.sh"
+    fm_backend_source tmux
+    fm_backend_tmux_create_task owned-session fm-dup-task /tmp "$2"
+  ' _ "$ROOT" "$identity" 2>&1) || status=$?
+  expect_code 1 "$status" "untagged legacy tmux creation"
+  assert_contains "$out" "ambiguous Firstmate-home ownership" "spawn did not refuse the legacy untagged label"
+  pass "untagged legacy tmux labels are ambiguous for audit and creation"
+}
+
+test_symlinked_meta_is_not_read_across_homes() {
+  local home outside out
+  home=$(make_fixture symlinked-meta)
+  outside="$TMP_ROOT/symlinked-meta-outside.meta"
+  printf 'backend=herdr\nwindow=default:foreign\nworktree=/foreign\n' > "$outside"
+  ln -s "$outside" "$home/state/foreign.meta"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    . == [{kind:"inventory_unavailable",backend:"unknown",task:"foreign",worktree:"",recorded_endpoint:"",live_endpoints:[],reason:"task metadata is symlinked or non-regular; cross-home read refused",action:"inspect; do not auto-close"}]
+  ' >/dev/null || fail "symlinked metadata did not produce a scoped unavailable result: $out"
+  [ ! -e "$home/herdr.log" ] || [ ! -s "$home/herdr.log" ] || fail "audit followed symlinked metadata into a backend query"
+  pass "symlinked metadata is reported without reading another home's endpoint fields"
 }
 
 test_tmux_unscoped_meta_reports_inventory_unavailable() {
@@ -410,7 +458,9 @@ test_missing_owned_workspace_is_an_empty_inventory
 test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
 test_tmux_duplicates_use_exact_recorded_session_and_task
+test_tmux_untagged_legacy_window_is_ambiguous
 test_tmux_unscoped_meta_reports_inventory_unavailable
+test_symlinked_meta_is_not_read_across_homes
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_orca_reports_unavailable_without_app_global_inventory

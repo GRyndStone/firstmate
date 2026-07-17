@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Shared tasks-axi backend selection, compatibility probe, and lifecycle receipt
-# invalidation for bootstrap, teardown, and backlog operations.
+# Shared tasks-axi backend selection, compatibility probe, durable mutation
+# ownership, and lifecycle receipt invalidation.
 # Usage: . bin/fm-tasks-axi-lib.sh
 # Compatible means tasks-axi --version reports 0.1.1 or newer,
 # `tasks-axi update --help` exposes --archive-body for recoverable note rewrites,
@@ -60,6 +60,109 @@ fm_tasks_axi_valid_task_id() {  # <id>
       ;;
     *) return 1 ;;
   esac
+}
+
+fm_tasks_axi_mutation_pid_identity() {  # <pid>
+  local identity
+  identity=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null) || return 1
+  identity=$(printf '%s\n' "$identity" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+
+fm_tasks_axi_mutation_owner_token() {
+  local token
+  token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]') || return 1
+  case "$token" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) printf '%s\n' "$token" ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_tasks_axi_mutation_owner_state() {  # <state-dir>
+  local state=$1 owner record pid identity token current_identity process_state
+  owner="$state/.backlog-mutation-owner"
+  if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then
+    return 1
+  fi
+  [ -d "$owner" ] && [ ! -L "$owner" ] || return 2
+  record="$owner/record"
+  [ -f "$record" ] && [ ! -L "$record" ] || return 2
+  [ -z "$(find "$owner" -mindepth 1 -maxdepth 1 ! -name record ! -name start -print -quit 2>/dev/null)" ] || return 2
+  [ ! -e "$owner/start" ] || { [ -f "$owner/start" ] && [ ! -L "$owner/start" ] && [ ! -s "$owner/start" ]; } || return 2
+  [ "$(sed -n '1p' "$record")" = version=1 ] || return 2
+  pid=$(sed -n 's/^pid=//p' "$record") || return 2
+  identity=$(sed -n 's/^identity=//p' "$record") || return 2
+  token=$(sed -n 's/^token=//p' "$record") || return 2
+  [ -z "$(sed -n '5p' "$record")" ] || return 2
+  case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+  [ -n "$identity" ] || return 2
+  case "$token" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 2 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  process_state=$(ps -p "$pid" -o stat= 2>/dev/null) || return 2
+  read -r process_state _ <<< "$process_state"
+  case "$process_state" in Z*) return 1 ;; '') return 2 ;; esac
+  current_identity=$(fm_tasks_axi_mutation_pid_identity "$pid") || return 2
+  [ "$current_identity" = "$identity" ] || return 1
+  return 0
+}
+
+fm_tasks_axi_reconcile_mutation_owner() {  # <state-dir>
+  local state=$1 owner status=0
+  owner="$state/.backlog-mutation-owner"
+  fm_tasks_axi_mutation_owner_state "$state" || status=$?
+  case "$status" in
+    0|2) return 1 ;;
+    1)
+      [ -e "$owner" ] || [ -L "$owner" ] || return 0
+      [ -d "$owner" ] && [ ! -L "$owner" ] || return 1
+      rm -f "$owner/start" "$owner/record" || return 1
+      rmdir "$owner"
+      ;;
+  esac
+}
+
+fm_tasks_axi_publish_mutation_owner() {  # <state-dir> <pid> <identity> <token>
+  local state=$1 pid=$2 identity=$3 token=$4 owner temporary
+  owner="$state/.backlog-mutation-owner"
+  [ ! -e "$owner" ] && [ ! -L "$owner" ] || return 1
+  temporary=$(mktemp -d "$state/.backlog-mutation-owner.tmp.XXXXXXXX") || return 1
+  if ! {
+    printf 'version=1\n'
+    printf 'pid=%s\n' "$pid"
+    printf 'identity=%s\n' "$identity"
+    printf 'token=%s\n' "$token"
+  } > "$temporary/record" || ! mv "$temporary" "$owner"; then
+    rm -f "$temporary/record" 2>/dev/null || true
+    rmdir "$temporary" 2>/dev/null || true
+    return 1
+  fi
+}
+
+fm_tasks_axi_start_mutation_owner() {  # <state-dir> <token>
+  local state=$1 token=$2 owner recorded
+  owner="$state/.backlog-mutation-owner"
+  [ -d "$owner" ] && [ ! -L "$owner" ] || return 1
+  recorded=$(sed -n 's/^token=//p' "$owner/record" 2>/dev/null) || return 1
+  [ "$recorded" = "$token" ] || return 1
+  (umask 077 && : > "$owner/start")
+}
+
+fm_tasks_axi_clear_mutation_owner() {  # <state-dir> <token>
+  local state=$1 token=$2 owner recorded
+  owner="$state/.backlog-mutation-owner"
+  [ -d "$owner" ] && [ ! -L "$owner" ] || return 1
+  recorded=$(sed -n 's/^token=//p' "$owner/record" 2>/dev/null) || return 1
+  [ "$recorded" = "$token" ] || return 1
+  rm -f "$owner/start" "$owner/record" || return 1
+  rmdir "$owner"
+}
+
+fm_tasks_axi_mutation_owner_start_path() {  # <state-dir>
+  printf '%s/.backlog-mutation-owner/start\n' "$1"
 }
 
 fm_tasks_axi_remove_completion_claim() {  # <claim-path>

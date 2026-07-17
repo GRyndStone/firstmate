@@ -83,13 +83,26 @@ fm_backend_tmux_container_ensure() {
 # The returned window id lets callers target the window even if its name is ever
 # lost, so worktree discovery cannot fall back to the active client's window.
 fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> [home-identity] -> prints window id
-  local ses=$1 wname=$2 proj_abs=$3 home_identity=${4:-} wid filter
+  local ses=$1 wname=$2 proj_abs=$3 home_identity=${4:-} wid filter inventory
   if [ -z "$home_identity" ]; then
     home_identity=$(fm_backend_home_identity) || return 1
   fi
-  filter="#{&&:#{==:#{window_name},$wname},#{==:#{@firstmate_home},$home_identity}}"
-  if tmux list-windows -t "=$ses" -f "$filter" -F '#{window_id}' | grep -q .; then
+  filter="#{==:#{window_name},$wname}"
+  inventory=$(tmux list-windows -t "=$ses" -f "$filter" \
+    -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$wname" '
+    NF != 4 || $1 !~ /^@[0-9]+$/ || $2 != label || $4 != "_" { bad=1 }
+    END { exit bad ? 1 : 0 }
+  '; then
+    echo "error: invalid tmux window inventory for $ses:$wname" >&2
+    return 1
+  fi
+  if printf '%s\n' "$inventory" | awk -F '\t' -v owner="$home_identity" 'NF == 4 && $3 == owner { found=1 } END { exit found ? 0 : 1 }'; then
     echo "error: window $ses:$wname already exists" >&2
+    return 1
+  fi
+  if printf '%s\n' "$inventory" | awk -F '\t' 'NF == 4 && $3 == "" { found=1 } END { exit found ? 0 : 1 }'; then
+    echo "error: untagged legacy window $ses:$wname has ambiguous Firstmate-home ownership" >&2
     return 1
   fi
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1

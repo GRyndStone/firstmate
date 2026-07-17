@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, parse, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -11,7 +11,7 @@ let guardFollowupRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let guardFollowupPendingMessage = "";
 let guardFollowupCleanupPending = false;
 
-type LockOwnership = "owned" | "missing" | "other";
+type LockOwnership = "owned" | "missing" | "other" | "unknown";
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
@@ -31,40 +31,47 @@ function primaryCheckout(): boolean {
   return paths.length === 2 && paths[0] === paths[1];
 }
 
-function parentPid(pid: string): string {
+function parentPid(pid: string): string | undefined {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
+  if (result.error || result.status !== 0) return undefined;
   return result.stdout.trim();
 }
 
-function pidAlive(pid: string): boolean {
-  try {
-    process.kill(Number(pid), 0);
-    return true;
-  } catch {
-    return false;
-  }
+function pidState(pid: string): "alive" | "dead" | "unknown" {
+  const result = spawnSync("ps", ["-o", "stat=", "-p", pid], { encoding: "utf8" });
+  if (result.error) return "unknown";
+  if (result.status === 1 && !result.stdout.trim()) return "dead";
+  if (result.status !== 0) return "unknown";
+  const state = result.stdout.trim();
+  if (!state) return "unknown";
+  return state.startsWith("Z") ? "dead" : "alive";
 }
 
 function lockOwnership(): LockOwnership {
   let lockPid = "";
   try {
     lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
-  } catch {
-    return "missing";
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return "missing";
+    return "unknown";
   }
   if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
   let pid = String(process.pid);
   for (let i = 0; i < 8; i += 1) {
     if (pid === lockPid) return "owned";
-    pid = parentPid(pid);
+    const parent = parentPid(pid);
+    if (parent === undefined) return "unknown";
+    pid = parent;
     if (!pid || pid === "1") break;
   }
-  return pidAlive(lockPid) ? "other" : "missing";
+  const lockPidState = pidState(lockPid);
+  if (lockPidState === "unknown") return "unknown";
+  return lockPidState === "alive" ? "other" : "missing";
 }
 
 function markLoaded(): void {
-  if (lockOwnership() === "other") return;
+  const ownership = lockOwnership();
+  if (ownership === "other" || ownership === "unknown") return;
   try {
     rejectSymlinkedComponents(fmHome, state);
   } catch {
@@ -98,18 +105,23 @@ function runGuard(): Promise<{ code: number; stderr: string }> {
 
 type Handoff = { record: string; token: string; message: string };
 
-function rejectSymlinkedComponents(base: string, target: string): void {
-  const scopedBase = resolve(base);
+function rejectSymlinkedComponents(_base: string, target: string): void {
   const scopedTarget = resolve(target);
-  const suffix = relative(scopedBase, scopedTarget);
-  if (suffix.startsWith("..") || isAbsolute(suffix)) return;
-  let cursor = scopedBase;
-  const baseInfo = lstatSync(cursor);
-  if (baseInfo.isSymbolicLink() || !baseInfo.isDirectory()) throw new Error("unsafe Firstmate home directory");
-  for (const component of suffix.split(/[\\/]/).filter(Boolean)) {
+  const filesystemRoot = parse(scopedTarget).root;
+  const components = relative(filesystemRoot, scopedTarget).split(/[\\/]/).filter(Boolean);
+  let cursor = filesystemRoot;
+  for (let index = 0; index < components.length; index += 1) {
+    const component = components[index];
     cursor = resolve(cursor, component);
-    const info = lstatSync(cursor);
+    let info;
+    try {
+      info = lstatSync(cursor);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue;
+      throw error;
+    }
     if (info.isSymbolicLink()) throw new Error("symlinked Firstmate state path component");
+    if (index < components.length - 1 && !info.isDirectory()) throw new Error("non-directory Firstmate state path component");
   }
 }
 
@@ -215,7 +227,17 @@ function ensureHandoff(): Handoff | undefined {
 }
 
 function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
-  if (lockOwnership() !== "owned") {
+  const ownership = lockOwnership();
+  if (ownership === "unknown") {
+    if (guardFollowupRetryTimer === undefined) {
+      guardFollowupRetryTimer = setTimeout(() => {
+        guardFollowupRetryTimer = undefined;
+        deliverHandoff(pi);
+      }, delay);
+    }
+    return;
+  }
+  if (ownership !== "owned") {
     cancelRetryOwner();
     return;
   }
@@ -228,7 +250,12 @@ function scheduleDelivery(pi: ExtensionAPI, delay = retryDelay()): void {
 }
 
 function deliverHandoff(pi: ExtensionAPI): void {
-  if (lockOwnership() !== "owned") {
+  const ownership = lockOwnership();
+  if (ownership === "unknown") {
+    scheduleDelivery(pi);
+    return;
+  }
+  if (ownership !== "owned") {
     cancelRetryOwner();
     return;
   }
@@ -256,7 +283,9 @@ function deliverHandoff(pi: ExtensionAPI): void {
 }
 
 function acknowledgeHandoff(): void {
-  if (lockOwnership() !== "owned") {
+  const ownership = lockOwnership();
+  if (ownership === "unknown") return;
+  if (ownership !== "owned") {
     cancelRetryOwner();
     return;
   }
@@ -316,10 +345,76 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
 
 export default function (pi: ExtensionAPI) {
   const inPrimaryCheckout = primaryCheckout();
+  let guardOwnershipRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelGuardOwnershipRetry = () => {
+    if (guardOwnershipRetryTimer !== undefined) clearTimeout(guardOwnershipRetryTimer);
+    guardOwnershipRetryTimer = undefined;
+  };
+  const scheduleGuardOwnershipRetry = () => {
+    if (guardOwnershipRetryTimer !== undefined) return;
+    guardOwnershipRetryTimer = setTimeout(() => {
+      guardOwnershipRetryTimer = undefined;
+      void handleAgentSettled();
+    }, retryDelay());
+  };
+  const handleAgentSettled = async () => {
+    const initialOwnership = lockOwnership();
+    if (initialOwnership === "unknown") {
+      scheduleGuardOwnershipRetry();
+      return;
+    }
+    cancelGuardOwnershipRetry();
+    if (initialOwnership !== "owned") {
+      cancelRetryOwner();
+      return;
+    }
+    const result = await runGuard();
+    const finalOwnership = lockOwnership();
+    if (finalOwnership === "unknown") {
+      scheduleGuardOwnershipRetry();
+      return;
+    }
+    if (finalOwnership !== "owned") {
+      cancelRetryOwner();
+      return;
+    }
+    if (result.code === 0) {
+      const retained = readHandoff();
+      if (!clearHandoff()) {
+        if (retained) guardFollowupAwaitingAck = retained.token;
+        guardFollowupCleanupPending = true;
+        scheduleDelivery(pi);
+        return;
+      }
+      guardFollowupAwaitingAck = "";
+      guardFollowupPendingMessage = "";
+      guardFollowupCleanupPending = false;
+      cancelRetryOwner();
+      return;
+    }
+    const detail = result.stderr.trim();
+    const reason = result.code === 2
+      ? detail || "shared turn-end guard blocked"
+      : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
+    const message =
+      "TURN WOULD END BLIND - supervision is off. " +
+      "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
+      reason;
+    guardFollowupPendingMessage = message;
+    guardFollowupAwaitingAck = "";
+    guardFollowupCleanupPending = false;
+    cancelRetryOwner();
+    deliverHandoff(pi);
+  };
 
   if (inPrimaryCheckout) {
     pi.on?.("session_start", () => {
-      if (lockOwnership() !== "owned") {
+      const ownership = lockOwnership();
+      if (ownership === "unknown") {
+        scheduleDelivery(pi);
+        return;
+      }
+      if (ownership !== "owned") {
         cancelRetryOwner();
         return;
       }
@@ -328,7 +423,12 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.on?.("agent_start", () => {
-      if (lockOwnership() !== "owned") {
+      const ownership = lockOwnership();
+      if (ownership === "unknown") {
+        scheduleDelivery(pi);
+        return;
+      }
+      if (ownership !== "owned") {
         cancelRetryOwner();
         return;
       }
@@ -352,46 +452,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   if (inPrimaryCheckout) {
-    pi.on("agent_settled", async () => {
-      if (lockOwnership() !== "owned") {
-        cancelRetryOwner();
-        return;
-      }
-      const result = await runGuard();
-      if (lockOwnership() !== "owned") {
-        cancelRetryOwner();
-        return;
-      }
-      if (result.code === 0) {
-        const retained = readHandoff();
-        if (!clearHandoff()) {
-          if (retained) guardFollowupAwaitingAck = retained.token;
-          guardFollowupCleanupPending = true;
-          scheduleDelivery(pi);
-          return;
-        }
-        guardFollowupAwaitingAck = "";
-        guardFollowupPendingMessage = "";
-        guardFollowupCleanupPending = false;
-        cancelRetryOwner();
-        return;
-      }
-      const detail = result.stderr.trim();
-      const reason = result.code === 2
-        ? detail || "shared turn-end guard blocked"
-        : `shared turn-end guard failed with exit ${result.code}${detail ? `: ${detail}` : ""}`;
-      const message =
-        "TURN WOULD END BLIND - supervision is off. " +
-        "Resume supervision according to the session-start operating block before ending the turn.\n\n" +
-        reason;
-      guardFollowupPendingMessage = message;
-      guardFollowupAwaitingAck = "";
-      guardFollowupCleanupPending = false;
-      cancelRetryOwner();
-      deliverHandoff(pi);
-    });
+    pi.on("agent_settled", handleAgentSettled);
 
     markLoaded();
-    if (lockOwnership() === "owned") scheduleDelivery(pi, 0);
+    const ownership = lockOwnership();
+    if (ownership === "owned") scheduleDelivery(pi, 0);
+    else if (ownership === "unknown") scheduleDelivery(pi);
   }
 }

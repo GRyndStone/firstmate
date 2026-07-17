@@ -27,24 +27,20 @@ if [ -z "$SESSION_ID" ]; then
   exit 0
 fi
 STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
-SCOPE_HOME=${FM_HOME:-$ROOT}
-SCOPE_HOME=${SCOPE_HOME%/}
-case "$STATE" in
-  "$SCOPE_HOME"|"$SCOPE_HOME"/*)
-    COMPONENT_PATH=$SCOPE_HOME
-    [ -d "$COMPONENT_PATH" ] && [ ! -L "$COMPONENT_PATH" ] || exit 1
-    COMPONENT_SUFFIX=${STATE#"$SCOPE_HOME"}
-    COMPONENT_SUFFIX=${COMPONENT_SUFFIX#/}
-    while [ -n "$COMPONENT_SUFFIX" ]; do
-      COMPONENT=${COMPONENT_SUFFIX%%/*}
-      if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
-      [ -n "$COMPONENT" ] || continue
-      case "$COMPONENT" in .|..) exit 1 ;; esac
-      COMPONENT_PATH="$COMPONENT_PATH/$COMPONENT"
-      [ ! -L "$COMPONENT_PATH" ] || exit 1
-    done
-    ;;
-esac
+case "$STATE" in /*) ;; *) STATE="$PWD/$STATE" ;; esac
+COMPONENT_PATH=/
+COMPONENT_SUFFIX=${STATE#/}
+while [ -n "$COMPONENT_SUFFIX" ]; do
+  COMPONENT=${COMPONENT_SUFFIX%%/*}
+  if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
+  [ -n "$COMPONENT" ] || continue
+  case "$COMPONENT" in .|..) exit 1 ;; esac
+  COMPONENT_PATH=${COMPONENT_PATH%/}/$COMPONENT
+  [ ! -L "$COMPONENT_PATH" ] || exit 1
+  if [ -n "$COMPONENT_SUFFIX" ] && [ -e "$COMPONENT_PATH" ]; then
+    [ -d "$COMPONENT_PATH" ] || exit 1
+  fi
+done
 [ ! -e "$STATE" ] && exit 0
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || exit 1
 HANDOFF_DIR="$STATE/.turnend-handoffs"

@@ -945,7 +945,7 @@ test_interrupted_mutation_receipt_claims_reconcile_from_files() {
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
     "$BACKLOG" show task-a 2>&1) || status=$?
   expect_code 1 "$status" "live orphan backend recovery"
-  assert_contains "$out" "could not be reconciled safely" \
+  assert_contains "$out" "durable backlog mutation" \
     "a new invocation did not fail closed while the orphan backend still owned the mutation"
   assert_absent "$home/state/task-a.teardown-complete" \
     "a live orphan backend restored completion authority before mutation settled"
@@ -1015,7 +1015,7 @@ test_interrupted_done_backend_retains_mutation_ownership() {
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
     "$BACKLOG" done task-a --note retry 2>&1) || status=$?
   expect_code 1 "$status" "Done retry with live orphan backend"
-  assert_contains "$out" "could not be reconciled safely" \
+  assert_contains "$out" "durable backlog mutation" \
     "Done retry did not fail closed behind its live orphan backend"
   assert_present "$completion_claim" \
     "Done retry recovered completion authority while the original backend remained live"

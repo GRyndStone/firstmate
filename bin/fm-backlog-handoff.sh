@@ -321,6 +321,15 @@ trap release_backlog_locks EXIT
 fm_lock_acquire_wait "$FIRST_LOCK"
 [ -z "$SECOND_LOCK" ] || fm_lock_acquire_wait "$SECOND_LOCK"
 LOCKS_HELD=1
+if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
+  echo "error: the active home still has live or unreadable durable backlog mutation ownership" >&2
+  exit 1
+fi
+if [ "$SUB_HOME/state" != "$STATE" ] \
+   && ! fm_tasks_axi_reconcile_mutation_owner "$SUB_HOME/state"; then
+  echo "error: secondmate $ID still has live or unreadable durable backlog mutation ownership" >&2
+  exit 1
+fi
 
 # Classify every key before changing anything: move-from-main, already-in-sub, or
 # missing. Abort with no changes if any key matches neither backlog.
@@ -404,12 +413,85 @@ if [ ! -f "$SUB_BACKLOG" ]; then
   SUB_CREATED=1
 fi
 
+run_owned_handoff_mutation() {
+  local parent_pid worker_pid worker_identity current_identity previous_identity=
+  local mutation_token start_path i=0 status=0 published_main=0 published_sub=0
+  parent_pid=${BASHPID:-$$}
+  mutation_token=$(fm_tasks_axi_mutation_owner_token) || return 1
+  start_path=$(fm_tasks_axi_mutation_owner_start_path "$STATE") || return 1
+  (
+    local wait_count=0
+    while [ ! -e "$start_path" ]; do
+      fm_pid_alive "$parent_pid" || exit 125
+      [ "$wait_count" -lt 200 ] || exit 125
+      sleep 0.05
+      wait_count=$((wait_count + 1))
+    done
+    cd "$ACTIVE_HOME" || exit 1
+    HOME="$ACTIVE_HOME" exec tasks-axi mv "${TO_MOVE[@]}" --backend markdown \
+      --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG"
+  ) &
+  worker_pid=$!
+  while [ "$i" -lt 40 ]; do
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    if [ -n "$current_identity" ] && [ -n "$previous_identity" ] \
+       && [ "$current_identity" = "$previous_identity" ]; then
+      worker_identity=$current_identity
+      break
+    fi
+    previous_identity=$current_identity
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if [ -z "${worker_identity:-}" ]; then
+    wait "$worker_pid" 2>/dev/null || true
+    return 1
+  fi
+  if ! fm_tasks_axi_publish_mutation_owner "$STATE" "$worker_pid" "$worker_identity" "$mutation_token"; then
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    return 1
+  fi
+  published_main=1
+  if [ "$SUB_HOME/state" != "$STATE" ]; then
+    if ! fm_tasks_axi_publish_mutation_owner "$SUB_HOME/state" "$worker_pid" "$worker_identity" "$mutation_token"; then
+      current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+      [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+      wait "$worker_pid" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+      return 1
+    fi
+    published_sub=1
+    if ! fm_tasks_axi_start_mutation_owner "$SUB_HOME/state" "$mutation_token"; then
+      current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+      [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+      wait "$worker_pid" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if ! fm_tasks_axi_start_mutation_owner "$STATE" "$mutation_token"; then
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" 2>/dev/null || true
+    [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+    return 1
+  fi
+  wait "$worker_pid" || status=$?
+  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" || status=1
+  [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || status=1
+  return "$status"
+}
+
 # Delegate the move to tasks-axi. Passing the whole in-scope set to one call is a
 # single atomic transaction, so a connected set (blocker + dependents) moves
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(cd "$ACTIVE_HOME" && HOME="$ACTIVE_HOME" tasks-axi mv "${TO_MOVE[@]}" --backend markdown --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
+if ! MV_OUT=$(run_owned_handoff_mutation 2>&1); then
   if [ "$SUB_CREATED" -eq 1 ]; then
     rm -f "$SUB_BACKLOG"
   fi
