@@ -46,6 +46,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 BACKLOG="$DATA/backlog.md"
+TODAY=${FM_FLEET_SNAPSHOT_TODAY:-$(date +%Y-%m-%d)}
 
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
@@ -173,7 +174,7 @@ backlog_json() {
     def links($rest): [$rest | scan(url_pattern)];
     def strip_trailing_metadata:
       reduce range(0; 20) as $_ (.;
-        sub("[[:space:]]*\\([[:space:]]*(?:(?:repo|kind|priority|hold|hold-kind):[[:space:]]*[^)]*|(?:since|merged|reported|done)[[:space:]]+[^)]*)[[:space:]]*\\)[[:space:]]*$"; ""));
+        sub("[[:space:]]*\\([[:space:]]*(?:(?:repo|kind|priority|hold|hold-kind|hold-until):[[:space:]]*[^)]*|(?:since|merged|reported|done)[[:space:]]+[^)]*)[[:space:]]*\\)[[:space:]]*$"; ""));
     def strip_title_artifacts:
       sub("[[:space:]]+-[[:space:]]+data/[^[:space:])]+/report\\.md$"; "")
       | sub("[[:space:]]+data/[^[:space:])]+/report\\.md$"; "")
@@ -196,6 +197,8 @@ backlog_json() {
       | if $reason == null then null
         else ($reason | clean_title | if . == "" then null else . end)
         end;
+    def blocker_ids($rest):
+      [$rest | scan("blocked-by:[[:space:]]*[^[:space:])]+") | sub("^blocked-by:[[:space:]]*"; "")];
     def local_note($rest):
       cap(($rest | strip_trailing_metadata); ".*(?:^|[[:space:]]+-[[:space:]]+|[[:space:]])(?<v>local main)$");
     def completion($rest):
@@ -230,7 +233,9 @@ backlog_json() {
              priority:metadata($rest; "priority"),
              hold:metadata($rest; "hold"),
              hold_kind:metadata($rest; "hold-kind"),
-             blocked_by:cap($rest; ".*blocked-by:[[:space:]]*(?<v>[^[:space:])]+).*"),
+             hold_until:metadata($rest; "hold-until"),
+             blocked_by:((blocker_ids($rest))[0] // null),
+             blocked_by_ids:blocker_ids($rest),
              blocked_reason:blocked_reason($rest),
              since:metadata_word($rest; "since"),
              merged:metadata_word($rest; "merged"),
@@ -468,6 +473,7 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
+  --arg today "$TODAY" \
   --argjson backlog "$BACKLOG_JSON" \
   --argjson tasks "$TASKS_JSON" \
   --argjson scout_reports "$SCOUT_REPORTS_JSON" \
@@ -476,6 +482,18 @@ jq -n \
   'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
+   def active_hold:
+     ((.hold // "") != "")
+     and (((.hold_until // "") == "") or ((.hold_until // "") > $today));
+   def blocker_ids: (.blocked_by_ids // (if (.blocked_by // "") == "" then [] else [.blocked_by] end));
+   def active_blocked:
+     blocker_ids as $ids
+     | ([$backlog.records[]?
+         | . as $candidate
+         | select($candidate.structured == true
+                  and $candidate.state != "done"
+                  and (($ids | index($candidate.id)) != null))] | length) > 0;
+   def runnable: (active_hold | not) and (active_blocked | not);
    {
      schema:"fm-fleet-snapshot.v1",
      fm_home:$fm_home,
@@ -489,10 +507,10 @@ jq -n \
        queued_total:([$backlog.records[]? | select(.state == "queued")] | length),
        structured_queued:([$backlog.records[]? | select(.state == "queued" and .structured == true)] | length),
        unstructured_queued:([$backlog.records[]? | select(.state == "queued" and .structured != true)] | length),
-       held:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") != "")] | length),
-       blocked:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.blocked_by // "") != "")] | length),
-       runnable_candidates:([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") == "" and (.blocked_by // "") == "")] | length),
-       empty_runnable_queue:(([$backlog.records[]? | select(.state == "queued" and .structured == true and (.hold // "") == "" and (.blocked_by // "") == "")] | length) == 0),
+       held:([$backlog.records[]? | select(.state == "queued" and .structured == true and active_hold)] | length),
+       blocked:([$backlog.records[]? | select(.state == "queued" and .structured == true and active_blocked)] | length),
+       runnable_candidates:([$backlog.records[]? | select(.state == "queued" and .structured == true and runnable)] | length),
+       empty_runnable_queue:(([$backlog.records[]? | select(.state == "queued" and .structured == true and runnable)] | length) == 0),
        durable_program_source_count:($program_sources | length),
        decomposition_status:(if ($program_sources | length) > 0 then "requires_supervisor_judgment" else "no_declared_program_sources" end),
        supervisor_boundary:(if ($program_sources | length) > 0 then "An empty runnable queue does not prove the durable program is complete; audit each program source for obligations that were never materialized as backlog tasks." else "No convention-named durable program source was found; absence does not prove that no plan exists elsewhere." end)

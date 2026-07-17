@@ -647,9 +647,15 @@ fm_backend_cmux_kill() {  # <target> [unused] [expected-label]
   win=${wininfo%% *}
   count=${wininfo##* }
   if [ -n "$win" ] && [ "$count" = 1 ]; then
-    fm_backend_cmux_cli new-workspace --window "$win" --focus false --id-format uuids >/dev/null 2>&1 || true
+    if ! fm_backend_cmux_cli new-workspace --window "$win" --focus false --id-format uuids >/dev/null 2>&1; then
+      [ "${FM_BACKEND_STRICT_CLOSE:-0}" = 1 ] && return 1
+    fi
   fi
-  fm_backend_cmux_cli close-workspace --workspace "$wsid" >/dev/null 2>&1 || true
+  if [ "${FM_BACKEND_STRICT_CLOSE:-0}" = 1 ]; then
+    fm_backend_cmux_cli close-workspace --workspace "$wsid" >/dev/null 2>&1
+  else
+    fm_backend_cmux_cli close-workspace --workspace "$wsid" >/dev/null 2>&1 || true
+  fi
 }
 
 # fm_backend_cmux_list_live: recovery/orphan discovery. Lists every workspace

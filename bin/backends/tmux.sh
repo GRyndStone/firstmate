@@ -270,7 +270,11 @@ fm_backend_tmux_send_literal() {  # <target> <text>
 # fm_backend_tmux_kill: remove the task's window, best-effort. Mirrors
 # fm-teardown.sh's `tmux kill-window -t "$T" 2>/dev/null || true`.
 fm_backend_tmux_kill() {  # <target>
-  tmux kill-window -t "$1" 2>/dev/null || true
+  if [ "${FM_BACKEND_STRICT_CLOSE:-0}" = 1 ]; then
+    tmux kill-window -t "$1" 2>/dev/null
+  else
+    tmux kill-window -t "$1" 2>/dev/null || true
+  fi
 }
 
 # fm_backend_tmux_current_command: <target>'s live foreground process name -

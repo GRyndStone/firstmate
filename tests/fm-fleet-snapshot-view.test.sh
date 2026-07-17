@@ -398,6 +398,7 @@ test_queue_accounting_surfaces_holds_and_durable_program_boundary() {
   home=$(make_home program-boundary)
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
+- [ ] dependency - Active Dependency (repo: alpha) (kind: ship)
 
 ## Queued
 - [ ] held-task - Held Task (repo: alpha) (kind: ship) (hold: captain decision pending) (hold-kind: captain)
@@ -423,6 +424,35 @@ EOF
   assert_contains "$view" "| held-task | Held Task | alpha | ship | captain - captain decision pending |" \
     "view omitted structured held work"
   pass "status reporting distinguishes an empty runnable queue from held work and durable program obligations"
+}
+
+test_queue_accounting_uses_active_hold_and_blocker_semantics() {
+  local home out
+  home=$(make_home active-queue-gates)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] live-dependency - Live Dependency (repo: alpha) (kind: ship)
+
+## Queued
+- [ ] future-hold - Future Hold (repo: alpha) (kind: ship) (hold: scheduled) (hold-kind: external) (hold-until: 2026-07-18)
+- [ ] expired-hold - Expired Hold (repo: alpha) (kind: ship) (hold: scheduled) (hold-kind: external) (hold-until: 2026-07-16)
+- [ ] active-blocker - Active Blocker (repo: alpha) (kind: ship) blocked-by: live-dependency - waits on live work
+- [ ] resolved-blocker - Resolved Blocker (repo: alpha) (kind: ship) blocked-by: done-dependency - already landed
+- [ ] missing-blocker - Missing Blocker (repo: alpha) (kind: ship) blocked-by: removed-dependency - legacy dangling edge
+
+## Done
+- [x] done-dependency - Done Dependency (repo: alpha) (kind: ship) (done 2026-07-16)
+EOF
+  out=$(FM_HOME="$home" FM_FLEET_SNAPSHOT_TODAY=2026-07-17 "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .queue_accounting.held == 1
+      and .queue_accounting.blocked == 1
+      and .queue_accounting.runnable_candidates == 3
+      and .queue_accounting.empty_runnable_queue == false
+      and (.backlog.records[] | select(.id == "future-hold") | .hold_until == "2026-07-18")
+      and (.backlog.records[] | select(.id == "resolved-blocker") | .blocked_by_ids == ["done-dependency"])
+  ' >/dev/null || fail "queue accounting did not resolve expired holds and landed or missing blockers: $out"
+  pass "queue accounting matches tasks-axi active hold and blocker semantics"
 }
 
 test_view_renders_dead_secondmate_agent_status() {
@@ -606,4 +636,5 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_queue_accounting_surfaces_holds_and_durable_program_boundary
+test_queue_accounting_uses_active_hold_and_blocker_semantics
 test_view_renders_dead_secondmate_agent_status

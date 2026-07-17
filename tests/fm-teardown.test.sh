@@ -72,7 +72,16 @@ make_case() {
   local name=$1 case_dir fakebin
   case_dir="$TMP_ROOT/$name"
   fakebin="$case_dir/fakebin"
-  mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
+  mkdir -p "$case_dir/state" "$case_dir/config" "$case_dir/fm-home/data" "$fakebin"
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$case_dir/fm-home/data/backlog.md"
+  cat > "$case_dir/fm-home/.tasks.toml" <<'EOF'
+backend = "markdown"
+
+[markdown]
+path = "data/backlog.md"
+archive = "data/done-archive.md"
+done_keep = 10
+EOF
 
   # Mocks for the post-check teardown steps. Refuse logic exits before these
   # run; the ALLOW cases need them so the script can complete cleanly.
@@ -84,6 +93,13 @@ SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 # tmux kill-window etc.: succeed silently.
+exit 0
+SH
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'tasks-axi 0.0.0'
+fi
 exit 0
 SH
   # Default gh-axi mock: no PR is associated with the branch, and viewing any PR
@@ -105,7 +121,7 @@ case "${1:-} ${2:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/gh-axi" "$fakebin/gh"
+  chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/tasks-axi" "$fakebin/gh-axi" "$fakebin/gh"
 
   # Bare origin so the clone has an `origin` remote and origin/HEAD.
   git init -q --bare "$case_dir/origin.git"
@@ -151,8 +167,10 @@ if [ "${1:-}" = done ]; then
     echo 'tasks-axi done ran before teardown state was cleared' >&2
     exit 8
   fi
-  [ -z "${FM_TASKS_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TASKS_LOG"
 fi
+case "${1:-}" in
+  done|hold|reopen) [ -z "${FM_TASKS_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TASKS_LOG" ;;
+esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/tasks-axi"
@@ -498,6 +516,7 @@ SH
 run_teardown() {
   local case_dir=$1; shift
   FM_ROOT_OVERRIDE="$ROOT" \
+  FM_HOME="$case_dir/fm-home" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
   PATH="$case_dir/fakebin:$PATH" \
@@ -528,6 +547,7 @@ test_teardown_records_tasks_axi_done_after_cleanup_when_compatible() {
   write_meta "$case_dir" no-mistakes ship
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   add_compatible_tasks_axi "$case_dir"
+  add_gh_pr_merged_for_head "$case_dir" "$(git -C "$case_dir/wt" rev-parse HEAD)"
 
   out=$(FM_TASKS_LOG="$log" run_teardown "$case_dir") || fail "teardown failed with compatible tasks-axi"
   assert_contains "$(cat "$log")" 'done task-x1 --pr https://github.com/example/repo/pull/7' \
@@ -550,6 +570,7 @@ test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present() {
   printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
   printf '%s\n' manual > "$case_dir/config/backlog-backend"
   add_compatible_tasks_axi "$case_dir"
+  add_gh_pr_merged_for_head "$case_dir" "$(git -C "$case_dir/wt" rev-parse HEAD)"
 
   out=$(run_teardown "$case_dir") || fail "teardown failed with manual backlog backend"
   printf '%s\n' "$out" | grep -F 'update data/backlog.md now - move task-x1 to Done' >/dev/null \
@@ -1261,8 +1282,15 @@ test_herdr_teardown_clears_escalation_marker() {
   printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-} ${2:-}" = "workspace list" ]; then
-  printf '%s\n' '{"result":{"workspaces":[]}}'
+  if [ "${1:-} ${2:-}" = "pane get" ]; then
+    printf '%s\n' '{"error":{"code":"pane_not_found","message":"gone"}}'
+    exit 1
+  elif [ "${1:-} ${2:-}" = "workspace get" ]; then
+    printf '%s\n' '{"result":{"workspace":{"workspace_id":"wG"}}}'
+  elif [ "${1:-} ${2:-}" = "tab list" ]; then
+    printf '%s\n' '{"result":{"tabs":[]}}'
+  elif [ "${1:-} ${2:-}" = "pane list" ]; then
+    printf '%s\n' '{"result":{"panes":[]}}'
 fi
 exit 0
 SH
@@ -1289,8 +1317,8 @@ test_herdr_duplicate_endpoints_refuse_teardown_without_closure() {
 set -u
 printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
 case "${1:-} ${2:-}" in
-  "workspace list")
-    printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n'
+  "workspace get")
+    printf '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"}}}\n'
     ;;
   "tab list")
     printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task-x1"},{"tab_id":"w1:t2","label":"fm-task-x1"}]}}\n'
@@ -1306,13 +1334,122 @@ SH
   rc=0
   FM_HERDR_LOG="$log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "duplicate endpoint teardown"
-  assert_contains "$(cat "$case_dir/stderr")" "duplicate same-home recovery endpoints" \
-    "teardown did not refuse duplicate recovery endpoints"
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
+    "teardown did not refuse the endpoint ownership anomaly"
   assert_contains "$(cat "$case_dir/stderr")" "default:w1:p1,default:w1:p2" \
     "teardown refusal did not identify the exact duplicates"
   assert_not_contains "$(cat "$log")" "close" "duplicate refusal automatically closed an endpoint"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "duplicate refusal removed task meta"
   pass "Herdr duplicate endpoints block teardown and remain inspect-only"
+}
+
+test_backlog_operational_read_failure_refuses_before_teardown() {
+  local case_dir rc
+  case_dir=$(make_case backlog-read-failure)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  cat > "$case_dir/fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "--version ") printf '%s\n' '0.2.2'; exit 0 ;;
+  "update --help") printf '%s\n' '--archive-body'; exit 0 ;;
+  "mv --help") printf '%s\n' '[<id>...]'; exit 0 ;;
+  "show task-x1") printf '%s\n' 'error: malformed backlog' 'code: VALIDATION_ERROR' >&2; exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tasks-axi"
+  rc=0
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "operational backlog read failure"
+  assert_contains "$(cat "$case_dir/stderr")" "could not determine whether backlog task task-x1 exists" \
+    "operational backlog failure was treated as task absence"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "backlog read failure removed lifecycle metadata"
+  pass "operational backlog read failures refuse teardown while NOT_FOUND remains distinct"
+}
+
+test_non_delivery_outcomes_never_record_done() {
+  local case_dir log hold_line reopen_line
+
+  case_dir=$(make_case force-truth)
+  log="$case_dir/tasks.log"
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "discarded work"
+  add_compatible_tasks_axi "$case_dir"
+  FM_TASKS_LOG="$log" run_teardown "$case_dir" --force >/dev/null || fail "forced truthful teardown failed"
+  assert_contains "$(cat "$log")" "hold task-x1 --reason discarded during explicitly forced teardown" \
+    "forced discard did not persist a truthful structured hold"
+  assert_contains "$(cat "$log")" "reopen task-x1" "forced discard did not return the held item to Queued"
+  hold_line=$(grep -n '^hold task-x1 ' "$log" | head -1 | cut -d: -f1)
+  reopen_line=$(grep -n '^reopen task-x1' "$log" | head -1 | cut -d: -f1)
+  [ "$hold_line" -lt "$reopen_line" ] || fail "forced discard reopened before its hold was durable"
+  assert_not_contains "$(cat "$log")" "done task-x1" "forced discard was recorded Done"
+
+  case_dir=$(make_case pushed-local-only-truth)
+  log="$case_dir/tasks.log"
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "pushed but not local main"
+  add_fork_with_pushed_branch "$case_dir"
+  add_compatible_tasks_axi "$case_dir"
+  FM_TASKS_LOG="$log" run_teardown "$case_dir" >/dev/null || fail "remote-recoverable local-only teardown failed"
+  assert_contains "$(cat "$log")" "hold task-x1 --reason teardown complete but work is recoverable only outside the delivered default branch" \
+    "remote-only local work did not remain explicitly unlanded"
+  assert_contains "$(cat "$log")" "reopen task-x1" "remote-only work did not return to Queued after its hold"
+  hold_line=$(grep -n '^hold task-x1 ' "$log" | head -1 | cut -d: -f1)
+  reopen_line=$(grep -n '^reopen task-x1' "$log" | head -1 | cut -d: -f1)
+  [ "$hold_line" -lt "$reopen_line" ] || fail "remote-only work reopened before its hold was durable"
+  assert_not_contains "$(cat "$log")" "done task-x1" "remote-only local work was recorded Done"
+
+  case_dir=$(make_case unmerged-pr-truth)
+  log="$case_dir/tasks.log"
+  write_meta "$case_dir" no-mistakes ship
+  printf '%s\n' 'pr=https://github.com/example/repo/pull/7' >> "$case_dir/state/task-x1.meta"
+  wt_commit "$case_dir" "open PR work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_compatible_tasks_axi "$case_dir"
+  FM_TASKS_LOG="$log" run_teardown "$case_dir" >/dev/null || fail "unmerged PR teardown failed"
+  assert_contains "$(cat "$log")" "hold task-x1 --reason teardown complete but work is recoverable only outside the delivered default branch" \
+    "unmerged PR did not remain explicitly unlanded"
+  assert_contains "$(cat "$log")" "reopen task-x1" "unmerged PR work did not return to Queued after its hold"
+  hold_line=$(grep -n '^hold task-x1 ' "$log" | head -1 | cut -d: -f1)
+  reopen_line=$(grep -n '^reopen task-x1' "$log" | head -1 | cut -d: -f1)
+  [ "$hold_line" -lt "$reopen_line" ] || fail "unmerged PR work reopened before its hold was durable"
+  assert_not_contains "$(cat "$log")" "done task-x1" "unmerged PR was recorded Done"
+  pass "discarded and unlanded teardowns remain outside Done with truthful holds"
+}
+
+test_endpoint_close_must_succeed_and_be_absent() {
+  local case_dir log rc mode
+  for mode in close-fails close-noop; do
+    case_dir=$(make_case "endpoint-$mode")
+    log="$case_dir/tmux.log"
+    write_meta "$case_dir" local-only ship
+    cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FM_TREEHOUSE_WT:-}" ] || rm -rf "$FM_TREEHOUSE_WT"
+exit 0
+SH
+    cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  list-windows) printf '%s\n' 'fm-task-x1'; exit 0 ;;
+  kill-window) [ "${FM_TMUX_CLOSE_MODE:-}" = close-fails ] && exit 1; exit 0 ;;
+esac
+exit 0
+SH
+    chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/tmux"
+    rc=0
+    FM_TREEHOUSE_WT="$case_dir/wt" FM_TMUX_LOG="$log" FM_TMUX_CLOSE_MODE="$mode" \
+      run_teardown "$case_dir" --force \
+      > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "$mode endpoint close verification"
+    [ -f "$case_dir/state/task-x1.meta" ] || fail "$mode removed meta after endpoint close failure"
+    [ -f "$case_dir/state/task-x1.tearing-down" ] || fail "$mode removed teardown tombstone after endpoint close failure"
+    [ -d "$case_dir/wt" ] || fail "$mode removed the worktree before endpoint closure was verified"
+  done
+  pass "endpoint close failure and success-shaped no-op both preserve lifecycle state"
 }
 
 test_local_only_fork_remote_allows
@@ -1325,6 +1462,9 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
+test_backlog_operational_read_failure_refuses_before_teardown
+test_non_delivery_outcomes_never_record_done
+test_endpoint_close_must_succeed_and_be_absent
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

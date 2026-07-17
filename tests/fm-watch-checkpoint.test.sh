@@ -115,8 +115,46 @@ test_interrupted_checkpoint_reaps_only_its_watcher() {
   pass "interrupted checkpoint reaps only its exact watcher child instead of orphaning it"
 }
 
+test_timeout_marks_then_kills_only_term_resistant_watcher() {
+  local home out err watcher pid_file order_file unrelated status started elapsed watcher_pid
+  home=$(make_home resistant-timeout)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/term-resistant-watch.sh"
+  pid_file="$home/watcher.pid"
+  order_file="$home/term-order"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap 'if [ -e "${FM_WATCH_CHECKPOINT_TIMEOUT_MARKER:-}" ]; then printf "marker-before-term\n" > "$WATCH_ORDER_FILE"; else printf "term-before-marker\n" > "$WATCH_ORDER_FILE"; fi' TERM
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+while :; do sleep 0.1; done
+SH
+  chmod +x "$watcher"
+  sleep 30 &
+  unrelated=$!
+  started=$SECONDS
+  status=0
+  WATCH_PID_FILE="$pid_file" WATCH_ORDER_FILE="$order_file" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 124 "$status" "TERM-resistant timeout exit"
+  [ "$(cat "$order_file" 2>/dev/null || true)" = marker-before-term ] \
+    || fail "timeout signaled the watcher before publishing its timeout marker"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  [ -n "$watcher_pid" ] || fail "TERM-resistant watcher did not record its pid"
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    fail "TERM-resistant watcher $watcher_pid survived bounded KILL escalation"
+  fi
+  [ "$elapsed" -lt 10 ] || fail "TERM-resistant timeout was not bounded (${elapsed}s)"
+  kill -0 "$unrelated" 2>/dev/null || fail "timeout escalation killed an unrelated process"
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+  pass "timeout marks before TERM, escalates exact watcher to KILL, and reaps it"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success
 test_interrupted_checkpoint_reaps_only_its_watcher
+test_timeout_marks_then_kills_only_term_resistant_watcher

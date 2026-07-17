@@ -50,6 +50,7 @@ FM_BEARINGS_GATES=${FM_BEARINGS_GATES:-20}
 FM_BEARINGS_REPORTS=${FM_BEARINGS_REPORTS:-20}
 FM_BEARINGS_RECORDED_PRS=${FM_BEARINGS_RECORDED_PRS:-20}
 FM_BEARINGS_UNHEALTHY=${FM_BEARINGS_UNHEALTHY:-20}
+FM_BEARINGS_PROGRAM_SOURCES=${FM_BEARINGS_PROGRAM_SOURCES:-10}
 FM_BEARINGS_PR_REPOS=${FM_BEARINGS_PR_REPOS:-10}
 FM_BEARINGS_PR_LIMIT=${FM_BEARINGS_PR_LIMIT:-20}
 FM_BEARINGS_PR_TIMEOUT=${FM_BEARINGS_PR_TIMEOUT:-20}
@@ -64,6 +65,7 @@ validate_bound FM_BEARINGS_GATES "$FM_BEARINGS_GATES"
 validate_bound FM_BEARINGS_REPORTS "$FM_BEARINGS_REPORTS"
 validate_bound FM_BEARINGS_RECORDED_PRS "$FM_BEARINGS_RECORDED_PRS"
 validate_bound FM_BEARINGS_UNHEALTHY "$FM_BEARINGS_UNHEALTHY"
+validate_bound FM_BEARINGS_PROGRAM_SOURCES "$FM_BEARINGS_PROGRAM_SOURCES"
 validate_bound FM_BEARINGS_PR_REPOS "$FM_BEARINGS_PR_REPOS"
 validate_bound FM_BEARINGS_PR_LIMIT "$FM_BEARINGS_PR_LIMIT"
 
@@ -80,13 +82,14 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,hold,blocked_by,reason}, program{...}, reports{id,path},
+  gates{id,title,hold,blocked_by,reason}, program{source_paths,...}, reports{id,path},
   recorded_prs{id,url}, duplicate_endpoints{...},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
   --all-decisions, --all-reports, --all-queued, --all-recorded-prs,
   --all-unhealthy, --all-pr-repos, --include-prs (adds candidate_prs).
 Raise FM_BEARINGS_PR_LIMIT to expand per-repository open-PR results.
+Raise FM_BEARINGS_PROGRAM_SOURCES to expand durable program source paths.
 EOF
 }
 
@@ -236,6 +239,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   --argjson reports_n "$FM_BEARINGS_REPORTS" \
   --argjson recorded_prs_n "$FM_BEARINGS_RECORDED_PRS" \
   --argjson unhealthy_n "$FM_BEARINGS_UNHEALTHY" \
+  --argjson program_sources_n "$FM_BEARINGS_PROGRAM_SOURCES" \
   --argjson include_prs "$INCLUDE_PRS" \
   --argjson all_in_flight "$ALL_IN_FLIGHT" \
   --argjson all_decisions "$ALL_DECISIONS" \
@@ -299,6 +303,9 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         held:$snap.queue_accounting.held,
         blocked:$snap.queue_accounting.blocked,
         durable_sources:$snap.queue_accounting.durable_program_source_count,
+        sources_shown:([$snap.program_sources[:$program_sources_n][]] | length),
+        source_paths:([$snap.program_sources[:$program_sources_n][] | .relative_path] | join("|")),
+        sources_truncated:(($snap.program_sources | length) > $program_sources_n),
         decomposition:$snap.queue_accounting.decomposition_status,
         boundary:$snap.queue_accounting.supervisor_boundary
       }],
@@ -327,6 +334,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $all_reports == 0 and ($reports_all | length) > $reports_n then {surface:("reports showing \($reports_n) of \($reports_all | length)"), reveal:"--all-reports"} else empty end),
         (if $all_recorded_prs == 0 and ($recorded_prs_all | length) > $recorded_prs_n then {surface:("recorded_prs showing \($recorded_prs_n) of \($recorded_prs_all | length)"), reveal:"--all-recorded-prs"} else empty end),
         (if $all_unhealthy == 0 and ($unhealthy_all | length) > $unhealthy_n then {surface:("unhealthy_endpoints showing \($unhealthy_n) of \($unhealthy_all | length)"), reveal:"--all-unhealthy"} else empty end),
+        (if ($snap.program_sources | length) > $program_sources_n then {surface:("program sources showing \($program_sources_n) of \($snap.program_sources | length)"), reveal:"raise FM_BEARINGS_PROGRAM_SOURCES"} else empty end),
         (if $include_prs == 1 and $pr_repos_total > $pr_repos_shown then {surface:("PR repositories showing \($pr_repos_shown) of \($pr_repos_total)"), reveal:"--all-pr-repos"} else empty end),
         (if $include_prs == 1 and $pr_rows_capped > 0 then {surface:("candidate_prs showing \($candidate_prs | length) of at least \($pr_rows_min_total); capped in \($pr_rows_capped) repo(s)"), reveal:"raise FM_BEARINGS_PR_LIMIT"} else empty end),
         (if $include_prs == 1 then empty else {surface:"live PR discovery + checks", reveal:"--include-prs"} end) ]) }

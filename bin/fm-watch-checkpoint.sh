@@ -5,6 +5,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
+WATCHER=${FM_WATCH_CHECKPOINT_WATCHER:-$SCRIPT_DIR/fm-watch.sh}
 
 usage() {
   cat <<'EOF'
@@ -101,12 +102,20 @@ trap cleanup_owned_children EXIT
 # Signal traps terminate and reap only those captured PIDs, so an interrupted
 # foreground tool call cannot reparent fm-watch.sh to PID 1 or touch a watcher
 # belonging to another checkpoint or Firstmate home.
-"$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR" &
+FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER" >"$OUT" 2>"$ERR" &
 WATCH_PID=$!
 (
+  i=0
   sleep "$SECONDS_ARG"
+  : > "$TIMEOUT_MARKER"
   if kill -TERM "$WATCH_PID" 2>/dev/null; then
-    : > "$TIMEOUT_MARKER"
+    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 40 ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    if kill -0 "$WATCH_PID" 2>/dev/null; then
+      kill -KILL "$WATCH_PID" 2>/dev/null || true
+    fi
   fi
 ) &
 TIMER_PID=$!

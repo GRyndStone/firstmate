@@ -280,6 +280,45 @@ outcome: failed
 EOF
 }
 
+run_checks_passed() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: completed
+  head: "abc1234"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+outcome: checks-passed
+EOF
+}
+
+run_cancelled() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: completed
+  head: "abc1234"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+outcome: cancelled
+EOF
+}
+
+run_failed_with_cancelled_status() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: cancelled
+  head: "abc1234"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+outcome: failed
+EOF
+}
+
 run_ci_monitoring() {  # <branch>
   cat <<EOF
 run:
@@ -488,7 +527,7 @@ test_top_level_ci_checks_green_surfaces_done() {
   pass "top-level ci status uses ci log green marker"
 }
 
-test_ci_monitoring_no_checks_terminal_surfaces_done() {
+test_ci_monitoring_zero_checks_stays_non_green() {
   reset_fakes
   local d; d=$(new_case ci-nochecks)
   make_repo_on_branch "$d/wt" fm/feat-cinochecks
@@ -497,9 +536,61 @@ test_ci_monitoring_no_checks_terminal_surfaces_done() {
   FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cinochecks)"
   FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
   local out; out=$(run_crew_state "$d" feat-cinochecks)
-  assert_contains "$out" "state: done" "terminal no-checks ci-monitor run -> done"
-  assert_contains "$out" "checks green" "terminal no-checks ci-monitor detail mentions checks green"
-  pass "terminal no-checks ci-monitor marker surfaces done"
+  assert_contains "$out" "state: working" "zero-check ci-monitor run stays working"
+  assert_contains "$out" "source: run-step" "zero-check ci-monitor remains run-step sourced"
+  assert_contains "$out" "no CI checks reported" "zero-check ci-monitor preserves distinct detail"
+  assert_not_contains "$out" "state: done" "zero-check ci-monitor must not report done"
+  assert_not_contains "$out" "checks green" "zero-check ci-monitor must not report green"
+  pass "zero-check ci-monitor remains a distinct non-green working state"
+}
+
+test_cancelled_zero_check_monitor_yields_to_live_work() {
+  reset_fakes
+  local d; d=$(new_case cancelled-zero-check-live-work)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-zero
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-zero.meta" "window=fm:fm-feat-cancelled-zero" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-zero)"
+  FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-cancelled-zero)
+  assert_contains "$out" "state: working" "busy live pane must outrank stale zero-check cancellation"
+  assert_contains "$out" "source: pane" "zero-check cancellation override must name the live pane source"
+  assert_contains "$out" "zero-check monitor cancelled" "zero-check cancellation detail is explicit"
+  assert_not_contains "$out" "state: failed" "stale zero-check cancellation must not false-fail live work"
+  pass "live pane work outranks only a cancelled zero-check monitor"
+}
+
+test_ordinary_cancelled_run_remains_failed_with_busy_pane() {
+  reset_fakes
+  local d; d=$(new_case ordinary-cancelled-busy)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-ordinary
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-ordinary.meta" "window=fm:fm-feat-cancelled-ordinary" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-ordinary)"
+  FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-cancelled-ordinary)
+  assert_contains "$out" "state: failed" "ordinary cancelled run remains failed"
+  assert_contains "$out" "source: run-step" "ordinary cancellation remains run-step sourced"
+  assert_contains "$out" "run cancelled" "ordinary cancellation preserves terminal detail"
+  pass "ordinary cancelled run remains failed despite a busy pane"
+}
+
+test_failed_outcome_never_yields_to_cancelled_status() {
+  reset_fakes
+  local d; d=$(new_case failed-outcome-cancelled-status)
+  make_repo_on_branch "$d/wt" fm/feat-failed-cancelled-status
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-failed-cancelled-status.meta" "window=fm:fm-feat-failed-cancelled-status" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_failed_with_cancelled_status fm/feat-failed-cancelled-status)"
+  FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
+  FM_FAKE_BUSY=1
+  local out; out=$(run_crew_state "$d" feat-failed-cancelled-status)
+  assert_contains "$out" "state: failed" "failed outcome must outrank cancelled status"
+  assert_contains "$out" "source: run-step" "failed outcome remains run-step sourced"
+  assert_contains "$out" "run failed" "failed outcome preserves terminal detail"
+  pass "failed outcome never yields to a cancelled status and busy pane"
 }
 
 test_ci_monitoring_green_then_rearm_stays_working() {
@@ -667,10 +758,25 @@ test_terminal_failed() {
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-e.meta" "window=fm:fm-feat-e" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-e)"
+  FM_FAKE_BUSY=1
   local out; out=$(run_crew_state "$d" feat-e)
   assert_contains "$out" "state: failed" "failed run -> failed"
   assert_contains "$out" "source: run-step" "failed -> run-step source"
   pass "terminal failed run is authoritative"
+}
+
+test_terminal_checks_passed() {
+  reset_fakes
+  local d; d=$(new_case checks-passed)
+  make_repo_on_branch "$d/wt" fm/feat-checks-passed
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-checks-passed.meta" "window=fm:fm-feat-checks-passed" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_checks_passed fm/feat-checks-passed)"
+  local out; out=$(run_crew_state "$d" feat-checks-passed)
+  assert_contains "$out" "state: done" "checks-passed run remains done"
+  assert_contains "$out" "source: run-step" "checks-passed remains run-step sourced"
+  assert_contains "$out" "checks green" "checks-passed preserves green detail"
+  pass "terminal checks-passed run remains done"
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
@@ -1110,7 +1216,10 @@ test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
 test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
-test_ci_monitoring_no_checks_terminal_surfaces_done
+test_ci_monitoring_zero_checks_stays_non_green
+test_cancelled_zero_check_monitor_yields_to_live_work
+test_ordinary_cancelled_run_remains_failed_with_busy_pane
+test_failed_outcome_never_yields_to_cancelled_status
 test_ci_monitoring_green_then_rearm_stays_working
 test_ci_monitoring_no_checks_yet_stays_working
 test_ci_monitoring_still_waiting_stays_working
@@ -1121,6 +1230,7 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_terminal_checks_passed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status

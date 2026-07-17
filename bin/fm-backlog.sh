@@ -20,11 +20,6 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
-CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
-BACKLOG="$DATA/backlog.md"
-BACKLOG_LOCK="$STATE/.backlog.lock"
 
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
@@ -45,13 +40,90 @@ EOF
 [ "$#" -gt 0 ] || { usage >&2; exit 2; }
 case "$1" in
   -h|--help) usage; exit 0 ;;
+  task)
+    case "${2:-}" in -h|--help) usage; exit 0 ;; esac
+    ;;
+esac
+
+FM_HOME=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || {
+  echo "error: FM_HOME is not an accessible directory: $FM_HOME" >&2
+  exit 1
+}
+
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+BACKLOG_SOURCE="$DATA/backlog.md"
+BACKLOG_LOCK="$STATE/.backlog.lock"
+
+resolved_path() {
+  local path=$1 label=$2 parent
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  parent=$(dirname "$path")
+  (cd "$parent" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")") || {
+    echo "error: cannot resolve $label parent: $path" >&2
+    return 1
+  }
+}
+
+contained_path() {
+  local path=$1 label=$2 parent resolved
+  case "$path" in
+    /*) ;;
+    *) path="$FM_HOME/$path" ;;
+  esac
+  parent=$(dirname "$path")
+  resolved=$(cd "$parent" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")") || {
+    echo "error: cannot resolve $label parent inside FM_HOME: $path" >&2
+    return 1
+  }
+  case "$resolved" in
+    "$FM_HOME"/*) printf '%s\n' "$resolved" ;;
+    *) echo "error: $label must remain inside FM_HOME: $path" >&2; return 1 ;;
+  esac
+}
+
+if [ -L "$BACKLOG_SOURCE" ]; then
+  echo "error: backlog must not be a symlink: $BACKLOG_SOURCE" >&2
+  exit 1
+fi
+BACKLOG=$(resolved_path "$BACKLOG_SOURCE" backlog) || exit 1
+if [ -z "${FM_DATA_OVERRIDE:-}" ]; then
+  BACKLOG=$(contained_path "$BACKLOG" backlog) || exit 1
+fi
+
+TASKS_CONFIG="$FM_HOME/.tasks.toml"
+if [ -L "$TASKS_CONFIG" ] || [ ! -f "$TASKS_CONFIG" ]; then
+  echo "error: FM_HOME must contain a regular .tasks.toml: $TASKS_CONFIG" >&2
+  exit 1
+fi
+ARCHIVE_REL=$(sed -n '/^[[:space:]]*\[markdown\][[:space:]]*$/,/^[[:space:]]*\[/s/^[[:space:]]*archive[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$TASKS_CONFIG" | head -1)
+[ -n "$ARCHIVE_REL" ] || {
+  echo "error: $TASKS_CONFIG must declare markdown.archive" >&2
+  exit 1
+}
+ARCHIVE_PATH=$(contained_path "$ARCHIVE_REL" markdown.archive) || exit 1
+if [ -L "$ARCHIVE_PATH" ]; then
+  echo "error: markdown.archive must not be a symlink: $ARCHIVE_PATH" >&2
+  exit 1
+fi
+
+if [ "$1" = task ]; then
+  shift
+  [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+fi
+case "$1" in
+  close) shift; set -- "done" "$@" ;;
 esac
 
 if fm_backlog_backend_manual "$CONFIG"; then
   echo "error: config/backlog-backend=manual; fm-backlog.sh will not mutate or reinterpret the manual backend" >&2
   exit 1
 fi
-fm_tasks_axi_compatible || {
+(cd "$FM_HOME" && HOME="$FM_HOME" fm_tasks_axi_compatible) || {
   echo "error: compatible tasks-axi is required for fm-backlog.sh" >&2
   exit 1
 }
@@ -72,6 +144,10 @@ case "$COMMAND" in
     exit 2
     ;;
 esac
+
+run_tasks_axi() {
+  (cd "$FM_HOME" && HOME="$FM_HOME" tasks-axi "$@" --backend markdown --file "$BACKLOG")
+}
 
 if [ "$COMMAND" = "done" ]; then
   ID=${2:-}
@@ -113,7 +189,7 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2
     exit 1
   fi
-  TASK_INFO=$(tasks-axi show "$ID" --full --file "$BACKLOG") || exit $?
+  TASK_INFO=$(run_tasks_axi show "$ID" --full) || exit $?
   TASK_KIND=$(printf '%s\n' "$TASK_INFO" | sed -n 's/^[[:space:]]*kind:[[:space:]]*//p' | head -n 1)
   if [ "$TASK_KIND" = scout ]; then
     EXPECTED_REL="data/$ID/report.md"
@@ -136,7 +212,7 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   fi
 fi
 
-tasks-axi "$@" --file "$BACKLOG"
+run_tasks_axi "$@"
 STATUS=$?
 release_backlog_lock
 exit "$STATUS"

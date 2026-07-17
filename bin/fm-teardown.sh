@@ -120,7 +120,7 @@ if [ "$BACKEND" = herdr ]; then
   DUPLICATE_LIVE=$(printf '%s' "$DUPLICATE_AUDIT" | jq -r --arg id "$ID" \
     '[.[] | select(.task == $id) | .live_endpoints[]] | unique | join(",")') || exit 1
   if [ -n "$DUPLICATE_LIVE" ]; then
-    echo "REFUSED: task $ID has duplicate same-home recovery endpoints: $DUPLICATE_LIVE" >&2
+    echo "REFUSED: task $ID has a same-home endpoint ownership anomaly: $DUPLICATE_LIVE" >&2
     echo "Inspect and reconcile exact endpoints without a broad sweep or automatic closure, then retry teardown." >&2
     exit 1
   fi
@@ -142,8 +142,17 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 BACKLOG_TRACKED=0
-if fm_tasks_axi_backend_available "$CONFIG" && "$SCRIPT_DIR/fm-backlog.sh" show "$ID" >/dev/null 2>&1; then
-  BACKLOG_TRACKED=1
+if fm_tasks_axi_backend_available "$CONFIG"; then
+  if BACKLOG_LOOKUP=$("$SCRIPT_DIR/fm-backlog.sh" show "$ID" 2>&1); then
+    BACKLOG_TRACKED=1
+  elif printf '%s\n' "$BACKLOG_LOOKUP" | grep -q 'code:[[:space:]]*NOT_FOUND'; then
+    BACKLOG_TRACKED=0
+  else
+    echo "REFUSED: could not determine whether backlog task $ID exists." >&2
+    [ -z "$BACKLOG_LOOKUP" ] || printf '%s\n' "$BACKLOG_LOOKUP" >&2
+    echo "Repair the selected home's backlog/configuration and retry; teardown will preserve lifecycle state." >&2
+    exit 1
+  fi
 fi
 
 default_branch() {
@@ -335,16 +344,16 @@ work_is_landed() {
   content_in_default
 }
 
-backlog_complete_after_teardown() {
-  local pr report_path
+backlog_record_after_teardown() {
+  local report_path reason
   [ "$KIND" = secondmate ] && return 0
   if fm_tasks_axi_backend_available "$CONFIG"; then
     if [ "$BACKLOG_TRACKED" -ne 1 ]; then
       printf '%s\n' "Backlog: $ID was not present in this home's tasks-axi backlog before teardown; no Done mutation was attempted. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
       return 0
     fi
-    case "$KIND" in
-      scout)
+    case "$DELIVERY_OUTCOME" in
+      delivered-report)
         report_path="data/$ID/report.md"
         if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --report "$report_path" >/dev/null; then
           printf '%s\n' "Backlog: $ID recorded Done with $report_path after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
@@ -353,31 +362,58 @@ backlog_complete_after_teardown() {
           return 1
         fi
         ;;
-      *)
-        if [ "$MODE" = local-only ]; then
-          if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --note "local main" >/dev/null; then
-            printf '%s\n' "Backlog: $ID recorded Done with local main after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+      delivered-local)
+        if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --note "local main" >/dev/null; then
+          printf '%s\n' "Backlog: $ID recorded Done with local main after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+        else
+          echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
+          return 1
+        fi
+        ;;
+      delivered-pr)
+        if [ -n "$PR_URL" ]; then
+          if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --pr "$PR_URL" >/dev/null; then
+            printf '%s\n' "Backlog: $ID recorded Done with $PR_URL after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
           else
             echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
             return 1
           fi
+        elif "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --note "merged PR verified" >/dev/null; then
+          printf '%s\n' "Backlog: $ID recorded Done after its merged PR was verified. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
         else
-          pr=$PR_URL
-          if [ -n "$pr" ]; then
-            if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --pr "$pr" >/dev/null; then
-              printf '%s\n' "Backlog: $ID recorded Done with $pr after successful teardown. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
-            else
-              echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
-              return 1
-            fi
-          else
-            printf '%s\n' "Backlog: $ID teardown succeeded, but no PR URL was recorded. It remains outside Done; run bin/fm-backlog.sh done $ID --pr PR_URL, then bin/fm-backlog.sh ready."
-          fi
+          echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
+          return 1
+        fi
+        ;;
+      delivered-default)
+        if "$SCRIPT_DIR/fm-backlog.sh" "done" "$ID" --note "default branch contains delivered work" >/dev/null; then
+          printf '%s\n' "Backlog: $ID recorded Done after delivery to the default branch was verified. Run bin/fm-backlog.sh ready, check date gates, and dispatch only work whose blockers are gone and date is due."
+        else
+          echo "error: teardown completed, but serialized backlog completion failed for $ID; it remains outside Done" >&2
+          return 1
+        fi
+        ;;
+      discarded|unlanded)
+        if [ "$DELIVERY_OUTCOME" = discarded ]; then
+          reason="discarded during explicitly forced teardown; no successful delivery recorded"
+        else
+          reason="teardown complete but work is recoverable only outside the delivered default branch; no successful delivery recorded"
+        fi
+        if "$SCRIPT_DIR/fm-backlog.sh" hold "$ID" --reason "$reason" --kind parked >/dev/null \
+           && "$SCRIPT_DIR/fm-backlog.sh" reopen "$ID" >/dev/null; then
+          printf '%s\n' "Backlog: $ID remains outside Done with a structured $DELIVERY_OUTCOME hold after teardown."
+        else
+          echo "error: teardown completed, but truthful $DELIVERY_OUTCOME backlog recording failed for $ID" >&2
+          return 1
         fi
         ;;
     esac
   else
-    printf '%s\n' "Backlog: $ID teardown succeeded. In manual backend mode only, update data/backlog.md now - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
+    if [ "$DELIVERY_OUTCOME" = discarded ] || [ "$DELIVERY_OUTCOME" = unlanded ]; then
+      printf '%s\n' "Backlog: $ID teardown succeeded with outcome $DELIVERY_OUTCOME. In manual backend mode, keep it outside Done and record a non-runnable structured hold with that reason."
+    else
+      printf '%s\n' "Backlog: $ID teardown succeeded. In manual backend mode only, update data/backlog.md now - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
+    fi
   fi
 }
 
@@ -662,6 +698,74 @@ validate_worktree_teardown_safety() {
       return 1
     fi
   fi
+}
+
+delivery_outcome_before_teardown() {
+  local branch default
+  if [ "$KIND" = secondmate ]; then
+    printf 'not-applicable'
+    return 0
+  fi
+  if [ "$FORCE" = --force ]; then
+    printf 'discarded'
+    return 0
+  fi
+  if [ "$KIND" = scout ]; then
+    printf 'delivered-report'
+    return 0
+  fi
+  if ! inspectable_git_worktree "$WT"; then
+    printf 'unlanded'
+    return 0
+  fi
+  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf HEAD)
+  if [ "$MODE" = local-only ]; then
+    default=$(default_branch) || { printf 'unlanded'; return 0; }
+    if git -C "$WT" merge-base --is-ancestor HEAD "refs/heads/$default" 2>/dev/null; then
+      printf 'delivered-local'
+    else
+      printf 'unlanded'
+    fi
+    return 0
+  fi
+  if [ -n "$PR_URL" ]; then
+    if pr_is_merged "$branch"; then
+      printf 'delivered-pr'
+    else
+      printf 'unlanded'
+    fi
+    return 0
+  fi
+  if pr_is_merged "$branch"; then
+    printf 'delivered-pr'
+  elif content_in_default; then
+    printf 'delivered-default'
+  else
+    printf 'unlanded'
+  fi
+}
+
+close_endpoint_before_lifecycle_cleanup() {
+  local attempt=0
+  [ -n "$T" ] || {
+    echo "REFUSED: task $ID has no exact recorded endpoint to close." >&2
+    return 1
+  }
+  if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" >/dev/null 2>&1; then
+    FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
+      echo "REFUSED: failed to close exact endpoint $T for task $ID; preserving lifecycle state." >&2
+      return 1
+    }
+  fi
+  while [ "$attempt" -lt 10 ]; do
+    if ! fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  echo "REFUSED: endpoint $T still exists after close; preserving lifecycle state for $ID." >&2
+  return 1
 }
 
 require_orca_worktree_path_match() {
@@ -1036,14 +1140,16 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+DELIVERY_OUTCOME=$(delivery_outcome_before_teardown) || exit 1
+
 # Tombstone for the watcher: everything from here to the state-file removal can
-# take the task's endpoint down (the treehouse return kills the crew's
-# processes, then fm_backend_kill closes the window), and a gone endpoint whose
+# take the task's endpoint down, and a gone endpoint whose
 # meta still exists must read as teardown-in-progress, not a crew death
 # (fm-watch.sh handle_gone_endpoint). Removed with the other state files below;
 # the watcher's absorb is age-bounded, so a crashed teardown cannot suppress a
 # real death past the bound.
 touch "$STATE/$ID.tearing-down"
+close_endpoint_before_lifecycle_cleanup || exit 1
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
@@ -1060,7 +1166,6 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
-  [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
@@ -1085,9 +1190,6 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$BACKEND" != orca ]; then
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
@@ -1103,4 +1205,4 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
-backlog_complete_after_teardown
+backlog_record_after_teardown

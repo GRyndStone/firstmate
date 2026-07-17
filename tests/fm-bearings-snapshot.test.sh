@@ -242,6 +242,26 @@ EOF
   pass "bearings includes held work and warns when an empty runnable queue still has durable program sources"
 }
 
+test_program_source_paths_are_bounded_and_disclosed() {
+  local home fakebin json
+  home=$(make_home program-source-cap)
+  printf '## Queued\n' > "$home/data/backlog.md"
+  mkdir -p "$home/data/programs"
+  printf '# A\n' > "$home/data/a-program.md"
+  printf '# B\n' > "$home/data/b-program.md"
+  printf '# C\n' > "$home/data/programs/c.md"
+  fakebin=$(make_fakebin "$home")
+  json=$(FM_BEARINGS_PROGRAM_SOURCES=2 run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .program[0].durable_sources == 3
+      and .program[0].sources_shown == 2
+      and .program[0].source_paths == "a-program.md|b-program.md"
+      and .program[0].sources_truncated == true
+      and ([.omitted[] | select(.surface == "program sources showing 2 of 3" and .reveal == "raise FM_BEARINGS_PROGRAM_SOURCES")] | length) == 1
+  ' >/dev/null || fail "bearings did not retain bounded source paths with truncation disclosure: $json"
+  pass "bearings retains bounded program source paths and discloses truncation"
+}
+
 test_include_prs_is_the_only_fetch_path() {
   local home fakebin json
   home=$(make_home prs); write_fixture "$home"
@@ -442,6 +462,7 @@ test_open_decision_surfaces_end_to_end
 test_report_pointers_surface
 test_superseded_queued_item_dropped_by_default
 test_held_work_and_program_boundary_are_never_omitted
+test_program_source_paths_are_bounded_and_disclosed
 test_include_prs_is_the_only_fetch_path
 test_partial_github_failure_degrades
 test_perl_fallback_bounds_github_call

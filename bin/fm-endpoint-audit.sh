@@ -6,10 +6,9 @@
 # It never enumerates another home's workspace, never sweeps unrelated Herdr
 # sessions, and never closes or mutates an endpoint.
 #
-# A task label with more than one live endpoint is reported deterministically
-# with the meta-owned worktree, recorded endpoint, and sorted live endpoints.
-# Earlier recovery endpoints therefore remain visible even when task meta was
-# overwritten to point only at the latest endpoint.
+# A task label with more than one live endpoint, or one live endpoint that does
+# not match the recorded endpoint, is reported deterministically with the
+# meta-owned worktree, recorded endpoint, and sorted live endpoints.
 # Usage: fm-endpoint-audit.sh [--json]
 set -u
 
@@ -76,18 +75,23 @@ done
 LC_ALL=C sort -u "$TARGETS" -o "$TARGETS"
 while IFS=$'\t' read -r session workspace; do
   [ -n "$session" ] && [ -n "$workspace" ] || continue
-  workspaces=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || {
-    echo "fm-endpoint-audit: cannot read Herdr session $session" >&2
-    exit 1
-  }
-  printf '%s' "$workspaces" | jq -e '.result.workspaces | type == "array"' >/dev/null 2>&1 || {
-    echo "fm-endpoint-audit: invalid workspace inventory from Herdr session $session" >&2
-    exit 1
-  }
-  if ! printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" \
-    'any(.result.workspaces[]?; .workspace_id == $workspace)' >/dev/null; then
+  workspace_read=0
+  if workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>/dev/null); then
+    workspace_read=1
+  fi
+  workspace_code=$(printf '%s' "$workspace_info" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ "$workspace_code" = workspace_not_found ]; then
     continue
   fi
+  if [ "$workspace_read" -ne 1 ]; then
+    echo "fm-endpoint-audit: cannot read Herdr workspace $session:$workspace" >&2
+    exit 1
+  fi
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" \
+    '.result.workspace.workspace_id == $workspace' >/dev/null 2>&1 || {
+    echo "fm-endpoint-audit: invalid exact workspace response for $session:$workspace" >&2
+    exit 1
+  }
   tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>/dev/null) || {
     echo "fm-endpoint-audit: cannot read tabs for $session:$workspace" >&2
     exit 1
@@ -131,13 +135,20 @@ for meta in "$STATE"/*.meta; do
   case "$count" in
     ''|*[!0-9]*) echo "fm-endpoint-audit: invalid live endpoint count" >&2; exit 1 ;;
   esac
-  [ "$count" -gt 1 ] || continue
+  anomaly_kind=
+  if [ "$count" -gt 1 ]; then
+    anomaly_kind=duplicate_recovery_endpoints
+  elif [ "$count" -eq 1 ] && ! printf '%s' "$live_json" | jq -e --arg recorded "$recorded" 'index($recorded) != null' >/dev/null; then
+    anomaly_kind=endpoint_ownership_mismatch
+  fi
+  [ -n "$anomaly_kind" ] || continue
   jq -n \
+    --arg kind "$anomaly_kind" \
     --arg task "$id" \
     --arg worktree "$worktree" \
     --arg recorded "$recorded" \
     --argjson live "$live_json" \
-    '{kind:"duplicate_recovery_endpoints",backend:"herdr",task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:$live,action:"inspect; do not auto-close"}' \
+    '{kind:$kind,backend:"herdr",task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:$live,action:"inspect; do not auto-close"}' \
     >> "$ROWS"
 done
 
@@ -152,7 +163,7 @@ if [ "$FORMAT" = json ]; then
 fi
 
 if [ "$RESULT" = '[]' ]; then
-  printf 'endpoint-audit: no same-home duplicate recovery endpoints found\n'
+  printf 'endpoint-audit: no same-home endpoint ownership anomalies found\n'
   exit 0
 fi
-printf '%s' "$RESULT" | jq -r '.[] | "ALERT duplicate-endpoints: task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) action=inspect-only"'
+printf '%s' "$RESULT" | jq -r '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) action=inspect-only"'
