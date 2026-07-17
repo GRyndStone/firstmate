@@ -32,6 +32,9 @@ case "${1:-}" in
   # probe"): recorded windows are live except dead-marked ones, which the
   # inventory omits exactly like a killed real window.
   list-windows)
+    case "$*" in
+      *' -f '*) exit 0 ;;
+    esac
     for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
       [ -e "$m" ] || continue
       sed -n 's/^window=//p' "$m"

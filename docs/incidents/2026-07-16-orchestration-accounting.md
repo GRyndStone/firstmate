@@ -68,12 +68,12 @@ These were Firstmate operator violations, not captain error and not failures in 
 `bin/fm-backlog.sh` is now the supported home-scoped tasks-axi entry point.
 It serializes mutations with `state/.backlog.lock`, refuses file/backend overrides, refuses `done` while meta or teardown state remains, and validates the exact scout report path and file.
 `bin/fm-teardown.sh` now records completion only from a durable finalizing phase after successful cleanup, retaining owned lifecycle state until the serialized mutation succeeds.
-Herdr teardown first refuses any duplicate or replacement same-home task endpoint reported by the audit, so a hidden earlier recovery endpoint blocks clean completion until explicitly reconciled.
+Tmux and Herdr teardown first refuse any duplicate or replacement same-home task endpoint reported by the audit, so a hidden earlier recovery endpoint blocks clean completion until explicitly reconciled.
 Zellij and cmux teardown refuse their unavailable exact-home inventories rather than sweep a shared namespace before closure.
 Forced secondmate retirement audits every supported child-home endpoint before closing children and refuses the whole retirement on an anomaly or unknown inventory.
 If artifact information or the Done mutation is unavailable after teardown, it leaves the task outside Done and reports the reconciliation action instead of fabricating completion.
 `bin/fm-backlog-handoff.sh` now holds both homes' backlog locks in deterministic path order through classification and the atomic move.
-`bin/fm-endpoint-audit.sh` compares Herdr live tabs only in sessions and exact workspace ids named by this home's meta.
+`bin/fm-endpoint-audit.sh` compares Herdr live tabs only in sessions and exact workspace ids named by this home's meta and tmux panes only in exact recorded sessions and task windows.
 It emits stable duplicate task, worktree, recorded endpoint, and live endpoint data to session-start recovery, fleet view, and bearings, and it contains no close path.
 For Zellij and cmux it emits `inventory_unavailable` without issuing any shared-session or global inventory command, preserving the anomaly for read-only fleet accounting while teardown fails closed.
 `bin/fm-watch-checkpoint.sh` now captures one watcher PID and one timer PID, and its signal and exit cleanup terminates and reaps only those owned children.

@@ -213,6 +213,75 @@ test_unresolved_herdr_pane_tab_fails_closed() {
   pass "Herdr panes must resolve to tabs in the exact workspace inventory"
 }
 
+test_tmux_duplicates_use_exact_recorded_session_and_task() {
+  local home log out
+  home=$(make_fixture tmux-exact-session)
+  log="$home/tmux.log"
+  fm_write_meta "$home/state/dup-task.meta" \
+    'window=owned-session:fm-dup-task' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  list-windows)
+    printf '%s\n' $'@11\tfm-dup-task' $'@12\tfm-dup-task'
+    ;;
+  list-panes)
+    case "$*" in
+      *' -t @11 '*) printf '%s\n' '%21' ;;
+      *' -t @12 '*) printf '%s\n' '%22' ;;
+      *) exit 7 ;;
+    esac
+    ;;
+  *) exit 8 ;;
+esac
+SH
+  chmod +x "$home/fakebin/tmux"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_LOG="$log" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    . == [{
+      kind:"duplicate_recovery_endpoints",
+      backend:"tmux",
+      task:"dup-task",
+      worktree:"/owned/worktree",
+      recorded_endpoint:"owned-session:fm-dup-task",
+      live_endpoints:["%21","%22"],
+      action:"inspect; do not auto-close"
+    }]
+  ' >/dev/null || fail "tmux duplicate endpoint JSON was incomplete: $out"
+  assert_contains "$(cat "$log")" 'list-windows -t =owned-session -f #{==:#{window_name},fm-dup-task}' \
+    "tmux audit did not query the exact recorded session and task label"
+  assert_not_contains "$(cat "$log")" ' -a ' "tmux audit enumerated other sessions"
+  assert_not_contains "$(cat "$log")" 'kill' "tmux audit attempted automatic closure"
+  pass "tmux duplicate audit stays inside the exact recorded session and task label"
+}
+
+test_tmux_unscoped_meta_reports_inventory_unavailable() {
+  local home log out
+  home=$(make_fixture tmux-unscoped)
+  log="$home/tmux.log"
+  fm_write_meta "$home/state/dup-task.meta" \
+    'window=fm-dup-task' \
+    'worktree=/owned/worktree'
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+exit 99
+SH
+  chmod +x "$home/fakebin/tmux"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_LOG="$log" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    length == 1
+      and .[0].kind == "inventory_unavailable"
+      and .[0].backend == "tmux"
+      and .[0].reason == "tmux meta lacks an exact recorded session; cross-session sweep refused"
+  ' >/dev/null || fail "unscoped tmux meta did not fail closed: $out"
+  [ ! -s "$log" ] || fail "unscoped tmux audit enumerated shared inventory: $(cat "$log")"
+  pass "tmux metadata without an exact session fails closed without a cross-session sweep"
+}
+
 test_zellij_reports_unavailable_without_cross_home_inventory() {
   local home log out status
   home=$(make_fixture zellij-no-sweep)
@@ -298,6 +367,8 @@ test_singleton_mismatch_is_reported
 test_missing_owned_workspace_is_an_empty_inventory
 test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
+test_tmux_duplicates_use_exact_recorded_session_and_task
+test_tmux_unscoped_meta_reports_inventory_unavailable
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

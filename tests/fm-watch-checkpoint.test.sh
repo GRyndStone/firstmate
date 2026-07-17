@@ -170,7 +170,7 @@ test_timeout_revalidates_watcher_birth_identity_before_escalation() {
   mkdir -p "$fakebin"
   cat > "$watcher" <<'SH'
 #!/usr/bin/env bash
-trap ': > "$WATCH_IDENTITY_FLIP"; sleep 0.3; exit 0' TERM
+trap ': > "$WATCH_IDENTITY_FLIP"' TERM
 while :; do sleep 0.1; done
 SH
   cat > "$fakebin/ps" <<'SH'
@@ -190,6 +190,33 @@ SH
   pass "timeout escalation revalidates stable watcher birth identity before every later signal"
 }
 
+test_checkpoint_polls_process_identity_coarsely() {
+  local home out err fakebin probe_log status probe_count
+  home=$(make_home coarse-identity-poll)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  fakebin="$home/fakebin"
+  probe_log="$home/identity-probes.log"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]]; then
+  printf 'probe\n' >> "$WATCH_IDENTITY_PROBE_LOG"
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" WATCH_IDENTITY_PROBE_LOG="$probe_log" FM_HOME="$home" \
+    FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 2 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "coarse identity polling checkpoint"
+  probe_count=$(wc -l < "$probe_log" | tr -d '[:space:]')
+  [ "$probe_count" -le 12 ] \
+    || fail "checkpoint hot-polled process identity $probe_count times during two seconds"
+  pass "checkpoint polls process identity coarsely outside signal-time revalidation"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
@@ -197,3 +224,4 @@ test_existing_singleton_watcher_is_not_success
 test_interrupted_checkpoint_reaps_only_its_watcher
 test_timeout_marks_then_kills_only_term_resistant_watcher
 test_timeout_revalidates_watcher_birth_identity_before_escalation
+test_checkpoint_polls_process_identity_coarsely

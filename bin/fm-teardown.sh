@@ -284,7 +284,7 @@ T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 BACKEND=$(fm_backend_of_meta "$META")
 case "$BACKEND" in
-  herdr|zellij|cmux)
+  tmux|herdr|zellij|cmux)
   DUPLICATE_AUDIT=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -1964,7 +1964,7 @@ audit_firstmate_home_children_endpoints() {
     child_id=$(basename "$child_meta" .meta)
     child_backend=$(fm_backend_of_meta "$child_meta")
     case "$child_backend" in
-      herdr|zellij|cmux)
+      tmux|herdr|zellij|cmux)
         audit=$(
           FM_ROOT_OVERRIDE="$home" \
             FM_HOME="$home" \

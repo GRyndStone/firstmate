@@ -72,13 +72,20 @@ Pi's real `ExtensionAPI.sendUserMessage` returns `void`, so calling it is never 
 Pi retains the handoff, keeps one process-retaining retry timer alive, and rechecks Firstmate session-lock ownership before scheduling, delivering, acknowledging, or removing the home-wide record.
 If ownership changes after scheduling, that process cancels its retry owner without reading or changing the retained handoff.
 The ensuing `agent_start` proves an assistant continuation began, but Pi releases retry ownership only after the acknowledged record's absence is confirmed.
-OpenCode treats a `promptAsync` promise that resolves within its bounded delivery window as explicit queue acknowledgement, while a process-retaining per-session retry timer owns rejected or timed-out delivery and acknowledged cleanup failure until record absence is confirmed; plugin startup recovers retained records.
+OpenCode requires current Firstmate session-lock ownership before it scans, delivers, acknowledges, or removes home-level handoffs.
+It serializes same-session idle handlers and binds cleanup to their invocation generation, so an older healthy result cannot remove a newer blind handoff.
+OpenCode keeps exactly one `promptAsync` delivery flight per session until that promise definitively resolves or rejects.
+A bounded local wait returns control while a process-retaining retry timer observes a hung flight without issuing another SDK request, and any newer blind generation is persisted as the desired handoff while that flight remains active.
+A rejected flight promotes that durable generation into the next single flight, while a successful flight consumes it without duplicate delivery.
+An explicitly resolved `promptAsync` promise is queue acknowledgement, while acknowledged cleanup failure remains owned until record absence is confirmed and plugin startup recovers retained records only for the lock-owning process.
 If Pi or OpenCode cannot synchronously persist a handoff, the message remains in process memory under the same referenced retry timer until persistence and delivery succeed or the predicate becomes healthy.
 Neither adapter reads, delivers, acknowledges, or clears a home-level handoff from a linked crewmate checkout.
 A shared-guard launch failure follows the same fail-closed delivery path instead of being converted into a healthy result.
 Grok stores the originating hook pid and process identity in its deterministic per-session handoff.
 One per-session preparation lock serializes pending replacement with worker acquisition, so a concurrent Stop preserves an already readiness-acknowledged owner instead of overwriting its token.
 The launching hook accepts an existing worker only when its token, pid, and process identity match the current pending record, otherwise waits for that owner to release before establishing a replacement, and the worker retains retry ownership until a bounded resume succeeds.
+Retained legacy `@continue` records are moved to a diagnostic quarantine inside the handoff directory and are never delivered.
+After a successful exact-session resume, the worker atomically moves the pending record into acknowledged-cleanup state and retries only state removal, never the resume.
 TERM or INT kills and reaps the exact active resume and timeout children before that worker releases its singleton lock.
 A healthy later Stop removes that session's stale pending record.
 After independently confirming the same primary-checkout scope, a missing shared guard enters that durable delivery path with an explicit adapter-failure reason.

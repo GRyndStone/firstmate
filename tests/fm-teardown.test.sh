@@ -96,7 +96,13 @@ SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  list-windows) printf '%s\n' 'fm-other fm-other' ;;
+  list-windows)
+    case "$*" in
+      *' -f '*) ;;
+      *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-other fm-other' ;;
+      *) printf '%s\n' 'fm-other fm-other' ;;
+    esac
+    ;;
 esac
 exit 0
 SH
@@ -266,7 +272,7 @@ SH
 write_meta() {
   local case_dir=$1 mode=$2 kind=$3
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    "window=fm-task-x1" \
+    "window=firstmate:fm-task-x1" \
     "worktree=$case_dir/wt" \
     "project=$case_dir/project" \
     "kind=$kind" \
@@ -1450,7 +1456,7 @@ test_secondmate_retirement_preflights_child_duplicates() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' \
+    'window=firstmate:fm-task-x1' \
     "worktree=$home" \
     "project=$home" \
     'kind=secondmate' \
@@ -1498,7 +1504,7 @@ test_secondmate_child_endpoint_close_requires_confirmed_absence() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     'backend=herdr' 'window=default:childw:p2' 'herdr_session=default' \
@@ -1532,109 +1538,83 @@ SH
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     "worktree=$case_dir/missing-child-worktree" "project=$case_dir/project" 'kind=scout'
   rc=0
   run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "secondmate child missing endpoint"
-  assert_contains "$(cat "$case_dir/stderr")" 'has no exact recorded endpoint' \
-    "forced child retirement treated a missing endpoint target as absent"
+  assert_contains "$(cat "$case_dir/stderr")" 'kind=inventory_unavailable' \
+    "forced child retirement did not fail closed when exact tmux scope was unavailable"
   [ -f "$home/state/child-a1.meta" ] || fail "missing child endpoint removed child metadata"
-  pass "forced child retirement verifies endpoint absence before cleanup"
+  pass "forced child retirement refuses missing exact endpoint scope before cleanup"
 }
 
-test_zellij_duplicate_endpoints_refuse_teardown_without_closure() {
-  local case_dir log rc title
-  case_dir=$(make_case zellij-duplicate-refusal)
+test_tmux_duplicate_endpoints_refuse_teardown_without_closure() {
+  local case_dir log rc
+  case_dir=$(make_case tmux-duplicate-refusal)
   write_meta "$case_dir" local-only ship
-  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
-    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  log="$case_dir/tmux.log"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  list-windows)
+    printf '%s\n' $'@7\tfm-task-x1' $'@8\tfm-task-x1'
+    ;;
+  list-panes)
+    case "$*" in
+      *' -t @7 '*) printf '%s\n' '%17' ;;
+      *' -t @8 '*) printf '%s\n' '%18' ;;
+      *) exit 7 ;;
+    esac
+    ;;
+  kill-window) exit 0 ;;
+  *) exit 8 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+
+  rc=0
+  FM_TMUX_LOG="$log" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "tmux duplicate endpoint teardown"
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
+    "tmux teardown did not refuse the endpoint ownership anomaly"
+  assert_contains "$(cat "$case_dir/stderr")" "%17,%18" \
+    "tmux teardown refusal did not identify both exact duplicate panes"
+  assert_not_contains "$(cat "$log")" "kill-window" "tmux duplicate refusal automatically closed an endpoint"
+  assert_not_contains "$(cat "$log")" " -a " "tmux duplicate preflight enumerated other sessions"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "tmux duplicate refusal removed task meta"
+  pass "tmux duplicate endpoints block teardown before automatic closure"
+}
+
+test_zellij_inventory_unavailable_refuses_teardown_without_sweep() {
+  local case_dir log rc
+  case_dir=$(make_case zellij-inventory-unavailable)
+  write_meta "$case_dir" local-only ship
   sed -i.bak 's/^window=.*/window=fm:42/' "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' 'backend=zellij' 'zellij_session=fm' 'zellij_tab_id=7' 'zellij_pane_id=42' >> "$case_dir/state/task-x1.meta"
   log="$case_dir/zellij.log"
   cat > "$case_dir/fakebin/zellij" <<'SH'
 #!/usr/bin/env bash
-set -u
 printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
-if [ "${1:-}" = list-sessions ]; then
-  printf '%s\n' fm
-  exit 0
-fi
-if [ "${1:-}" = --session ]; then
-  shift 2
-fi
-case "$*" in
-  "action list-tabs --json")
-    printf '[{"tab_id":7,"name":"%s"},{"tab_id":8,"name":"%s"}]\n' "${FM_DUPLICATE_TITLE:?}" "${FM_DUPLICATE_TITLE:?}"
-    ;;
-  "action list-panes --json")
-    printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false},{"id":43,"tab_id":8,"is_plugin":false}]'
-    ;;
-esac
-exit 0
+exit 99
 SH
   chmod +x "$case_dir/fakebin/zellij"
 
   rc=0
-  FM_ZELLIJ_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
+  FM_ZELLIJ_LOG="$log" run_teardown "$case_dir" --force \
     > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
-  expect_code 1 "$rc" "Zellij duplicate endpoint teardown"
-  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
-    "Zellij teardown did not refuse the endpoint ownership anomaly"
-  assert_contains "$(cat "$case_dir/stderr")" "fm:42,fm:43" \
-    "Zellij teardown refusal did not identify both exact duplicate tabs"
-  assert_not_contains "$(cat "$log")" "close-tab" "Zellij duplicate refusal automatically closed an endpoint"
-  [ -f "$case_dir/state/task-x1.meta" ] || fail "Zellij duplicate refusal removed task meta"
-  pass "Zellij duplicate endpoints block teardown before any automatic closure"
-}
-
-test_zellij_replacement_endpoint_refuses_teardown_without_closure() {
-  local case_dir log rc title
-  case_dir=$(make_case zellij-replacement-refusal)
-  write_meta "$case_dir" local-only ship
-  title=$(FM_HOME="$case_dir/fm-home" FM_ROOT_OVERRIDE="$ROOT" \
-    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
-  sed -i.bak 's/^window=.*/window=fm:42/' "$case_dir/state/task-x1.meta"
-  rm -f "$case_dir/state/task-x1.meta.bak"
-  printf '%s\n' 'backend=zellij' 'zellij_session=fm' 'zellij_tab_id=7' 'zellij_pane_id=42' >> "$case_dir/state/task-x1.meta"
-  log="$case_dir/zellij.log"
-  cat > "$case_dir/fakebin/zellij" <<'SH'
-#!/usr/bin/env bash
-set -u
-printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
-if [ "${1:-}" = list-sessions ]; then
-  printf '%s\n' fm
-  exit 0
-fi
-if [ "${1:-}" = --session ]; then
-  shift 2
-fi
-case "$*" in
-  "action list-tabs --json")
-    printf '[{"tab_id":7,"name":"%s"}]\n' "${FM_DUPLICATE_TITLE:?}"
-    ;;
-  "action list-panes --json")
-    printf '%s\n' '[{"id":43,"tab_id":7,"is_plugin":false}]'
-    ;;
-esac
-exit 0
-SH
-  chmod +x "$case_dir/fakebin/zellij"
-
-  rc=0
-  FM_ZELLIJ_LOG="$log" FM_DUPLICATE_TITLE="$title" run_teardown "$case_dir" --force \
-    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
-  expect_code 1 "$rc" "Zellij replacement endpoint teardown"
-  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly" \
-    "Zellij teardown did not refuse the replacement endpoint mismatch"
-  assert_contains "$(cat "$case_dir/stderr")" "fm:43" \
-    "Zellij teardown refusal did not identify the exact replacement pane"
-  assert_not_contains "$(cat "$log")" "close-tab" "Zellij replacement refusal automatically closed the endpoint"
-  [ -f "$case_dir/state/task-x1.meta" ] || fail "Zellij replacement refusal removed task meta"
-  pass "Zellij replacement endpoint blocks teardown before automatic closure"
+  expect_code 1 "$rc" "Zellij unavailable endpoint inventory"
+  assert_contains "$(cat "$case_dir/stderr")" "kind=inventory_unavailable live=unknown" \
+    "Zellij teardown did not explain its fail-closed exact-home boundary"
+  [ ! -s "$log" ] || fail "Zellij teardown enumerated the shared session: $(cat "$log")"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "Zellij inventory refusal removed task meta"
+  pass "Zellij teardown fails closed without shared-session inventory"
 }
 
 test_cmux_duplicate_endpoints_refuse_teardown_without_closure() {
@@ -1778,7 +1758,14 @@ SH
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
-  list-windows) printf '%s\n' 'fm-task-x1'; exit 0 ;;
+  list-windows)
+    case "$*" in
+      *' -f '*) printf '%s\n' $'@42\tfm-task-x1' ;;
+      *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
+      *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
+    esac
+    ;;
+  list-panes) printf '%s\n' '%42' ;;
   kill-window) [ "${FM_TMUX_CLOSE_MODE:-}" = close-fails ] && exit 1; exit 0 ;;
 esac
 exit 0
@@ -1803,7 +1790,15 @@ test_unknown_endpoint_state_preserves_lifecycle() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  list-windows|list-panes|list-sessions)
+  list-windows)
+    case "$*" in
+      *' -f '*) printf '%s\n' $'@42\tfm-task-x1'; exit 0 ;;
+    esac
+    echo 'permission denied while reading tmux inventory' >&2
+    exit 2
+    ;;
+  list-panes) printf '%s\n' '%42' ;;
+  list-sessions)
     echo 'permission denied while reading tmux inventory' >&2
     exit 2
     ;;
@@ -1818,7 +1813,7 @@ SH
   rc=0
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "unknown endpoint inventory"
-  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for fm-task-x1 is unknown" \
+  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for firstmate:fm-task-x1 is unknown" \
     "unreadable endpoint inventory was treated as confirmed absence"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "unknown endpoint state removed lifecycle metadata"
   [ -d "$case_dir/wt" ] || fail "unknown endpoint state removed worktree"
@@ -2043,7 +2038,7 @@ test_secondmate_registry_cleanup_retries_after_home_removal() {
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf -- '- task-x1 (home: %s; scope: test; projects: none)\n' "$home" > "$registry"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
     'mode=secondmate' "home=$home"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
@@ -2301,58 +2296,23 @@ SH
   pass "Orca endpoint probe treats ok:false and CLI failures as typed absence or unknown"
 }
 
-test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab() {
-  local case_dir fakebin title state actual
+test_zellij_endpoint_probe_refuses_shared_session_inventory() {
+  local case_dir fakebin log actual
   case_dir="$TMP_ROOT/zellij-endpoint-state-unit"
   fakebin="$case_dir/fakebin"
+  log="$case_dir/zellij.log"
   mkdir -p "$fakebin"
-  title=$(FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
-    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
   cat > "$fakebin/zellij" <<'SH'
 #!/usr/bin/env bash
-set -u
-if [ "${1:-}" = list-sessions ]; then
-  printf '%s\n' fm
-  exit 0
-fi
-if [ "${1:-}" = --session ]; then
-  shift 2
-fi
-case "$*" in
-  "action list-panes --json")
-    case "${FM_ZELLIJ_STATE:?}" in
-      live|mismatch|orphan) printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false}]' ;;
-      ghost|recovered|foreign|inventory-error|absent) printf '%s\n' '[]' ;;
-      partial) printf '%s\n' '[{"id":42}]' ;;
-      unknown) printf '%s\n' 'pane inventory unavailable' >&2; exit 3 ;;
-    esac
-    ;;
-  "action list-tabs --json")
-    case "${FM_ZELLIJ_STATE:?}" in
-      live|ghost) printf '[{"tab_id":7,"name":"%s"}]\n' "${FM_ZELLIJ_EXPECTED_TITLE:?}" ;;
-      recovered) printf '[{"tab_id":99,"name":"%s"}]\n' "${FM_ZELLIJ_EXPECTED_TITLE:?}" ;;
-      foreign) printf '%s\n' '[{"tab_id":99,"name":"fm-another-home-task-x1"}]' ;;
-      inventory-error) printf '%s\n' 'tab inventory unavailable' >&2; exit 4 ;;
-      mismatch) printf '%s\n' '[{"tab_id":7,"name":"fm-other"}]' ;;
-      orphan) printf '%s\n' '[{"tab_id":8,"name":"fm-other"}]' ;;
-      absent) printf '%s\n' '[]' ;;
-    esac
-    ;;
-  *) exit 1 ;;
-esac
+printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
+exit 99
 SH
   chmod +x "$fakebin/zellij"
-  for state in live ghost recovered foreign inventory-error absent mismatch orphan unknown partial; do
-    actual=$(PATH="$fakebin:$PATH" FM_ZELLIJ_STATE="$state" FM_ZELLIJ_EXPECTED_TITLE="$title" \
-      FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
-      bash -c '. "$1"; fm_backend_target_state zellij fm:42 fm-task-x1 7' _ "$ROOT/bin/fm-backend.sh")
-    case "$state" in
-      live|ghost|recovered) [ "$actual" = present ] || fail "$state Zellij endpoint read $actual" ;;
-      foreign|absent) [ "$actual" = absent ] || fail "$state Zellij endpoint read $actual" ;;
-      inventory-error|mismatch|orphan|unknown|partial) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
-    esac
-  done
-  pass "Zellij endpoint probe finds exact same-home recovery tabs and fails closed on unreadable inventory"
+  actual=$(PATH="$fakebin:$PATH" FM_ZELLIJ_LOG="$log" FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_target_state zellij fm:42 fm-task-x1 7' _ "$ROOT/bin/fm-backend.sh")
+  [ "$actual" = unknown ] || fail "Zellij endpoint probe did not fail closed: $actual"
+  [ ! -s "$log" ] || fail "Zellij endpoint probe enumerated the shared session: $(cat "$log")"
+  pass "Zellij endpoint finalization fails closed without shared-session inventory"
 }
 
 test_cmux_endpoint_probe_refuses_cross_home_inventory() {
@@ -2496,7 +2456,7 @@ test_secondmate_child_absent_orca_path_requires_absent_id() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" 'kind=secondmate' \
     'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
     'backend=orca' 'window=fm-child-a1' 'terminal=terminal-child' \
@@ -2530,7 +2490,7 @@ test_teardown_state_must_be_external_to_cleanup_target() {
   nested="$case_dir/wt/state"
   mkdir -p "$nested"
   fm_write_meta "$nested/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
+    'window=firstmate:fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   rc=0
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir/fm-home" FM_STATE_OVERRIDE="$nested" \
@@ -2546,7 +2506,7 @@ test_teardown_state_must_be_external_to_cleanup_target() {
   nested="$tasktmp/state"
   mkdir -p "$nested"
   fm_write_meta "$nested/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
+    'window=firstmate:fm-task-x1' "worktree=$case_dir/wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only' "tasktmp=$tasktmp"
   rc=0
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir/fm-home" FM_STATE_OVERRIDE="$nested" \
@@ -2888,7 +2848,14 @@ test_postcleanup_retry_rechecks_endpoint_absence() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  list-windows) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
+  list-windows)
+    case "$*" in
+      *' -f '*) printf '%s\n' $'@42\tfm-task-x1' ;;
+      *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
+      *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
+    esac
+    ;;
+  list-panes) printf '%s\n' '%42' ;;
 esac
 exit 0
 SH
@@ -2972,10 +2939,10 @@ test_child_worktree_replacement_loses_auxiliary_cleanup_authority() {
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
-    'window=fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+    'window=firstmate:fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
@@ -3161,7 +3128,7 @@ test_plain_secondmate_home_rechecks_exact_owner_before_removal() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   cat > "$case_dir/fakebin/git" <<'SH'
 #!/usr/bin/env bash
@@ -3223,11 +3190,11 @@ test_symlinked_auxiliary_targets_are_refused() {
     "$case_dir/secondmate-home/config" "$case_dir/secondmate-home/projects"
   printf 'task-x1\n' > "$case_dir/secondmate-home/.fm-secondmate-home"
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$case_dir/secondmate-home" \
+    'window=firstmate:fm-task-x1' "worktree=$case_dir/secondmate-home" \
     "project=$case_dir/secondmate-home" 'kind=secondmate' 'mode=secondmate' \
     "home=$case_dir/secondmate-home"
   fm_write_meta "$case_dir/secondmate-home/state/child-a1.meta" \
-    'window=fm-child-a1' "worktree=$case_dir/child-wt-link" \
+    'window=firstmate:fm-child-a1' "worktree=$case_dir/child-wt-link" \
     "project=$case_dir/project" 'kind=ship' 'mode=local-only'
   rc=0
   run_teardown "$case_dir" --force >/dev/null 2>"$case_dir/stderr" || rc=$?
@@ -3246,10 +3213,10 @@ test_child_treehouse_retry_revalidates_auxiliary_authority() {
   printf 'task-x1\n' > "$home/.fm-secondmate-home"
   git -C "$case_dir/project" worktree add -q -b fm/child-a1 "$child_wt" main
   fm_write_meta "$case_dir/state/task-x1.meta" \
-    'window=fm-task-x1' "worktree=$home" "project=$home" \
+    'window=firstmate:fm-task-x1' "worktree=$home" "project=$home" \
     'kind=secondmate' 'mode=secondmate' "home=$home"
   fm_write_meta "$home/state/child-a1.meta" \
-    'window=fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
+    'window=firstmate:fm-child-a1' "worktree=$child_wt" "project=$case_dir/project" \
     'kind=ship' 'mode=local-only'
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
@@ -3341,8 +3308,8 @@ test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_secondmate_retirement_preflights_child_duplicates
 test_secondmate_child_endpoint_close_requires_confirmed_absence
-test_zellij_duplicate_endpoints_refuse_teardown_without_closure
-test_zellij_replacement_endpoint_refuses_teardown_without_closure
+test_tmux_duplicate_endpoints_refuse_teardown_without_closure
+test_zellij_inventory_unavailable_refuses_teardown_without_sweep
 test_cmux_duplicate_endpoints_refuse_teardown_without_closure
 test_backlog_operational_read_failure_refuses_before_teardown
 test_non_delivery_outcomes_never_record_done
@@ -3358,7 +3325,7 @@ test_staged_orca_retry_rechecks_backend_worktree_identity
 test_staged_teardown_refuses_changed_backlog_record
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
 test_orca_endpoint_probe_rejects_success_shaped_errors
-test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab
+test_zellij_endpoint_probe_refuses_shared_session_inventory
 test_cmux_endpoint_probe_refuses_cross_home_inventory
 test_forced_staged_retry_cannot_reuse_delivery_proof
 test_task_owned_marker_rejects_recreated_worktree

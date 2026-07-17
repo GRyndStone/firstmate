@@ -18,8 +18,7 @@ It persists the completion proof and exact-backlog-record phase in canonically e
 Cleanup ownership combines canonical path identity with a random task-owned marker outside worktree contents, so filesystem identity reuse cannot authorize removal of a replacement target.
 An interrupted retry refuses a changed backlog record and cannot inspect or remove a path after either ownership binding no longer matches.
 After independently confirmed cleanup, lifecycle state remains through serialized backlog finalization and is removed only after that mutation succeeds.
-Before automatic endpoint closure, teardown runs the same-home duplicate audit for Herdr tasks and refuses any duplicate or replacement endpoint, leaving exact reconciliation to the supervisor.
-Zellij and cmux expose no exact-home inventory source, so their read-only audits emit a structured `inventory_unavailable` finding without issuing a shared-session or app-global inventory command, and teardown refuses that finding before endpoint closure.
+Before automatic endpoint closure, teardown invokes the read-only duplicate owner described under [Runtime backend](#runtime-backend-configbackend--fm_backend) and refuses every reported anomaly, leaving exact reconciliation to the supervisor.
 Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
 If the Done mutation fails after teardown, the lifecycle is safely closed, finalization remains retryable, and the command fails loudly with the backlog outside Done.
 Manual backend mode suppresses the `TASKS_AXI: available` capability notice, while the wrapper remains the normal path for home-scoped reads, serialized mutations, and receipt-gated completion.
@@ -78,8 +77,10 @@ Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, 
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
 `bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate endpoints on backends with an exact-home inventory boundary.
 For Herdr it queries only sessions and exact workspace ids named by the active home's own meta.
+For tmux it queries only the exact session and task window label named by each meta, then reads panes only from those matching windows.
 It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
 For Zellij and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global window namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
+Zellij lifecycle finalization follows the fail-closed exact-home boundary in [`docs/zellij-backend.md`](zellij-backend.md#teardown-absence-boundary).
 Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.

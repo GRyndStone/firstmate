@@ -605,6 +605,7 @@ test_equals_note_completion_is_normalized() {
 
 test_interrupted_completion_claim_reconciles_from_backlog_state() {
   local home marker state_file mode_file archive_file claim out pid status candidate ack_file
+  local transaction backend_pid i
   home=$(make_home interrupted-retry)
   marker="$home/done-started"
   ack_file="$home/done-ack"
@@ -618,6 +619,11 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     sleep 0.01
   done
   [ -f "$marker" ] || fail "interrupted Done did not reach the claimed-proof interval"
+  transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
+  [ -n "$transaction" ] || fail "interrupted Done did not retain backend ownership"
+  backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
+  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
+    || fail "interrupted Done backend owner was not live"
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -627,6 +633,13 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     fail "interrupted active task left a stranded proof claim"
   done
+  i=0
+  while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -0 "$backend_pid" 2>/dev/null \
+    && fail "interrupted Done backend $backend_pid survived the bounded wait"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" "retry after interrupted proof recovery did not consume proof"
 
@@ -646,6 +659,11 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     sleep 0.01
   done
   [ -f "$marker" ] || fail "completed interrupted Done did not reach the claimed-proof interval"
+  transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
+  [ -n "$transaction" ] || fail "completed interrupted Done did not retain backend ownership"
+  backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
+  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
+    || fail "completed interrupted Done backend owner was not live"
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -655,6 +673,16 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     fail "completed interrupted Done left a stranded proof claim"
   done
+  i=0
+  while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -0 "$backend_pid" 2>/dev/null \
+    && fail "completed Done backend $backend_pid survived the bounded wait"
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "completed interrupted Done left backend ownership state"
+  fi
 
   home=$(make_home interrupted-archived)
   marker="$home/done-started"
@@ -673,6 +701,11 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     sleep 0.01
   done
   [ -f "$marker" ] || fail "archived interrupted Done did not reach the claimed-proof interval"
+  transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
+  [ -n "$transaction" ] || fail "archived interrupted Done did not retain backend ownership"
+  backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
+  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
+    || fail "archived interrupted Done backend owner was not live"
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -683,6 +716,16 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     fail "archived interrupted Done left a stranded proof claim"
   done
+  i=0
+  while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -0 "$backend_pid" 2>/dev/null \
+    && fail "archived Done backend $backend_pid survived the bounded wait"
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "archived interrupted Done left backend ownership state"
+  fi
 
   home=$(make_home interrupted-operational-error)
   mode_file="$home/show-mode"
@@ -801,7 +844,7 @@ test_help_does_not_require_home_configuration() {
 }
 
 test_interrupted_mutation_receipt_claims_reconcile_from_files() {
-  local home marker release wrapper_pid status
+  local home marker release wrapper_pid status out claim backend_pid recorded_identity current_identity i
   home=$(make_home interrupted-mutation-claim-unchanged)
   marker="$home/backend-started"
   release="$home/backend-release"
@@ -815,8 +858,32 @@ test_interrupted_mutation_receipt_claims_reconcile_from_files() {
   status=0
   wait "$wrapper_pid" 2>/dev/null || status=$?
   expect_code 137 "$status" "interrupted unchanged mutation"
+  claim=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
+  [ -n "$claim" ] || fail "interrupted mutation lost its durable claim"
+  backend_pid=$(sed -n '1p' "$claim/backend-owner" 2>/dev/null || true)
+  recorded_identity=$(sed -n '2p' "$claim/backend-owner" 2>/dev/null || true)
+  current_identity=$(LC_ALL=C ps -p "$backend_pid" -o lstart= 2>/dev/null \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)
+  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
+    || fail "interrupted mutation did not retain its live backend owner"
+  [ -n "$recorded_identity" ] && [ "$recorded_identity" = "$current_identity" ] \
+    || fail "interrupted mutation backend owner identity was not exact and durable"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
+    "$BACKLOG" show task-a 2>&1) || status=$?
+  expect_code 1 "$status" "live orphan backend recovery"
+  assert_contains "$out" "could not be reconciled safely" \
+    "a new invocation did not fail closed while the orphan backend still owned the mutation"
+  assert_absent "$home/state/task-a.teardown-complete" \
+    "a live orphan backend restored completion authority before mutation settled"
   : > "$release"
-  sleep 0.2
+  i=0
+  while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -0 "$backend_pid" 2>/dev/null \
+    && fail "released orphan backend $backend_pid did not exit within the bounded wait"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" show task-a >/dev/null
   assert_present "$home/state/task-a.teardown-complete" \
     "unchanged interrupted mutation did not restore its receipt"
@@ -847,6 +914,56 @@ test_interrupted_mutation_receipt_claims_reconcile_from_files() {
     fail "changed interrupted mutation left an orphan receipt claim"
   fi
   pass "interrupted mutation claims reconcile from durable before and current file state"
+}
+
+test_interrupted_done_backend_retains_mutation_ownership() {
+  local home marker release wrapper_pid status out transaction backend_pid completion_claim i
+  home=$(make_home interrupted-done-backend)
+  marker="$home/backend-started"
+  release="$home/backend-release"
+  write_completion_proof "$home" task-a ship delivered-local
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_MUTATION_WAIT_MARKER="$marker" FM_FAKE_MUTATION_WAIT_RELEASE="$release" \
+    "$BACKLOG" done task-a --note delivered >/dev/null 2>&1 &
+  wrapper_pid=$!
+  wait_for_file "$marker" 5 || fail "Done never reached its backend"
+  kill -KILL "$wrapper_pid"
+  status=0
+  wait "$wrapper_pid" 2>/dev/null || status=$?
+  expect_code 137 "$status" "interrupted Done wrapper"
+  transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
+  completion_claim=$(compgen -G "$home/state/.task-a.teardown-complete.claimed.*" | head -1)
+  [ -n "$transaction" ] || fail "interrupted Done lost durable backend ownership"
+  [ -n "$completion_claim" ] || fail "interrupted Done lost its completion proof claim"
+  backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
+  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
+    || fail "interrupted Done backend owner was not live"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
+    "$BACKLOG" done task-a --note retry 2>&1) || status=$?
+  expect_code 1 "$status" "Done retry with live orphan backend"
+  assert_contains "$out" "could not be reconciled safely" \
+    "Done retry did not fail closed behind its live orphan backend"
+  assert_present "$completion_claim" \
+    "Done retry recovered completion authority while the original backend remained live"
+  : > "$release"
+  i=0
+  while kill -0 "$backend_pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -0 "$backend_pid" 2>/dev/null \
+    && fail "released Done backend $backend_pid did not exit within the bounded wait"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a --note retry >/dev/null
+  assert_absent "$home/state/task-a.teardown-complete" \
+    "retryable Done left its restored completion proof unconsumed"
+  if compgen -G "$home/state/.task-a.teardown-complete.claimed.*" >/dev/null; then
+    fail "retryable Done left an orphan completion claim"
+  fi
+  if compgen -G "$home/state/.backlog-receipts.claimed.*" >/dev/null; then
+    fail "retryable Done left an orphan backend ownership transaction"
+  fi
+  pass "Done backend ownership survives wrapper death and gates completion recovery"
 }
 
 test_documented_overrides_remain_compatible() {
@@ -975,6 +1092,7 @@ test_completion_and_move_aliases_cannot_bypass_guards
 test_tasks_axi_is_scoped_to_selected_home
 test_help_does_not_require_home_configuration
 test_interrupted_mutation_receipt_claims_reconcile_from_files
+test_interrupted_done_backend_retains_mutation_ownership
 test_documented_overrides_remain_compatible
 test_backlog_and_archive_symlink_escapes_are_rejected
 test_duplicate_markdown_archive_is_rejected

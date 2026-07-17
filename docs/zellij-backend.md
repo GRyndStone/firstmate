@@ -181,6 +181,12 @@ Unlike herdr (where closing a tab's only root pane also closes the tab), zellij'
 `close-tab-by-id <id>` on a still-LIVE tab (pane running normally) was separately verified to cleanly remove both the pane and the tab in one call, needing no `close-pane` first.
 This is why `fm_backend_zellij_kill` resolves the owning tab id from the pane when possible, accepts teardown's recorded `zellij_tab_id` as a fallback when the pane has already gone, verifies the expected caller-facing `fm-<id>` label through the home-scoped-title or unambiguous legacy-title check when teardown provides it, and calls `close-tab-by-id`, rather than mirroring herdr's simpler "close the pane, the tab follows" contract.
 
+## Teardown absence boundary
+
+Zellij exposes only shared-session `list-panes` and `list-tabs` inventories, not an exact-home endpoint query that can prove a recorded task absent without reading other homes.
+`fm_backend_target_state` therefore returns `unknown` for Zellij without issuing either shared inventory command, and lifecycle finalization fails closed on that result even when resuming a teardown stage created before this boundary was enforced.
+The read-only duplicate audit reports the same missing exact-home capability as `inventory_unavailable` rather than sweeping the shared session.
+
 ## Composer verification: delta-based
 
 Zellij's CLI exposes no cursor-row/ANSI-only capture primitive (like tmux's), so `fm_backend_zellij_send_text_submit` still uses a content-diff strategy: capture the pane right after typing (the unsubmitted "typed" baseline), then after each Enter attempt capture again - unchanged means retry, changed means submitted.
@@ -206,7 +212,8 @@ Beyond the fake-CLI unit tests (`tests/fm-backend-zellij.test.sh`) and the real-
 6. The crewmate appended `done: ready in branch fm/zellij-e2e-t1` to its status file, and its commit (`add hello.txt`, message `add hello.txt`) was confirmed present on branch `fm/zellij-e2e-t1` in the project's git history, with `hello.txt` containing exactly the expected line.
 7. `bin/fm-teardown.sh zellij-e2e-t1` **REFUSED**, exactly as required: `REFUSED: local-only worktree ... has work not yet merged into main and not on any remote.`
 8. `bin/fm-merge-local.sh zellij-e2e-t1` - fast-forwarded local `main` to the crewmate's commit (`02c9dd2 -> ba41f90`).
-9. `bin/fm-teardown.sh zellij-e2e-t1` now succeeded: terminated the lingering worktree processes, returned the treehouse worktree, closed the zellij tab (confirmed gone via `list-tabs --json` - only the default `Tab #1` remained), and removed all of the task's `state/` files.
+9. In this historical verification, `bin/fm-teardown.sh zellij-e2e-t1` succeeded: terminated the lingering worktree processes, returned the treehouse worktree, closed the zellij tab, confirmed it gone via the then-current shared `list-tabs --json` path, and removed all of the task's `state/` files.
+   Current lifecycle finalization follows the fail-closed exact-home contract in [Teardown absence boundary](#teardown-absence-boundary) and does not repeat that shared-session check.
 
 The one real bug this pass caught - the `pane_cwd`-does-not-track-a-subshell gap (see "Worktree-path discovery" above) - was found and fixed during this E2E run itself: the FIRST attempt refused to launch with "did not yield an isolated worktree" because `current_path`'s original (JSON-only) implementation never saw `treehouse get`'s subshell move away from the project directory, so the 60-second poll's own comparison collapsed to "same path" and the isolation guard correctly (if confusingly) refused. After the `pwd`-probe fix, the identical flow spawned cleanly on the very next attempt.
 

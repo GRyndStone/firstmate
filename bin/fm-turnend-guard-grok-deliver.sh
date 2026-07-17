@@ -6,7 +6,14 @@ PENDING=${1:-}
 ROOT=${2:-}
 EXPECTED_TOKEN=${3:-}
 [ -n "$PENDING" ] && [ -n "$ROOT" ] || exit 1
-[ -f "$PENDING" ] && [ ! -L "$PENDING" ] || exit 0
+[ -L "$PENDING" ] && exit 1
+ACKNOWLEDGED="$PENDING.acknowledged"
+if [ ! -f "$PENDING" ]; then
+  if [ -f "$ACKNOWLEDGED" ] && [ ! -L "$ACKNOWLEDGED" ]; then
+    rm -f "$ACKNOWLEDGED" 2>/dev/null || true
+  fi
+  exit 0
+fi
 [ -n "$EXPECTED_TOKEN" ] || EXPECTED_TOKEN=$(sed -n '1p' "$PENDING" 2>/dev/null || true)
 [ -n "$EXPECTED_TOKEN" ] || exit 1
 . "$ROOT/bin/fm-wake-lib.sh" || exit 1
@@ -117,19 +124,11 @@ mv -f "$READY_TMP" "$READY" || { rm -f "$READY_TMP"; exit 1; }
 
 run_delivery() {
   local rc deadline term_deadline
-  if [ "$SESSION_ID" = '@continue' ]; then
-    GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
-      grok --continue \
-        --cwd "$ROOT" \
-        --output-format plain \
-        -p "$MESSAGE" >/dev/null 2>&1 &
-  else
-    GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
-      grok --resume "$SESSION_ID" \
-        --cwd "$ROOT" \
-        --output-format plain \
-        -p "$MESSAGE" >/dev/null 2>&1 &
-  fi
+  GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
+    grok --resume "$SESSION_ID" \
+      --cwd "$ROOT" \
+      --output-format plain \
+      -p "$MESSAGE" >/dev/null 2>&1 &
   DELIVERY_PID=$!
   DELIVERY_IDENTITY=$(fm_pid_identity "$DELIVERY_PID" 2>/dev/null || true)
   deadline=$((SECONDS + TIMEOUT))
@@ -159,6 +158,35 @@ run_delivery() {
   return "$rc"
 }
 
+quarantine_legacy_pending() {
+  local record=$1 quarantine
+  quarantine=$(mktemp "$PENDING.legacy-continue.quarantined.XXXXXX") || return 1
+  rm -f "$quarantine" || return 1
+  [ "$(cat "$PENDING" 2>/dev/null || true)" = "$record" ] || return 0
+  mv "$PENDING" "$quarantine"
+}
+
+acknowledged_matches() {
+  local record=$1
+  [ -f "$ACKNOWLEDGED" ] && [ ! -L "$ACKNOWLEDGED" ] \
+    && [ "$(cat "$ACKNOWLEDGED" 2>/dev/null || true)" = "$record" ]
+}
+
+cleanup_acknowledged() {
+  local record=$1
+  if [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; then
+    [ "$(cat "$PENDING" 2>/dev/null || true)" = "$record" ] || return 1
+    if ! acknowledged_matches "$record"; then
+      mv "$PENDING" "$ACKNOWLEDGED" || return 1
+    else
+      rm -f "$PENDING" || return 1
+    fi
+  fi
+  acknowledged_matches "$record" || return 1
+  rm -f "$ACKNOWLEDGED" || return 1
+  [ ! -e "$ACKNOWLEDGED" ]
+}
+
 wait_for_originating_hook() {
   local hook_pid=$1 hook_identity=$2 current_identity
   while fm_pid_alive "$hook_pid"; do
@@ -168,7 +196,13 @@ wait_for_originating_hook() {
   done
 }
 
-while [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; do
+ACKNOWLEDGED_RECORD=
+while { [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; } \
+  || { [ -f "$ACKNOWLEDGED" ] && [ ! -L "$ACKNOWLEDGED" ]; }; do
+  if [ ! -f "$PENDING" ]; then
+    rm -f "$ACKNOWLEDGED" 2>/dev/null || sleep "$RETRY_DELAY"
+    continue
+  fi
   RECORD=$(cat "$PENDING" 2>/dev/null || true)
   TOKEN=$(printf '%s\n' "$RECORD" | sed -n '1p')
   HOOK_PID=$(printf '%s\n' "$RECORD" | sed -n '2p')
@@ -177,13 +211,30 @@ while [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; do
   REASON=$(printf '%s\n' "$RECORD" | sed '1,4d')
   [ -n "$TOKEN" ] && [ -n "$HOOK_PID" ] && [ -n "$HOOK_IDENTITY" ] && [ -n "$SESSION_ID" ] || exit 1
   wait_for_originating_hook "$HOOK_PID" "$HOOK_IDENTITY"
+  if [ "$SESSION_ID" = '@continue' ]; then
+    quarantine_legacy_pending "$RECORD" || exit 1
+    continue
+  fi
   sleep "$DELAY"
   [ "$(cat "$PENDING" 2>/dev/null || true)" = "$RECORD" ] || continue
+  if [ "$ACKNOWLEDGED_RECORD" = "$RECORD" ] || acknowledged_matches "$RECORD"; then
+    if cleanup_acknowledged "$RECORD"; then
+      ACKNOWLEDGED_RECORD=
+    else
+      sleep "$RETRY_DELAY"
+    fi
+    continue
+  fi
+  if [ -e "$ACKNOWLEDGED" ]; then
+    [ -f "$ACKNOWLEDGED" ] && [ ! -L "$ACKNOWLEDGED" ] || exit 1
+    rm -f "$ACKNOWLEDGED" || { sleep "$RETRY_DELAY"; continue; }
+  fi
   MESSAGE="TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
 
 $REASON"
   if run_delivery; then
-    [ "$(cat "$PENDING" 2>/dev/null || true)" = "$RECORD" ] && rm -f "$PENDING"
+    ACKNOWLEDGED_RECORD=$RECORD
+    cleanup_acknowledged "$RECORD" || true
     continue
   fi
   sleep "$RETRY_DELAY"

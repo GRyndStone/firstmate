@@ -147,7 +147,7 @@ else
   RC=125
   REASON='shared turn-end guard is unavailable'
 fi
-[ "$RC" -ne 0 ] || { rm -f "$PENDING" 2>/dev/null || true; exit 0; }
+[ "$RC" -ne 0 ] || { rm -f "$PENDING" "$PENDING.acknowledged" 2>/dev/null || true; exit 0; }
 
 [ -n "$REASON" ] || {
   if [ "$RC" -eq 2 ]; then

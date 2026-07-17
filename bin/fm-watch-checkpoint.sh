@@ -113,7 +113,7 @@ signal_watch_child() {
 stop_watch_child() {
   local limit=$1 i=0
   if signal_watch_child TERM; then
-    while watch_child_matches && [ "$i" -lt "$limit" ]; do
+    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt "$limit" ]; do
       sleep 0.05
       i=$((i + 1))
     done
@@ -166,7 +166,7 @@ capture_watch_identity
 TIMER_PID=$!
 
 while [ ! -e "$TIMEOUT_MARKER" ] && watch_child_matches; do
-  sleep 0.05
+  sleep 1
 done
 if [ -e "$TIMEOUT_MARKER" ]; then
   TIMED_OUT=1

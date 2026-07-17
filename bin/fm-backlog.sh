@@ -457,6 +457,7 @@ CLAIM_SETTLED_STATE=
 MUTATION_RECEIPT_DIR=
 MUTATION_SNAPSHOT_BEFORE=
 MUTATION_COMMAND_SUCCEEDED=0
+MUTATION_DURABLE=0
 MUTATION_SCOPE=
 MUTATION_ID=
 
@@ -501,6 +502,9 @@ mutation_receipt_claim_is_valid() {
         [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
         snapshots=$((snapshots + 1))
         ;;
+      backend-owner|backend-start)
+        [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+        ;;
       *.teardown-complete)
         [ ! -d "$entry" ] && [ ! -L "$entry" ] || return 1
         ;;
@@ -513,13 +517,44 @@ mutation_receipt_claim_is_valid() {
   [ "$snapshots" -eq 1 ]
 }
 
+mutation_backend_owner_is_live() {
+  local claim=$1 owner pid recorded_identity current_identity process_state
+  owner="$claim/backend-owner"
+  [ -f "$owner" ] && [ ! -L "$owner" ] || return 1
+  pid=$(sed -n '1p' "$owner") || return 2
+  recorded_identity=$(sed -n '2,$p' "$owner") || return 2
+  case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+  [ -n "$recorded_identity" ] || return 2
+  [ -z "$(sed -n '3p' "$owner")" ] || return 2
+  kill -0 "$pid" 2>/dev/null || return 1
+  process_state=$(ps -p "$pid" -o stat= 2>/dev/null) || return 2
+  read -r process_state _ <<< "$process_state"
+  case "$process_state" in Z*) return 1 ;; '') return 2 ;; esac
+  current_identity=$(mutation_backend_pid_identity "$pid") || return 2
+  [ "$current_identity" = "$recorded_identity" ]
+}
+
+mutation_backend_pid_identity() {
+  local identity
+  identity=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null) || return 1
+  identity=$(printf '%s\n' "$identity" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+
 restore_mutation_receipts() {
   local held destination name
   [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
   for held in "$MUTATION_RECEIPT_DIR"/* "$MUTATION_RECEIPT_DIR"/.[!.]* "$MUTATION_RECEIPT_DIR"/..?*; do
     [ -e "$held" ] || [ -L "$held" ] || continue
     name=$(basename "$held")
-    [ "$name" != snapshot-before ] || continue
+    case "$name" in
+      snapshot-before) continue ;;
+      backend-owner|backend-start|.backend-owner.tmp|.backend-start.tmp)
+        rm -f "$held" || return 1
+        continue
+        ;;
+    esac
     destination="$STATE/$name"
     if [ -e "$destination" ] || [ -L "$destination" ] || ! mv "$held" "$destination"; then
       return 1
@@ -537,7 +572,9 @@ discard_mutation_receipts() {
     [ -e "$held" ] || [ -L "$held" ] || continue
     name=$(basename "$held")
     case "$name" in
-      snapshot-before) rm -f "$held" || status=1 ;;
+      snapshot-before|backend-owner|backend-start|.backend-owner.tmp|.backend-start.tmp)
+        rm -f "$held" || status=1
+        ;;
       *.teardown-complete) rm -f "$held" || status=1 ;;
       .*.teardown-complete.claimed.*) fm_tasks_axi_remove_completion_claim "$held" || status=1 ;;
       *) status=1 ;;
@@ -550,33 +587,7 @@ discard_mutation_receipts() {
   return "$status"
 }
 
-claim_mutation_receipts() {
-  local scope=$1 id=${2:-} candidate name
-  local -a candidates=()
-  if [ "$scope" = all ]; then
-    for candidate in "$STATE"/*.teardown-complete "$STATE"/.*.teardown-complete.claimed.*; do
-      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
-      candidates+=("$candidate")
-    done
-  else
-    candidate="$STATE/$id.teardown-complete"
-    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
-      candidates+=("$candidate")
-    fi
-    for candidate in "$STATE"/."$id".teardown-complete.claimed.*; do
-      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
-      candidates+=("$candidate")
-    done
-  fi
-  [ "${#candidates[@]}" -gt 0 ] || return 0
-  for candidate in "${candidates[@]}"; do
-    name=$(basename "$candidate")
-    case "$name" in
-      *.teardown-complete) [ ! -d "$candidate" ] || return 1 ;;
-      .*.teardown-complete.claimed.*) mutation_claim_is_removable "$candidate" || return 1 ;;
-      *) return 1 ;;
-    esac
-  done
+prepare_mutation_transaction() {
   MUTATION_RECEIPT_DIR=$(mktemp -d "$STATE/.backlog-receipts.claimed.XXXXXXXX") || return 1
   if ! printf '%s\n' "$MUTATION_SNAPSHOT_BEFORE" > "$MUTATION_RECEIPT_DIR/.snapshot-before.tmp" \
      || ! mv "$MUTATION_RECEIPT_DIR/.snapshot-before.tmp" "$MUTATION_RECEIPT_DIR/snapshot-before"; then
@@ -585,16 +596,53 @@ claim_mutation_receipts() {
     MUTATION_RECEIPT_DIR=
     return 1
   fi
-  for candidate in "${candidates[@]}"; do
+}
+
+claim_mutation_receipts() {
+  local scope=$1 id=${2:-} candidate name candidate_count=0 candidate_index=0
+  local -a candidates
+  if [ "$scope" = all ]; then
+    for candidate in "$STATE"/*.teardown-complete "$STATE"/.*.teardown-complete.claimed.*; do
+      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+      candidates[$candidate_count]=$candidate
+      candidate_count=$((candidate_count + 1))
+    done
+  else
+    candidate="$STATE/$id.teardown-complete"
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      candidates[$candidate_count]=$candidate
+      candidate_count=$((candidate_count + 1))
+    fi
+    for candidate in "$STATE"/."$id".teardown-complete.claimed.*; do
+      [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+      candidates[$candidate_count]=$candidate
+      candidate_count=$((candidate_count + 1))
+    done
+  fi
+  while [ "$candidate_index" -lt "$candidate_count" ]; do
+    candidate=${candidates[$candidate_index]}
+    name=$(basename "$candidate")
+    case "$name" in
+      *.teardown-complete) [ ! -d "$candidate" ] || return 1 ;;
+      .*.teardown-complete.claimed.*) mutation_claim_is_removable "$candidate" || return 1 ;;
+      *) return 1 ;;
+    esac
+    candidate_index=$((candidate_index + 1))
+  done
+  prepare_mutation_transaction || return 1
+  candidate_index=0
+  while [ "$candidate_index" -lt "$candidate_count" ]; do
+    candidate=${candidates[$candidate_index]}
     if ! mv "$candidate" "$MUTATION_RECEIPT_DIR/"; then
       restore_mutation_receipts || true
       return 1
     fi
+    candidate_index=$((candidate_index + 1))
   done
 }
 
 recover_mutation_receipt_claims() {
-  local claim entry name has_receipt snapshot_before snapshot_after cleanup_only
+  local claim entry name has_receipt snapshot_before snapshot_after cleanup_only owner_status
   for claim in "$STATE"/.backlog-receipts.claimed.*; do
     [ -e "$claim" ] || [ -L "$claim" ] || continue
     [ -d "$claim" ] && [ ! -L "$claim" ] || return 1
@@ -615,7 +663,19 @@ recover_mutation_receipt_claims() {
       rmdir "$claim" || return 1
       continue
     fi
+    if [ -e "$claim/.backend-owner.tmp" ] || [ -e "$claim/.backend-start.tmp" ]; then
+      [ ! -e "$claim/backend-start" ] || return 1
+      rm -f "$claim/.backend-owner.tmp" "$claim/.backend-start.tmp" || return 1
+    fi
+    if [ -e "$claim/backend-start" ] && [ ! -e "$claim/backend-owner" ]; then
+      return 1
+    fi
     mutation_receipt_claim_is_valid "$claim" || return 1
+    owner_status=0
+    mutation_backend_owner_is_live "$claim" || owner_status=$?
+    case "$owner_status" in
+      0|2) return 1 ;;
+    esac
     snapshot_before=$(cat "$claim/snapshot-before") || return 1
     snapshot_after=$(mutation_files_snapshot) || return 1
     MUTATION_RECEIPT_DIR=$claim
@@ -628,8 +688,15 @@ recover_mutation_receipt_claims() {
 }
 
 settle_mutation_receipts() {
-  local snapshot_after
+  local snapshot_after owner_status=0
   [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
+  mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || owner_status=$?
+  case "$owner_status" in
+    0|2)
+      MUTATION_RECEIPT_DIR=
+      return 1
+      ;;
+  esac
   if [ "$MUTATION_COMMAND_SUCCEEDED" -eq 1 ]; then
     discard_mutation_receipts
     return $?
@@ -645,6 +712,94 @@ settle_mutation_receipts() {
   fi
 }
 
+run_mutation_tasks_axi() {
+  local owner gate owner_tmp gate_tmp worker_pid worker_identity current_identity previous_identity=
+  local parent_pid i=0 status=0
+  owner="$MUTATION_RECEIPT_DIR/backend-owner"
+  gate="$MUTATION_RECEIPT_DIR/backend-start"
+  owner_tmp="$MUTATION_RECEIPT_DIR/.backend-owner.tmp"
+  gate_tmp="$MUTATION_RECEIPT_DIR/.backend-start.tmp"
+  parent_pid=${BASHPID:-$$}
+  (
+    local wait_count=0
+    while [ ! -e "$gate" ]; do
+      fm_pid_alive "$parent_pid" || exit 125
+      [ "$wait_count" -lt 200 ] || exit 125
+      sleep 0.05
+      wait_count=$((wait_count + 1))
+    done
+    cd "$FM_HOME" || exit 1
+    HOME="$FM_HOME" exec tasks-axi "$@" --backend markdown --file "$BACKLOG"
+  ) &
+  worker_pid=$!
+  while [ "$i" -lt 40 ]; do
+    current_identity=$(mutation_backend_pid_identity "$worker_pid" 2>/dev/null || true)
+    if [ -n "$current_identity" ] && [ -n "$previous_identity" ] \
+       && [ "$current_identity" = "$previous_identity" ]; then
+      worker_identity=$current_identity
+      break
+    fi
+    previous_identity=$current_identity
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if [ -z "${worker_identity:-}" ]; then
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    return 1
+  fi
+  if ! { printf '%s\n' "$worker_pid"; printf '%s\n' "$worker_identity"; } > "$owner_tmp" \
+     || ! mv "$owner_tmp" "$owner"; then
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    rm -f "$owner_tmp"
+    return 1
+  fi
+  current_identity=$(mutation_backend_pid_identity "$worker_pid" 2>/dev/null || true)
+  if ! fm_pid_alive "$worker_pid" || [ "$current_identity" != "$worker_identity" ] \
+     || ! : > "$gate_tmp" || ! mv "$gate_tmp" "$gate"; then
+    kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    rm -f "$owner" "$owner_tmp" "$gate" "$gate_tmp"
+    return 1
+  fi
+  wait "$worker_pid" || status=$?
+  rm -f "$owner" "$gate" "$owner_tmp" "$gate_tmp" 2>/dev/null || true
+  return "$status"
+}
+
+stop_owned_mutation_backend() {
+  local owner_status=0 pid i=0
+  [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
+  mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || owner_status=$?
+  case "$owner_status" in
+    1) return 0 ;;
+    2) return 1 ;;
+  esac
+  pid=$(sed -n '1p' "$MUTATION_RECEIPT_DIR/backend-owner") || return 1
+  mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || return 1
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$i" -lt 40 ]; do
+    owner_status=0
+    mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || owner_status=$?
+    [ "$owner_status" -eq 0 ] || break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  owner_status=0
+  mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || owner_status=$?
+  if [ "$owner_status" -eq 0 ]; then
+    mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || return 1
+    kill -KILL "$pid" 2>/dev/null || true
+  elif [ "$owner_status" -eq 2 ]; then
+    return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  owner_status=0
+  mutation_backend_owner_is_live "$MUTATION_RECEIPT_DIR" || owner_status=$?
+  [ "$owner_status" -eq 1 ]
+}
+
 release_backlog_lock() {
   if [ "$LOCKED" -eq 1 ]; then
     fm_lock_release "$BACKLOG_LOCK"
@@ -654,6 +809,11 @@ release_backlog_lock() {
 cleanup_backlog_wrapper() {
   local status=$?
   trap - EXIT INT TERM
+  if ! stop_owned_mutation_backend; then
+    [ "$status" -ne 0 ] || status=1
+    release_backlog_lock
+    exit "$status"
+  fi
   if [ -n "${CLAIM_DIR:-}" ] && ! completion_claim_settle; then
     [ "$status" -ne 0 ] || status=1
   fi
@@ -818,11 +978,13 @@ if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
   set -- "${DONE_ARGS[@]}"
 fi
 
-if [ "$COMMAND" != done ] && [ "$COMMAND_HELP" -eq 0 ]; then
+if [ "$COMMAND_HELP" -eq 0 ]; then
+  MUTATION_DURABLE=0
   MUTATION_SCOPE=
   MUTATION_ID=
   case "$COMMAND" in
     add)
+      MUTATION_DURABLE=1
       MUTATION_ID=${2:-}
       ADD_MINTED=0
       for arg in "$@"; do
@@ -835,6 +997,7 @@ if [ "$COMMAND" != done ] && [ "$COMMAND_HELP" -eq 0 ]; then
       fi
       ;;
     start|reopen|update|rm|block|unblock|hold|unhold)
+      MUTATION_DURABLE=1
       MUTATION_ID=${2:-}
       if fm_tasks_axi_valid_task_id "$MUTATION_ID"; then
         MUTATION_SCOPE=id
@@ -842,23 +1005,38 @@ if [ "$COMMAND" != done ] && [ "$COMMAND_HELP" -eq 0 ]; then
         MUTATION_SCOPE=all
       fi
       ;;
-    prune|render) MUTATION_SCOPE=all ;;
+    done)
+      MUTATION_DURABLE=1
+      ;;
+    prune|render|setup)
+      MUTATION_DURABLE=1
+      MUTATION_SCOPE=all
+      ;;
   esac
-  if [ -n "$MUTATION_SCOPE" ]; then
+  if [ "$MUTATION_DURABLE" -eq 1 ]; then
     MUTATION_SNAPSHOT_BEFORE=$(mutation_files_snapshot) || {
       echo "error: backlog state could not be captured before mutation" >&2
       exit 1
     }
-    if ! claim_mutation_receipts "$MUTATION_SCOPE" "$MUTATION_ID"; then
+    if [ -n "$MUTATION_SCOPE" ] \
+       && ! claim_mutation_receipts "$MUTATION_SCOPE" "$MUTATION_ID"; then
       echo "error: completion receipts could not be invalidated safely before backlog mutation" >&2
+      exit 1
+    elif [ -z "$MUTATION_SCOPE" ] && ! prepare_mutation_transaction; then
+      echo "error: durable backlog mutation ownership could not be prepared" >&2
       exit 1
     fi
   fi
 fi
 
-run_tasks_axi "$@"
-STATUS=$?
-if [ "$STATUS" -eq 0 ] && [ -n "$MUTATION_SCOPE" ]; then
+if [ "$MUTATION_DURABLE" -eq 1 ]; then
+  run_mutation_tasks_axi "$@"
+  STATUS=$?
+else
+  run_tasks_axi "$@"
+  STATUS=$?
+fi
+if [ "$STATUS" -eq 0 ] && [ "$MUTATION_DURABLE" -eq 1 ]; then
   MUTATION_COMMAND_SUCCEEDED=1
 fi
 if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then

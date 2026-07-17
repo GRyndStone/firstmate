@@ -81,7 +81,7 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if (.endpoint_anomalies | length) == 0 then
     "No same-home duplicate recovery endpoints found."
    else
-    (.endpoint_anomalies[] | "ALERT \(.task): recorded \(.recorded_endpoint); live \(.live_endpoints | join(", ")); worktree \(.worktree); inspect only, do not auto-close.")
+    (.endpoint_anomalies[] | "ALERT kind=\(.kind) task=\(.task): reason=\(.reason // "-"); recorded \(.recorded_endpoint); live \(.live_endpoints | join(", ")); worktree \(.worktree); inspect only, do not auto-close.")
    end),
   "",
   "## In Flight",

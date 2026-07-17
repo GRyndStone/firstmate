@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Read-only duplicate recovery-endpoint audit.
 #
-# The audit examines exact Herdr workspaces named by this home's own task meta.
+# The audit examines exact Herdr workspaces and tmux sessions named by this
+# home's own task meta.
 # Zellij and cmux do not expose exact-home inventories, so their audits emit
 # structured unavailable findings instead of enumerating shared namespaces.
 # It never closes or mutates an endpoint.
@@ -218,6 +219,70 @@ audit_zellij_meta() {
   append_inventory_unavailable zellij "$meta" "zellij has no exact-home duplicate inventory; shared-session sweep refused"
 }
 
+audit_tmux_meta() {
+  local meta=$1 id label recorded session inventory wid panes pane live_json count
+  id=$(basename "$meta" .meta)
+  label="fm-$id"
+  recorded=$(fm_backend_target_of_meta "$meta")
+  case "$recorded" in
+    *:*)
+      session=${recorded%%:*}
+      ;;
+    *)
+      append_inventory_unavailable tmux "$meta" "tmux meta lacks an exact recorded session; cross-session sweep refused"
+      return
+      ;;
+  esac
+  if [ -z "$session" ] || [ "$session" = "$recorded" ]; then
+    append_inventory_unavailable tmux "$meta" "tmux meta lacks an exact recorded session; cross-session sweep refused"
+    return
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "fm-endpoint-audit: tmux not found" >&2
+    return 1
+  fi
+  if ! inventory=$(tmux list-windows -t "=$session" -f "#{==:#{window_name},$label}" -F $'#{window_id}\t#{window_name}' 2>&1); then
+    if printf '%s\n' "$inventory" | grep -Eqi "can't find session|no server running|(failed to connect|error connecting).*(no such file|connection refused)|no sessions"; then
+      inventory=
+    else
+      echo "fm-endpoint-audit: cannot read exact tmux session $session for $id" >&2
+      return 1
+    fi
+  fi
+  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$label" '
+    NF != 2 || $1 !~ /^@[0-9]+$/ || $2 != label { bad=1 }
+    END { exit bad ? 1 : 0 }
+  '; then
+    echo "fm-endpoint-audit: invalid exact tmux window inventory for $session:$label" >&2
+    return 1
+  fi
+  live_json='[]'
+  while IFS=$'\t' read -r wid _; do
+    [ -n "$wid" ] || continue
+    if ! panes=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>&1); then
+      echo "fm-endpoint-audit: cannot read exact tmux window $wid for $session:$label" >&2
+      return 1
+    fi
+    if [ -z "$panes" ] || ! printf '%s\n' "$panes" | awk '/^%[0-9]+$/ { next } { bad=1 } END { exit bad ? 1 : 0 }'; then
+      echo "fm-endpoint-audit: invalid exact tmux pane inventory for $wid" >&2
+      return 1
+    fi
+    while IFS= read -r pane; do
+      live_json=$(printf '%s' "$live_json" | jq --arg pane "$pane" '. + [$pane]') || return 1
+    done <<EOF
+$panes
+EOF
+  done <<EOF
+$inventory
+EOF
+  live_json=$(printf '%s' "$live_json" | jq 'unique | sort') || return 1
+  count=$(printf '%s' "$live_json" | jq 'length') || return 1
+  if [ "$count" -eq 1 ]; then
+    live_json=$(jq -n --arg recorded "$recorded" '[$recorded]') || return 1
+  fi
+  append_anomaly tmux "$meta" "$live_json" "$recorded"
+}
+
 audit_cmux_meta() {
   local meta=$1 id
   id=$(basename "$meta" .meta)
@@ -228,6 +293,7 @@ for meta in "$STATE"/*.meta; do
   [ -e "$meta" ] || continue
   meta_selected "$meta" || continue
   case "$(fm_backend_of_meta "$meta")" in
+    tmux) audit_tmux_meta "$meta" || exit 1 ;;
     zellij) audit_zellij_meta "$meta" || exit 1 ;;
     cmux) audit_cmux_meta "$meta" || exit 1 ;;
   esac

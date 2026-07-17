@@ -30,6 +30,9 @@ for arg in "$@"; do
 done
 case "${1:-}" in
   list-windows)
+    case "$*" in
+      *' -f '*) exit 0 ;;
+    esac
     # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
     # probe"): every recorded window is live in this suite; deadness is
     # expressed through agent_alive (a zsh pane_current_command), not a gone
@@ -399,6 +402,10 @@ test_view_renders_snapshot() {
     "view should show secondmate endpoint agent liveness"
   assert_not_contains "$view" "fm-peek.sh fm-secondmate-task" \
     "view must not tell firstmate to routinely peek secondmates"
+  assert_contains "$view" "ALERT kind=inventory_unavailable task=cmux-task" \
+    "view should identify the endpoint anomaly kind"
+  assert_contains "$view" "reason=cmux has no exact-home duplicate inventory; app-global sweep refused" \
+    "view should explain why endpoint inventory is unavailable"
   pass "fleet view renders the snapshot without secondmate peek guidance"
 }
 

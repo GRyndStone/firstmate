@@ -666,7 +666,7 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # Prints present, absent, or unknown; backend inventory/read failures are
 # unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
 fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
-  local backend=$1 target=$2 expected_label=${3:-} backend_id=${4:-} out code session pane tabs panes state pane_tab_id scoped label_count
+  local backend=$1 target=$2 expected_label=${3:-} out code session pane state
   if [ "$backend" = herdr ]; then
     fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
     session=${target%%:*}
@@ -734,103 +734,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
       ;;
     herdr) printf 'unknown' ;;
     zellij)
-      fm_backend_source zellij >/dev/null 2>&1 || { printf 'unknown'; return 0; }
-      fm_backend_zellij_parse_target "$target" || { printf 'unknown'; return 0; }
-      if ! out=$(zellij list-sessions --short --no-formatting 2>&1); then
-        if printf '%s\n' "$out" | grep -Eqi 'no active zellij sessions|no sessions'; then
-          printf 'absent'
-        else
-          printf 'unknown'
-        fi
-        return 0
-      fi
-      if ! printf '%s\n' "$out" | grep -qxF "$FM_BACKEND_ZELLIJ_SESSION"; then
-        printf 'absent'
-        return 0
-      fi
-      panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>&1) || {
-        printf 'unknown'
-        return 0
-      }
-      printf '%s' "$panes" | jq -e '
-        type == "array"
-        and all(.[]?;
-          ((.id | type) == "number")
-          and (.id == (.id | floor))
-          and ((.tab_id | type) == "number")
-          and (.tab_id == (.tab_id | floor))
-          and ((.is_plugin | type) == "boolean")
-        )
-      ' >/dev/null 2>&1 || {
-        printf 'unknown'
-        return 0
-      }
-      tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
-        printf 'unknown'
-        return 0
-      }
-      printf '%s' "$tabs" | jq -e '
-        type == "array"
-        and all(.[]?;
-          ((.tab_id | type) == "number")
-          and (.tab_id == (.tab_id | floor))
-          and ((.name | type) == "string")
-        )
-      ' >/dev/null 2>&1 || {
-        printf 'unknown'
-        return 0
-      }
-      jq -en --argjson tabs "$tabs" --argjson panes "$panes" '
-        ($tabs | map(.tab_id)) as $tab_ids
-        | all($panes[]?; .tab_id as $pane_tab_id | ($tab_ids | index($pane_tab_id)) != null)
-      ' >/dev/null 2>&1 || {
-        printf 'unknown'
-        return 0
-      }
-      case "$FM_BACKEND_ZELLIJ_PANE" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
-      pane_tab_id=$(printf '%s' "$panes" | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)
-      if [ -n "$pane_tab_id" ]; then
-        case "$pane_tab_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
-        if [ -z "$expected_label" ]; then
-          printf 'present'
-          return 0
-        fi
-        scoped=$(fm_backend_zellij_scoped_title "$expected_label")
-        if printf '%s' "$tabs" | jq -e --argjson t "$pane_tab_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
-          printf 'present'
-          return 0
-        fi
-        label_count=$(printf '%s' "$tabs" | jq -r --arg want "$expected_label" '[.[]? | select(.name == $want)] | length' 2>/dev/null)
-        if [ "$label_count" = 1 ] && printf '%s' "$tabs" | jq -e --argjson t "$pane_tab_id" --arg want "$expected_label" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
-          printf 'present'
-        else
-          printf 'unknown'
-        fi
-        return 0
-      fi
-      if [ -n "$expected_label" ]; then
-        scoped=$(fm_backend_zellij_scoped_title "$expected_label")
-        if printf '%s' "$tabs" | jq -e --arg want "$scoped" 'any(.[]?; .name == $want)' >/dev/null 2>&1; then
-          printf 'present'
-          return 0
-        fi
-        [ -n "$backend_id" ] || { printf 'absent'; return 0; }
-        case "$backend_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
-        if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" 'any(.[]?; .tab_id == $t)' >/dev/null 2>&1; then
-          if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
-            printf 'present'
-          else
-            label_count=$(printf '%s' "$tabs" | jq -r --arg want "$expected_label" '[.[]? | select(.name == $want)] | length' 2>/dev/null)
-            if [ "$label_count" = 1 ] && printf '%s' "$tabs" | jq -e --argjson t "$backend_id" --arg want "$expected_label" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
-              printf 'present'
-            else
-              printf 'unknown'
-            fi
-          fi
-          return 0
-        fi
-      fi
-      printf 'absent'
+      printf 'unknown'
       ;;
     orca)
       fm_backend_source orca >/dev/null 2>&1 || { printf 'unknown'; return 0; }
