@@ -194,8 +194,18 @@ mv -f "$TMP" "$PENDING" || { rm -f "$TMP"; exit 1; }
 DELIVER="$ROOT/bin/fm-turnend-guard-grok-deliver.sh"
 [ -x "$DELIVER" ] || exit 1
 READY="$PENDING.ready"
-nohup "$DELIVER" "$PENDING" "$ROOT" "$TOKEN" </dev/null >>"$HANDOFF_DIR/grok-delivery.log" 2>&1 &
+DELIVERY_LOG="$HANDOFF_DIR/grok-delivery-$TOKEN.log"
+[ ! -e "$DELIVERY_LOG" ] && [ ! -L "$DELIVERY_LOG" ] || exit 1
+set -o noclobber
+if ! { exec 9>"$DELIVERY_LOG"; } 2>/dev/null; then
+  set +o noclobber
+  exit 1
+fi
+set +o noclobber
+[ -f "$DELIVERY_LOG" ] && [ ! -L "$DELIVERY_LOG" ] || { exec 9>&-; exit 1; }
+nohup "$DELIVER" "$PENDING" "$ROOT" "$TOKEN" </dev/null >&9 2>&1 &
 WORKER_PID=$!
+exec 9>&-
 attempt=0
 while [ "$attempt" -lt 100 ]; do
   WORKER_IDENTITY=$(fm_pid_identity "$WORKER_PID" 2>/dev/null || true)

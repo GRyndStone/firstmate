@@ -57,7 +57,8 @@ fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
-TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
+TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+TMP_ROOT=$(TMPDIR="$TMP_BASE" fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
 REAL_STAT_FOR_TEST=$(command -v stat)
@@ -1570,6 +1571,30 @@ SH
   pass "forced secondmate retirement audits child-home duplicates before any closure"
 }
 
+test_secondmate_retirement_refuses_symlinked_child_metadata() {
+  local case_dir home outside rc
+  case_dir=$(make_case secondmate-child-meta-symlink-refusal)
+  home="$case_dir/secondmate-home"
+  outside="$case_dir/foreign-child.meta"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+  printf 'window=@99\nworktree=%s\nproject=%s\nkind=ship\n' \
+    "$case_dir/foreign-worktree" "$case_dir/project" > "$outside"
+  ln -s "$outside" "$home/state/child-a1.meta"
+  rc=0
+  run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "symlinked child metadata retirement"
+  assert_contains "$(cat "$case_dir/stderr")" "child task metadata is symlinked or non-regular" \
+    "forced retirement parsed symlinked child metadata"
+  [ -L "$home/state/child-a1.meta" ] || fail "child metadata refusal removed the symlink"
+  [ -f "$outside" ] || fail "child metadata refusal removed the foreign target"
+  [ -d "$home" ] || fail "child metadata refusal removed the secondmate home"
+  pass "forced secondmate retirement rejects symlinked child metadata before parsing"
+}
+
 test_secondmate_child_endpoint_close_requires_confirmed_absence() {
   local case_dir home log rc
   case_dir=$(make_case secondmate-child-close-noop)
@@ -1636,7 +1661,7 @@ set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
-    printf '@7\tfm-task-x1\t%s\n@8\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
+    printf '@7\tfm-task-x1\t%s\t_\n@8\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
     ;;
   kill-window) exit 0 ;;
   *) exit 8 ;;
@@ -1828,6 +1853,7 @@ printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
     case "$*" in
+      *'#{@firstmate_home}'$'\t_'*) printf '@42\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" ;;
       *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
       *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
       *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
@@ -1863,6 +1889,7 @@ case "${1:-}" in
   list-windows)
     case "$*" in
       *'#{window_id},@42'*) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
+      *'#{@firstmate_home}'$'\t_'*) printf '@42\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
       *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
     esac
     echo 'permission denied while reading tmux inventory' >&2
@@ -2948,6 +2975,7 @@ test_postcleanup_retry_rechecks_endpoint_absence() {
 case "${1:-}" in
   list-windows)
     case "$*" in
+      *'#{@firstmate_home}'$'\t_'*) printf '@42\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" ;;
       *' -f '*) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
       *'#{session_name}:#{window_name}'*) printf '%s\n' 'firstmate:fm-task-x1 fm-task-x1' ;;
       *) printf '%s\n' 'fm-task-x1 fm-task-x1' ;;
@@ -3407,6 +3435,7 @@ test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_endpoint_duplicate_created_after_preflight_blocks_close
 test_secondmate_retirement_preflights_child_duplicates
+test_secondmate_retirement_refuses_symlinked_child_metadata
 test_secondmate_child_endpoint_close_requires_confirmed_absence
 test_tmux_duplicate_endpoints_refuse_teardown_without_closure
 test_zellij_inventory_unavailable_refuses_teardown_without_sweep

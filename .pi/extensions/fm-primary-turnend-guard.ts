@@ -78,7 +78,19 @@ function markLoaded(): void {
     return;
   }
   mkdirSync(state, { recursive: true });
-  writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
+  try {
+    const info = lstatSync(marker);
+    if (info.isSymbolicLink() || !info.isFile()) return;
+  } catch (error) {
+    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") return;
+  }
+  const temp = `${marker}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    writeFileSync(temp, `${extensionVersion}\n${process.pid}\n`, { mode: 0o600, flag: "wx" });
+    renameSync(temp, marker);
+  } catch {
+    try { unlinkSync(temp); } catch {}
+  }
 }
 
 function runGuard(): Promise<{ code: number; stderr: string }> {
@@ -346,21 +358,23 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
 export default function (pi: ExtensionAPI) {
   const inPrimaryCheckout = primaryCheckout();
   let guardOwnershipRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let guardSettlementGeneration = 0;
   const cancelGuardOwnershipRetry = () => {
     if (guardOwnershipRetryTimer !== undefined) clearTimeout(guardOwnershipRetryTimer);
     guardOwnershipRetryTimer = undefined;
   };
-  const scheduleGuardOwnershipRetry = () => {
+  const scheduleGuardOwnershipRetry = (generation: number) => {
     if (guardOwnershipRetryTimer !== undefined) return;
     guardOwnershipRetryTimer = setTimeout(() => {
       guardOwnershipRetryTimer = undefined;
-      void handleAgentSettled();
+      if (generation === guardSettlementGeneration) void handleAgentSettled(generation);
     }, retryDelay());
   };
-  const handleAgentSettled = async () => {
+  const handleAgentSettled = async (generation: number) => {
+    if (generation !== guardSettlementGeneration) return;
     const initialOwnership = lockOwnership();
     if (initialOwnership === "unknown") {
-      scheduleGuardOwnershipRetry();
+      scheduleGuardOwnershipRetry(generation);
       return;
     }
     cancelGuardOwnershipRetry();
@@ -369,9 +383,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const result = await runGuard();
+    if (generation !== guardSettlementGeneration) return;
     const finalOwnership = lockOwnership();
     if (finalOwnership === "unknown") {
-      scheduleGuardOwnershipRetry();
+      scheduleGuardOwnershipRetry(generation);
       return;
     }
     if (finalOwnership !== "owned") {
@@ -423,8 +438,11 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.on?.("agent_start", () => {
+      guardSettlementGeneration += 1;
+      cancelGuardOwnershipRetry();
       const ownership = lockOwnership();
       if (ownership === "unknown") {
+        guardFollowupCleanupPending = true;
         scheduleDelivery(pi);
         return;
       }
@@ -452,7 +470,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   if (inPrimaryCheckout) {
-    pi.on("agent_settled", handleAgentSettled);
+    pi.on("agent_settled", () => {
+      guardSettlementGeneration += 1;
+      return handleAgentSettled(guardSettlementGeneration);
+    });
 
     markLoaded();
     const ownership = lockOwnership();

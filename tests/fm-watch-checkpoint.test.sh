@@ -254,6 +254,48 @@ SH
   pass "checkpoint polls process identity coarsely outside signal-time revalidation"
 }
 
+test_transient_identity_probe_failure_remains_bounded() {
+  local home out err watcher fakebin launched failed pid_file status started elapsed watcher_pid
+  home=$(make_home transient-identity)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/transient-watch.sh"
+  fakebin="$home/fakebin"
+  launched="$home/launched"
+  failed="$home/failed-once"
+  pid_file="$home/watcher.pid"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+: > "$WATCH_LAUNCHED"
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_LAUNCHED" ] && [ ! -e "$WATCH_FAILED_ONCE" ]; then
+  : > "$WATCH_FAILED_ONCE"
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  started=$SECONDS
+  PATH="$fakebin:$PATH" WATCH_LAUNCHED="$launched" WATCH_FAILED_ONCE="$failed" \
+    WATCH_PID_FILE="$pid_file" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 124 "$status" "transient identity-probe timeout"
+  assert_present "$failed" "fixture did not inject a transient identity failure"
+  [ "$elapsed" -lt 8 ] || fail "transient identity failure made checkpoint unbounded (${elapsed}s)"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  [ -z "$watcher_pid" ] || ! kill -0 "$watcher_pid" 2>/dev/null \
+    || fail "transient identity failure left the exact watcher child alive"
+  pass "transient watcher identity failures retry without fallback signaling or unbounded wait"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
@@ -263,3 +305,4 @@ test_timeout_marks_then_kills_only_term_resistant_watcher
 test_timeout_revalidates_watcher_birth_identity_before_escalation
 test_identity_capture_failure_never_signals_pid_fallback
 test_checkpoint_polls_process_identity_coarsely
+test_transient_identity_probe_failure_remains_bounded

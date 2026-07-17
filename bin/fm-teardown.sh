@@ -1040,7 +1040,8 @@ collect_child_auxiliary_owners() {
   local home=$1 manifest=$2 child_meta child_kind child_wt child_home index
   [ -d "$home/state" ] || return 0
   for child_meta in "$home/state"/*.meta; do
-    [ -f "$child_meta" ] || continue
+    [ -e "$child_meta" ] || [ -L "$child_meta" ] || continue
+    child_meta_is_regular "$child_meta" || return 1
     child_kind=$(fm_meta_get "$child_meta" kind)
     child_wt=$(fm_meta_get "$child_meta" worktree)
     if [ "$child_kind" = secondmate ]; then
@@ -1056,6 +1057,14 @@ collect_child_auxiliary_owners() {
       append_auxiliary_owner child-worktree "$child_wt" "$manifest" "$index" || return 1
     fi
   done
+}
+
+child_meta_is_regular() {
+  local child_meta=$1
+  if [ -L "$child_meta" ] || [ ! -f "$child_meta" ]; then
+    echo "REFUSED: child task metadata is symlinked or non-regular: $child_meta" >&2
+    return 1
+  fi
 }
 
 prepare_auxiliary_owners() {
@@ -2073,7 +2082,8 @@ validate_firstmate_home_children_removal() {
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
+    [ -e "$child_meta" ] || [ -L "$child_meta" ] || continue
+    child_meta_is_regular "$child_meta" || return 1
     child_id=$(basename "$child_meta" .meta)
     child_wt=$(meta_value "$child_meta" worktree)
     child_kind=$(meta_value "$child_meta" kind)
@@ -2103,7 +2113,8 @@ audit_firstmate_home_children_endpoints() {
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
+    [ -e "$child_meta" ] || [ -L "$child_meta" ] || continue
+    child_meta_is_regular "$child_meta" || return 1
     child_id=$(basename "$child_meta" .meta)
     child_backend=$(fm_backend_of_meta "$child_meta")
     case "$child_backend" in
@@ -2193,7 +2204,8 @@ cleanup_firstmate_home_children() {
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
+    [ -e "$child_meta" ] || [ -L "$child_meta" ] || continue
+    child_meta_is_regular "$child_meta" || return 1
     child_id=$(basename "$child_meta" .meta)
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
@@ -2319,7 +2331,8 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
   SUB_STATE="$HOME_PATH/state"
   if [ -d "$SUB_STATE" ]; then
     for child_meta in "$SUB_STATE"/*.meta; do
-      [ -e "$child_meta" ] || continue
+      [ -e "$child_meta" ] || [ -L "$child_meta" ] || continue
+      child_meta_is_regular "$child_meta" || exit 1
       echo "REFUSED: secondmate $ID still has in-flight work in $SUB_STATE." >&2
       echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
       exit 1

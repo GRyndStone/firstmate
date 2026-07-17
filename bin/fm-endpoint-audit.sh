@@ -43,6 +43,38 @@ done
 
 command -v jq >/dev/null 2>&1 || { echo "fm-endpoint-audit: jq not found" >&2; exit 1; }
 
+validate_state_path() {
+  local path=$1 component suffix cursor=/
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  suffix=${path#/}
+  while [ -n "$suffix" ]; do
+    component=${suffix%%/*}
+    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
+    [ -n "$component" ] || continue
+    case "$component" in
+      .|..)
+        echo "fm-endpoint-audit: unsafe effective state path component: $component" >&2
+        return 1
+        ;;
+    esac
+    cursor=${cursor%/}/$component
+    if [ -L "$cursor" ]; then
+      echo "fm-endpoint-audit: symlinked effective state path component refused: $cursor" >&2
+      return 1
+    fi
+    if [ -n "$suffix" ] && [ -e "$cursor" ] && [ ! -d "$cursor" ]; then
+      echo "fm-endpoint-audit: non-directory effective state path component refused: $cursor" >&2
+      return 1
+    fi
+  done
+  [ -d "$path" ] && [ ! -L "$path" ] || {
+    echo "fm-endpoint-audit: effective state path is not a regular directory: $path" >&2
+    return 1
+  }
+  STATE=$path
+}
+validate_state_path "$STATE" || exit 1
+
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-endpoint-audit.XXXXXX") || exit 1
 LIVE="$TMP_ROOT/live.tsv"
 ROWS="$TMP_ROOT/rows.jsonl"

@@ -110,6 +110,18 @@ watch_child_matches() {
   [ "$current_identity" = "$WATCH_IDENTITY" ]
 }
 
+reap_watch_child_bounded() {
+  local limit=$1 i=0
+  [ -n "$WATCH_PID" ] || return 0
+  while fm_pid_alive "$WATCH_PID" && [ "$i" -lt "$limit" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  fm_pid_alive "$WATCH_PID" && return 1
+  wait "$WATCH_PID" 2>/dev/null || true
+  WATCH_PID=
+}
+
 signal_watch_child() {
   local signal=$1
   watch_child_matches || return 1
@@ -117,16 +129,23 @@ signal_watch_child() {
 }
 
 stop_watch_child() {
-  local limit=$1 i=0
-  if signal_watch_child TERM; then
-    while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt "$limit" ]; do
-      sleep 0.05
-      i=$((i + 1))
-    done
+  local limit=$1 i=0 term_sent=0
+  while [ "$i" -lt "$limit" ]; do
+    fm_pid_alive "$WATCH_PID" || return 0
     if watch_child_matches; then
-      signal_watch_child KILL || true
+      if [ "$term_sent" -eq 0 ]; then
+        signal_watch_child TERM || true
+        term_sent=1
+      fi
     fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  fm_pid_alive "$WATCH_PID" || return 0
+  if watch_child_matches; then
+    signal_watch_child KILL || true
   fi
+  reap_watch_child_bounded 20
 }
 
 # shellcheck disable=SC2329 # Invoked by EXIT and signal traps below.
@@ -139,8 +158,7 @@ cleanup_owned_children() {
   [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
   TIMER_PID=
   stop_watch_child 20
-  [ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null || true
-  WATCH_PID=
+  reap_watch_child_bounded 40 || true
   rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER" "$ABORT_MARKER"
 }
 
@@ -177,16 +195,11 @@ WATCH_PID=$!
 if ! capture_watch_identity; then
   : > "$ABORT_MARKER"
   i=0
-  while kill -0 "$WATCH_PID" 2>/dev/null && [ "$i" -lt 100 ]; do
+  while fm_pid_alive "$WATCH_PID" && [ "$i" -lt 300 ]; do
     sleep 0.01
     i=$((i + 1))
   done
-  if kill -0 "$WATCH_PID" 2>/dev/null; then
-    WATCH_PID=
-  else
-    wait "$WATCH_PID" 2>/dev/null || true
-    WATCH_PID=
-  fi
+  reap_watch_child_bounded 20 || true
   echo "checkpoint: exact watcher child identity could not be captured; watcher was not started" >&2
   exit 1
 fi
@@ -197,18 +210,30 @@ fi
 ) &
 TIMER_PID=$!
 
-while [ ! -e "$TIMEOUT_MARKER" ] && watch_child_matches; do
+WATCH_FINISHED=0
+while [ ! -e "$TIMEOUT_MARKER" ]; do
+  if ! fm_pid_alive "$WATCH_PID"; then
+    WATCH_FINISHED=1
+    break
+  fi
   sleep 1
 done
 if [ -e "$TIMEOUT_MARKER" ]; then
   TIMED_OUT=1
-  stop_watch_child 40
+  stop_watch_child 40 || true
 fi
 set +e
-wait "$WATCH_PID"
-RC=$?
+RC=1
+if [ -z "$WATCH_PID" ]; then
+  RC=0
+elif [ "$WATCH_FINISHED" -eq 1 ] || ! fm_pid_alive "$WATCH_PID"; then
+  wait "$WATCH_PID"
+  RC=$?
+  WATCH_PID=
+elif reap_watch_child_bounded 40; then
+  RC=0
+fi
 set -e
-WATCH_PID=
 if kill -0 "$TIMER_PID" 2>/dev/null; then
   kill -TERM "$TIMER_PID" 2>/dev/null || true
 fi

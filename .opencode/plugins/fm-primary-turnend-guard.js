@@ -6,6 +6,7 @@ import { effectivePrimaryPaths, sessionLockOwnership } from "../lib/fm-primary-s
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
 let handoffSequence = 0;
+const processEpoch = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function runProcess(command, args, input = "") {
   return new Promise((resolve) => {
@@ -142,10 +143,11 @@ function persistHandoff(root, sessionID, message, generation) {
   const handoff = safeHandoffDirectory(root, sessionID, true);
   handoffSequence += 1;
   const token = `${process.pid}-${Date.now()}-${handoffSequence}`;
-  const record = JSON.stringify({ token, sessionID, message, generation });
+  const epoch = processEpoch;
+  const record = JSON.stringify({ token, sessionID, message, generation, epoch });
   if (!replaceableRecord(handoff.path)) throw new Error("unsafe Firstmate handoff record");
   writeAtomic(handoff.path, record, token);
-  return { ...handoff, record, token, sessionID, message, generation };
+  return { ...handoff, record, token, sessionID, message, generation, epoch };
 }
 
 function readHandoff(root, sessionID) {
@@ -156,7 +158,8 @@ function readHandoff(root, sessionID) {
     const parsed = JSON.parse(record);
     if (parsed?.sessionID !== sessionID || typeof parsed.token !== "string" || typeof parsed.message !== "string") return undefined;
     const generation = Number.isSafeInteger(parsed.generation) && parsed.generation >= 0 ? parsed.generation : 0;
-    return { ...handoff, record, token: parsed.token, sessionID, message: parsed.message, generation };
+    const epoch = typeof parsed.epoch === "string" ? parsed.epoch : "";
+    return { ...handoff, record, token: parsed.token, sessionID, message: parsed.message, generation, epoch };
   } catch {
     return undefined;
   }
@@ -187,9 +190,11 @@ function parseDurableRecord(path, sessionID, kind) {
       || !Number.isSafeInteger(parsed.generation) || parsed.generation < 0
       || typeof parsed.pendingRecord !== "string") return undefined;
     const pending = JSON.parse(parsed.pendingRecord);
+    const epoch = typeof parsed.epoch === "string" ? parsed.epoch : "";
+    const pendingEpoch = typeof pending?.epoch === "string" ? pending.epoch : "";
     if (pending?.token !== parsed.token || pending.sessionID !== sessionID || pending.generation !== parsed.generation
-      || typeof pending.message !== "string") return undefined;
-    return { ...parsed, record };
+      || pendingEpoch !== epoch || typeof pending.message !== "string") return undefined;
+    return { ...parsed, epoch, record };
   } catch {
     return undefined;
   }
@@ -214,6 +219,7 @@ function persistFlight(root, handoff) {
     token: handoff.token,
     sessionID: handoff.sessionID,
     generation: handoff.generation,
+    epoch: handoff.epoch,
     pendingRecord: handoff.record,
     ownerPid: process.pid,
   });
@@ -254,6 +260,7 @@ function persistAcknowledged(root, handoff, coveredGeneration) {
     token: handoff.token,
     sessionID: handoff.sessionID,
     generation: handoff.generation,
+    epoch: handoff.epoch,
     coveredGeneration,
     pendingRecord: handoff.record,
   });
@@ -269,7 +276,8 @@ function cleanupAcknowledged(root, sessionID, acknowledged) {
     const coveredGeneration = Number.isSafeInteger(acknowledged.coveredGeneration)
       ? acknowledged.coveredGeneration
       : acknowledged.generation;
-    if (current && current.generation <= coveredGeneration) {
+    if (current && (current.record === acknowledged.pendingRecord
+      || (current.epoch === acknowledged.epoch && current.generation <= coveredGeneration))) {
       if (!clearHandoff(root, sessionID, current.record)) return false;
     }
     const flight = readFlight(root, sessionID);
@@ -376,11 +384,15 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     flight.settling = true;
     flight.outcome = acknowledged;
     if (acknowledged) {
-      const currentGeneration = invocationGenerations.get(sessionID) ?? flight.handoff.generation;
-      flight.coveredGeneration = Math.max(
-        flight.handoff.generation,
-        Number.isSafeInteger(coveredGeneration) ? coveredGeneration : currentGeneration,
-      );
+      if (flight.handoff.epoch === processEpoch) {
+        const currentGeneration = invocationGenerations.get(sessionID) ?? flight.handoff.generation;
+        flight.coveredGeneration = Math.max(
+          flight.handoff.generation,
+          Number.isSafeInteger(coveredGeneration) ? coveredGeneration : currentGeneration,
+        );
+      } else {
+        flight.coveredGeneration = flight.handoff.generation;
+      }
     }
     const ownership = await sessionLockOwnership(paths);
     if (ownership === "unknown") {
@@ -402,12 +414,16 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
         scheduleDelivery(sessionID);
         return;
       }
-      satisfiedGenerations.set(
-        sessionID,
-        Math.max(satisfiedGenerations.get(sessionID) ?? 0, flight.coveredGeneration),
-      );
+      if (flight.handoff.epoch === processEpoch) {
+        satisfiedGenerations.set(
+          sessionID,
+          Math.max(satisfiedGenerations.get(sessionID) ?? 0, flight.coveredGeneration),
+        );
+      }
       const pending = pendingMessages.get(sessionID);
-      if (pending && pending.generation <= flight.coveredGeneration) pendingMessages.delete(sessionID);
+      if (flight.handoff.epoch === processEpoch && pending && pending.generation <= flight.coveredGeneration) {
+        pendingMessages.delete(sessionID);
+      }
       deliveryFlights.delete(sessionID);
       cleanupAcknowledged(root, sessionID, durableAcknowledged);
     } else {
@@ -446,10 +462,12 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       }))
       .then(
         () => {
-          flight.coveredGeneration = Math.max(
-            flight.handoff.generation,
-            invocationGenerations.get(sessionID) ?? flight.handoff.generation,
-          );
+          if (flight.handoff.epoch === processEpoch) {
+            flight.coveredGeneration = Math.max(
+              flight.handoff.generation,
+              invocationGenerations.get(sessionID) ?? flight.handoff.generation,
+            );
+          }
           return settleDelivery(sessionID, flight, true, flight.coveredGeneration);
         },
         () => settleDelivery(sessionID, flight, false),

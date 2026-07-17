@@ -6,7 +6,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 AUDIT="$ROOT/bin/fm-endpoint-audit.sh"
-TMP_ROOT=$(fm_test_tmproot fm-endpoint-audit)
+TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+TMP_ROOT=$(TMPDIR="$TMP_BASE" fm_test_tmproot fm-endpoint-audit)
 
 make_fixture() {
   local name=$1 home fakebin
@@ -303,6 +304,26 @@ test_symlinked_meta_is_not_read_across_homes() {
   pass "symlinked metadata is reported without reading another home's endpoint fields"
 }
 
+test_symlinked_state_path_component_is_refused_before_enumeration() {
+  local home outside out status
+  home=$(make_fixture symlinked-state-path)
+  outside="$TMP_ROOT/symlinked-state-path-outside"
+  mkdir -p "$outside"
+  fm_write_meta "$outside/foreign.meta" \
+    'backend=herdr' 'window=default:foreign' 'worktree=/foreign'
+  rm -rf "$home/state"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+    "$AUDIT" --json 2>&1) || status=$?
+  expect_code 1 "$status" "symlinked effective state path"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "audit did not reject the symlinked state directory before enumeration"
+  [ ! -e "$home/herdr.log" ] || [ ! -s "$home/herdr.log" ] \
+    || fail "audit queried a backend through foreign state metadata"
+  pass "endpoint audit rejects symlinked effective state path components"
+}
+
 test_tmux_unscoped_meta_reports_inventory_unavailable() {
   local home log out
   home=$(make_fixture tmux-unscoped)
@@ -461,6 +482,7 @@ test_tmux_duplicates_use_exact_recorded_session_and_task
 test_tmux_untagged_legacy_window_is_ambiguous
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
+test_symlinked_state_path_component_is_refused_before_enumeration
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_orca_reports_unavailable_without_app_global_inventory

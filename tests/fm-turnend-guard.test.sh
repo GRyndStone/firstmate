@@ -2584,6 +2584,135 @@ EOF
   pass "passive primary adapters reject symlinked ancestor components in effective handoff state"
 }
 
+test_opencode_recovered_generation_does_not_cover_new_process_idle() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-recovered-generation-root"
+  home="$TMP_ROOT/opencode-recovered-generation-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.turnend-handoffs"
+  record_opencode_test_lock "$home/state"
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nprintf "blind\\n" >&2\nexit 2\n' > "$repo/bin/fm-turnend-guard.sh"
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const sessionID = "recovered-generation";
+const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+writeFileSync(`${process.env.FM_HOME}/state/.turnend-handoffs/opencode-${key}.pending`, `${JSON.stringify({ token: "old", sessionID, message: "recovered", generation: 9 })}\n`);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+for (let i = 0; i < 100 && prompts < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`recovered delivery count was ${prompts}`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+if (prompts !== 2) throw new Error(`recovered generation suppressed new-process idle: ${prompts}`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode recovered generation process epoch"
+  [ -z "$out" ] || fail "OpenCode recovered-generation test printed output: $out"
+  pass ".opencode primary plugin: recovered generations cannot satisfy new-process idle events"
+}
+
+test_pi_unknown_agent_start_retains_ack_and_cancels_stale_settled_retry() {
+  local repo home ext fakebin release guard_log out status
+  repo="$TMP_ROOT/pi-unknown-start-root"
+  home="$TMP_ROOT/pi-unknown-start-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  fakebin="$TMP_ROOT/pi-unknown-start-fakebin"
+  release="$TMP_ROOT/pi-unknown-start-release"
+  guard_log="$TMP_ROOT/pi-unknown-start-guard.log"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state" "$fakebin"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nprintf "guard\\n" >> "$PI_GUARD_LOG"\nexit 2\n' > "$repo/bin/fm-turnend-guard.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/bin/fm-arm-pretool-check.sh"
+  cp "$repo/bin/fm-arm-pretool-check.sh" "$repo/bin/fm-cd-pretool-check.sh"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+[ -e "$PI_PS_RELEASE" ] || exit 2
+exec /bin/ps "$@"
+SH
+  chmod +x "$repo/bin/"*.sh "$fakebin/ps"
+  : > "$release"
+  out=$(PATH="$fakebin:$PATH" PLUGIN="$ext" FM_HOME="$home" PI_PS_RELEASE="$release" PI_GUARD_LOG="$guard_log" FM_TURNEND_HANDOFF_RETRY_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const handlers = new Map();
+let prompts = 0;
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendUserMessage() { prompts += 1; } };
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.ppid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("agent_settled")?.({}, {});
+if (prompts !== 1) throw new Error(`initial continuation count was ${prompts}`);
+unlinkSync(process.env.PI_PS_RELEASE);
+await handlers.get("agent_settled")?.({}, {});
+await handlers.get("agent_start")?.({}, {});
+writeFileSync(process.env.PI_PS_RELEASE, "ready\n");
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/pi.pending`;
+for (let i = 0; i < 100 && existsSync(pending); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (existsSync(pending)) throw new Error("unknown agent_start lost acknowledgement ownership");
+if (prompts !== 1) throw new Error(`unknown agent_start redelivered ${prompts} continuations`);
+await new Promise((resolve) => setTimeout(resolve, 40));
+if (prompts !== 1) throw new Error("stale settled retry crossed agent_start");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi unknown agent_start acknowledgement"
+  [ -z "$out" ] || fail "Pi unknown-agent-start test printed output: $out"
+  [ "$(wc -l < "$guard_log" | tr -d ' ')" -eq 1 ] || fail "stale Pi settled retry reran the guard"
+  pass ".pi primary extension: unknown agent-start retains acknowledgement and supersedes settled retries"
+}
+
+test_pi_loaded_marker_never_follows_symlink() {
+  local repo home ext outside out status
+  repo="$TMP_ROOT/pi-marker-symlink-root"
+  home="$TMP_ROOT/pi-marker-symlink-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  outside="$TMP_ROOT/pi-marker-symlink-outside"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/.pi/extensions" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$home/state/.pi-turnend-extension-loaded"
+  out=$(PLUGIN="$ext" FM_HOME="$home" OUTSIDE="$outside" node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default({ on() {}, sendUserMessage() {} });
+if (readFileSync(process.env.OUTSIDE, "utf8") !== "sentinel\n") throw new Error("Pi marker followed symlink");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi symlinked loaded marker"
+  [ -z "$out" ] || fail "Pi loaded-marker test printed output: $out"
+  pass ".pi primary extension: loaded marker replacement never follows symlinks"
+}
+
+test_grok_delivery_log_never_follows_symlink() {
+  local dir fakebin outside out status
+  dir=$(make_primary_dir "$TMP_ROOT/grok-log-symlink")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-log-symlink-fakebin")
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/grok"
+  chmod +x "$fakebin/grok"
+  mkdir -p "$dir/state/.turnend-handoffs"
+  outside="$TMP_ROOT/grok-log-symlink-outside"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$dir/state/.turnend-handoffs/grok-delivery.log"
+  out=$(printf '{"sessionId":"log-symlink"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  expect_code 0 "$status" "Grok symlinked delivery log"
+  [ -z "$out" ] || fail "Grok delivery-log test printed output: $out"
+  [ "$(cat "$outside")" = sentinel ] || fail "Grok delivery worker followed the symlinked log"
+  find "$dir/state/.turnend-handoffs" -name 'grok-delivery-*.log' -type f -print -quit | grep -q . || fail "Grok did not create an owned unique delivery log"
+  pass "fm-turnend-guard-grok: delivery logging never follows a preexisting symlink"
+}
+
 test_grok_hook_invokes_adapter() {
   local settings command
   settings="$ROOT/.grok/hooks/fm-primary-turnend-guard.json"
@@ -2634,6 +2763,7 @@ test_grok_worker_launch_requires_token_readiness
 test_grok_worker_signal_reaps_delivery_children
 test_grok_worker_quarantines_legacy_continue_handoff
 test_grok_acknowledged_cleanup_never_redelivers
+test_grok_delivery_log_never_follows_symlink
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
@@ -2655,6 +2785,7 @@ test_opencode_cleanup_failure_retains_acknowledged_owner
 test_opencode_unresolved_flight_is_durably_quarantined
 test_opencode_durable_acknowledgement_only_retries_cleanup
 test_opencode_unknown_lock_probe_retains_in_process_retry
+test_opencode_recovered_generation_does_not_cover_new_process_idle
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
@@ -2665,6 +2796,8 @@ test_pi_readonly_session_does_not_recover_or_acknowledge_handoff
 test_pi_cleanup_failure_retains_acknowledged_owner
 test_pi_persistence_failure_retains_retry_owner
 test_pi_unknown_lock_probe_retries_without_shared_mutation
+test_pi_unknown_agent_start_retains_ack_and_cancels_stale_settled_retry
+test_pi_loaded_marker_never_follows_symlink
 test_passive_handoff_adapters_reject_symlinked_state
 test_passive_handoff_adapters_reject_symlinked_state_ancestor
 test_grok_hook_invokes_adapter

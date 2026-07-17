@@ -626,6 +626,85 @@ SH
   pass "handoff mutation ownership survives wrapper death in both locked homes"
 }
 
+test_handoff_refuses_interrupted_receipt_transactions_in_either_home() {
+  local scope home sub claim_root out status
+  for scope in main sub; do
+    home="$TMP_ROOT/receipt-transaction-$scope-main"
+    sub="$TMP_ROOT/receipt-transaction-$scope-sub"
+    setup_homes "$home" "$sub"
+    cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] transaction-item - must not race receipt recovery (repo: alpha)
+
+## Done
+EOF
+    if [ "$scope" = main ]; then claim_root=$home; else claim_root=$sub; fi
+    mkdir -p "$claim_root/state/.backlog-receipts.claimed.interrupted"
+    printf 'snapshot\n' > "$claim_root/state/.backlog-receipts.claimed.interrupted/before"
+    status=0
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design transaction-item 2>&1) || status=$?
+    expect_code 1 "$status" "$scope-home interrupted receipt transaction"
+    assert_contains "$out" "interrupted backlog receipt transaction" \
+      "$scope-home receipt transaction did not block handoff"
+    assert_grep 'transaction-item' "$home/data/backlog.md" \
+      "$scope-home receipt transaction allowed the source item to move"
+    if [ -f "$sub/data/backlog.md" ]; then
+      assert_no_grep 'transaction-item' "$sub/data/backlog.md" \
+        "$scope-home receipt transaction populated the destination"
+    fi
+  done
+  pass "handoff refuses interrupted receipt transactions in both locked homes"
+}
+
+test_committed_handoff_preserves_destination_when_owner_cleanup_fails() {
+  local home="$TMP_ROOT/committed-cleanup-main" sub="$TMP_ROOT/committed-cleanup-sub"
+  local fakebin out status
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] committed-item - destination must survive cleanup failure (repo: alpha)
+
+## Done
+EOF
+  fakebin="$home/fakebin"
+  mkdir -p "$fakebin"
+  printf 'stale\n' > "$home/state/committed-item.teardown-complete"
+  printf 'stale\n' > "$sub/state/committed-item.teardown-complete"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ] || { [ "${1:-}" = update ] && [ "${2:-}" = --help ]; } \
+   || { [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; }; then
+  exec "${REAL_TASKS_AXI:?}" "$@"
+fi
+"${REAL_TASKS_AXI:?}" "$@"
+status=$?
+chmod 500 "${FM_MAIN_OWNER:?}" "${FM_SUB_OWNER:?}"
+exit "$status"
+SH
+  chmod +x "$fakebin/tasks-axi"
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_MAIN_OWNER="$home/state/.backlog-mutation-owner" \
+    FM_SUB_OWNER="$sub/state/.backlog-mutation-owner" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design committed-item 2>&1) || status=$?
+  chmod 700 "$home/state/.backlog-mutation-owner" "$sub/state/.backlog-mutation-owner" 2>/dev/null || true
+  expect_code 1 "$status" "committed handoff owner cleanup failure"
+  assert_contains "$out" "handoff committed" "committed cleanup failure was reported as an uncommitted move"
+  assert_no_grep 'committed-item' "$home/data/backlog.md" "committed move remained in the source backlog"
+  assert_grep 'committed-item' "$sub/data/backlog.md" "committed destination backlog was deleted"
+  assert_absent "$home/state/committed-item.teardown-complete" \
+    "committed cleanup failure retained the source lifecycle receipt"
+  assert_absent "$sub/state/committed-item.teardown-complete" \
+    "committed cleanup failure retained the destination lifecycle receipt"
+  pass "committed handoff preserves its destination across owner cleanup failure"
+}
+
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole
@@ -639,5 +718,7 @@ test_handoff_tasks_axi_is_contained_to_selected_home
 test_active_home_data_symlink_escape_is_rejected
 test_handoff_invalidates_interrupted_completion_claims
 test_handoff_child_owns_both_homes_after_wrapper_death
+test_handoff_refuses_interrupted_receipt_transactions_in_either_home
+test_committed_handoff_preserves_destination_when_owner_cleanup_fails
 
 echo "ALL TESTS PASSED"

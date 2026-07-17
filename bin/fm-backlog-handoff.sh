@@ -310,7 +310,9 @@ else
   SECOND_LOCK=$MAIN_LOCK
 fi
 LOCKS_HELD=0
+MOVE_RESULT=
 release_backlog_locks() {
+  [ -z "$MOVE_RESULT" ] || rm -f "$MOVE_RESULT" 2>/dev/null || true
   if [ "$LOCKS_HELD" -eq 1 ]; then
     [ -z "$SECOND_LOCK" ] || fm_lock_release "$SECOND_LOCK"
     fm_lock_release "$FIRST_LOCK"
@@ -329,6 +331,18 @@ if [ "$SUB_HOME/state" != "$STATE" ] \
    && ! fm_tasks_axi_reconcile_mutation_owner "$SUB_HOME/state"; then
   echo "error: secondmate $ID still has live or unreadable durable backlog mutation ownership" >&2
   exit 1
+fi
+refuse_receipt_transactions() {
+  local label=$1 state_dir=$2 claim
+  for claim in "$state_dir"/.backlog-receipts.claimed.*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    echo "error: $label has an interrupted backlog receipt transaction; reconcile it with fm-backlog.sh before handoff" >&2
+    return 1
+  done
+}
+refuse_receipt_transactions "the active home" "$STATE" || exit 1
+if [ "$SUB_HOME/state" != "$STATE" ]; then
+  refuse_receipt_transactions "secondmate $ID" "$SUB_HOME/state" || exit 1
 fi
 
 # Classify every key before changing anything: move-from-main, already-in-sub, or
@@ -412,6 +426,8 @@ if [ ! -f "$SUB_BACKLOG" ]; then
   printf '## In flight\n\n## Queued\n\n## Done\n' > "$SUB_BACKLOG"
   SUB_CREATED=1
 fi
+MOVE_RESULT=$(mktemp "$STATE/.backlog-handoff-result.XXXXXX") || exit 1
+printf '%s\n' ambiguous > "$MOVE_RESULT" || exit 1
 
 run_owned_handoff_mutation() {
   local parent_pid worker_pid worker_identity current_identity previous_identity=
@@ -481,8 +497,13 @@ run_owned_handoff_mutation() {
     return 1
   fi
   wait "$worker_pid" || status=$?
-  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" || status=1
-  [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || status=1
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' committed > "$MOVE_RESULT" || return 1
+  else
+    printf '%s\n' failed > "$MOVE_RESULT" || return 1
+  fi
+  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" || status=70
+  [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || status=70
   return "$status"
 }
 
@@ -491,21 +512,36 @@ run_owned_handoff_mutation() {
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(run_owned_handoff_mutation 2>&1); then
-  if [ "$SUB_CREATED" -eq 1 ]; then
+MV_STATUS=0
+MV_OUT=$(run_owned_handoff_mutation 2>&1) || MV_STATUS=$?
+MOVE_OUTCOME=$(cat "$MOVE_RESULT" 2>/dev/null || printf '%s\n' ambiguous)
+rm -f "$MOVE_RESULT"
+MOVE_RESULT=
+RECEIPT_INVALIDATION_FAILED=0
+if [ "$MOVE_OUTCOME" = committed ]; then
+  for key in "${TO_MOVE[@]}"; do
+    fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || RECEIPT_INVALIDATION_FAILED=1
+    fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || RECEIPT_INVALIDATION_FAILED=1
+  done
+fi
+if [ "$MV_STATUS" -ne 0 ]; then
+  if [ "$SUB_CREATED" -eq 1 ] && [ "$MOVE_OUTCOME" = failed ]; then
     rm -f "$SUB_BACKLOG"
   fi
   if [ -n "$MV_OUT" ]; then
     printf '%s\n' "$MV_OUT" >&2
   fi
-  echo "error: tasks-axi mv failed; nothing was moved." >&2
+  if [ "$MOVE_OUTCOME" = committed ]; then
+    echo "error: backlog handoff committed, but durable mutation-owner cleanup failed; destination was preserved" >&2
+    [ "$RECEIPT_INVALIDATION_FAILED" -eq 0 ] \
+      || echo "error: one or more completion receipts also could not be invalidated safely" >&2
+  elif [ "$MOVE_OUTCOME" = failed ]; then
+    echo "error: tasks-axi mv failed; nothing was moved." >&2
+  else
+    echo "error: backlog handoff outcome is ambiguous; destination was preserved for reconciliation" >&2
+  fi
   exit 1
 fi
-RECEIPT_INVALIDATION_FAILED=0
-for key in "${TO_MOVE[@]}"; do
-  fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || RECEIPT_INVALIDATION_FAILED=1
-  fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || RECEIPT_INVALIDATION_FAILED=1
-done
 if [ "$RECEIPT_INVALIDATION_FAILED" -ne 0 ]; then
   echo "error: handoff succeeded but one or more completion receipts could not be invalidated safely" >&2
   exit 1
