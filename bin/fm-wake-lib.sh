@@ -16,11 +16,17 @@ fm_current_pid() {
 }
 
 fm_pid_alive() {
-  local pid=$1
+  local pid=$1 stat
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  stat=$(ps -p "$pid" -o stat= 2>/dev/null) || return 1
+  read -r stat _ <<< "$stat"
+  case "$stat" in
+    Z*|'') return 1 ;;
+  esac
+  return 0
 }
 
 fm_pid_identity() {
@@ -81,12 +87,15 @@ fm_watcher_healthy() {
 
 FM_WATCHER_OWNER_KIND=
 FM_WATCHER_OWNER_PID=
+FM_WATCHER_OWNER_MODE=
 fm_watcher_live_owner() {
-  local state=$1 lockdir kind pid recorded_identity current_identity
+  local state=$1 lockdir kind mode pid recorded_identity current_identity
   FM_WATCHER_OWNER_KIND=
   FM_WATCHER_OWNER_PID=
+  FM_WATCHER_OWNER_MODE=
   lockdir="$state/.watch.lock"
   kind=$(cat "$lockdir/owner-kind" 2>/dev/null || true)
+  mode=$(cat "$lockdir/owner-mode" 2>/dev/null || true)
   pid=$(cat "$lockdir/owner-pid" 2>/dev/null || true)
   recorded_identity=$(cat "$lockdir/owner-identity" 2>/dev/null || true)
   case "$kind" in
@@ -99,6 +108,7 @@ fm_watcher_live_owner() {
   [ "$current_identity" = "$recorded_identity" ] || return 1
   FM_WATCHER_OWNER_KIND=$kind
   FM_WATCHER_OWNER_PID=$pid
+  FM_WATCHER_OWNER_MODE=$mode
   return 0
 }
 
@@ -109,6 +119,7 @@ fm_lock_clean_known_files() {
     "$lockdir/fm-home" \
     "$lockdir/owner-identity" \
     "$lockdir/owner-kind" \
+    "$lockdir/owner-mode" \
     "$lockdir/owner-pid" \
     "$lockdir/pid-identity" \
     "$lockdir/watcher-path" \

@@ -5,7 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-let guardFollowupActive = false;
+let guardFollowupDeliveryActive = false;
 
 type LockOwnership = "owned" | "missing" | "other";
 
@@ -118,15 +118,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    if (guardFollowupActive) {
-      guardFollowupActive = false;
-      return;
-    }
-
     const result = await runGuard();
     if (result.code !== 2) return;
-
-    guardFollowupActive = true;
+    if (guardFollowupDeliveryActive) return;
+    guardFollowupDeliveryActive = true;
     try {
       await pi.sendUserMessage(
         "TURN WOULD END BLIND - supervision is off. " +
@@ -135,7 +130,8 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "followUp" },
       );
     } catch {
-      guardFollowupActive = false;
+    } finally {
+      guardFollowupDeliveryActive = false;
     }
   });
 

@@ -11,7 +11,7 @@
 # OpenCode, pi, and grok adapters use the same predicate and force one bounded
 # follow-up because their turn-end events are passive.
 # See docs/turnend-guard.md for the per-harness mechanics, validation evidence,
-# and fail-open tradeoffs.
+# and passive-adapter delivery boundaries.
 #
 # Ships with TRACKED harness hook files at the repo root, so this file is
 # checked out into every worktree of this repo: the primary checkout, any
@@ -37,17 +37,15 @@ WATCH="$SCRIPT_DIR/fm-watch.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 
-# Read the whole turn-end hook payload once; never block on unreadable/absent
-# stdin.
+# Read and drain the whole turn-end hook payload once.
+# The payload is diagnostic only: malformed or missing input can never bypass
+# the primary-scoped ownership predicate.
 PAYLOAD=$(cat 2>/dev/null || true)
-[ -n "$PAYLOAD" ] || exit 0
-
-# jq is the repo's established JSON dependency (bin/fm-x-poll.sh uses the same
-# "missing jq -> silent no-op" degrade). Without it we cannot safely read the
-# loop-guard field, so we must never block - fail open, not noisy.
-command -v jq >/dev/null 2>&1 || exit 0
-
-STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2>/dev/null) || exit 0
+PAYLOAD_COMPACT=$(printf '%s' "$PAYLOAD" | tr -d '[:space:]')
+STOP_HOOK_ACTIVE=false
+case "$PAYLOAD_COMPACT" in
+  *'"stop_hook_active":true'*) STOP_HOOK_ACTIVE=true ;;
+esac
 
 # --- scope precisely to the PRIMARY checkout --------------------------------
 # Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
@@ -75,13 +73,45 @@ fm_supervision_status "$STATE" "$GRACE"
 
 HARNESS=${FM_TURNEND_HARNESS:-}
 [ -n "$HARNESS" ] || HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
+
+daemon_owner_active() {
+  local pid=$1 identity=$2 daemon_pid daemon_lock daemon_lock_owner lock_pid lock_identity
+  [ "$FM_WATCHER_OWNER_MODE" = away-inject ] || return 1
+  [ -f "$STATE/.afk" ] || return 1
+  [ ! -L "$STATE/.afk" ] || return 1
+  [ -f "$STATE/.supervise-daemon.pid" ] || return 1
+  [ ! -L "$STATE/.supervise-daemon.pid" ] || return 1
+  daemon_pid=$(cat "$STATE/.supervise-daemon.pid" 2>/dev/null || true)
+  daemon_lock=$(fm_lock_abs_path "$STATE/.supervise-daemon.lock" 2>/dev/null || true)
+  [ -n "$daemon_lock" ] || return 1
+  daemon_lock_owner=$(fm_lock_link_owner "$STATE/.supervise-daemon.lock" 2>/dev/null || true)
+  daemon_lock_owner=$(cd "$daemon_lock_owner" 2>/dev/null && pwd -P) || return 1
+  case "$daemon_lock_owner" in
+    "$daemon_lock".owner.*) ;;
+    *) return 1 ;;
+  esac
+  [ -d "$daemon_lock_owner" ] || return 1
+  [ ! -L "$daemon_lock_owner" ] || return 1
+  lock_pid=$(cat "$daemon_lock_owner/pid" 2>/dev/null || true)
+  lock_identity=$(cat "$daemon_lock_owner/pid-identity" 2>/dev/null || true)
+  [ "$daemon_pid" = "$pid" ] || return 1
+  [ "$lock_pid" = "$pid" ] || return 1
+  [ "$lock_identity" = "$identity" ] || return 1
+  fm_pid_alive "$pid"
+}
+
 WATCH_OWNER_DESC="no healthy watcher"
 if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   WATCH_OWNER_DESC="healthy watcher has no live owner provenance"
   if fm_watcher_live_owner "$STATE"; then
     WATCH_OWNER_DESC="$FM_WATCHER_OWNER_KIND owner pid=$FM_WATCHER_OWNER_PID"
     case "$FM_WATCHER_OWNER_KIND:$HARNESS" in
-      daemon:*) exit 0 ;;
+      daemon:*)
+        if daemon_owner_active "$FM_WATCHER_OWNER_PID" "$(cat "$STATE/.watch.lock/owner-identity" 2>/dev/null || true)"; then
+          exit 0
+        fi
+        WATCH_OWNER_DESC="daemon owner is not active in declared away-inject mode"
+        ;;
       arm:claude|arm:grok|arm:pi|arm:opencode) exit 0 ;;
       arm:codex) WATCH_OWNER_DESC="arm owner is not durable in Codex" ;;
       checkpoint:*) WATCH_OWNER_DESC="foreground checkpoint owner cannot survive turn yield" ;;
@@ -112,11 +142,15 @@ crew_state_bounded() {
 }
 
 attention_detail() {
-  local meta id line state scanned=0 shown=0 scan_limit detail="" omitted=0
+  local meta id line state scanned=0 shown=0 scan_limit detail="" total=0 unprobed omitted_nonworking=0
   scan_limit=$((DETAIL_LIMIT * 2))
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
-    [ "$scanned" -lt "$scan_limit" ] || { omitted=1; break; }
+    total=$((total + 1))
+  done
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ "$scanned" -lt "$scan_limit" ] || break
     scanned=$((scanned + 1))
     id=$(basename "$meta" .meta)
     line=$(crew_state_bounded "$id" || true)
@@ -126,18 +160,18 @@ attention_detail() {
       working) continue ;;
     esac
     if [ "$shown" -ge "$DETAIL_LIMIT" ]; then
-      omitted=1
+      omitted_nonworking=$((omitted_nonworking + 1))
       continue
     fi
     [ -z "$detail" ] || detail="$detail, "
     detail="$detail${id:0:48}=$state"
     shown=$((shown + 1))
   done
+  unprobed=$((total - scanned))
   if [ -z "$detail" ]; then
     detail="none among $scanned bounded probe(s)"
-  elif [ "$omitted" -eq 1 ]; then
-    detail="$detail, additional tasks omitted"
   fi
+  detail="$detail; $omitted_nonworking additional non-working task(s) omitted; $unprobed task(s) unprobed"
   printf '%s\n' "$detail"
 }
 

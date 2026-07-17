@@ -57,6 +57,10 @@ case "${1:-} ${2:-}" in
       printf '{"result":{"panes":[{"pane_id":"subw:p1"}]}}\n'
       exit 0
     fi
+    if [ "${FM_HERDR_UNRESOLVED_PANE:-0}" = 1 ]; then
+      printf '{"result":{"panes":[{"pane_id":"subw:p-hidden","tab_id":"subw:t-hidden"}]}}\n'
+      exit 0
+    fi
     if [ "$workspace" = subw ]; then
       if [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
         printf '{"result":{"panes":[{"pane_id":"subw:p1","tab_id":"subw:t1"}]}}\n'
@@ -191,6 +195,24 @@ test_partial_herdr_inventory_fails_closed() {
   pass "partial Herdr tab and pane records fail closed before duplicate joining"
 }
 
+test_unresolved_herdr_pane_tab_fails_closed() {
+  local home out status
+  home=$(make_fixture unresolved-herdr-pane)
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'worktree=/owned/worktree'
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+    FM_HERDR_UNRESOLVED_PANE=1 "$AUDIT" --json 2>&1) || status=$?
+  expect_code 1 "$status" "unresolved Herdr pane tab reference"
+  assert_contains "$out" "unresolved pane tab reference" "unresolved Herdr pane vanished from duplicate accounting"
+  pass "Herdr panes must resolve to tabs in the exact workspace inventory"
+}
+
 test_cmux_reports_unavailable_without_cross_home_inventory() {
   local home log out status
   home=$(make_fixture cmux-no-sweep)
@@ -241,5 +263,6 @@ test_inventory_failure_is_loud
 test_singleton_mismatch_is_reported
 test_missing_owned_workspace_is_an_empty_inventory
 test_partial_herdr_inventory_fails_closed
+test_unresolved_herdr_pane_tab_fails_closed
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

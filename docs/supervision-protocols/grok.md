@@ -30,7 +30,7 @@ When you see a background-task-completed system reminder for the arm:
    Re-arm attaches to an existing cycle when one is already healthy, so the background task stays live until that cycle ends.
 
 Grok Stop hooks are passive.
-The primary project hook runs `bin/fm-turnend-guard-grok.sh`, which forces at most one same-session follow-up via `grok --resume` when a turn would end blind.
+The primary project hook runs `bin/fm-turnend-guard-grok.sh`, which forces one same-session follow-up via `grok --resume` for every Stop event that would still end blind.
 That is a backstop, not the normal wake path.
 After any forced follow-up, arm the watcher with the background protocol above.
 

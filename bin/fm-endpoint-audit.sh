@@ -176,6 +176,18 @@ while IFS=$'\t' read -r session workspace; do
     echo "fm-endpoint-audit: invalid pane inventory for $session:$workspace" >&2
     exit 1
   }
+  jq -en \
+    --argjson tabs "$tabs" \
+    --argjson panes "$panes" '
+      ($tabs.result.tabs | map(.tab_id)) as $tab_ids
+      | all($panes.result.panes[]?;
+          .tab_id as $pane_tab_id
+          | ($tab_ids | index($pane_tab_id)) != null
+        )
+    ' >/dev/null 2>&1 || {
+    echo "fm-endpoint-audit: unresolved pane tab reference for $session:$workspace" >&2
+    exit 1
+  }
   jq -nr \
     --arg session "$session" \
     --argjson tabs "$tabs" \

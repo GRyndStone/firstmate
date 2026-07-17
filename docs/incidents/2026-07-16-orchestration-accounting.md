@@ -95,7 +95,7 @@ After the fix, `tests/fm-backlog.test.sh` launches update and hold concurrently 
 Before the fix, panes `p1F`, `p1K`, and `p1M` accumulated while only `p1M` remained recorded.
 After the fix, `tests/fm-endpoint-audit.test.sh` models two live same-label endpoints, proves deterministic reporting, proves only the active home's workspace was queried, and proves no close operation was issued.
 `tests/fm-teardown.test.sh` also proves those duplicates block teardown, preserve task meta, and trigger no endpoint closure.
-It additionally proves forced secondmate retirement surfaces a child-home duplicate before closure and that interrupted cleanup never reuses a returned worktree path after its ownership marker is gone.
+It additionally proves forced secondmate retirement surfaces a child-home duplicate before closure and that interrupted cleanup never reuses a returned worktree path after its state-owned canonical path, device, and inode identity changes.
 Before the fix, captain-facing accounting omitted held tasks and treated a sparse queue as the whole program.
 After the fix, `tests/fm-fleet-snapshot-view.test.sh` and `tests/fm-bearings-snapshot.test.sh` prove held work remains visible and a zero-candidate queue with a durable program source reports `requires_supervisor_judgment`.
 

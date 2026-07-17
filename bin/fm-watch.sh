@@ -745,11 +745,13 @@ printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 WATCH_OWNER_KIND=${FM_WATCH_OWNER_KIND:-unknown}
 WATCH_OWNER_PID=${FM_WATCH_OWNER_PID:-}
+WATCH_OWNER_MODE=${FM_WATCH_OWNER_MODE:-}
 case "$WATCH_OWNER_KIND" in
   arm|checkpoint|daemon) ;;
   *) WATCH_OWNER_KIND=unknown ;;
 esac
 printf '%s\n' "$WATCH_OWNER_KIND" > "$WATCH_LOCK/owner-kind" || true
+printf '%s\n' "$WATCH_OWNER_MODE" > "$WATCH_LOCK/owner-mode" || true
 if fm_pid_alive "$WATCH_OWNER_PID"; then
   printf '%s\n' "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-pid" || true
   fm_pid_identity "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-identity" 2>/dev/null || true

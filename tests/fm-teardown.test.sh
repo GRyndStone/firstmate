@@ -60,6 +60,8 @@ PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
+REAL_STAT_FOR_TEST=$(command -v stat)
+export REAL_STAT_FOR_TEST
 
 # Build a fresh sandbox for one test case. Sets up:
 #   $CASE/state/        - firstmate state dir (with a fresh watcher beacon)
@@ -476,8 +478,13 @@ add_stat_error() {
   local case_dir=$1
   cat > "$case_dir/fakebin/stat" <<'SH'
 #!/usr/bin/env bash
-echo "stat: simulated failure" >&2
-exit 1
+for arg in "$@"; do
+  if [ "$arg" = "${FM_STAT_ERROR_PATH:?}" ]; then
+    echo "stat: simulated failure" >&2
+    exit 1
+  fi
+done
+exec "${REAL_STAT_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/stat"
 }
@@ -1102,6 +1109,7 @@ test_index_lock_mtime_read_failure_refuses() {
   touch -t 200001010000 "$lock"
 
   set +e
+  FM_STAT_ERROR_PATH="$lock" \
   FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
@@ -1720,7 +1728,8 @@ test_interrupted_cleanup_never_reuses_returned_worktree_path() {
 set -u
 printf '%s\n' "$*" >> "${FM_TREEHOUSE_LOG:?}"
 wt=${3:?}
-rm -f "$wt"/.fm-teardown-owner-*
+rm -rf "$wt"
+mkdir -p "$wt"
 touch "$wt/reused-by-another-task"
 exit 0
 SH
@@ -1767,6 +1776,221 @@ SH
     assert_not_contains "$(cat "$log")" "done task-x1" "ownership-lost retry recorded false completion"
   fi
   pass "durable cleanup phase blocks finalization after worktree ownership is lost"
+}
+
+test_teardown_stage_does_not_dirty_retry_target() {
+  local case_dir rc stage_fail status
+  case_dir=$(make_case stage-outside-worktree)
+  write_meta "$case_dir" local-only ship
+  add_compatible_tasks_axi "$case_dir"
+  stage_fail="$case_dir/stage-failed"
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/mv"
+
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "state-owned teardown identity interruption"
+  status=$(git -C "$case_dir/wt" status --porcelain)
+  [ -z "$status" ] || fail "teardown staging dirtied its own retry target: $status"
+  assert_absent "$case_dir/wt/.fm-teardown-owner-task-x1" \
+    "teardown staging wrote ownership authority into the worktree"
+
+  rc=0
+  FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+  expect_code 0 "$rc" "state-owned teardown identity retry"
+  pass "teardown retry ownership stays outside and never self-dirties the worktree"
+}
+
+test_absent_staged_target_retries_only_while_still_absent() {
+  local case_dir rc stage_fail mode
+  for mode in absent reused; do
+    case_dir=$(make_case "stage-absent-$mode")
+    write_meta "$case_dir" local-only ship
+    add_compatible_tasks_axi "$case_dir"
+    rm -rf "$case_dir/wt"
+    stage_fail="$case_dir/stage-failed"
+    cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+    chmod +x "$case_dir/fakebin/mv"
+
+    rc=0
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+      run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "$mode absent-target staging interruption"
+    assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" "owner-identity=absent" \
+      "$mode fixture did not stage target absence"
+
+    if [ "$mode" = reused ]; then
+      mkdir -p "$case_dir/wt"
+      printf '%s\n' 'replacement work' > "$case_dir/wt/replacement.txt"
+    fi
+
+    rc=0
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+      run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+    if [ "$mode" = absent ]; then
+      expect_code 0 "$rc" "still-absent staged target retry"
+    else
+      expect_code 1 "$rc" "reused formerly absent target retry"
+      assert_contains "$(cat "$case_dir/retry-stderr")" "cleanup-target identity no longer matches" \
+        "formerly absent target reuse did not fail closed"
+      [ -f "$case_dir/wt/replacement.txt" ] || fail "retry modified a path that appeared after absent staging"
+      [ -f "$case_dir/state/task-x1.meta" ] || fail "reused absent-target retry removed lifecycle metadata"
+    fi
+  done
+  pass "absent staged targets retry only while the recorded path remains absent"
+}
+
+test_staged_retry_rechecks_dirty_and_unlanded_work() {
+  local case_dir rc stage_fail return_log mode
+  for mode in dirty unlanded; do
+    case_dir=$(make_case "staged-recheck-$mode")
+    write_meta "$case_dir" local-only ship
+    add_compatible_tasks_axi "$case_dir"
+    stage_fail="$case_dir/stage-failed"
+    return_log="$case_dir/treehouse.log"
+    cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TREEHOUSE_LOG:?}"
+exit 0
+SH
+    cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=worktree-cleanup-started$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+    chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/mv"
+
+    rc=0
+    FM_TREEHOUSE_LOG="$return_log" FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" \
+      FM_STAGE_FAIL_FLAG="$stage_fail" run_teardown "$case_dir" \
+      > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "$mode staged cleanup interruption"
+    assert_contains "$(cat "$case_dir/state/task-x1.teardown-stage")" "phase=endpoint-closed" \
+      "$mode fixture did not stop before destructive cleanup"
+
+    if [ "$mode" = dirty ]; then
+      printf '%s\n' 'new uncommitted work' > "$case_dir/wt/recovered.txt"
+    else
+      wt_commit_file "$case_dir" recovered.txt 'new committed work' 'recovered after interruption'
+    fi
+
+    rc=0
+    FM_TREEHOUSE_LOG="$return_log" FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" \
+      FM_STAGE_FAIL_FLAG="$stage_fail" run_teardown "$case_dir" \
+      > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+    expect_code 1 "$rc" "$mode staged cleanup safety retry"
+    [ ! -s "$return_log" ] || fail "$mode staged retry ran treehouse return after safety changed"
+    if [ "$mode" = dirty ]; then
+      assert_contains "$(cat "$case_dir/retry-stderr")" "uncommitted changes" \
+        "staged retry did not recheck dirtiness"
+    else
+      assert_contains "$(cat "$case_dir/retry-stderr")" "not yet merged" \
+        "staged retry did not recheck landing"
+    fi
+    [ -f "$case_dir/state/task-x1.meta" ] || fail "$mode staged retry removed lifecycle metadata"
+  done
+  pass "staged destructive retries recheck dirtiness and landing before cleanup"
+}
+
+test_staged_orca_retry_rechecks_backend_worktree_identity() {
+  local case_dir rc stage_fail remove_log other
+  case_dir=$(make_case staged-orca-identity)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' \
+    'backend=orca' \
+    'terminal=terminal-1' \
+    'orca_worktree_id=orca-wt-1' \
+    >> "$case_dir/state/task-x1.meta"
+  add_compatible_tasks_axi "$case_dir"
+  stage_fail="$case_dir/stage-failed"
+  remove_log="$case_dir/orca-remove.log"
+  other="$case_dir/other-worktree"
+  mkdir -p "$other"
+  cat > "$case_dir/fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  "terminal read")
+    printf '%s\n' '{"ok":false,"error":{"code":"terminal_not_found"}}'
+    exit 1
+    ;;
+  "worktree show")
+    printf '{"ok":true,"result":{"worktree":{"id":"orca-wt-1","path":"%s"}}}\n' "${FM_ORCA_PATH:?}"
+    exit 0
+    ;;
+  "worktree rm")
+    printf '%s\n' "$*" >> "${FM_ORCA_REMOVE_LOG:?}"
+    printf '%s\n' '{"ok":true,"result":{}}'
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  cat > "$case_dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src=${1:-}
+dst=${2:-}
+if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
+   && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
+   && grep -q '^phase=worktree-cleanup-started$' "$src" 2>/dev/null; then
+  touch "$FM_STAGE_FAIL_FLAG"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$case_dir/fakebin/orca" "$case_dir/fakebin/mv"
+
+  rc=0
+  FM_ORCA_PATH="$case_dir/wt" FM_ORCA_REMOVE_LOG="$remove_log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "staged Orca cleanup interruption"
+
+  rc=0
+  FM_ORCA_PATH="$other" FM_ORCA_REMOVE_LOG="$remove_log" \
+    FM_STAGE_PATH="$case_dir/state/task-x1.teardown-stage" FM_STAGE_FAIL_FLAG="$stage_fail" \
+    run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
+  expect_code 1 "$rc" "staged Orca identity mismatch retry"
+  assert_contains "$(cat "$case_dir/retry-stderr")" "not inspected worktree" \
+    "staged Orca retry did not re-resolve its exact backend worktree id"
+  [ ! -s "$remove_log" ] || fail "staged Orca retry removed a worktree after path identity changed"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "staged Orca mismatch removed lifecycle metadata"
+  pass "staged Orca retries re-resolve exact backend worktree identity before removal"
 }
 
 test_staged_teardown_refuses_changed_backlog_record() {
@@ -1996,6 +2220,10 @@ test_endpoint_close_must_succeed_and_be_absent
 test_unknown_endpoint_state_preserves_lifecycle
 test_completion_proof_write_failure_preserves_lifecycle
 test_interrupted_cleanup_never_reuses_returned_worktree_path
+test_teardown_stage_does_not_dirty_retry_target
+test_absent_staged_target_retries_only_while_still_absent
+test_staged_retry_rechecks_dirty_and_unlanded_work
+test_staged_orca_retry_rechecks_backend_worktree_identity
 test_staged_teardown_refuses_changed_backlog_record
 test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
 test_orca_endpoint_probe_rejects_success_shaped_errors

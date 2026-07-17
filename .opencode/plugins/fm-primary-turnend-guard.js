@@ -3,8 +3,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
-
-let skipNextIdle = false;
+const followupDeliveryActive = new Set();
 
 function runProcess(command, args, input = "") {
   return new Promise((resolve) => {
@@ -60,18 +59,15 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     event: async ({ event }) => {
       if (event.type !== "session.idle") return;
 
-      if (skipNextIdle) {
-        skipNextIdle = false;
-        return;
-      }
-
       const sessionID = event.properties?.sessionID;
       if (!sessionID) return;
 
-      if (await letWatchArmRun(sessionID, client)) return;
+      await letWatchArmRun(sessionID, client);
 
       const result = await runGuard(root);
       if (result.code !== 2) return;
+      if (followupDeliveryActive.has(sessionID)) return;
+      followupDeliveryActive.add(sessionID);
 
       try {
         await client.session.promptAsync({
@@ -88,9 +84,9 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
             ],
           },
         });
-        skipNextIdle = true;
       } catch {
-        skipNextIdle = false;
+      } finally {
+        followupDeliveryActive.delete(sessionID);
       }
     },
   };

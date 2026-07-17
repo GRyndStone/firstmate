@@ -13,8 +13,8 @@ When the default backend is selected and compatible `tasks-axi` is on `PATH`, fi
 That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
 The wrapper refuses `done` while owned task meta or teardown state exists, and it refuses a scout report completion unless the exact owned report exists.
 `fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, clearing owned lifecycle state, and only then asking the wrapper to record Done.
-It persists the completion proof, a teardown phase bound to the exact backlog record, and an exact worktree ownership marker before destructive cleanup.
-An interrupted retry refuses a changed backlog record and cannot inspect, return, or finalize a path after that marker disappears.
+It persists the completion proof, a teardown phase bound to the exact backlog record, and a state-owned cleanup-target identity derived from canonical path, device, and inode before destructive cleanup.
+An interrupted retry refuses a changed backlog record and cannot inspect, return, or finalize a path after that identity no longer matches.
 Before automatic endpoint closure, teardown runs the same-home duplicate audit for Herdr and Zellij tasks and refuses any duplicate or replacement endpoint, leaving exact reconciliation to the supervisor.
 cmux exposes no exact-home inventory source, so its read-only audit emits a structured `inventory_unavailable` finding without issuing an app-global inventory command, and teardown refuses that finding before endpoint closure.
 Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.

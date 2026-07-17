@@ -156,7 +156,7 @@ watcher_identity() {
 }
 
 record_watcher_lock() {
-  local dir=$1 pid=$2 identity=$3 kind=${4:-} owner_pid=${5:-} owner_identity=${6:-} root bin_dir
+  local dir=$1 pid=$2 identity=$3 kind=${4:-} owner_pid=${5:-} owner_identity=${6:-} mode=${7:-} root bin_dir
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$dir/bin" && pwd)
   mkdir -p "$dir/state/.watch.lock"
@@ -166,6 +166,7 @@ record_watcher_lock() {
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
   if [ -n "$kind" ]; then
     printf '%s\n' "$kind" > "$dir/state/.watch.lock/owner-kind"
+    printf '%s\n' "$mode" > "$dir/state/.watch.lock/owner-mode"
     printf '%s\n' "$owner_pid" > "$dir/state/.watch.lock/owner-pid"
     printf '%s\n' "$owner_identity" > "$dir/state/.watch.lock/owner-identity"
   fi
@@ -230,6 +231,42 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   expect_code 0 "$status" "hook must exit 0 with a live watcher and verified durable arm owner"
   [ -z "$out" ] || fail "hook produced output despite a durable live watcher owner: $out"
   pass "fm-turnend-guard: silent no-op with a verified durable watcher owner"
+}
+
+test_hook_accepts_only_active_away_inject_daemon() {
+  local dir pid identity owner_pid owner_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-daemon-owner")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  sleep 60 &
+  owner_pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || fail "could not identify daemon watcher"
+  owner_identity=$(watcher_identity "$dir" "$owner_pid") || fail "could not identify daemon owner"
+  record_watcher_lock "$dir" "$pid" "$identity" daemon "$owner_pid" "$owner_identity" monitor-only
+  touch "$dir/state/.last-watcher-beat"
+
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "daemon ownership must not authorize stop in a non-injecting mode"
+  assert_contains "$out" "daemon owner is not active in declared away-inject mode" "non-injecting daemon rejection was not explained"
+
+  printf '%s\n' away-inject > "$dir/state/.watch.lock/owner-mode"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "away-inject daemon ownership must not authorize stop while away mode is inactive"
+  assert_contains "$out" "daemon owner is not active in declared away-inject mode" "inactive daemon rejection was not explained"
+
+  : > "$dir/state/.afk"
+  printf '%s\n' "$owner_pid" > "$dir/state/.supervise-daemon.pid"
+  mkdir -p "$dir/state/.supervise-daemon.lock.owner.test"
+  ln -s "$dir/state/.supervise-daemon.lock.owner.test" "$dir/state/.supervise-daemon.lock"
+  printf '%s\n' "$owner_pid" > "$dir/state/.supervise-daemon.lock.owner.test/pid"
+  printf '%s\n' "$owner_identity" > "$dir/state/.supervise-daemon.lock.owner.test/pid-identity"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" "$owner_pid" 2>/dev/null || true
+  wait "$pid" "$owner_pid" 2>/dev/null || true
+  expect_code 0 "$status" "active away-inject daemon ownership must authorize stop"
+  [ -z "$out" ] || fail "active away-inject daemon produced output: $out"
+  pass "fm-turnend-guard: daemon ownership is bound to active away-inject mode"
 }
 
 test_hook_blocks_live_foreground_checkpoint_then_blocks_retry() {
@@ -355,11 +392,14 @@ test_hook_surfaces_bounded_parked_and_idle_tasks() {
   : > "$dir/state/parked-task.meta"
   : > "$dir/state/paused-task.meta"
   : > "$dir/state/working-task.meta"
+  : > "$dir/state/y-working-task.meta"
+  : > "$dir/state/z-late-parked.meta"
   cat > "$dir/bin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
 case "$1" in
   parked-task) printf 'state: parked · source: run-step · parked at review\n' ;;
   paused-task) printf 'state: paused · source: status-log · external wait\n' ;;
+  z-late-parked) printf 'state: parked · source: run-step · late parked task\n' ;;
   *) printf 'state: working · source: pane · harness busy\n' ;;
 esac
 SH
@@ -369,6 +409,7 @@ SH
   assert_contains "$out" "parked-task=parked" "parked task id/state was omitted"
   assert_contains "$out" "paused-task=paused" "idle paused task id/state was omitted"
   assert_not_contains "$out" "working-task=working" "working task polluted parked/idle detail"
+  assert_contains "$out" "0 additional non-working task(s) omitted; 1 task(s) unprobed" "bounded detail omitted-count disclosure was not exact"
   pass "fm-turnend-guard: fail-closed banner includes bounded parked and idle task detail"
 }
 
@@ -394,30 +435,40 @@ test_hook_silent_in_crewmate_worktree() {
   pass "fm-turnend-guard: inert in a crewmate/scout task worktree (linked git worktree) even when unhealthy"
 }
 
-test_hook_silent_without_jq() {
+test_hook_blocks_without_jq() {
   local dir out status fakebin tool tool_path
   dir=$(make_primary_dir "$TMP_ROOT/hook-nojq")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/hook-nojq-fake")
-  for tool in bash sh git cat printf date uname stat mkdir dirname; do
+  for tool in bash sh git cat printf date uname stat mkdir dirname tr basename ps sed; do
     tool_path=$(command -v "$tool") || fail "test host must provide $tool"
     ln -s "$tool_path" "$fakebin/$tool"
   done
   out=$(printf '{"stop_hook_active":false}' | PATH="$fakebin" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
   status=$?
-  expect_code 0 "$status" "hook must fail open (exit 0) when jq is unavailable"
-  [ -z "$out" ] || fail "hook produced output without jq: $out"
-  pass "fm-turnend-guard: fails open (never blocks) when jq is missing"
+  expect_code 2 "$status" "hook must fail closed when jq is unavailable and work is in flight"
+  assert_contains "$out" "TURN WOULD END BLIND" "missing-jq path did not run the shared predicate"
+  pass "fm-turnend-guard: missing jq cannot bypass the shared predicate"
 }
 
-test_hook_silent_without_stdin() {
+test_hook_blocks_without_stdin() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-nostdin")
   : > "$dir/state/task1.meta"
   out=$(bash "$dir/bin/fm-turnend-guard.sh" < /dev/null 2>&1); status=$?
-  expect_code 0 "$status" "hook must exit 0 on empty/absent stdin"
-  [ -z "$out" ] || fail "hook produced output on empty stdin: $out"
-  pass "fm-turnend-guard: silent no-op on empty stdin"
+  expect_code 2 "$status" "hook must fail closed on empty stdin when work is in flight"
+  assert_contains "$out" "TURN WOULD END BLIND" "empty-input path did not run the shared predicate"
+  pass "fm-turnend-guard: empty input cannot bypass the shared predicate"
+}
+
+test_hook_blocks_with_malformed_stdin() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-malformed-stdin")
+  : > "$dir/state/task1.meta"
+  out=$(printf '{not-json' | bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "hook must fail closed on malformed stdin when work is in flight"
+  assert_contains "$out" "TURN WOULD END BLIND" "malformed-input path did not run the shared predicate"
+  pass "fm-turnend-guard: malformed input cannot bypass the shared predicate"
 }
 
 test_hook_runs_fast() {
@@ -453,7 +504,6 @@ EOF
   out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must fail open after queuing a forced resume"
   [ -z "$out" ] || fail "grok adapter printed output: $out"
-  assert_contains "$(cat "$log")" 'active=1' "grok adapter must mark its forced resume as loop-guarded"
   assert_contains "$(cat "$log")" '<--resume>' "grok adapter must resume the current session"
   assert_contains "$(cat "$log")" '<session-test>' "grok adapter must pass the hook session id"
   assert_not_contains "$(cat "$log")" '<--permission-mode>' "grok adapter must not add a stronger permission mode"
@@ -462,22 +512,31 @@ EOF
   pass "fm-turnend-guard-grok: forces one same-session resume when the shared predicate blocks"
 }
 
-test_grok_adapter_loop_guard_skips_resume() {
-  local dir fakebin log out status
+test_grok_adapter_repeats_resume_when_still_blind() {
+  local dir fakebin log guard_log out status
   dir=$(make_primary_dir "$TMP_ROOT/grok-adapter-loop")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/grok-adapter-loop-fakebin")
   log="$TMP_ROOT/grok-adapter-loop-call.log"
+  guard_log="$TMP_ROOT/grok-adapter-loop-guard.log"
   cat > "$fakebin/grok" <<EOF
 #!/usr/bin/env bash
 printf 'called\n' >> "$log"
 EOF
   chmod +x "$fakebin/grok"
+  cat > "$dir/bin/fm-turnend-guard.sh" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'guard\n' >> "$guard_log"
+exit 2
+EOF
+  chmod +x "$dir/bin/fm-turnend-guard.sh"
   out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" GROK_TURNEND_GUARD_ACTIVE=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
-  expect_code 0 "$status" "grok adapter must allow its own forced resume turn to end"
-  [ -z "$out" ] || fail "grok adapter printed output while loop-guarded: $out"
-  [ ! -e "$log" ] || fail "grok adapter spawned another resume while loop-guarded: $(cat "$log")"
-  pass "fm-turnend-guard-grok: loop guard prevents a nested resume loop"
+  expect_code 0 "$status" "grok adapter must queue another continuation after a still-blind forced turn"
+  [ -z "$out" ] || fail "grok adapter printed output on repeated continuation: $out"
+  [ "$(cat "$log")" = called ] || fail "Grok follow-up discarded a still-blocking predicate result"
+  [ "$(cat "$guard_log")" = guard ] || fail "Grok follow-up skipped the shared predicate"
+  pass "fm-turnend-guard-grok: every still-blind Stop schedules another continuation"
 }
 
 test_settings_hook_uses_claude_project_dir() {
@@ -506,6 +565,7 @@ test_codex_hook_invokes_shared_guard() {
   assert_contains "$command" '.codex/hooks.json' "codex hook must verify the hook-loaded firstmate root"
   assert_contains "$command" 'fm-turnend-guard.sh' "codex hook must invoke the shared guard"
   assert_not_contains "$command" '.cwd' "codex hook must not use payload cwd to select the guard executable"
+  assert_not_contains "$command" 'command -v jq' "codex hook must not fail open when jq is unavailable"
   pass ".codex/hooks.json: Stop hook invokes the shared primary guard"
 }
 
@@ -580,36 +640,49 @@ test_opencode_plugin_forces_followup() {
   assert_contains "$content" 'session.idle' "OpenCode plugin must run on session.idle"
   assert_contains "$content" 'fm-turnend-guard.sh' "OpenCode plugin must invoke the shared guard"
   assert_contains "$content" 'promptAsync' "OpenCode plugin must force a follow-up turn"
-  assert_contains "$content" 'skipNextIdle' "OpenCode plugin must carry a loop guard"
+  assert_contains "$content" 'followupDeliveryActive' "OpenCode plugin must deduplicate only overlapping SDK delivery"
+  assert_not_contains "$content" 'skipNextIdle' "OpenCode plugin must not skip the predicate after its follow-up"
   assert_contains "$content" 'worktree' "OpenCode plugin must anchor the guard from the git worktree path"
   pass ".opencode primary plugin: session.idle forces one follow-up through the shared guard"
 }
 
 test_opencode_plugin_anchors_guard_to_worktree() {
-  local plugin parent worktree_dir wrong_dir out status
+  local plugin parent worktree_dir wrong_dir log out status
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   [ -f "$plugin" ] || fail "tracked OpenCode primary plugin is missing"
   parent="$TMP_ROOT/opencode-plugin-parent"
   git init -q "$parent"
   worktree_dir="$parent/nested/opencode-plugin-worktree"
   wrong_dir="$TMP_ROOT/opencode-plugin-cwd/subdir"
+  log="$TMP_ROOT/opencode-plugin-guard.log"
   mkdir -p "$worktree_dir/bin" "$wrong_dir"
   cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'EOF'
 #!/usr/bin/env bash
 cat >/dev/null
+printf 'guard\n' >> "${FM_GUARD_LOG:?}"
 printf 'guard-fired\n' >&2
 exit 2
 EOF
   chmod +x "$worktree_dir/bin/fm-turnend-guard.sh"
-  out=$(PLUGIN="$plugin" DIRECTORY="$wrong_dir" WORKTREE="$worktree_dir" node 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" DIRECTORY="$wrong_dir" WORKTREE="$worktree_dir" FM_GUARD_LOG="$log" node 2>&1 <<'EOF'
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 let promptBody = "";
+let prompts = 0;
+let releaseFirst;
+let markFirstStarted;
+const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
 const client = {
   session: {
     promptAsync: async (request) => {
+      prompts += 1;
       promptBody = request.body.parts[0].text;
+      if (prompts === 1) {
+        markFirstStarted();
+        await new Promise((resolve) => { releaseFirst = resolve; });
+      }
     },
   },
 };
@@ -618,17 +691,25 @@ const hooks = await mod.FmPrimaryTurnendGuard({
   directory: process.env.DIRECTORY,
   worktree: process.env.WORKTREE,
 });
+const firstIdle = hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+await firstStarted;
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+releaseFirst();
+await firstIdle;
 await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
 if (!promptBody.includes("guard-fired")) {
   console.error(`missing prompt body: ${promptBody}`);
   process.exit(1);
 }
+if (prompts !== 2) throw new Error(`expected one follow-up per still-blind idle, saw ${prompts}`);
+const guardRuns = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
+if (guardRuns !== 3) throw new Error(`three idle events ran predicate ${guardRuns} times`);
 EOF
 )
   status=$?
   expect_code 0 "$status" "OpenCode plugin must run the guard from worktree even when directory is elsewhere"
   [ -z "$out" ] || fail "OpenCode plugin worktree-root test printed output: $out"
-  pass ".opencode primary plugin: guard path is anchored to worktree, not directory"
+  pass ".opencode primary plugin: forced follow-up reruns the worktree-anchored predicate"
 }
 
 test_pi_extension_forces_followup() {
@@ -640,7 +721,8 @@ test_pi_extension_forces_followup() {
   assert_contains "$content" 'fm-turnend-guard.sh' "pi extension must invoke the shared guard"
   assert_contains "$content" 'sendUserMessage' "pi extension must force a follow-up turn"
   assert_contains "$content" 'deliverAs: "followUp"' "pi extension must queue the follow-up safely"
-  assert_contains "$content" 'guardFollowupActive' "pi extension must carry a logical-run loop guard"
+  assert_contains "$content" 'guardFollowupDeliveryActive' "pi extension must deduplicate only overlapping SDK delivery"
+  assert_not_contains "$content" 'guardFollowupActive' "pi extension must not skip the predicate or delivery after its follow-up"
   assert_not_contains "$content" 'skipNextTurnEnd' "pi extension kept the internal-turn loop guard"
   assert_contains "$content" 'session-start operating block' "pi extension must use harness-neutral repair wording"
   assert_contains "$content" '.pi-turnend-extension-loaded' "pi extension must write its loaded marker for session-start diagnostics"
@@ -678,6 +760,9 @@ import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
 let prompts = 0;
+let releaseFirst;
+let markFirstStarted;
+const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
 const pi = {
   on(event, handler) {
     handlers.set(event, handler);
@@ -686,7 +771,10 @@ const pi = {
     prompts += 1;
     if (!message.includes("TURN WOULD END BLIND")) throw new Error(`unexpected prompt: ${message}`);
     if (options?.deliverAs !== "followUp") throw new Error("guard prompt was not a follow-up");
-    await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+    if (prompts === 1) {
+      markFirstStarted();
+      await new Promise((resolve) => { releaseFirst = resolve; });
+    }
   },
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -695,23 +783,27 @@ if (handlers.has("turn_end")) throw new Error("guard still treats internal Pi tu
 const settled = handlers.get("agent_settled");
 if (!settled) throw new Error("agent_settled handler was not registered");
 
+const firstSettled = settled({ type: "agent_settled" }, {});
+await firstStarted;
 await settled({ type: "agent_settled" }, {});
-if (prompts !== 1) throw new Error(`no-tool run injected ${prompts} follow-ups`);
+if (prompts !== 1) throw new Error(`overlapping settlement injected ${prompts} follow-ups`);
+releaseFirst();
+await firstSettled;
 
 for (let i = 0; i < 3; i += 1) {
   await handlers.get("turn_end")?.({ type: "turn_end", turnIndex: i }, {});
 }
 await settled({ type: "agent_settled" }, {});
-if (prompts !== 2) throw new Error(`multi-tool run produced ${prompts - 1} follow-ups`);
+if (prompts !== 2) throw new Error(`later settled event produced ${prompts - 1} new follow-ups`);
 
 const guardRuns = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
-if (guardRuns !== 2) throw new Error(`guard predicate ran ${guardRuns} times for two logical runs`);
+if (guardRuns !== 3) throw new Error(`guard predicate ran ${guardRuns} times for three logical runs`);
 EOF
 )
   status=$?
   expect_code 0 "$status" "Pi guard must inject once for no-tool and multi-tool logical runs"
   [ -z "$out" ] || fail "Pi logical-run guard test printed output: $out"
-  pass ".pi primary extension: no-tool and multi-tool runs each inject exactly one guard follow-up"
+  pass ".pi primary extension: every still-blind logical run injects a future continuation"
 }
 
 test_pi_extension_retries_after_followup_delivery_failure() {
@@ -744,7 +836,6 @@ const pi = {
   async sendUserMessage() {
     attempts += 1;
     if (attempts === 1) throw new Error("synthetic delivery failure");
-    await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
   },
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -756,9 +847,9 @@ if (attempts !== 2) throw new Error(`expected delivery retry, saw ${attempts} at
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi guard latch must reset after follow-up delivery failure"
+  expect_code 0 "$status" "Pi guard must retry delivery on the next settled event after a failure"
   [ -z "$out" ] || fail "Pi delivery-failure guard test printed output: $out"
-  pass ".pi primary extension: delivery failure resets the logical-run latch"
+  pass ".pi primary extension: delivery failure does not suppress the next continuation"
 }
 
 test_grok_hook_invokes_adapter() {
@@ -781,6 +872,7 @@ test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_accepts_only_active_away_inject_daemon
 test_hook_blocks_live_foreground_checkpoint_then_blocks_retry
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
@@ -792,11 +884,12 @@ test_hook_retry_requires_durable_ownership
 test_hook_surfaces_bounded_parked_and_idle_tasks
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
-test_hook_silent_without_jq
-test_hook_silent_without_stdin
+test_hook_blocks_without_jq
+test_hook_blocks_without_stdin
+test_hook_blocks_with_malformed_stdin
 test_hook_runs_fast
 test_grok_adapter_forces_one_resume_when_unhealthy
-test_grok_adapter_loop_guard_skips_resume
+test_grok_adapter_repeats_resume_when_still_blind
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root

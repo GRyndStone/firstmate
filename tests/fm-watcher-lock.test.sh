@@ -709,8 +709,33 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_pid_alive_rejects_zombie_state() {
+  local dir fakebin real_ps live status=0
+  dir=$(make_case pid-zombie-state)
+  fakebin="$dir/zombie-fakebin"
+  mkdir -p "$fakebin"
+  real_ps=$(command -v ps) || fail "test host must provide ps"
+  cat > "$fakebin/ps" <<EOF
+#!/usr/bin/env bash
+if [ "\$*" = "-p \${FM_ZOMBIE_PID:?} -o stat=" ]; then
+  printf 'Z+\n'
+  exit 0
+fi
+exec "$real_ps" "\$@"
+EOF
+  chmod +x "$fakebin/ps"
+  sleep 300 &
+  live=$!
+  PATH="$fakebin:$PATH" FM_ZOMBIE_PID="$live" bash -c '. "$1"; fm_pid_alive "$2"' _ "$LIB" "$live" || status=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "fm_pid_alive accepted a zombie process state"
+  pass "fm_pid_alive rejects zombie watcher and owner processes"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_pid_alive_rejects_zombie_state
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
