@@ -12,6 +12,8 @@ set -u
 # The move is delegated to `tasks-axi mv`, so this suite exercises the real
 # binary. Skip cleanly when it is absent (matching the backend smoke suites).
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found (required by the delegated handoff path)"; exit 0; }
+REAL_TASKS_AXI=$(command -v tasks-axi)
+export REAL_TASKS_AXI
 
 TMP_ROOT=$(fm_test_tmproot fm-backlog-handoff)
 
@@ -23,6 +25,17 @@ setup_homes() {
   sub_abs=$(cd "$subhome" && pwd -P)
   printf -- '- %s - feature work (home: %s; scope: feature work; projects: alpha; added 2026-07-09)\n' \
     "$id" "$sub_abs" > "$home/data/secondmates.md"
+  for tasks_home in "$home" "$subhome"; do
+    mkdir -p "$tasks_home/data"
+    cat > "$tasks_home/.tasks.toml" <<'EOF'
+backend = "markdown"
+
+[markdown]
+path = "data/backlog.md"
+archive = "data/done-archive.md"
+done_keep = 10
+EOF
+  done
 }
 
 # Exact multi-line block extract: header matching key plus following body lines
@@ -472,6 +485,38 @@ EOF
   pass "multi-paragraph body with internal blank lines moves whole and is idempotent"
 }
 
+test_handoff_tasks_axi_is_contained_to_selected_home() {
+  local home="$TMP_ROOT/contained-main" sub="$TMP_ROOT/contained-sub"
+  local hostile="$TMP_ROOT/contained-hostile" fakebin="$TMP_ROOT/contained-fakebin" log out home_phys sub_phys
+  setup_homes "$home" "$sub"
+  home_phys=$(cd "$home" && pwd -P)
+  sub_phys=$(cd "$sub" && pwd -P)
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] contained-item - stays home scoped (repo: alpha)
+EOF
+  mkdir -p "$hostile" "$fakebin"
+  cat > "$hostile/.tasks.toml" <<'EOF'
+backend = "sqlite"
+
+[markdown]
+archive = "/tmp/ambient-archive.md"
+EOF
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+printf 'pwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "${FM_HANDOFF_ARGS_LOG:?}"
+exec "${REAL_TASKS_AXI:?}" "$@"
+SH
+  chmod +x "$fakebin/tasks-axi"
+  log="$home/tasks.log"
+  out=$(cd "$hostile" && PATH="$fakebin:$PATH" HOME="$hostile" FM_HOME="$home" FM_HANDOFF_ARGS_LOG="$log" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design contained-item 2>&1) || fail "contained handoff failed: $out"
+  assert_contains "$(cat "$log")" "pwd=$home_phys home=$home_phys args=mv contained-item --backend markdown --file $home/data/backlog.md --to $sub_phys/data/backlog.md" \
+    "handoff tasks-axi mv inherited ambient cwd, HOME, backend, or file"
+  assert_not_contains "$(cat "$log")" "$hostile" "ambient handoff configuration reached tasks-axi"
+  pass "handoff tasks-axi execution is contained to the selected Firstmate home"
+}
+
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole
@@ -481,5 +526,6 @@ test_untouched_eof_line_preserves_terminator
 test_body_handoff_is_idempotent
 test_noncanonical_indented_continuations_refuse_without_changes
 test_indented_heading_is_not_section_boundary
+test_handoff_tasks_axi_is_contained_to_selected_home
 
 echo "ALL TESTS PASSED"

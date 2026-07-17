@@ -52,6 +52,108 @@ fm_tasks_axi_mv_has_multi_id() {
   printf '%s\n' "$output" | grep -F -- '[<id>...]' >/dev/null
 }
 
+fm_tasks_axi_valid_task_id() {  # <id>
+  case "${1:-}" in
+    [A-Za-z0-9]*)
+      case "$1" in
+        *[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_tasks_axi_task_fingerprint() {
+  local normalized
+  normalized=$(awk '
+    $0 == "task:" {
+      in_task = 1
+      found_task = 1
+      print
+      next
+    }
+    in_task && /^[^[:space:]]/ { exit }
+    in_task {
+      if ($0 ~ /^  (blocked|blocked_by|held):/)
+        next
+      if ($0 ~ /^  id:/)
+        found_id = 1
+      print
+    }
+    END {
+      if (!found_task || !found_id)
+        exit 1
+    }
+  ') || return 1
+  [ -n "$normalized" ] || return 1
+  printf '%s' "$normalized" | cksum | awk '{print $1 ":" $2}'
+}
+
+fm_tasks_axi_markdown_archive() {  # <config>
+  local config=$1 parsed count valid rest value
+  parsed=$(awk '
+    {
+      stripped = ""
+      in_quote = ""
+      for (i = 1; i <= length($0); i++) {
+        char = substr($0, i, 1)
+        if (char == "\"" || char == "\047") {
+          if (in_quote == "")
+            in_quote = char
+          else if (in_quote == char)
+            in_quote = ""
+        }
+        if (char == "#" && in_quote == "")
+          break
+        stripped = stripped char
+      }
+      line = stripped
+      sub(/^[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      if (line ~ /^\[[^]]+\]$/) {
+        section = line
+        sub(/^\[/, "", section)
+        sub(/\]$/, "", section)
+        sub(/^[[:space:]]*/, "", section)
+        sub(/[[:space:]]*$/, "", section)
+        in_markdown = (section == "markdown")
+        next
+      }
+      if (!in_markdown || line !~ /^archive[[:space:]]*=/)
+        next
+      count++
+      rhs = line
+      sub(/^archive[[:space:]]*=[[:space:]]*/, "", rhs)
+      quote = substr(rhs, 1, 1)
+      if (length(rhs) < 2 || (quote != "\"" && quote != "\047") || substr(rhs, length(rhs), 1) != quote)
+        next
+      value = substr(rhs, 2, length(rhs) - 2)
+      nonblank = value
+      sub(/^[[:space:]]*/, "", nonblank)
+      sub(/[[:space:]]*$/, "", nonblank)
+      if (nonblank == "")
+        next
+      valid++
+      last = value
+    }
+    END { printf "%d\t%d\t%s", count, valid, last }
+  ' "$config") || return 1
+  count=${parsed%%$'\t'*}
+  rest=${parsed#*$'\t'}
+  valid=${rest%%$'\t'*}
+  value=${rest#*$'\t'}
+  if [ "$count" -ne 1 ]; then
+    echo "error: $config must declare markdown.archive exactly once (found $count)" >&2
+    return 1
+  fi
+  if [ "$valid" -ne 1 ] || [ -z "$value" ]; then
+    echo "error: $config markdown.archive must be one non-empty single- or double-quoted string" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
 fm_backlog_backend_value() {
   local config_dir=$1 backend_file value
   backend_file="$config_dir/backlog-backend"

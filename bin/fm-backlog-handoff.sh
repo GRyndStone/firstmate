@@ -64,6 +64,12 @@ MAIN_BACKLOG="$DATA/backlog.md"
 [ $# -ge 2 ] || { echo "usage: fm-backlog-handoff.sh <secondmate-id> <item-key>..." >&2; exit 1; }
 ID=$1
 shift
+for key in "$@"; do
+  fm_tasks_axi_valid_task_id "$key" || {
+    echo "error: invalid backlog item id: $key" >&2
+    exit 2
+  }
+done
 
 secondmate_home() {
   local id=$1 line
@@ -187,6 +193,36 @@ validate_backlog_file() {
   fi
 }
 
+validate_home_tasks_config() {
+  local home=$1 config archive_rel archive_path archive_parent archive_resolved
+  config="$home/.tasks.toml"
+  if [ -L "$config" ] || [ ! -f "$config" ]; then
+    echo "error: firstmate home must contain a regular .tasks.toml: $config" >&2
+    return 1
+  fi
+  archive_rel=$(fm_tasks_axi_markdown_archive "$config") || return 1
+  case "$archive_rel" in
+    /*) archive_path=$archive_rel ;;
+    *) archive_path="$home/$archive_rel" ;;
+  esac
+  archive_parent=$(dirname "$archive_path")
+  archive_resolved=$(cd "$archive_parent" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$archive_path")") || {
+    echo "error: cannot resolve markdown.archive parent inside firstmate home: $archive_path" >&2
+    return 1
+  }
+  case "$archive_resolved" in
+    "$home"/*) ;;
+    *)
+      echo "error: markdown.archive must remain inside firstmate home: $archive_path" >&2
+      return 1
+      ;;
+  esac
+  if [ -L "$archive_resolved" ]; then
+    echo "error: markdown.archive must not be a symlink: $archive_resolved" >&2
+    return 1
+  fi
+}
+
 # Classify a single key by the section it lives under (## In flight /
 # ## Queued / ## Done), or return non-zero if no `- [ ] <key>` / `- [x] <key>`
 # header exists in the file. This reads only section headings and item header
@@ -235,6 +271,7 @@ backlog_key_noncanonical_body_lines() {
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
 SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
+ACTIVE_HOME=$(resolved_existing_dir "$FM_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
@@ -328,7 +365,10 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-if ! fm_tasks_axi_compatible; then
+validate_home_tasks_config "$ACTIVE_HOME" || exit 1
+validate_home_tasks_config "$SUB_HOME" || exit 1
+
+if ! (cd "$ACTIVE_HOME" && HOME="$ACTIVE_HOME" fm_tasks_axi_compatible); then
   echo "error: tasks-axi with atomic multi-ID mv support (0.2.2+) is required to move backlog items" >&2
   exit 1
 fi
@@ -349,7 +389,7 @@ fi
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
+if ! MV_OUT=$(cd "$ACTIVE_HOME" && HOME="$ACTIVE_HOME" tasks-axi mv "${TO_MOVE[@]}" --backend markdown --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
   if [ "$SUB_CREATED" -eq 1 ]; then
     rm -f "$SUB_BACKLOG"
   fi
@@ -359,6 +399,9 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   echo "error: tasks-axi mv failed; nothing was moved." >&2
   exit 1
 fi
+for key in "${TO_MOVE[@]}"; do
+  rm -f "$STATE/$key.teardown-complete" "$SUB_HOME/state/$key.teardown-complete"
+done
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"

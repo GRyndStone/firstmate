@@ -23,9 +23,16 @@ for ((i=0; i<${#args[@]}; i++)); do
   [ "${args[$i]}" != --workspace ] || workspace=${args[$((i+1))]:-}
 done
 case "${1:-} ${2:-}" in
+  "pane get")
+    case "${FM_HERDR_PANE_STATE:-present}" in
+      present) printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}" ;;
+      absent) printf '{"error":{"code":"pane_not_found"}}\n' >&2; exit 1 ;;
+      unknown) printf '{"error":{"code":"transport_error"}}\n' >&2; exit 1 ;;
+    esac
+    ;;
   "workspace get")
     if [ "${FM_HERDR_WORKSPACE_NOT_FOUND:-0}" = 1 ]; then
-      printf '{"error":{"code":"workspace_not_found","message":"gone"}}\n'
+      printf '{"error":{"code":"workspace_not_found","message":"gone"}}\n' >&2
       exit 1
     fi
     printf '{"result":{"workspace":{"workspace_id":"%s","label":"2ndmate-sub-a1"}}}\n' "${3:-}"
@@ -156,7 +163,20 @@ test_missing_owned_workspace_is_an_empty_inventory() {
   pass "structured workspace_not_found is an absent owned workspace"
 }
 
+test_herdr_endpoint_probe_distinguishes_absent_from_unreadable() {
+  local home log state actual
+  home=$(make_fixture herdr-tristate)
+  log="$home/herdr.log"
+  for state in present absent unknown; do
+    actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" FM_HERDR_PANE_STATE="$state" \
+      bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-dup-task' _ "$ROOT/bin/fm-backend.sh")
+    [ "$actual" = "$state" ] || fail "$state Herdr endpoint read $actual"
+  done
+  pass "Herdr endpoint probe treats structured absence differently from inventory failure"
+}
+
 test_duplicate_is_reported_inside_owned_workspace_only
 test_inventory_failure_is_loud
 test_singleton_mismatch_is_reported
 test_missing_owned_workspace_is_an_empty_inventory
+test_herdr_endpoint_probe_distinguishes_absent_from_unreadable

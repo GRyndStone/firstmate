@@ -76,7 +76,7 @@ LC_ALL=C sort -u "$TARGETS" -o "$TARGETS"
 while IFS=$'\t' read -r session workspace; do
   [ -n "$session" ] && [ -n "$workspace" ] || continue
   workspace_read=0
-  if workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>/dev/null); then
+  if workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1); then
     workspace_read=1
   fi
   workspace_code=$(printf '%s' "$workspace_info" | jq -r '.error.code // empty' 2>/dev/null)

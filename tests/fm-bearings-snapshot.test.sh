@@ -221,19 +221,28 @@ test_held_work_and_program_boundary_are_never_omitted() {
   home=$(make_home held-program)
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
+- [ ] live-dependency - Live dependency (repo: firstmate) (kind: ship)
 
 ## Queued
 - [ ] held-gate - Held work (repo: firstmate) (kind: ship) (hold: captain review pending) (hold-kind: captain)
+- [ ] expired-gate - Expired work (repo: firstmate) (kind: ship) (hold: old schedule) (hold-kind: external) (hold-until: 2026-07-16)
+- [ ] active-blocked - Active blocked work (repo: firstmate) (kind: ship) blocked-by: live-dependency - still in flight
+- [ ] resolved-blocked - Resolved blocked work (repo: firstmate) (kind: ship) blocked-by: done-dependency - already landed
 
 ## Done
+- [x] done-dependency - Done dependency (repo: firstmate) (kind: ship) (done 2026-07-16)
 EOF
   printf '# Durable program\n\nMore obligations require decomposition.\n' > "$home/data/firstmate-program.md"
   fakebin=$(make_fakebin "$home")
-  json=$(run "$home" "$fakebin" --json)
+  json=$(FM_FLEET_SNAPSHOT_TODAY=2026-07-17 run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.gates | any(.[]; .id == "held-gate" and .hold == "captain: captain review pending"))
-      and .program[0].runnable_candidates == 0
+      and (.gates | any(.[]; .id == "expired-gate" and .hold == "-" and .blocked_by == "-" and .reason == "-"))
+      and (.gates | any(.[]; .id == "active-blocked" and .hold == "-" and .blocked_by == "live-dependency" and .reason == "still in flight"))
+      and (.gates | any(.[]; .id == "resolved-blocked" and .hold == "-" and .blocked_by == "-" and .reason == "-"))
+      and .program[0].runnable_candidates == 2
       and .program[0].held == 1
+      and .program[0].blocked == 1
       and .program[0].durable_sources == 1
       and .program[0].decomposition == "requires_supervisor_judgment"
       and (.program[0].boundary | contains("does not prove the durable program is complete"))

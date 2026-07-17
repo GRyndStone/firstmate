@@ -57,6 +57,8 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
+#   Backend endpoint creation invalidates any same-id teardown-complete proof
+#   first, so a new lifecycle can never reuse a prior delivery proof.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -698,6 +700,7 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 W="fm-$ID"
+rm -f "$STATE/$ID.teardown-complete"
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)

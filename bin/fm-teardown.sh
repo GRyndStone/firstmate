@@ -98,10 +98,16 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
+fm_tasks_axi_valid_task_id "$ID" || {
+  echo "error: invalid task id: $ID" >&2
+  exit 2
+}
 FORCE=${2:-}
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+COMPLETION_PROOF="$STATE/$ID.teardown-complete"
+rm -f "$COMPLETION_PROOF"
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
@@ -142,9 +148,14 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 BACKLOG_TRACKED=0
+BACKLOG_RECORD_CKSUM=
 if fm_tasks_axi_backend_available "$CONFIG"; then
-  if BACKLOG_LOOKUP=$("$SCRIPT_DIR/fm-backlog.sh" show "$ID" 2>&1); then
+  if BACKLOG_LOOKUP=$("$SCRIPT_DIR/fm-backlog.sh" show "$ID" --full 2>&1); then
     BACKLOG_TRACKED=1
+    BACKLOG_RECORD_CKSUM=$(printf '%s' "$BACKLOG_LOOKUP" | fm_tasks_axi_task_fingerprint) || {
+      echo "REFUSED: tasks-axi returned no stable task record for $ID." >&2
+      exit 1
+    }
   elif printf '%s\n' "$BACKLOG_LOOKUP" | grep -q 'code:[[:space:]]*NOT_FOUND'; then
     BACKLOG_TRACKED=0
   else
@@ -415,6 +426,24 @@ backlog_record_after_teardown() {
       printf '%s\n' "Backlog: $ID teardown succeeded. In manual backend mode only, update data/backlog.md now - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
     fi
   fi
+}
+
+write_completion_proof() {
+  local tmp
+  [ "$BACKLOG_TRACKED" -eq 1 ] || return 0
+  case "$DELIVERY_OUTCOME" in
+    delivered-report|delivered-local|delivered-pr|delivered-default) ;;
+    *) return 0 ;;
+  esac
+  tmp="$COMPLETION_PROOF.tmp.$$"
+  {
+    printf 'version=1\n'
+    printf 'task=%s\n' "$ID"
+    printf 'kind=%s\n' "$KIND"
+    printf 'outcome=%s\n' "$DELIVERY_OUTCOME"
+    printf 'record-cksum=%s\n' "$BACKLOG_RECORD_CKSUM"
+  } > "$tmp"
+  mv "$tmp" "$COMPLETION_PROOF"
 }
 
 registry_home_for_line() {
@@ -746,21 +775,34 @@ delivery_outcome_before_teardown() {
 }
 
 close_endpoint_before_lifecycle_cleanup() {
-  local attempt=0
+  local attempt=0 endpoint_state
   [ -n "$T" ] || {
     echo "REFUSED: task $ID has no exact recorded endpoint to close." >&2
     return 1
   }
-  if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" >/dev/null 2>&1; then
-    FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
-      echo "REFUSED: failed to close exact endpoint $T for task $ID; preserving lifecycle state." >&2
+  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" "$(meta_value "$META" zellij_tab_id)")
+  case "$endpoint_state" in
+    present)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
+        echo "REFUSED: failed to close exact endpoint $T for task $ID; preserving lifecycle state." >&2
+        return 1
+      }
+      ;;
+    absent) ;;
+    *)
+      echo "REFUSED: endpoint state for $T is unknown; preserving lifecycle state for $ID." >&2
       return 1
-    }
-  fi
+      ;;
+  esac
   while [ "$attempt" -lt 10 ]; do
-    if ! fm_backend_target_exists "$BACKEND" "$T" "fm-$ID" >/dev/null 2>&1; then
-      return 0
-    fi
+    endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" "$(meta_value "$META" zellij_tab_id)")
+    case "$endpoint_state" in
+      absent) return 0 ;;
+      unknown)
+        echo "REFUSED: cannot confirm endpoint $T is absent after close; preserving lifecycle state for $ID." >&2
+        return 1
+        ;;
+    esac
     sleep 0.1
     attempt=$((attempt + 1))
   done
@@ -1200,6 +1242,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+write_completion_proof
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

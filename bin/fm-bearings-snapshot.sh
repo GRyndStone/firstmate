@@ -279,9 +279,9 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(($all_queued == 1)
                 or (((.body_excerpt // "") | test("SUPERSEDED|NOT REQUIRED|NOT-REQUIRED|DEFERRED"; "i")) | not))
        | {id, title:(.title | trunc(60)),
-          hold:(if (.hold // "") == "" then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
-          blocked_by:(.blocked_by // "-"),
-          reason:((if (.hold // "") != "" then .hold else (.blocked_reason // "-") end) | trunc(60))} ]) as $gates_all
+          hold:(if .active_hold != true then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
+          blocked_by:(.active_blocked_by // "-"),
+          reason:((if .active_hold == true then .hold else (.active_blocked_reason // "-") end) | trunc(60))} ]) as $gates_all
   | ([ .scout_reports[]
        | . as $r
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))

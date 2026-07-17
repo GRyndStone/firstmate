@@ -92,7 +92,9 @@ exit 0
 SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
-# tmux kill-window etc.: succeed silently.
+case "${1:-}" in
+  list-windows) printf '%s\n' 'fm-other fm-other' ;;
+esac
 exit 0
 SH
   cat > "$fakebin/tasks-axi" <<'SH'
@@ -160,6 +162,10 @@ if [ "${1:-}" = update ] && [ "${2:-}" = --help ]; then
 fi
 if [ "${1:-}" = mv ] && [ "${2:-}" = --help ]; then
   printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'
+  exit 0
+fi
+if [ "${1:-}" = show ]; then
+  printf 'task:\n  id: %s\n  kind: ship\n' "${2:-task-x1}"
   exit 0
 fi
 if [ "${1:-}" = done ]; then
@@ -552,6 +558,7 @@ test_teardown_records_tasks_axi_done_after_cleanup_when_compatible() {
   out=$(FM_TASKS_LOG="$log" run_teardown "$case_dir") || fail "teardown failed with compatible tasks-axi"
   assert_contains "$(cat "$log")" 'done task-x1 --pr https://github.com/example/repo/pull/7' \
     "teardown did not record Done after cleanup"
+  assert_absent "$case_dir/state/task-x1.teardown-complete" "successful backlog completion left reusable teardown proof"
   printf '%s\n' "$out" | grep -F 'recorded Done with https://github.com/example/repo/pull/7 after successful teardown' >/dev/null \
     || fail "teardown did not confirm ordered backlog completion: $out"
   printf '%s\n' "$out" | grep -F 'bin/fm-backlog.sh ready' >/dev/null \
@@ -1452,6 +1459,199 @@ SH
   pass "endpoint close failure and success-shaped no-op both preserve lifecycle state"
 }
 
+test_unknown_endpoint_state_preserves_lifecycle() {
+  local case_dir rc
+  case_dir=$(make_case endpoint-unknown)
+  write_meta "$case_dir" local-only ship
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows|list-panes|list-sessions)
+    echo 'permission denied while reading tmux inventory' >&2
+    exit 2
+    ;;
+  kill-window)
+    echo 'kill must not run for unknown endpoint state' >&2
+    exit 99
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "unknown endpoint inventory"
+  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for fm-task-x1 is unknown" \
+    "unreadable endpoint inventory was treated as confirmed absence"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "unknown endpoint state removed lifecycle metadata"
+  [ -d "$case_dir/wt" ] || fail "unknown endpoint state removed worktree"
+  assert_absent "$case_dir/state/task-x1.teardown-complete" "unknown endpoint state emitted a completion proof"
+  pass "unknown endpoint inventory fails closed and preserves retryable lifecycle state"
+}
+
+test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
+  local case_dir fakebin state actual
+  case_dir="$TMP_ROOT/endpoint-state-unit"
+  fakebin="$case_dir/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${FM_TMUX_STATE:?}" in
+  present) printf '%s\n' '@42 fm-task-x1'; exit 0 ;;
+  absent) printf '%s\n' '@99 fm-other'; exit 0 ;;
+  mismatch) printf '%s\n' '@42 fm-other'; exit 0 ;;
+  no-server) echo 'no server running on /tmp/tmux-test/default' >&2; exit 1 ;;
+  unknown) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux"
+  for state in present absent mismatch no-server unknown; do
+    actual=$(PATH="$fakebin:$PATH" FM_TMUX_STATE="$state" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '. "$1"; fm_backend_target_state tmux @42 fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+    case "$state" in
+      present) [ "$actual" = present ] || fail "present tmux endpoint read $actual" ;;
+      absent|no-server) [ "$actual" = absent ] || fail "$state tmux endpoint read $actual" ;;
+      mismatch|unknown) [ "$actual" = unknown ] || fail "$state tmux endpoint read $actual" ;;
+    esac
+  done
+  pass "tmux endpoint probe separates confirmed absence from ownership mismatch and unreadability"
+}
+
+test_orca_endpoint_probe_rejects_success_shaped_errors() {
+  local case_dir fakebin state actual
+  case_dir="$TMP_ROOT/orca-endpoint-state-unit"
+  fakebin="$case_dir/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+case "${FM_ORCA_STATE:?}" in
+  present) printf '%s\n' '{"ok":true,"result":{"terminal":{"tail":[]}}}'; exit 0 ;;
+  absent) printf '%s\n' '{"ok":false,"error":{"code":"terminal_handle_stale"}}'; exit 0 ;;
+  unknown) printf '%s\n' '{"ok":false,"error":{"code":"transport_error"}}'; exit 0 ;;
+  failed) printf '%s\n' '{"ok":false,"error":{"code":"transport_error"}}'; exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/orca"
+  for state in present absent unknown failed; do
+    actual=$(PATH="$fakebin:$PATH" FM_ORCA_STATE="$state" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '. "$1"; fm_backend_target_state orca terminal-42 fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+    case "$state" in
+      present|absent|unknown) [ "$actual" = "$state" ] || fail "$state Orca endpoint read $actual" ;;
+      failed) [ "$actual" = unknown ] || fail "failed Orca endpoint read $actual" ;;
+    esac
+  done
+  pass "Orca endpoint probe treats ok:false and CLI failures as typed absence or unknown"
+}
+
+test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab() {
+  local case_dir fakebin title state actual
+  case_dir="$TMP_ROOT/zellij-endpoint-state-unit"
+  fakebin="$case_dir/fakebin"
+  mkdir -p "$fakebin"
+  title=$(FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_source zellij; fm_backend_zellij_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  cat > "$fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = list-sessions ]; then
+  printf '%s\n' fm
+  exit 0
+fi
+if [ "${1:-}" = --session ]; then
+  shift 2
+fi
+case "$*" in
+  "action list-panes --json")
+    case "${FM_ZELLIJ_STATE:?}" in
+      live|mismatch) printf '%s\n' '[{"id":42,"tab_id":7,"is_plugin":false}]' ;;
+      ghost|absent) printf '%s\n' '[]' ;;
+      unknown) printf '%s\n' 'pane inventory unavailable' >&2; exit 3 ;;
+    esac
+    ;;
+  "action list-tabs --json")
+    case "${FM_ZELLIJ_STATE:?}" in
+      live|ghost) printf '[{"tab_id":7,"name":"%s"}]\n' "${FM_ZELLIJ_EXPECTED_TITLE:?}" ;;
+      mismatch) printf '%s\n' '[{"tab_id":7,"name":"fm-other"}]' ;;
+      absent) printf '%s\n' '[]' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/zellij"
+  for state in live ghost absent mismatch unknown; do
+    actual=$(PATH="$fakebin:$PATH" FM_ZELLIJ_STATE="$state" FM_ZELLIJ_EXPECTED_TITLE="$title" \
+      FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '. "$1"; fm_backend_target_state zellij fm:42 fm-task-x1 7' _ "$ROOT/bin/fm-backend.sh")
+    case "$state" in
+      live|ghost) [ "$actual" = present ] || fail "$state Zellij endpoint read $actual" ;;
+      absent) [ "$actual" = absent ] || fail "absent Zellij endpoint read $actual" ;;
+      mismatch|unknown) [ "$actual" = unknown ] || fail "$state Zellij endpoint read $actual" ;;
+    esac
+  done
+  pass "Zellij endpoint probe verifies live panes and owned ghost tabs"
+}
+
+test_cmux_endpoint_probe_searches_all_windows_fail_closed() {
+  local case_dir fakebin title state actual
+  case_dir="$TMP_ROOT/cmux-endpoint-state-unit"
+  fakebin="$case_dir/fakebin"
+  mkdir -p "$fakebin"
+  title=$(FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+    bash -c '. "$1"; fm_backend_source cmux; fm_backend_cmux_scoped_title fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+  cat > "$fakebin/cmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  ping)
+    printf 'PONG\n'
+    ;;
+  list-windows)
+    printf '%s\n' '[{"id":"win-current"},{"id":"win-parked"}]'
+    ;;
+  workspace)
+    window=
+    previous=
+    for arg in "$@"; do
+      if [ "$previous" = --window ]; then
+        window=$arg
+        previous=
+        continue
+      fi
+      [ "$arg" != --window ] || previous=--window
+    done
+    if [ -z "$window" ]; then
+      printf '%s\n' '{"workspaces":[]}'
+      exit 0
+    fi
+    case "${FM_CMUX_STATE:?}:$window" in
+      present:win-current|absent:win-current|absent:win-parked|unknown:win-parked)
+        printf '%s\n' '{"workspaces":[{"id":"ws-other","title":"unrelated"}]}'
+        ;;
+      present:win-parked)
+        printf '{"workspaces":[{"id":"ws-target","title":"%s"}]}\n' "${FM_CMUX_EXPECTED_TITLE:?}"
+        ;;
+      unknown:win-current)
+        printf 'workspace inventory unavailable\n' >&2
+        exit 3
+        ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$fakebin/cmux"
+  for state in present absent unknown; do
+    actual=$(PATH="$fakebin:$PATH" FM_CMUX_STATE="$state" FM_CMUX_EXPECTED_TITLE="$title" \
+      FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
+      bash -c '. "$1"; fm_backend_target_state cmux ws-target:surface-target fm-task-x1' _ "$ROOT/bin/fm-backend.sh")
+    [ "$actual" = "$state" ] || fail "$state cmux endpoint read $actual"
+  done
+  pass "cmux endpoint probe searches parked windows and fails closed on partial inventory"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_records_tasks_axi_done_after_cleanup_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1465,6 +1665,11 @@ test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_backlog_operational_read_failure_refuses_before_teardown
 test_non_delivery_outcomes_never_record_done
 test_endpoint_close_must_succeed_and_be_absent
+test_unknown_endpoint_state_preserves_lifecycle
+test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch
+test_orca_endpoint_probe_rejects_success_shaped_errors
+test_zellij_endpoint_probe_verifies_live_pane_and_owned_ghost_tab
+test_cmux_endpoint_probe_searches_all_windows_fail_closed
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

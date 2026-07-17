@@ -4,8 +4,8 @@
 # home's data/backlog.md, so update/hold and other last-writer races cannot run
 # concurrently against one backend file.
 #
-# `done` additionally refuses while state/<id>.meta or
-# state/<id>.tearing-down exists.
+# `done` additionally requires a single-use state/<id>.teardown-complete proof
+# written by successful lifecycle teardown.
 # A scout report completion must name the owned data/<id>/report.md and that
 # report must exist.
 # fm-teardown.sh calls this command only after successful endpoint/worktree and
@@ -32,7 +32,7 @@ Usage: fm-backlog.sh <tasks-axi-command> [args...]
 
 Run tasks-axi against this Firstmate home's data/backlog.md.
 Mutations are serialized with state/.backlog.lock.
-Completion refuses until the owned task meta/teardown lifecycle is resolved.
+Completion requires single-use proof from successful owned lifecycle teardown.
 Use bin/fm-backlog-handoff.sh, not `mv`, for secondmate handoffs.
 EOF
 }
@@ -100,11 +100,7 @@ if [ -L "$TASKS_CONFIG" ] || [ ! -f "$TASKS_CONFIG" ]; then
   echo "error: FM_HOME must contain a regular .tasks.toml: $TASKS_CONFIG" >&2
   exit 1
 fi
-ARCHIVE_REL=$(sed -n '/^[[:space:]]*\[markdown\][[:space:]]*$/,/^[[:space:]]*\[/s/^[[:space:]]*archive[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$TASKS_CONFIG" | head -1)
-[ -n "$ARCHIVE_REL" ] || {
-  echo "error: $TASKS_CONFIG must declare markdown.archive" >&2
-  exit 1
-}
+ARCHIVE_REL=$(fm_tasks_axi_markdown_archive "$TASKS_CONFIG") || exit 1
 ARCHIVE_PATH=$(contained_path "$ARCHIVE_REL" markdown.archive) || exit 1
 if [ -L "$ARCHIVE_PATH" ]; then
   echo "error: markdown.archive must not be a symlink: $ARCHIVE_PATH" >&2
@@ -150,8 +146,6 @@ run_tasks_axi() {
 }
 
 if [ "$COMMAND" = "done" ]; then
-  ID=${2:-}
-  [ -n "$ID" ] || { echo "error: done requires a task id" >&2; exit 2; }
   HELP=0
   REPORT_ARG=
   previous=
@@ -167,6 +161,14 @@ if [ "$COMMAND" = "done" ]; then
       --report=*) REPORT_ARG=${arg#--report=} ;;
     esac
   done
+  ID=${2:-}
+  if [ "$HELP" -eq 0 ]; then
+    [ -n "$ID" ] || { echo "error: done requires a task id" >&2; exit 2; }
+    fm_tasks_axi_valid_task_id "$ID" || {
+      echo "error: invalid task id: $ID" >&2
+      exit 2
+    }
+  fi
 fi
 
 LOCKED=0
@@ -184,13 +186,48 @@ fm_lock_acquire_wait "$BACKLOG_LOCK"
 LOCKED=1
 
 if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
+  COMPLETION_PROOF="$STATE/$ID.teardown-complete"
   if [ -e "$STATE/$ID.meta" ] || [ -e "$STATE/$ID.tearing-down" ]; then
     echo "REFUSED: task $ID still has unresolved owned lifecycle state." >&2
     echo "Run bin/fm-teardown.sh $ID successfully before recording Done." >&2
     exit 1
   fi
+  if [ -L "$COMPLETION_PROOF" ] || [ ! -f "$COMPLETION_PROOF" ]; then
+    echo "REFUSED: task $ID has no durable successful-teardown proof." >&2
+    echo "Run bin/fm-teardown.sh $ID successfully; never-dispatched work must be removed or cancelled instead of recorded Done." >&2
+    exit 1
+  fi
+  PROOF_TASK=$(sed -n 's/^task=//p' "$COMPLETION_PROOF" | tail -1)
+  PROOF_VERSION=$(sed -n 's/^version=//p' "$COMPLETION_PROOF" | tail -1)
+  PROOF_KIND=$(sed -n 's/^kind=//p' "$COMPLETION_PROOF" | tail -1)
+  PROOF_OUTCOME=$(sed -n 's/^outcome=//p' "$COMPLETION_PROOF" | tail -1)
+  PROOF_RECORD_CKSUM=$(sed -n 's/^record-cksum=//p' "$COMPLETION_PROOF" | tail -1)
+  if [ "$PROOF_VERSION" != 1 ] || [ "$PROOF_TASK" != "$ID" ]; then
+    echo "REFUSED: teardown proof is not bound to task $ID." >&2
+    exit 1
+  fi
   TASK_INFO=$(run_tasks_axi show "$ID" --full) || exit $?
+  TASK_RECORD_CKSUM=$(printf '%s' "$TASK_INFO" | fm_tasks_axi_task_fingerprint) || {
+    echo "REFUSED: tasks-axi returned no stable task record for $ID." >&2
+    exit 1
+  }
+  if [ -z "$PROOF_RECORD_CKSUM" ] || [ "$PROOF_RECORD_CKSUM" != "$TASK_RECORD_CKSUM" ]; then
+    echo "REFUSED: teardown proof does not match the current backlog record for $ID." >&2
+    exit 1
+  fi
   TASK_KIND=$(printf '%s\n' "$TASK_INFO" | sed -n 's/^[[:space:]]*kind:[[:space:]]*//p' | head -n 1)
+  [ "$TASK_KIND" != task ] || TASK_KIND=ship
+  if [ "$PROOF_KIND" != "$TASK_KIND" ]; then
+    echo "REFUSED: teardown proof kind ${PROOF_KIND:-missing} does not match backlog kind ${TASK_KIND:-missing} for $ID." >&2
+    exit 1
+  fi
+  case "$TASK_KIND:$PROOF_OUTCOME" in
+    scout:delivered-report|ship:delivered-local|ship:delivered-pr|ship:delivered-default) ;;
+    *)
+      echo "REFUSED: teardown proof does not record a delivered outcome for $ID." >&2
+      exit 1
+      ;;
+  esac
   if [ "$TASK_KIND" = scout ]; then
     EXPECTED_REL="data/$ID/report.md"
     EXPECTED_ABS="$DATA/$ID/report.md"
@@ -212,7 +249,47 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
   fi
 fi
 
+CLAIMED_PROOF=
+CLAIM_DIR=
+if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
+  CLAIM_DIR=$(mktemp -d "$STATE/.${ID}.teardown-complete.claimed.XXXXXXXX") || {
+    echo "error: could not prepare a single-use teardown proof claim for $ID" >&2
+    exit 1
+  }
+  CLAIMED_PROOF="$CLAIM_DIR/proof"
+  if ! mv "$COMPLETION_PROOF" "$CLAIMED_PROOF"; then
+    rmdir "$CLAIM_DIR" 2>/dev/null || true
+    echo "REFUSED: teardown proof for $ID could not be claimed for single use." >&2
+    exit 1
+  fi
+fi
+
 run_tasks_axi "$@"
 STATUS=$?
+if [ "$COMMAND" = "done" ] && [ "${HELP:-0}" -eq 0 ]; then
+  if [ "$STATUS" -eq 0 ]; then
+    if ! rm -f "$CLAIMED_PROOF" || ! rmdir "$CLAIM_DIR"; then
+      echo "error: Done succeeded but teardown proof claim could not be consumed for $ID" >&2
+      STATUS=1
+    fi
+  else
+    if mv "$CLAIMED_PROOF" "$COMPLETION_PROOF"; then
+      rmdir "$CLAIM_DIR" 2>/dev/null || true
+    else
+      echo "error: Done failed and teardown proof claim could not be restored for $ID" >&2
+      STATUS=1
+    fi
+  fi
+fi
+if [ "$STATUS" -eq 0 ] && [ "$COMMAND" != "done" ]; then
+  case "$COMMAND" in
+    add|update|hold|reopen|start|rm|remove|cancel)
+      MUTATED_ID=${2:-}
+      if fm_tasks_axi_valid_task_id "$MUTATED_ID"; then
+        rm -f "$STATE/$MUTATED_ID.teardown-complete"
+      fi
+      ;;
+  esac
+fi
 release_backlog_lock
 exit "$STATUS"

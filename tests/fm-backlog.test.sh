@@ -4,6 +4,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$ROOT/bin/fm-tasks-axi-lib.sh"
 
 BACKLOG="$ROOT/bin/fm-backlog.sh"
 TMP_ROOT=$(fm_test_tmproot fm-backlog)
@@ -27,7 +29,19 @@ EOF
 set -u
 case "${1:-}" in
   --version) printf 'tasks-axi 0.2.2\n'; exit 0 ;;
-  show) printf 'task:\n  kind: %s\n' "${FM_FAKE_TASK_KIND:-ship}"; exit 0 ;;
+  show)
+    printf 'task:\n'
+    printf '  id: %s\n' "${2:-task-a}"
+    printf '  title: stable task\n'
+    printf '  state: queued\n'
+    printf '  blocked: %s\n' "${FM_FAKE_BLOCKED:-no}"
+    printf '  blocked_by: %s\n' "${FM_FAKE_BLOCKED_BY:-none}"
+    printf '  held: %s\n' "${FM_FAKE_HELD:-no}"
+    printf '  kind: %s\n' "${FM_FAKE_TASK_KIND:-ship}"
+    printf '  body: stable body\n'
+    printf 'help[1]:\n  - %s\n' "${FM_FAKE_HELP:-inspect ready work}"
+    exit 0
+    ;;
   update)
     if [ "${2:-}" = --help ]; then printf '%s\n' '--archive-body'; exit 0; fi
     ;;
@@ -47,10 +61,24 @@ fi
 if [ -n "${FM_FAKE_ARGS_LOG:-}" ]; then
   printf 'pwd=%s home=%s args=%s\n' "$PWD" "$HOME" "$*" >> "$FM_FAKE_ARGS_LOG"
 fi
+[ "${FM_FAKE_FAIL_MUTATION:-0}" != 1 ] || exit 9
 exit 0
 SH
   chmod +x "$home/fakebin/tasks-axi"
   printf '%s\n' "$home"
+}
+
+write_completion_proof() {
+  local home=$1 id=$2 kind=$3 outcome=$4 record_kind=${5:-$3} record checksum
+  record=$(printf 'task:\n  id: %s\n  title: stable task\n  state: queued\n  blocked: no\n  blocked_by: none\n  held: no\n  kind: %s\n  body: stable body\n' "$id" "$record_kind")
+  checksum=$(printf '%s' "$record" | fm_tasks_axi_task_fingerprint) || fail "could not fingerprint fake task $id"
+  {
+    printf 'version=1\n'
+    printf 'task=%s\n' "$id"
+    printf 'kind=%s\n' "$kind"
+    printf 'outcome=%s\n' "$outcome"
+    printf 'record-cksum=%s\n' "$checksum"
+  } > "$home/state/$id.teardown-complete"
 }
 
 test_same_file_mutations_are_serialized() {
@@ -106,6 +134,7 @@ test_scout_done_requires_owned_report() {
   local home log out status
   home=$(make_home report)
   log="$home/args.log"
+  write_completion_proof "$home" scout-a scout delivered-report
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=scout FM_FAKE_ARGS_LOG="$log" \
     "$BACKLOG" "done" scout-a --note superseded 2>&1) || status=$?
@@ -128,6 +157,61 @@ test_scout_done_requires_owned_report() {
   assert_contains "$(cat "$log")" "args=done scout-a --report data/scout-a/report.md --backend markdown --file $home/data/backlog.md" \
     "scoped Done call did not reach the owned backlog file"
   pass "scout completion requires the exact owned report after lifecycle cleanup"
+}
+
+test_done_requires_matching_single_use_teardown_proof() {
+  local home log out status
+  home=$(make_home proof)
+  log="$home/args.log"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "never-dispatched Done"
+  assert_contains "$out" "no durable successful-teardown proof" "never-dispatched work was not kept outside Done"
+  write_completion_proof "$home" task-a ship delivered-local
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" FM_FAKE_FAIL_MUTATION=1 \
+    FM_FAKE_BLOCKED=yes FM_FAKE_BLOCKED_BY=dep-a FM_FAKE_HELD=yes FM_FAKE_HELP='changed suggestion' \
+    "$BACKLOG" done task-a --note 'local main' >/dev/null 2>&1 || status=$?
+  expect_code 9 "$status" "backend Done failure"
+  assert_present "$home/state/task-a.teardown-complete" "backend failure consumed the retry proof"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
+    FM_FAKE_BLOCKED=yes FM_FAKE_BLOCKED_BY=dep-a FM_FAKE_HELD=yes FM_FAKE_HELP='another suggestion' \
+    "$BACKLOG" done task-a --note 'local main'
+  assert_absent "$home/state/task-a.teardown-complete" "successful Done did not consume its proof"
+  write_completion_proof "$home" task-a ship delivered-local
+  printf 'record changed after teardown\n' >> "$home/state/task-a.teardown-complete"
+  printf 'record-cksum=1:1\n' >> "$home/state/task-a.teardown-complete"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  expect_code 1 "$status" "stale proof checksum"
+  assert_contains "$out" "does not match the current backlog record" "stale proof was accepted for a replacement record"
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" rm task-a
+  assert_absent "$home/state/task-a.teardown-complete" "successful record removal left a reusable teardown proof"
+  pass "Done requires a matching single-use proof and preserves it only for retryable backend failure"
+}
+
+test_default_tasks_kind_matches_legacy_ship_lifecycle() {
+  local home
+  home=$(make_home default-kind)
+  write_completion_proof "$home" legacy-a ship delivered-local task
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=task \
+    "$BACKLOG" done legacy-a --note 'local main'
+  assert_absent "$home/state/legacy-a.teardown-complete" "default tasks kind did not normalize to ship"
+  pass "default tasks kind remains compatible with legacy Firstmate ship tasks"
+}
+
+test_done_rejects_noncanonical_id_before_proof_access() {
+  local home outside out status
+  home=$(make_home invalid-id)
+  outside="$home/task-a.teardown-complete"
+  printf 'must remain unread\n' > "$outside"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done ../task-a 2>&1) || status=$?
+  expect_code 2 "$status" "traversal-shaped completion id"
+  assert_contains "$out" "invalid task id" "completion did not reject a noncanonical id"
+  assert_present "$outside" "completion accessed a proof path before validating the id"
+  pass "Done validates canonical task ids before proof and report path access"
 }
 
 test_completion_and_move_aliases_cannot_bypass_guards() {
@@ -184,13 +268,17 @@ EOF
 }
 
 test_help_does_not_require_home_configuration() {
-  local missing out status
+  local home missing out status
   missing="$TMP_ROOT/help-missing-home"
   status=0
   out=$(FM_HOME="$missing" "$BACKLOG" --help 2>&1) || status=$?
   expect_code 0 "$status" "help without FM_HOME configuration"
   assert_contains "$out" "Usage: fm-backlog.sh" "help output was not available before home validation"
-  pass "help succeeds without an initialized Firstmate home"
+  home=$(make_home done-help)
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done --help >/dev/null 2>&1 || status=$?
+  expect_code 0 "$status" "Done help without a task id"
+  pass "wrapper and Done help succeed without lifecycle arguments"
 }
 
 test_documented_overrides_remain_compatible() {
@@ -231,11 +319,31 @@ test_backlog_and_archive_symlink_escapes_are_rejected() {
   pass "backlog and archive symlink escapes are rejected"
 }
 
+test_duplicate_markdown_archive_is_rejected() {
+  local home outside out status
+  home=$(make_home duplicate-archive)
+  outside="$TMP_ROOT/outside-archive.md"
+  cat >> "$home/.tasks.toml" <<EOF
+
+archive = '$outside' # later tasks-axi override
+EOF
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" ready 2>&1) || status=$?
+  expect_code 1 "$status" "duplicate markdown.archive"
+  assert_contains "$out" "markdown.archive exactly once (found 2)" "later archive override was not rejected"
+  assert_absent "$outside" "duplicate archive override escaped FM_HOME"
+  pass "duplicate markdown.archive assignments cannot bypass home containment"
+}
+
 test_same_file_mutations_are_serialized
 test_done_refuses_unresolved_meta
 test_scout_done_requires_owned_report
+test_done_requires_matching_single_use_teardown_proof
+test_default_tasks_kind_matches_legacy_ship_lifecycle
+test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards
 test_tasks_axi_is_scoped_to_selected_home
 test_help_does_not_require_home_configuration
 test_documented_overrides_remain_compatible
 test_backlog_and_archive_symlink_escapes_are_rejected
+test_duplicate_markdown_archive_is_rejected

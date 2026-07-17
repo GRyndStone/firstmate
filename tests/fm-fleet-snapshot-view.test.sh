@@ -427,7 +427,7 @@ EOF
 }
 
 test_queue_accounting_uses_active_hold_and_blocker_semantics() {
-  local home out
+  local home out view
   home=$(make_home active-queue-gates)
   cat > "$home/data/backlog.md" <<'EOF'
 ## In flight
@@ -439,19 +439,56 @@ test_queue_accounting_uses_active_hold_and_blocker_semantics() {
 - [ ] active-blocker - Active Blocker (repo: alpha) (kind: ship) blocked-by: live-dependency - waits on live work
 - [ ] resolved-blocker - Resolved Blocker (repo: alpha) (kind: ship) blocked-by: done-dependency - already landed
 - [ ] missing-blocker - Missing Blocker (repo: alpha) (kind: ship) blocked-by: removed-dependency - legacy dangling edge
+- [ ] prose-hold - Explain (hold: scheduled) in title prose (repo: alpha) (kind: ship)
+- [ ] prose-blocker - Explain blocked-by: live-dependency in title prose (repo: alpha) (kind: ship)
+- [ ] mixed-blockers - Mixed Blockers (repo: alpha) (kind: ship) blocked-by: done-dependency - already landed blocked-by: live-dependency - waits on live work
+- [ ] repeated-hold - Repeated Hold (repo: alpha) (kind: ship) (hold: older value) (hold: rightmost value)
+- [ ] embedded-marker - Embedded Marker unblocked-by: live-dependency (repo: alpha) (kind: ship)
 
 ## Done
 - [x] done-dependency - Done Dependency (repo: alpha) (kind: ship) (done 2026-07-16)
 EOF
   out=$(FM_HOME="$home" FM_FLEET_SNAPSHOT_TODAY=2026-07-17 "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
-    .queue_accounting.held == 1
-      and .queue_accounting.blocked == 1
-      and .queue_accounting.runnable_candidates == 3
+    .queue_accounting.held == 2
+      and .queue_accounting.blocked == 3
+      and .queue_accounting.runnable_candidates == 5
       and .queue_accounting.empty_runnable_queue == false
-      and (.backlog.records[] | select(.id == "future-hold") | .hold_until == "2026-07-18")
-      and (.backlog.records[] | select(.id == "resolved-blocker") | .blocked_by_ids == ["done-dependency"])
+      and (.backlog.records[] | select(.id == "future-hold")
+           | .hold_until == "2026-07-18" and .active_hold == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "expired-hold")
+           | .hold == "scheduled" and .active_hold == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "active-blocker")
+           | .active_blocked_by_ids == ["live-dependency"] and .active_blocked == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "resolved-blocker")
+           | .blocked_by_ids == ["done-dependency"] and .active_blocked_by_ids == [] and .active_blocked == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "missing-blocker")
+           | .active_blocked_by_ids == [] and .runnable == true)
+      and (.backlog.records[] | select(.id == "prose-hold")
+           | .title == "Explain (hold: scheduled) in title prose" and .hold == null and .active_hold == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "prose-blocker")
+           | .title == "Explain blocked-by: live-dependency in title prose" and .blocked_by_ids == [] and .active_blocked == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "mixed-blockers")
+           | .blocked_by_ids == ["done-dependency","live-dependency"]
+             and .active_blocked_by_ids == ["live-dependency"]
+             and .active_blocked_reason == "waits on live work")
+      and (.backlog.records[] | select(.id == "repeated-hold")
+           | .hold == "rightmost value" and .active_hold == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "embedded-marker")
+           | .title == "Embedded Marker un" and .blocked_by_ids == ["live-dependency"]
+             and .active_blocked_by_ids == ["live-dependency"] and .runnable == false)
   ' >/dev/null || fail "queue accounting did not resolve expired holds and landed or missing blockers: $out"
+  view=$(FM_HOME="$home" FM_FLEET_SNAPSHOT_TODAY=2026-07-17 "$VIEW")
+  assert_contains "$view" "| future-hold | Future Hold | alpha | ship | external - scheduled | - |" \
+    "view omitted an active hold"
+  assert_contains "$view" "| expired-hold | Expired Hold | alpha | ship | - | - |" \
+    "view rendered an expired hold as active"
+  assert_contains "$view" "| active-blocker | Active Blocker | alpha | ship | - | live-dependency - waits on live work |" \
+    "view omitted an active blocker"
+  assert_contains "$view" "| resolved-blocker | Resolved Blocker | alpha | ship | - | - |" \
+    "view rendered a resolved blocker as active"
+  assert_contains "$view" "| prose-hold | Explain (hold: scheduled) in title prose | alpha | ship | - | - |" \
+    "view treated title prose as a hold tag"
   pass "queue accounting matches tasks-axi active hold and blocker semantics"
 }
 

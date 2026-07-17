@@ -662,6 +662,227 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
   esac
 }
 
+# fm_backend_target_state: teardown-grade endpoint existence probe.
+# Prints present, absent, or unknown; backend inventory/read failures are
+# unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
+fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-id]
+  local backend=$1 target=$2 expected_label=${3:-} backend_id=${4:-} out code session pane tabs panes state workspace expected_title workspace_title wins wid wss exact_found recovered_found inventory_unknown pane_tab_id scoped label_count
+  if [ "$backend" = herdr ]; then
+    fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+    session=${target%%:*}
+    pane=${target#*:}
+    if [ -z "$session" ] || [ -z "$pane" ] || [ "$pane" = "$target" ]; then
+      printf 'unknown'
+      return 0
+    fi
+    if out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>&1); then
+      if printf '%s' "$out" | jq -e --arg pane "$pane" '.result.pane.pane_id == $pane' >/dev/null 2>&1; then
+        printf 'present'
+      else
+        printf 'unknown'
+      fi
+      return 0
+    fi
+    code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+    case "$code" in
+      pane_not_found|tab_not_found|workspace_not_found) printf 'absent' ;;
+      *) printf 'unknown' ;;
+    esac
+    return 0
+  fi
+  if fm_backend_target_exists "$backend" "$target" "$expected_label" >/dev/null 2>&1; then
+    printf 'present'
+    return 0
+  fi
+  case "$backend" in
+    tmux)
+      fm_backend_source tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      command -v tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      case "$target" in
+        @*) if out=$(tmux list-windows -a -F '#{window_id} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
+        %*) if out=$(tmux list-panes -a -F '#{pane_id} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
+        *:*.*|*:%*) printf 'unknown'; return 0 ;;
+        *:*) if out=$(tmux list-windows -a -F '#{session_name}:#{window_name} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
+        *) if out=$(tmux list-windows -a -F '#{window_name} #{window_name}' 2>&1); then state=0; else state=$?; fi ;;
+      esac
+      if [ "$state" -ne 0 ]; then
+        if printf '%s\n' "$out" | grep -Eqi 'no server running|failed to connect.*(no such file|connection refused)|no sessions'; then
+          printf 'absent'
+        else
+          printf 'unknown'
+        fi
+        return 0
+      fi
+      if [ -z "$out" ] || printf '%s\n' "$out" | awk 'NF < 2 { bad=1 } END { exit bad ? 0 : 1 }'; then
+        printf 'unknown'
+        return 0
+      fi
+      if printf '%s\n' "$out" | awk -v target="$target" '$1 == target { found=1 } END { exit found ? 0 : 1 }'; then
+        if [ -z "$expected_label" ] || printf '%s\n' "$out" | awk -v target="$target" -v label="$expected_label" '$1 == target && $2 == label { found=1 } END { exit found ? 0 : 1 }'; then
+          printf 'present'
+        else
+          printf 'unknown'
+        fi
+      else
+        printf 'absent'
+      fi
+      ;;
+    herdr) printf 'unknown' ;;
+    zellij)
+      fm_backend_source zellij >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      fm_backend_zellij_parse_target "$target" || { printf 'unknown'; return 0; }
+      if ! out=$(zellij list-sessions --short --no-formatting 2>&1); then
+        if printf '%s\n' "$out" | grep -Eqi 'no active zellij sessions|no sessions'; then
+          printf 'absent'
+        else
+          printf 'unknown'
+        fi
+        return 0
+      fi
+      if ! printf '%s\n' "$out" | grep -qxF "$FM_BACKEND_ZELLIJ_SESSION"; then
+        printf 'absent'
+        return 0
+      fi
+      panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>&1) || {
+        printf 'unknown'
+        return 0
+      }
+      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || {
+        printf 'unknown'
+        return 0
+      }
+      case "$FM_BACKEND_ZELLIJ_PANE" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+      pane_tab_id=$(printf '%s' "$panes" | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)
+      if [ -n "$pane_tab_id" ]; then
+        case "$pane_tab_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
+        if [ -z "$expected_label" ]; then
+          printf 'present'
+          return 0
+        fi
+        tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
+          printf 'unknown'
+          return 0
+        }
+        printf '%s' "$tabs" | jq -e 'type == "array" and all(.[]?; ((.tab_id | type) == "number") and ((.name | type) == "string"))' >/dev/null 2>&1 || {
+          printf 'unknown'
+          return 0
+        }
+        scoped=$(fm_backend_zellij_scoped_title "$expected_label")
+        if printf '%s' "$tabs" | jq -e --argjson t "$pane_tab_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
+          printf 'present'
+          return 0
+        fi
+        label_count=$(printf '%s' "$tabs" | jq -r --arg want "$expected_label" '[.[]? | select(.name == $want)] | length' 2>/dev/null)
+        if [ "$label_count" = 1 ] && printf '%s' "$tabs" | jq -e --argjson t "$pane_tab_id" --arg want "$expected_label" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
+          printf 'present'
+        else
+          printf 'unknown'
+        fi
+        return 0
+      fi
+      if [ -n "$expected_label" ] && [ -n "$backend_id" ]; then
+        case "$backend_id" in *[!0-9]*) printf 'unknown'; return 0 ;; esac
+        tabs=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-tabs --json 2>&1) || {
+          printf 'unknown'
+          return 0
+        }
+        printf '%s' "$tabs" | jq -e 'type == "array" and all(.[]?; ((.tab_id | type) == "number") and ((.name | type) == "string"))' >/dev/null 2>&1 || {
+          printf 'unknown'
+          return 0
+        }
+        if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" 'any(.[]?; .tab_id == $t)' >/dev/null 2>&1; then
+          scoped=$(fm_backend_zellij_scoped_title "$expected_label")
+          if printf '%s' "$tabs" | jq -e --argjson t "$backend_id" --arg want "$scoped" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
+            printf 'present'
+          else
+            label_count=$(printf '%s' "$tabs" | jq -r --arg want "$expected_label" '[.[]? | select(.name == $want)] | length' 2>/dev/null)
+            if [ "$label_count" = 1 ] && printf '%s' "$tabs" | jq -e --argjson t "$backend_id" --arg want "$expected_label" 'any(.[]?; .tab_id == $t and .name == $want)' >/dev/null 2>&1; then
+              printf 'present'
+            else
+              printf 'unknown'
+            fi
+          fi
+          return 0
+        fi
+      fi
+      printf 'absent'
+      ;;
+    orca)
+      fm_backend_source orca >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      if out=$(orca terminal read --terminal "$target" --limit 1 --json 2>&1); then
+        state=0
+      else
+        state=$?
+      fi
+      if [ "$state" -eq 0 ] && printf '%s' "$out" | jq -e 'type == "object" and (.ok != false) and (.result | type == "object")' >/dev/null 2>&1; then
+        printf 'present'
+        return 0
+      fi
+      code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+      case "$code" in
+        terminal_handle_stale|terminal_not_found|not_found) printf 'absent' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+    cmux)
+      fm_backend_source cmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      fm_backend_cmux_parse_target "$target" || { printf 'unknown'; return 0; }
+      state=$(fm_backend_cmux_ping_state)
+      case "$state" in
+        ok) ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      workspace=$FM_BACKEND_CMUX_WORKSPACE
+      wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>&1) || {
+        printf 'unknown'
+        return 0
+      }
+      printf '%s' "$wins" | jq -e 'type == "array" and all(.[]?; ((.id | type) == "string") and ((.id | length) > 0))' >/dev/null 2>&1 || {
+        printf 'unknown'
+        return 0
+      }
+      expected_title=
+      [ -z "$expected_label" ] || expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
+      exact_found=0
+      recovered_found=0
+      inventory_unknown=0
+      workspace_title=
+      while IFS= read -r wid; do
+        [ -n "$wid" ] || continue
+        if ! wss=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>&1); then
+          inventory_unknown=1
+          continue
+        fi
+        if ! printf '%s' "$wss" | jq -e '(.workspaces | type == "array") and all(.workspaces[]?; ((.id | type) == "string") and ((.id | length) > 0) and ((.title | type) == "string"))' >/dev/null 2>&1; then
+          inventory_unknown=1
+          continue
+        fi
+        if printf '%s' "$wss" | jq -e --arg id "$workspace" 'any(.workspaces[]?; .id == $id)' >/dev/null 2>&1; then
+          exact_found=1
+          workspace_title=$(printf '%s' "$wss" | jq -r --arg id "$workspace" '.workspaces[]? | select(.id == $id) | .title // empty' 2>/dev/null)
+        fi
+        if [ -n "$expected_title" ] && printf '%s' "$wss" | jq -e --arg title "$expected_title" 'any(.workspaces[]?; .title == $title)' >/dev/null 2>&1; then
+          recovered_found=1
+        fi
+      done < <(printf '%s' "$wins" | jq -r '.[]? | .id // empty' 2>/dev/null)
+      if [ "$exact_found" -eq 1 ]; then
+        if [ -z "$expected_title" ] || [ "$workspace_title" = "$expected_title" ]; then
+          printf 'present'
+        else
+          printf 'unknown'
+        fi
+      elif [ "$recovered_found" -eq 1 ]; then
+        printf 'present'
+      elif [ "$inventory_unknown" -eq 1 ]; then
+        printf 'unknown'
+      else
+        printf 'absent'
+      fi
+      ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS
 # under <target>, distinct from fm_backend_target_exists's pane-PRESENCE-only
 # check above. A secondmate agent that has exited leaves its backend endpoint

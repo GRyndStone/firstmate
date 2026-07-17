@@ -53,11 +53,11 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def task_row($t):
     "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) |";
   def blocker($r):
-    if ($r.blocked_by // "") == "" then "-"
-    elif ($r.blocked_reason // "") == "" then $r.blocked_by
-    else "\($r.blocked_by) - \($r.blocked_reason)" end;
+    if ($r.active_blocked_by // "") == "" then "-"
+    elif ($r.active_blocked_reason // "") == "" then $r.active_blocked_by
+    else "\($r.active_blocked_by) - \($r.active_blocked_reason)" end;
   def hold($r):
-    if ($r.hold // "") == "" then "-"
+    if $r.active_hold != true then "-"
     elif ($r.hold_kind // "") == "" then $r.hold
     else "\($r.hold_kind) - \($r.hold)" end;
   def backlog_row($r):
