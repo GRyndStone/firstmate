@@ -246,13 +246,18 @@ function clearFlight(root, sessionID, record) {
 function readAcknowledged(root, sessionID) {
   try {
     const handoff = safeHandoffDirectory(root, sessionID);
-    return parseDurableRecord(handoff.acknowledged, sessionID, "acknowledged-cleanup");
+    const acknowledged = parseDurableRecord(handoff.acknowledged, sessionID, "acknowledged-cleanup");
+    if (!acknowledged) return undefined;
+    const coverageEpoch = typeof acknowledged.coverageEpoch === "string"
+      ? acknowledged.coverageEpoch
+      : acknowledged.epoch;
+    return { ...acknowledged, coverageEpoch };
   } catch {
     return undefined;
   }
 }
 
-function persistAcknowledged(root, handoff, coveredGeneration) {
+function persistAcknowledged(root, handoff, coveredGeneration, coverageEpoch) {
   const paths = safeHandoffDirectory(root, handoff.sessionID, true);
   if (pathExists(paths.acknowledged)) throw new Error("an OpenCode acknowledgement is already pending cleanup");
   const record = JSON.stringify({
@@ -262,6 +267,7 @@ function persistAcknowledged(root, handoff, coveredGeneration) {
     generation: handoff.generation,
     epoch: handoff.epoch,
     coveredGeneration,
+    coverageEpoch,
     pendingRecord: handoff.record,
   });
   writeAtomic(paths.acknowledged, record, `${handoff.token}.acknowledged`);
@@ -277,7 +283,8 @@ function cleanupAcknowledged(root, sessionID, acknowledged) {
       ? acknowledged.coveredGeneration
       : acknowledged.generation;
     if (current && (current.record === acknowledged.pendingRecord
-      || (current.epoch === acknowledged.epoch && current.generation <= coveredGeneration))) {
+      || (acknowledged.coverageEpoch !== "" && current.epoch !== ""
+        && current.epoch === acknowledged.coverageEpoch && current.generation <= coveredGeneration))) {
       if (!clearHandoff(root, sessionID, current.record)) return false;
     }
     const flight = readFlight(root, sessionID);
@@ -384,11 +391,10 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     flight.settling = true;
     flight.outcome = acknowledged;
     if (acknowledged) {
-      if (flight.handoff.epoch === processEpoch) {
-        const currentGeneration = invocationGenerations.get(sessionID) ?? flight.handoff.generation;
+      if (flight.coverageEpoch === processEpoch) {
         flight.coveredGeneration = Math.max(
-          flight.handoff.generation,
-          Number.isSafeInteger(coveredGeneration) ? coveredGeneration : currentGeneration,
+          0,
+          Number.isSafeInteger(coveredGeneration) ? coveredGeneration : flight.coveredGeneration,
         );
       } else {
         flight.coveredGeneration = flight.handoff.generation;
@@ -408,20 +414,25 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     if (acknowledged) {
       let durableAcknowledged;
       try {
-        durableAcknowledged = persistAcknowledged(root, flight.handoff, flight.coveredGeneration);
+        durableAcknowledged = persistAcknowledged(
+          root,
+          flight.handoff,
+          flight.coveredGeneration,
+          flight.coverageEpoch,
+        );
       } catch {
         flight.settling = false;
         scheduleDelivery(sessionID);
         return;
       }
-      if (flight.handoff.epoch === processEpoch) {
+      if (flight.coverageEpoch === processEpoch) {
         satisfiedGenerations.set(
           sessionID,
           Math.max(satisfiedGenerations.get(sessionID) ?? 0, flight.coveredGeneration),
         );
       }
       const pending = pendingMessages.get(sessionID);
-      if (flight.handoff.epoch === processEpoch && pending && pending.generation <= flight.coveredGeneration) {
+      if (flight.coverageEpoch === processEpoch && pending && pending.generation <= flight.coveredGeneration) {
         pendingMessages.delete(sessionID);
       }
       deliveryFlights.delete(sessionID);
@@ -453,7 +464,15 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       else cancelRetryOwner(sessionID);
       return;
     }
-    const flight = { handoff, durable, settled, outcome: undefined, settling: false, coveredGeneration: handoff.generation };
+    const flight = {
+      handoff,
+      durable,
+      settled,
+      outcome: undefined,
+      settling: false,
+      coveredGeneration: handoff.epoch === processEpoch ? handoff.generation : 0,
+      coverageEpoch: handoff.epoch === processEpoch ? processEpoch : "",
+    };
     deliveryFlights.set(sessionID, flight);
     Promise.resolve()
       .then(() => client.session.promptAsync({
@@ -462,11 +481,11 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       }))
       .then(
         () => {
-          if (flight.handoff.epoch === processEpoch) {
-            flight.coveredGeneration = Math.max(
-              flight.handoff.generation,
-              invocationGenerations.get(sessionID) ?? flight.handoff.generation,
-            );
+          const currentGeneration = invocationGenerations.get(sessionID);
+          if (Number.isSafeInteger(currentGeneration) && currentGeneration > 0) {
+            if (flight.coverageEpoch !== processEpoch) flight.coveredGeneration = currentGeneration;
+            else flight.coveredGeneration = Math.max(flight.coveredGeneration, currentGeneration);
+            flight.coverageEpoch = processEpoch;
           }
           return settleDelivery(sessionID, flight, true, flight.coveredGeneration);
         },
@@ -609,6 +628,12 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       reason;
     if ((satisfiedGenerations.get(sessionID) ?? 0) >= generation) return;
     if (deliveryFlights.has(sessionID) || readFlight(root, sessionID)) {
+      const activeFlight = deliveryFlights.get(sessionID);
+      if (activeFlight && activeFlight.outcome === undefined) {
+        if (activeFlight.coverageEpoch !== processEpoch) activeFlight.coveredGeneration = generation;
+        else activeFlight.coveredGeneration = Math.max(activeFlight.coveredGeneration, generation);
+        activeFlight.coverageEpoch = processEpoch;
+      }
       pendingMessages.set(sessionID, { message, generation });
       ensureHandoff(sessionID);
     } else if (!readHandoff(root, sessionID) && !pendingMessages.has(sessionID)) {

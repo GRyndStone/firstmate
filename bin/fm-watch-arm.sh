@@ -63,6 +63,11 @@ CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 
+if ! fm_reconcile_checkpoint_orphan "$STATE"; then
+  echo "watcher: FAILED - unresolved foreground checkpoint ownership"
+  exit 1
+fi
+
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
   lock_home=$(cat "$WATCH_LOCK/fm-home" 2>/dev/null || true)

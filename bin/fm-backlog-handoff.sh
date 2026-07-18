@@ -390,7 +390,20 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+invalidate_requested_receipts() {
+  local key failed=0
+  for key in "$@"; do
+    fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || failed=1
+    fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || failed=1
+  done
+  [ "$failed" -eq 0 ]
+}
+
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
+  if ! invalidate_requested_receipts "$@"; then
+    echo "error: idempotent handoff could not reconcile one or more completion receipts" >&2
+    exit 1
+  fi
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
   exit 0
 fi
@@ -519,10 +532,7 @@ rm -f "$MOVE_RESULT"
 MOVE_RESULT=
 RECEIPT_INVALIDATION_FAILED=0
 if [ "$MOVE_OUTCOME" = committed ]; then
-  for key in "${TO_MOVE[@]}"; do
-    fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || RECEIPT_INVALIDATION_FAILED=1
-    fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || RECEIPT_INVALIDATION_FAILED=1
-  done
+  invalidate_requested_receipts "$@" || RECEIPT_INVALIDATION_FAILED=1
 fi
 if [ "$MV_STATUS" -ne 0 ]; then
   if [ "$SUB_CREATED" -eq 1 ] && [ "$MOVE_OUTCOME" = failed ]; then

@@ -3423,6 +3423,23 @@ test_concurrent_force_retry_cannot_replace_staged_outcome() {
   pass "concurrent forced retries cannot replace an in-memory staged outcome"
 }
 
+test_effective_state_is_validated_before_teardown_lock_mutation() {
+  local case_dir outside out status
+  case_dir=$(make_case prelock-state-scope)
+  outside="$case_dir/foreign-state"
+  mkdir -p "$outside"
+  rm -rf "$case_dir/state"
+  ln -s "$outside" "$case_dir/state"
+  status=0
+  out=$(run_teardown "$case_dir" 2>&1) || status=$?
+  expect_code 1 "$status" "symlinked teardown state before lock acquisition"
+  assert_contains "$out" "symlinked effective state path component" \
+    "teardown did not reject foreign state before acquiring its lock"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "teardown mutated foreign state before path validation: $(find "$outside" -mindepth 1 -maxdepth 2 -print)"
+  pass "teardown validates effective state before every lock, read, and mutation"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_records_tasks_axi_done_after_cleanup_when_compatible
 test_teardown_manual_backend_uses_receipt_gated_done
@@ -3483,6 +3500,7 @@ test_symlinked_auxiliary_targets_are_refused
 test_child_treehouse_retry_revalidates_auxiliary_authority
 test_finalizing_retry_rechecks_current_record
 test_concurrent_force_retry_cannot_replace_staged_outcome
+test_effective_state_is_validated_before_teardown_lock_mutation
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

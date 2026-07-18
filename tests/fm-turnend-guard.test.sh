@@ -362,6 +362,26 @@ test_hook_blocks_with_live_lock_and_stale_beacon() {
   pass "fm-turnend-guard: blocks on a live watcher lock with an ancient beacon"
 }
 
+test_hook_reconciles_exact_checkpoint_orphan_before_guarding() {
+  local dir orphan_pid orphan_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/checkpoint-orphan-guard")
+  : > "$dir/state/task1.meta"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(FM_HOME="$dir" bash -c '. "$1"; fm_pid_birth_identity "$2"' _ \
+    "$dir/bin/fm-wake-lib.sh" "$orphan_pid") || fail "could not capture checkpoint orphan identity"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$dir/state/.watch-checkpoint-orphan"
+  status=0
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$dir" FM_TURNEND_HARNESS=codex \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1) || status=$?
+  expect_code 2 "$status" "turn-end guard after checkpoint orphan reconciliation"
+  assert_absent "$dir/state/.watch-checkpoint-orphan" "turn-end guard retained a reconciled orphan record"
+  kill -0 "$orphan_pid" 2>/dev/null && fail "turn-end guard did not terminate the exact checkpoint orphan"
+  wait "$orphan_pid" 2>/dev/null || true
+  assert_contains "$out" "TURN WOULD END BLIND" "guard did not continue its fail-closed predicate after reconciliation"
+  pass "fm-turnend-guard: reconciles only the exact durable checkpoint orphan before guarding"
+}
+
 test_hook_blocks_when_unhealthy_in_primary() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-block")
@@ -656,7 +676,7 @@ EOF
   {
     printf 'origin-token\n%s\n%s\nsession-origin\norigin barrier\n' "$origin_pid" "$origin_identity"
   } > "$pending"
-  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" &
+  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" "" "$dir/state" &
   worker_pid=$!
   sleep 0.2
   [ ! -e "$log" ] || fail "Grok resume began while the originating Stop hook identity was alive"
@@ -929,7 +949,7 @@ SH
   printf 'signal-token\n999999\nmissing-origin\nsignal-session\nsignal cleanup\n' > "$pending"
   PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_DELIVERY_TIMEOUT=120 \
     FM_TEST_PS_LOG="$ps_log" FM_TEST_REAL_PS="$real_ps" \
-    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" signal-token &
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" signal-token "$dir/state" &
   worker_pid=$!
   children=
   child_count=0
@@ -977,7 +997,7 @@ EOF
   mkdir -p "$dir/state/.turnend-handoffs"
   pending="$dir/state/.turnend-handoffs/grok-legacy.pending"
   printf '%s\n' legacy-token 999999 legacy-identity @continue 'legacy reason' > "$pending"
-  out=$(PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" legacy-token 2>&1); status=$?
+  out=$(PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" legacy-token "$dir/state" 2>&1); status=$?
   expect_code 0 "$status" "legacy Grok @continue handoff must be quarantined without delivery"
   [ -z "$out" ] || fail "legacy Grok quarantine printed output: $out"
   [ ! -e "$calls" ] || fail "legacy Grok @continue handoff invoked an ambiguous continuation"
@@ -1016,13 +1036,43 @@ EOF
   mkdir -p "$dir/state/.turnend-handoffs"
   pending="$dir/state/.turnend-handoffs/grok-ack.pending"
   printf '%s\n' ack-token 999999 ack-identity session-ack 'ack reason' > "$pending"
-  out=$(PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" ack-token 2>&1); status=$?
+  out=$(PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" ack-token "$dir/state" 2>&1); status=$?
   expect_code 0 "$status" "acknowledged Grok cleanup failure must retry cleanup without delivery"
   [ -z "$out" ] || fail "Grok acknowledged-cleanup test printed output: $out"
   [ -e "$rm_failed" ] || fail "Grok acknowledged-cleanup test did not exercise deletion failure"
   [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] || fail "Grok acknowledged cleanup redelivered the continuation"
   [ ! -e "$pending" ] && [ ! -e "$pending.acknowledged" ] || fail "Grok acknowledged cleanup retained retry state"
   pass "fm-turnend-guard-grok: acknowledged cleanup retries never redeliver"
+}
+
+test_grok_worker_binds_pending_to_exact_external_state() {
+  local dir external wrong fakebin calls pending out status
+  dir=$(make_primary_dir "$TMP_ROOT/grok-external-state-root")
+  external="$TMP_ROOT/grok-external-state"
+  wrong="$TMP_ROOT/grok-wrong-state"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-external-state-fakebin")
+  calls="$TMP_ROOT/grok-external-state-calls"
+  mkdir -p "$external/.turnend-handoffs" "$wrong"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$fakebin/grok"
+  pending="$external/.turnend-handoffs/grok-external.pending"
+  printf '%s\n' external-token 999999 external-identity session-external 'external state reason' > "$pending"
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$external" FM_GROK_TURNEND_DELAY=0 \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" external-token "$wrong" 2>&1) || status=$?
+  expect_code 1 "$status" "Grok worker mismatched external state binding"
+  [ ! -e "$calls" ] || fail "Grok worker delivered from a pending path not bound to effective state"
+  assert_present "$pending" "Grok worker consumed a mismatched-state pending record"
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$external" FM_GROK_TURNEND_DELAY=0 \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" external-token "$external" 2>&1) || status=$?
+  expect_code 0 "$status" "Grok worker exact external state binding"
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] || fail "Grok worker did not deliver exactly once from bound external state"
+  assert_absent "$pending" "Grok worker retained a successfully acknowledged external-state handoff"
+  pass "fm-turnend-guard-grok: worker binds pending delivery to exact validated effective state"
 }
 
 test_settings_hook_uses_claude_project_dir() {
@@ -2617,6 +2667,91 @@ EOF
   pass ".opencode primary plugin: recovered generations cannot satisfy new-process idle events"
 }
 
+test_opencode_legacy_ack_requires_exact_pending_record() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-legacy-ack-root"
+  home="$TMP_ROOT/opencode-legacy-ack-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.turnend-handoffs"
+  record_opencode_test_lock "$home/state"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const sessionID = "legacy-ack-exact";
+const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/opencode-${key}.pending`;
+const oldRecord = JSON.stringify({ token: "old-token", sessionID, message: "old", generation: 7 });
+const currentRecord = JSON.stringify({ token: "current-token", sessionID, message: "current", generation: 1 });
+writeFileSync(pending, `${currentRecord}\n`);
+writeFileSync(`${pending}.acknowledged`, `${JSON.stringify({
+  kind: "acknowledged-cleanup",
+  token: "old-token",
+  sessionID,
+  generation: 7,
+  coveredGeneration: 7,
+  pendingRecord: oldRecord,
+})}\n`);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+for (let i = 0; i < 100 && prompts < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`legacy acknowledgement consumed a different pending record: ${prompts}`);
+for (let i = 0; i < 100 && existsSync(pending); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode legacy acknowledgement exact-record cleanup"
+  [ -z "$out" ] || fail "OpenCode legacy-ack test printed output: $out"
+  pass ".opencode primary plugin: legacy acknowledgements cannot range-delete another process handoff"
+}
+
+test_opencode_recovered_flight_covers_current_queued_idle_once() {
+  local plugin repo home out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  repo="$TMP_ROOT/opencode-recovered-flight-watermark-root"
+  home="$TMP_ROOT/opencode-recovered-flight-watermark-home"
+  make_adapter_primary_repo "$repo"
+  mkdir -p "$repo/bin" "$home/state/.turnend-handoffs"
+  record_opencode_test_lock "$home/state"
+  printf '#!/usr/bin/env bash\ncat >/dev/null\nprintf "blind\\n" >&2\nexit 2\n' > "$repo/bin/fm-turnend-guard.sh"
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_TURNEND_HANDOFF_RETRY_MS=10 node 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const sessionID = "recovered-flight-watermark";
+const key = createHash("sha256").update(sessionID).digest("hex").slice(0, 24);
+const pending = `${process.env.FM_HOME}/state/.turnend-handoffs/opencode-${key}.pending`;
+writeFileSync(pending, `${JSON.stringify({ token: "recovered", sessionID, message: "recovered", generation: 9 })}\n`);
+let prompts = 0;
+let release;
+const client = { session: { promptAsync: async () => {
+  prompts += 1;
+  await new Promise((resolve) => { release = resolve; });
+} } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+for (let i = 0; i < 100 && prompts < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`recovered flight did not start exactly once: ${prompts}`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+release();
+for (let i = 0; i < 100 && existsSync(pending); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (prompts !== 1) throw new Error(`queued idle behind recovered flight was redelivered: ${prompts}`);
+if (existsSync(pending) || existsSync(`${pending}.flight`) || existsSync(`${pending}.acknowledged`)) {
+  throw new Error("recovered flight watermark did not consume covered durable state");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode recovered-flight resolution watermark"
+  [ -z "$out" ] || fail "OpenCode recovered-flight watermark test printed output: $out"
+  pass ".opencode primary plugin: one recovered flight covers current queued idle without redelivery"
+}
+
 test_pi_unknown_agent_start_retains_ack_and_cancels_stale_settled_retry() {
   local repo home ext fakebin release guard_log out status
   repo="$TMP_ROOT/pi-unknown-start-root"
@@ -2736,6 +2871,7 @@ test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_accepts_only_active_away_inject_daemon
 test_hook_blocks_live_foreground_checkpoint_then_blocks_retry
 test_hook_blocks_with_live_lock_and_stale_beacon
+test_hook_reconciles_exact_checkpoint_orphan_before_guarding
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
@@ -2763,6 +2899,7 @@ test_grok_worker_launch_requires_token_readiness
 test_grok_worker_signal_reaps_delivery_children
 test_grok_worker_quarantines_legacy_continue_handoff
 test_grok_acknowledged_cleanup_never_redelivers
+test_grok_worker_binds_pending_to_exact_external_state
 test_grok_delivery_log_never_follows_symlink
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
@@ -2786,6 +2923,8 @@ test_opencode_unresolved_flight_is_durably_quarantined
 test_opencode_durable_acknowledgement_only_retries_cleanup
 test_opencode_unknown_lock_probe_retains_in_process_retry
 test_opencode_recovered_generation_does_not_cover_new_process_idle
+test_opencode_legacy_ack_requires_exact_pending_record
+test_opencode_recovered_flight_covers_current_queued_idle_once
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure

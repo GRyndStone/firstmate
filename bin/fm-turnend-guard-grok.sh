@@ -203,7 +203,7 @@ if ! { exec 9>"$DELIVERY_LOG"; } 2>/dev/null; then
 fi
 set +o noclobber
 [ -f "$DELIVERY_LOG" ] && [ ! -L "$DELIVERY_LOG" ] || { exec 9>&-; exit 1; }
-nohup "$DELIVER" "$PENDING" "$ROOT" "$TOKEN" </dev/null >&9 2>&1 &
+nohup "$DELIVER" "$PENDING" "$ROOT" "$TOKEN" "$STATE" </dev/null >&9 2>&1 &
 WORKER_PID=$!
 exec 9>&-
 attempt=0

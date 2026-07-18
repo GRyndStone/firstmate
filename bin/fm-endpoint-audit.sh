@@ -67,6 +67,10 @@ validate_state_path() {
       return 1
     fi
   done
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    STATE=$path
+    return 0
+  fi
   [ -d "$path" ] && [ ! -L "$path" ] || {
     echo "fm-endpoint-audit: effective state path is not a regular directory: $path" >&2
     return 1
@@ -74,6 +78,15 @@ validate_state_path() {
   STATE=$path
 }
 validate_state_path "$STATE" || exit 1
+
+if [ ! -d "$STATE" ]; then
+  if [ "$FORMAT" = json ]; then
+    printf '[]\n'
+  else
+    printf 'endpoint-audit: no same-home endpoint ownership anomalies found\n'
+  fi
+  exit 0
+fi
 
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-endpoint-audit.XXXXXX") || exit 1
 LIVE="$TMP_ROOT/live.tsv"

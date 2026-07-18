@@ -70,6 +70,9 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+CHECKPOINT_ORPHAN_UNRESOLVED=0
+fm_reconcile_checkpoint_orphan "$STATE" || CHECKPOINT_ORPHAN_UNRESOLVED=1
+
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 
@@ -134,7 +137,9 @@ daemon_owner_active() {
 }
 
 WATCH_OWNER_DESC="no healthy watcher"
-if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+if [ "$CHECKPOINT_ORPHAN_UNRESOLVED" -eq 1 ]; then
+  WATCH_OWNER_DESC="unresolved foreground checkpoint ownership"
+elif fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   WATCH_OWNER_DESC="healthy watcher has no live owner provenance"
   if fm_watcher_live_owner "$STATE"; then
     WATCH_OWNER_DESC="$FM_WATCHER_OWNER_KIND owner pid=$FM_WATCHER_OWNER_PID"

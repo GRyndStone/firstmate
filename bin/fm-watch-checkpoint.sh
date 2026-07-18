@@ -75,11 +75,7 @@ CLEANED=0
 TIMED_OUT=0
 
 watch_birth_identity() {
-  local identity
-  identity=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null) || return 1
-  identity=$(printf '%s\n' "$identity" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-  [ -n "$identity" ] || return 1
-  printf '%s\n' "$identity"
+  fm_pid_birth_identity "$1"
 }
 
 capture_watch_identity() {
@@ -100,52 +96,91 @@ capture_watch_identity() {
   return 1
 }
 
-watch_child_matches() {
-  local current_identity current_parent
-  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || return 1
-  fm_pid_alive "$WATCH_PID" || return 1
-  current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]') || return 1
-  [ "$current_parent" = "$CHECKPOINT_PID" ] || return 1
-  current_identity=$(watch_birth_identity "$WATCH_PID") || return 1
-  [ "$current_identity" = "$WATCH_IDENTITY" ]
+watch_child_state() {
+  local current_identity current_parent pid_state
+  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || { printf '%s\n' unknown; return; }
+  pid_state=$(fm_pid_state "$WATCH_PID")
+  [ "$pid_state" = alive ] || { printf '%s\n' "$pid_state"; return; }
+  current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]') || {
+    printf '%s\n' unknown
+    return
+  }
+  [ "$current_parent" = "$CHECKPOINT_PID" ] || { printf '%s\n' mismatch; return; }
+  current_identity=$(watch_birth_identity "$WATCH_PID") || { printf '%s\n' unknown; return; }
+  [ "$current_identity" = "$WATCH_IDENTITY" ] || { printf '%s\n' mismatch; return; }
+  printf '%s\n' alive
 }
 
 reap_watch_child_bounded() {
-  local limit=$1 i=0
+  local limit=$1 i=0 child_state
   [ -n "$WATCH_PID" ] || return 0
-  while fm_pid_alive "$WATCH_PID" && [ "$i" -lt "$limit" ]; do
+  while [ "$i" -lt "$limit" ]; do
+    child_state=$(watch_child_state)
+    case "$child_state" in
+      dead)
+        wait "$WATCH_PID" 2>/dev/null || true
+        WATCH_PID=
+        return 0
+        ;;
+      mismatch)
+        WATCH_PID=
+        return 0
+        ;;
+    esac
     sleep 0.05
     i=$((i + 1))
   done
-  fm_pid_alive "$WATCH_PID" && return 1
-  wait "$WATCH_PID" 2>/dev/null || true
-  WATCH_PID=
+  return 1
 }
 
 signal_watch_child() {
   local signal=$1
-  watch_child_matches || return 1
+  [ "$(watch_child_state)" = alive ] || return 1
   kill "-$signal" "$WATCH_PID" 2>/dev/null
 }
 
+retain_watch_child() {
+  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || return 1
+  fm_record_checkpoint_orphan "$STATE" "$WATCH_PID" "$WATCH_IDENTITY" || {
+    echo "checkpoint: FAILED - exact watcher pid=$WATCH_PID remains live but durable orphan ownership could not be recorded" >&2
+    return 1
+  }
+  echo "checkpoint: ORPHANED exact watcher pid=$WATCH_PID; durable ownership retained at $(fm_checkpoint_orphan_path "$STATE")" >&2
+  WATCH_PID=
+  return 0
+}
+
 stop_watch_child() {
-  local limit=$1 i=0 term_sent=0
+  local limit=$1 i=0 term_sent=0 child_state
+  [ -n "$WATCH_PID" ] || return 0
   while [ "$i" -lt "$limit" ]; do
-    fm_pid_alive "$WATCH_PID" || return 0
-    if watch_child_matches; then
-      if [ "$term_sent" -eq 0 ]; then
-        signal_watch_child TERM || true
-        term_sent=1
-      fi
+    child_state=$(watch_child_state)
+    case "$child_state" in
+      dead|mismatch)
+        reap_watch_child_bounded 1 && return 0
+        retain_watch_child
+        return
+        ;;
+    esac
+    if [ "$child_state" = alive ] && [ "$term_sent" -eq 0 ] && signal_watch_child TERM; then
+      term_sent=1
     fi
     sleep 0.05
     i=$((i + 1))
   done
-  fm_pid_alive "$WATCH_PID" || return 0
-  if watch_child_matches; then
+  child_state=$(watch_child_state)
+  case "$child_state" in
+    dead|mismatch)
+      reap_watch_child_bounded 1 && return 0
+      retain_watch_child
+      return
+      ;;
+  esac
+  if [ "$child_state" = alive ]; then
     signal_watch_child KILL || true
   fi
-  reap_watch_child_bounded 20
+  reap_watch_child_bounded 20 && return 0
+  retain_watch_child
 }
 
 # shellcheck disable=SC2329 # Invoked by EXIT and signal traps below.
@@ -157,8 +192,7 @@ cleanup_owned_children() {
   fi
   [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
   TIMER_PID=
-  stop_watch_child 20
-  reap_watch_child_bounded 40 || true
+  stop_watch_child 20 || retain_watch_child || true
   rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER" "$ABORT_MARKER"
 }
 
@@ -195,11 +229,18 @@ WATCH_PID=$!
 if ! capture_watch_identity; then
   : > "$ABORT_MARKER"
   i=0
-  while fm_pid_alive "$WATCH_PID" && [ "$i" -lt 300 ]; do
+  CHILD_STATE=$(fm_pid_state "$WATCH_PID")
+  while [ "$CHILD_STATE" != dead ] && [ "$i" -lt 200 ]; do
     sleep 0.01
     i=$((i + 1))
+    CHILD_STATE=$(fm_pid_state "$WATCH_PID")
   done
-  reap_watch_child_bounded 20 || true
+  if [ "$CHILD_STATE" = dead ]; then
+    wait "$WATCH_PID" 2>/dev/null || true
+  else
+    echo "checkpoint: exact wrapper exit could not be confirmed after its abort gate closed" >&2
+  fi
+  WATCH_PID=
   echo "checkpoint: exact watcher child identity could not be captured; watcher was not started" >&2
   exit 1
 fi
@@ -212,26 +253,26 @@ TIMER_PID=$!
 
 WATCH_FINISHED=0
 while [ ! -e "$TIMEOUT_MARKER" ]; do
-  if ! fm_pid_alive "$WATCH_PID"; then
-    WATCH_FINISHED=1
-    break
-  fi
+  CHILD_STATE=$(watch_child_state)
+  case "$CHILD_STATE" in dead|mismatch) WATCH_FINISHED=1; break ;; esac
   sleep 1
 done
 if [ -e "$TIMEOUT_MARKER" ]; then
   TIMED_OUT=1
-  stop_watch_child 40 || true
+  stop_watch_child 20 || retain_watch_child || true
 fi
 set +e
 RC=1
 if [ -z "$WATCH_PID" ]; then
   RC=0
-elif [ "$WATCH_FINISHED" -eq 1 ] || ! fm_pid_alive "$WATCH_PID"; then
+elif [ "$WATCH_FINISHED" -eq 1 ] && [ "$(watch_child_state)" = dead ]; then
   wait "$WATCH_PID"
   RC=$?
   WATCH_PID=
 elif reap_watch_child_bounded 40; then
   RC=0
+else
+  retain_watch_child || true
 fi
 set -e
 if kill -0 "$TIMER_PID" 2>/dev/null; then

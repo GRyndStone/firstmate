@@ -16,17 +16,136 @@ fm_current_pid() {
 }
 
 fm_pid_alive() {
+  [ "$(fm_pid_state "$1")" = alive ]
+}
+
+fm_pid_state() {
   local pid=$1 stat
+  case "$pid" in
+    ''|*[!0-9]*) printf '%s\n' dead; return ;;
+  esac
+  if ! kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' dead
+    return
+  fi
+  if ! stat=$(ps -p "$pid" -o stat= 2>/dev/null); then
+    printf '%s\n' unknown
+    return
+  fi
+  read -r stat _ <<< "$stat"
+  case "$stat" in
+    Z*) printf '%s\n' dead ;;
+    '') printf '%s\n' unknown ;;
+    *) printf '%s\n' alive ;;
+  esac
+}
+
+fm_pid_birth_identity() {
+  local pid=$1 out
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null || return 1
-  stat=$(ps -p "$pid" -o stat= 2>/dev/null) || return 1
-  read -r stat _ <<< "$stat"
-  case "$stat" in
-    Z*|'') return 1 ;;
+  out=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+  out=$(printf '%s\n' "$out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+fm_checkpoint_orphan_path() {
+  printf '%s/.watch-checkpoint-orphan\n' "$1"
+}
+
+fm_record_checkpoint_orphan() {
+  local state=$1 pid=$2 identity=$3 path tmp
+  [ -n "$identity" ] || return 1
+  path=$(fm_checkpoint_orphan_path "$state")
+  [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  tmp=$(mktemp "$state/.watch-checkpoint-orphan.tmp.XXXXXX") || return 1
+  if ! printf '%s\n%s\n' "$pid" "$identity" > "$tmp" || ! ln "$tmp" "$path"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+fm_clear_checkpoint_orphan() {
+  local path=$1 record=$2
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(cat "$path" 2>/dev/null || true)" = "$record" ] || return 1
+  rm -f "$path" || return 1
+  [ ! -e "$path" ] && [ ! -L "$path" ]
+}
+
+fm_reconcile_checkpoint_orphan() {
+  local state=$1 path record pid identity pid_state current_identity i signal_sent=0
+  path=$(fm_checkpoint_orphan_path "$state")
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
+    echo "watcher: FAILED - unsafe checkpoint orphan ownership record at $path" >&2
+    return 1
+  fi
+  record=$(cat "$path" 2>/dev/null) || {
+    echo "watcher: FAILED - unreadable checkpoint orphan ownership record at $path" >&2
+    return 1
+  }
+  pid=$(printf '%s\n' "$record" | sed -n '1p')
+  identity=$(printf '%s\n' "$record" | sed '1d')
+  case "$pid" in
+    ''|*[!0-9]*)
+      echo "watcher: FAILED - invalid checkpoint orphan ownership record at $path" >&2
+      return 1
+      ;;
   esac
-  return 0
+  [ -n "$identity" ] || {
+    echo "watcher: FAILED - invalid checkpoint orphan ownership record at $path" >&2
+    return 1
+  }
+  i=0
+  while [ "$i" -lt 40 ]; do
+    pid_state=$(fm_pid_state "$pid")
+    case "$pid_state" in
+      dead)
+        fm_clear_checkpoint_orphan "$path" "$record" || {
+          echo "watcher: FAILED - checkpoint orphan ownership changed during cleanup at $path" >&2
+          return 1
+        }
+        return 0
+        ;;
+      unknown)
+        sleep 0.05
+        i=$((i + 1))
+        continue
+        ;;
+    esac
+    current_identity=$(fm_pid_birth_identity "$pid" 2>/dev/null || true)
+    if [ -z "$current_identity" ]; then
+      sleep 0.05
+      i=$((i + 1))
+      continue
+    fi
+    if [ "$current_identity" != "$identity" ]; then
+      fm_clear_checkpoint_orphan "$path" "$record" || {
+        echo "watcher: FAILED - checkpoint orphan ownership changed during cleanup at $path" >&2
+        return 1
+      }
+      return 0
+    fi
+    if [ "$signal_sent" -eq 0 ]; then
+      current_identity=$(fm_pid_birth_identity "$pid" 2>/dev/null || true)
+      [ "$current_identity" = "$identity" ] || continue
+      if kill -TERM "$pid" 2>/dev/null; then
+        signal_sent=1
+      fi
+    elif [ "$i" -ge 20 ]; then
+      current_identity=$(fm_pid_birth_identity "$pid" 2>/dev/null || true)
+      [ "$current_identity" = "$identity" ] || continue
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  echo "watcher: FAILED - checkpoint orphan pid=$pid could not be reconciled by exact birth identity; ownership retained at $path" >&2
+  return 1
 }
 
 fm_pid_identity() {

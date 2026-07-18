@@ -5,28 +5,29 @@ set -u
 PENDING=${1:-}
 ROOT=${2:-}
 EXPECTED_TOKEN=${3:-}
-[ -n "$PENDING" ] && [ -n "$ROOT" ] || exit 1
+EXPECTED_STATE=${4:-}
+[ -n "$PENDING" ] && [ -n "$ROOT" ] && [ -n "$EXPECTED_STATE" ] || exit 1
+case "$PENDING" in /*) ;; *) PENDING="$PWD/$PENDING" ;; esac
 [ -L "$PENDING" ] && exit 1
 HANDOFF_DIR=${PENDING%/*}
 STATE_DIR=${HANDOFF_DIR%/*}
-SCOPE_HOME=${FM_HOME:-$ROOT}
-SCOPE_HOME=${SCOPE_HOME%/}
-case "$STATE_DIR" in
-  "$SCOPE_HOME"|"$SCOPE_HOME"/*)
-    COMPONENT_PATH=$SCOPE_HOME
-    [ -d "$COMPONENT_PATH" ] && [ ! -L "$COMPONENT_PATH" ] || exit 1
-    COMPONENT_SUFFIX=${STATE_DIR#"$SCOPE_HOME"}
-    COMPONENT_SUFFIX=${COMPONENT_SUFFIX#/}
-    while [ -n "$COMPONENT_SUFFIX" ]; do
-      COMPONENT=${COMPONENT_SUFFIX%%/*}
-      if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
-      [ -n "$COMPONENT" ] || continue
-      case "$COMPONENT" in .|..) exit 1 ;; esac
-      COMPONENT_PATH="$COMPONENT_PATH/$COMPONENT"
-      [ ! -L "$COMPONENT_PATH" ] || exit 1
-    done
-    ;;
-esac
+EFFECTIVE_STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
+case "$EFFECTIVE_STATE" in /*) ;; *) EFFECTIVE_STATE="$PWD/$EFFECTIVE_STATE" ;; esac
+case "$EXPECTED_STATE" in /*) ;; *) EXPECTED_STATE="$PWD/$EXPECTED_STATE" ;; esac
+[ "$EXPECTED_STATE" = "$EFFECTIVE_STATE" ] || exit 1
+[ "$STATE_DIR" = "$EXPECTED_STATE" ] || exit 1
+FM_STATE_OVERRIDE=$EXPECTED_STATE
+COMPONENT_PATH=/
+COMPONENT_SUFFIX=${EXPECTED_STATE#/}
+while [ -n "$COMPONENT_SUFFIX" ]; do
+  COMPONENT=${COMPONENT_SUFFIX%%/*}
+  if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
+  [ -n "$COMPONENT" ] || continue
+  case "$COMPONENT" in .|..) exit 1 ;; esac
+  COMPONENT_PATH=${COMPONENT_PATH%/}/$COMPONENT
+  [ ! -L "$COMPONENT_PATH" ] || exit 1
+  [ ! -e "$COMPONENT_PATH" ] || [ -d "$COMPONENT_PATH" ] || exit 1
+done
 [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || exit 1
 [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
 case "$PENDING" in "$HANDOFF_DIR"/grok-*.pending) ;; *) exit 1 ;; esac

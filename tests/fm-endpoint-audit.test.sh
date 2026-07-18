@@ -324,6 +324,18 @@ test_symlinked_state_path_component_is_refused_before_enumeration() {
   pass "endpoint audit rejects symlinked effective state path components"
 }
 
+test_absent_final_state_directory_is_an_empty_read_only_audit() {
+  local home out status
+  home=$(make_fixture absent-final-state)
+  rm -rf "$home/state"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$AUDIT" --json 2>&1) || status=$?
+  expect_code 0 "$status" "absent final state directory audit"
+  [ "$out" = '[]' ] || fail "absent final state directory did not return an empty audit: $out"
+  assert_absent "$home/state" "read-only endpoint audit created an absent state directory"
+  pass "endpoint audit accepts an absent final state directory after validating its ancestors"
+}
+
 test_tmux_unscoped_meta_reports_inventory_unavailable() {
   local home log out
   home=$(make_fixture tmux-unscoped)
@@ -483,6 +495,7 @@ test_tmux_untagged_legacy_window_is_ambiguous
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
 test_symlinked_state_path_component_is_refused_before_enumeration
+test_absent_final_state_directory_is_an_empty_read_only_audit
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_orca_reports_unavailable_without_app_global_inventory

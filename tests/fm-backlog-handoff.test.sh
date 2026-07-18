@@ -26,7 +26,7 @@ setup_homes() {
   printf -- '- %s - feature work (home: %s; scope: feature work; projects: alpha; added 2026-07-09)\n' \
     "$id" "$sub_abs" > "$home/data/secondmates.md"
   for tasks_home in "$home" "$subhome"; do
-    mkdir -p "$tasks_home/data"
+    mkdir -p "$tasks_home/data" "$tasks_home/state"
     cat > "$tasks_home/.tasks.toml" <<'EOF'
 backend = "markdown"
 
@@ -705,6 +705,54 @@ SH
   pass "committed handoff preserves its destination across owner cleanup failure"
 }
 
+test_idempotent_and_mixed_handoffs_reconcile_all_completion_receipts() {
+  local home="$TMP_ROOT/receipt-reconcile-main" sub="$TMP_ROOT/receipt-reconcile-sub" state key out
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] newly-moved - committed alongside an already-present item (repo: alpha)
+
+## Done
+EOF
+  cat > "$sub/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] already-there - prior committed move needs receipt cleanup (repo: alpha)
+
+## Done
+EOF
+  for state in "$home/state" "$sub/state"; do
+    printf 'stale\n' > "$state/already-there.teardown-complete"
+  done
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design already-there 2>&1) \
+    || fail "all-ALREADY receipt reconciliation failed: $out"
+  assert_contains "$out" "already present" "idempotent receipt reconciliation lost existing reporting"
+  for state in "$home/state" "$sub/state"; do
+    assert_absent "$state/already-there.teardown-complete" \
+      "all-ALREADY retry retained a completion receipt in $state"
+  done
+  for state in "$home/state" "$sub/state"; do
+    for key in newly-moved already-there; do
+      printf 'stale\n' > "$state/$key.teardown-complete"
+    done
+  done
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design newly-moved already-there 2>&1) \
+    || fail "mixed committed receipt reconciliation failed: $out"
+  assert_grep 'newly-moved' "$sub/data/backlog.md" "mixed handoff did not commit its new item"
+  for state in "$home/state" "$sub/state"; do
+    for key in newly-moved already-there; do
+      assert_absent "$state/$key.teardown-complete" \
+        "mixed committed handoff retained $key completion receipt in $state"
+    done
+  done
+  pass "idempotent and mixed committed handoffs reconcile every requested receipt in both homes"
+}
+
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole
@@ -720,5 +768,6 @@ test_handoff_invalidates_interrupted_completion_claims
 test_handoff_child_owns_both_homes_after_wrapper_death
 test_handoff_refuses_interrupted_receipt_transactions_in_either_home
 test_committed_handoff_preserves_destination_when_owner_cleanup_fails
+test_idempotent_and_mixed_handoffs_reconcile_all_completion_receipts
 
 echo "ALL TESTS PASSED"
