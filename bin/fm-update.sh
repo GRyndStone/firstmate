@@ -34,6 +34,12 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 SECONDMATES_MD="$FM_HOME/data/secondmates.md"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+fm_validate_task_meta_files "$STATE" || exit 1
+fm_validate_home_file_path "$FM_HOME" "$SECONDMATES_MD" allow-missing || exit 1
+SECONDMATES_MD=$FM_VALIDATED_HOME_FILE_PATH
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 

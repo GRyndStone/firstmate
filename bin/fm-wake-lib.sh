@@ -58,6 +58,52 @@ fm_validate_effective_state_path() {
   FM_VALIDATED_STATE_PATH=$path
 }
 
+# shellcheck disable=SC2034 # Result is read by sourcing callers.
+FM_VALIDATED_HOME_FILE_PATH=
+fm_validate_home_file_path() {
+  local home=$1 path=$2 mode=${3:-allow-missing} saved_state home_path parent_path base
+  FM_VALIDATED_HOME_FILE_PATH=
+  saved_state=$FM_VALIDATED_STATE_PATH
+  if ! fm_validate_effective_state_path "$home" require-existing; then
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  fi
+  home_path=$FM_VALIDATED_STATE_PATH
+  parent_path=${path%/*}
+  base=${path##*/}
+  [ -n "$base" ] && [ "$base" != . ] && [ "$base" != .. ] || {
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  }
+  if ! fm_validate_effective_state_path "$parent_path" allow-missing-final; then
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  fi
+  parent_path=$FM_VALIDATED_STATE_PATH
+  case "$parent_path" in
+    "$home_path"|"$home_path"/*) ;;
+    *)
+      echo "error: home-scoped file parent escapes FM_HOME: $parent_path" >&2
+      FM_VALIDATED_STATE_PATH=$saved_state
+      return 1
+      ;;
+  esac
+  path="$parent_path/$base"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] || {
+      echo "error: home-scoped file is symlinked or non-regular: $path" >&2
+      FM_VALIDATED_STATE_PATH=$saved_state
+      return 1
+    }
+  elif [ "$mode" != allow-missing ]; then
+    echo "error: home-scoped file does not exist: $path" >&2
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  fi
+  FM_VALIDATED_HOME_FILE_PATH=$path
+  FM_VALIDATED_STATE_PATH=$saved_state
+}
+
 fm_publish_file_no_follow() {
   local source=$1 destination=$2 mode=${3:-replace} parent source_parent platform
   [ -f "$source" ] && [ ! -L "$source" ] || return 1
@@ -142,6 +188,14 @@ fm_validate_task_meta_files() {
   done
 }
 
+fm_meta_lock_path() {
+  local meta=$1 parent base
+  parent=${meta%/*}
+  base=${meta##*/}
+  [ -n "$parent" ] && [ -n "$base" ] && [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  printf '%s/.%s.update.lock\n' "$parent" "$base"
+}
+
 fm_append_file_no_follow() {
   local destination=$1 parent tmp
   parent=${destination%/*}
@@ -181,8 +235,17 @@ fi
 STATE=$FM_VALIDATED_STATE_PATH
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
-if [ "${FM_WAKE_STATE_INIT:-create}" != skip ] && [ ! -d "$STATE" ]; then
-  mkdir "$STATE" || { return 1 2>/dev/null || exit 1; }
+
+fm_prepare_effective_state_path() {
+  if [ ! -e "$STATE" ] && [ ! -L "$STATE" ]; then
+    fm_ensure_dir_no_follow "$STATE" || return 1
+  fi
+  fm_validate_effective_state_path "$STATE" require-existing || return 1
+  STATE=$FM_VALIDATED_STATE_PATH
+}
+
+if [ "${FM_WAKE_STATE_INIT:-create}" != skip ]; then
+  fm_prepare_effective_state_path || { return 1 2>/dev/null || exit 1; }
 fi
 
 fm_current_pid() {

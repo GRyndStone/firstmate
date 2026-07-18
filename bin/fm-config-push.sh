@@ -61,6 +61,8 @@ SECONDMATES_MD="$DATA/secondmates.md"
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 STATE=$FM_VALIDATED_STATE_PATH
 fm_validate_task_meta_files "$STATE" || exit 1
+fm_validate_home_file_path "$FM_HOME" "$SECONDMATES_MD" allow-missing || exit 1
+SECONDMATES_MD=$FM_VALIDATED_HOME_FILE_PATH
 
 "$SCRIPT_DIR/fm-guard.sh" || true
 

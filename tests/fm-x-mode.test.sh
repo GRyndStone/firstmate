@@ -666,6 +666,27 @@ test_x_state_publications_reject_final_symlinks() {
   pass "X state publications reject symlinked final targets"
 }
 
+test_x_inbox_context_rejects_symlinked_parent() {
+  local home outside meta err status
+  home="$TMP_ROOT/x-inbox-parent-symlink"
+  outside="$TMP_ROOT/x-inbox-parent-outside"
+  mkdir -p "$home/state" "$outside"
+  meta="$home/state/task-a.meta"
+  printf 'window=w\nkind=ship\n' > "$meta"
+  jq -cn '{request_id:"req-a",platform:"discord",text:"foreign"}' > "$outside/req-a.json"
+  ln -s "$outside" "$home/state/x-inbox"
+  err="$home/link.err"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a \
+    --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
+    >/dev/null 2>"$err" || status=$?
+  [ "$status" -ne 0 ] || fail "x-link followed a symlinked inbox parent"
+  assert_grep "failed to inspect request platform context" "$err" \
+    "x-link did not fail closed on the redirected inbox parent"
+  assert_no_grep "x_request=" "$meta" "redirected inbox context changed local task metadata"
+  pass "X inbox context validates its nested parent before reading"
+}
+
 test_reply_dry_run_records_not_posts() {
   local home fakebin log out rc
   home="$TMP_ROOT/reply-dry"; mkdir -p "$home"
@@ -1384,6 +1405,65 @@ TXT
   pass "fm-x-link records Discord platform context so follow-ups keep the Discord budget"
 }
 
+test_pr_and_x_metadata_updates_share_one_lock() {
+  local home fakebin meta ready release pr_pid x_pid waited pr_rc x_rc
+  home="$TMP_ROOT/pr-x-meta-lock"
+  fakebin="$home/fakebin"
+  ready="$home/pr-ready"
+  release="$home/pr-release"
+  mkdir -p "$home/state" "$home/wt" "$fakebin"
+  touch "$home/state/.last-watcher-beat"
+  meta="$home/state/task-a.meta"
+  printf 'window=w\nworktree=%s\nkind=ship\n' "$home/wt" > "$meta"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+: > "${FM_PR_READY:?}"
+while [ ! -e "${FM_PR_RELEASE:?}" ]; do sleep 0.02; done
+printf '%s\n' deadbeefcafefeed0000000000000000deadbeef
+SH
+  chmod +x "$fakebin/gh"
+
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_PR_READY="$ready" FM_PR_RELEASE="$release" \
+    "$ROOT/bin/fm-pr-check.sh" task-a https://example.test/pr/1 >/dev/null 2>"$home/pr.err" &
+  pr_pid=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || {
+    : > "$release"
+    wait "$pr_pid" 2>/dev/null || true
+    fail "PR metadata writer did not enter its serialized update"
+  }
+
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a \
+    --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
+    >/dev/null 2>"$home/x.err" &
+  x_pid=$!
+  sleep 0.2
+  if ! kill -0 "$x_pid" 2>/dev/null; then
+    : > "$release"
+    wait "$pr_pid" 2>/dev/null || true
+    x_rc=0
+    wait "$x_pid" || x_rc=$?
+    fail "X metadata writer bypassed the PR writer lock (exit $x_rc)"
+  fi
+  assert_no_grep "x_request=" "$meta" "X metadata update committed before the PR lock released"
+  : > "$release"
+  pr_rc=0
+  wait "$pr_pid" || pr_rc=$?
+  x_rc=0
+  wait "$x_pid" || x_rc=$?
+  expect_code 0 "$pr_rc" "serialized PR metadata update"
+  expect_code 0 "$x_rc" "serialized X metadata update"
+  assert_grep "pr=https://example.test/pr/1" "$meta" "serialized metadata lost the PR URL"
+  assert_grep "pr_head=deadbeefcafefeed0000000000000000deadbeef" "$meta" \
+    "serialized metadata lost the PR head"
+  assert_grep "x_request=req-a" "$meta" "serialized metadata lost the X request link"
+  pass "PR and X metadata rewrites serialize on the task lock"
+}
+
 # Regression (2026-07-10 incident): a ~470-char Discord follow-up posted as a
 # (1/2)(2/2) thread because the link was recorded AFTER the ack reply drained the
 # inbox file, so the platform was lost and the splitter defaulted to X's 280-char
@@ -1975,6 +2055,7 @@ test_dismiss_unsafe_request_id_rejected
 test_dismiss_usage_error
 test_link_records_request_and_timestamp
 test_link_records_discord_platform_for_followups
+test_pr_and_x_metadata_updates_share_one_lock
 test_link_resolves_platform_by_request_id_after_inbox_cleanup
 test_link_warns_loudly_when_platform_unresolvable
 test_link_carry_count_and_ts_preserve_followup_binding
@@ -2006,3 +2087,4 @@ test_bootstrap_opt_out_reports_cleanup_failure
 test_bootstrap_opt_out_removes_cadence_without_state_directory
 test_bootstrap_x_artifacts_reject_final_symlinks
 test_x_state_publications_reject_final_symlinks
+test_x_inbox_context_rejects_symlinked_parent

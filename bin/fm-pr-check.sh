@@ -24,22 +24,38 @@ if [ -e "$META" ] || [ -L "$META" ]; then
 fi
 "$FM_ROOT/bin/fm-guard.sh" || true
 if [ -e "$META" ] || [ -L "$META" ]; then
-  fm_validate_task_meta_file "$META" || exit 1
-  WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
-  PR_HEAD=
-  if [ -n "$WT" ] && [ -d "$WT" ]; then
-    if command -v gh >/dev/null 2>&1; then
-      if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-        PR_HEAD=$REMOTE_HEAD
+  META_LOCK=$(fm_meta_lock_path "$META") || exit 1
+  fm_lock_acquire_wait "$META_LOCK"
+  META_ADDITIONS=$(mktemp "$STATE/.fm-pr-meta.XXXXXX") || {
+    fm_lock_release "$META_LOCK"
+    exit 1
+  }
+  update_status=0
+  if ! fm_validate_task_meta_file "$META"; then
+    update_status=1
+  else
+    WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+    PR_HEAD=
+    if [ -n "$WT" ] && [ -d "$WT" ]; then
+      if command -v gh >/dev/null 2>&1; then
+        if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
+          PR_HEAD=$REMOTE_HEAD
+        fi
       fi
     fi
+    if ! grep -qxF "pr=$URL" "$META"; then
+      printf 'pr=%s\n' "$URL" >> "$META_ADDITIONS" || update_status=1
+    fi
+    if [ -n "$PR_HEAD" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
+      printf 'pr_head=%s\n' "$PR_HEAD" >> "$META_ADDITIONS" || update_status=1
+    fi
+    if [ "$update_status" -eq 0 ] && [ -s "$META_ADDITIONS" ]; then
+      fm_append_file_no_follow "$META" < "$META_ADDITIONS" || update_status=1
+    fi
   fi
-  if ! grep -qxF "pr=$URL" "$META"; then
-    printf 'pr=%s\n' "$URL" | fm_append_file_no_follow "$META" || exit 1
-  fi
-  if [ -n "$PR_HEAD" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
-    printf 'pr_head=%s\n' "$PR_HEAD" | fm_append_file_no_follow "$META" || exit 1
-  fi
+  rm -f "$META_ADDITIONS" 2>/dev/null || true
+  fm_lock_release "$META_LOCK"
+  [ "$update_status" -eq 0 ] || exit 1
 fi
 
 fm_write_file_no_follow "$STATE/$ID.check.sh" <<EOF

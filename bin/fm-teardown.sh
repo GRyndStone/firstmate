@@ -1703,21 +1703,20 @@ endpoint_audit_clean_for_close() {
 }
 
 close_endpoint_before_lifecycle_cleanup() {
-  local attempt=0 endpoint_state
+  local attempt=0 endpoint_state close_attempted=0
   [ -n "$T" ] || {
     echo "REFUSED: task $ID has no exact recorded endpoint to close." >&2
     return 1
   }
   endpoint_audit_clean_for_close || return 1
-  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
-    "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
-    "$(fm_backend_target_container_of_meta "$META")")
+  endpoint_state=$(fm_backend_target_state_of_meta "$META" "fm-$ID")
   case "$endpoint_state" in
     present)
-      FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" || {
+      fm_backend_kill_owned_meta "$META" "fm-$ID" || {
         echo "REFUSED: failed to close exact endpoint $T for task $ID; preserving lifecycle state." >&2
         return 1
       }
+      close_attempted=1
       ;;
     absent) ;;
     *)
@@ -1726,9 +1725,11 @@ close_endpoint_before_lifecycle_cleanup() {
       ;;
   esac
   while [ "$attempt" -lt 10 ]; do
-    endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
-      "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
-      "$(fm_backend_target_container_of_meta "$META")")
+    if [ "$close_attempted" -eq 1 ]; then
+      endpoint_state=$(fm_backend_closed_target_state_of_meta "$META" "fm-$ID")
+    else
+      endpoint_state=$(fm_backend_target_state_of_meta "$META" "fm-$ID")
+    fi
     case "$endpoint_state" in
       absent) return 0 ;;
       unknown)
@@ -2159,18 +2160,17 @@ audit_firstmate_home_children_endpoints() {
 
 child_endpoint_state() {
   local home=$1 child_meta=$2 child_id=$3 child_backend=$4 child_target=$5
+  : "$child_backend" "$child_target"
   (
     unset FM_ROOT_OVERRIDE
     FM_HOME=$home
     FM_ROOT=$home
-    fm_backend_target_state "$child_backend" "$child_target" "fm-$child_id" \
-      "$(fm_backend_target_identity_of_meta "$child_meta")" "$(meta_value "$child_meta" worktree)" \
-      "$(fm_backend_target_container_of_meta "$child_meta")"
+    fm_backend_target_state_of_meta "$child_meta" "fm-$child_id"
   )
 }
 
 close_child_endpoint() {
-  local home=$1 child_meta=$2 child_id=$3 child_backend=$4 child_target=$5 state attempt=0
+  local home=$1 child_meta=$2 child_id=$3 child_backend=$4 child_target=$5 state attempt=0 close_attempted=0
   audit_firstmate_home_children_endpoints "$home" || return 1
   state=$(child_endpoint_state "$home" "$child_meta" "$child_id" "$child_backend" "$child_target") || return 1
   case "$state" in
@@ -2180,11 +2180,12 @@ close_child_endpoint() {
         unset FM_ROOT_OVERRIDE
         FM_HOME=$home
         FM_ROOT=$home
-        FM_BACKEND_STRICT_CLOSE=1 fm_backend_kill "$child_backend" "$child_target" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id"
+        fm_backend_kill_owned_meta "$child_meta" "fm-$child_id"
       ) || {
         echo "REFUSED: failed to close exact child endpoint $child_target for $child_id; preserving child lifecycle state." >&2
         return 1
       }
+      close_attempted=1
       ;;
     *)
       echo "REFUSED: child endpoint state for $child_target is unknown; preserving child lifecycle state for $child_id." >&2
@@ -2192,7 +2193,15 @@ close_child_endpoint() {
       ;;
   esac
   while [ "$attempt" -lt 10 ]; do
-    state=$(child_endpoint_state "$home" "$child_meta" "$child_id" "$child_backend" "$child_target") || return 1
+    if [ "$close_attempted" -eq 1 ]; then
+      state=$(
+        unset FM_ROOT_OVERRIDE
+        FM_HOME=$home FM_ROOT=$home \
+          fm_backend_closed_target_state_of_meta "$child_meta" "fm-$child_id"
+      ) || return 1
+    else
+      state=$(child_endpoint_state "$home" "$child_meta" "$child_id" "$child_backend" "$child_target") || return 1
+    fi
     case "$state" in
       absent) return 0 ;;
       unknown) return 1 ;;
@@ -2544,9 +2553,7 @@ cleanup_backend_absence_confirmed() {
 endpoint_absence_confirmed() {
   local endpoint_state
   [ -n "$T" ] || return 1
-  endpoint_state=$(fm_backend_target_state "$BACKEND" "$T" "fm-$ID" \
-    "$(fm_backend_target_identity_of_meta "$META")" "$(meta_value "$META" worktree)" \
-    "$(fm_backend_target_container_of_meta "$META")") || return 1
+  endpoint_state=$(fm_backend_closed_target_state_of_meta "$META" "fm-$ID") || return 1
   [ "$endpoint_state" = absent ]
 }
 

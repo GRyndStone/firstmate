@@ -857,6 +857,8 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
       backend_container=$(fm_meta_get "$meta" tmux_session)
       ;;
     herdr)
+      fm_backend_source herdr >/dev/null 2>&1 \
+        || { printf 'unknown'; return 0; }
       backend_identity=$(fm_meta_get "$meta" herdr_workspace_id)
       backend_container=$(fm_meta_get "$meta" herdr_session)
       pane=$(fm_meta_get "$meta" herdr_pane_id)
@@ -876,6 +878,8 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
           || { printf 'unknown'; return 0; }
       fi
       ;;
+    orca)
+      ;;
     *)
       printf 'unknown'
       return 0
@@ -883,6 +887,36 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
   esac
   [ -n "$target" ] || { printf 'unknown'; return 0; }
   fm_backend_target_state "$backend" "$target" "$expected_label" "$backend_identity" "$worktree" "$backend_container" "${workspace_label:-}"
+}
+
+fm_backend_closed_target_state_of_meta() {  # <meta-file> [expected-label]
+  local meta=$1 expected_label=${2:-} backend target session pane out code
+  [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
+  backend=$(fm_backend_of_meta "$meta")
+  [ "$backend" = herdr ] || {
+    fm_backend_target_state_of_meta "$meta" "$expected_label"
+    return
+  }
+  target=$(fm_backend_target_of_meta "$meta")
+  session=$(fm_meta_get "$meta" herdr_session)
+  pane=$(fm_meta_get "$meta" herdr_pane_id)
+  [ -n "$session" ] && [ -n "$pane" ] && [ "$target" = "$session:$pane" ] \
+    || { printf 'unknown'; return 0; }
+  fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  if out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>&1); then
+    if printf '%s' "$out" | jq -e --arg pane "$pane" \
+      '.result.pane.pane_id == $pane' >/dev/null 2>&1; then
+      printf 'present'
+    else
+      printf 'unknown'
+    fi
+    return 0
+  fi
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  case "$code" in
+    pane_not_found) printf 'absent' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 fm_backend_kill_owned_meta() {  # <meta-file> <expected-label>
@@ -917,6 +951,9 @@ fm_backend_kill_owned_meta() {  # <meta-file> <expected-label>
     zellij)
       tab_id=$(fm_meta_get "$meta" zellij_tab_id)
       FM_BACKEND_STRICT_CLOSE=1 fm_backend_zellij_kill "$target" "$tab_id" "$expected_label"
+      ;;
+    orca)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_orca_kill "$target"
       ;;
     *) return 1 ;;
   esac

@@ -44,6 +44,12 @@ if [ -z "${FM_HOME+x}" ] || [ -z "${FM_HOME:-}" ]; then
 fi
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Read while sourcing the state library.
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 if [ ! -d "$FM_HOME" ]; then
   echo "error: FM_HOME '$FM_HOME' is not a directory; fm-send cannot resolve this home's state" >&2
   exit 1
@@ -52,6 +58,7 @@ if [ ! -d "$STATE" ]; then
   echo "error: state dir '$STATE' is missing; fm-send cannot resolve targets for FM_HOME '$FM_HOME'" >&2
   exit 1
 fi
+fm_validate_task_meta_files "$STATE" || exit 1
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"

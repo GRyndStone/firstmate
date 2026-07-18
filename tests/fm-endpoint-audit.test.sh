@@ -509,6 +509,30 @@ SH
   pass "tmux liveness cleanup binds ownership inside the close action"
 }
 
+test_herdr_owned_kill_refuses_same_label_duplicates() {
+  local home log status
+  home=$(make_fixture herdr-owned-kill-duplicate)
+  log="$home/herdr.log"
+  fm_write_meta "$home/state/owned.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'worktree=/owned/worktree'
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
+    bash -c '. "$1"; fm_backend_kill_owned_meta "$2" fm-dup-task' \
+      _ "$ROOT/bin/fm-backend.sh" "$home/state/owned.meta" || status=$?
+  [ "$status" -ne 0 ] || fail "owned Herdr close accepted a same-label duplicate"
+  [ -s "$log" ] || fail "owned Herdr close refused before inspecting endpoint ownership"
+  assert_contains "$(cat "$log")" 'pane list --workspace subw' \
+    "owned Herdr close did not inspect all scoped endpoints"
+  assert_not_contains "$(cat "$log")" 'pane close' \
+    "owned Herdr close automatically closed one of multiple scoped endpoints"
+  pass "Herdr owned close refuses every same-label duplicate"
+}
+
 test_symlinked_meta_is_not_read_across_homes() {
   local home outside out
   home=$(make_fixture symlinked-meta)
@@ -734,6 +758,7 @@ test_tmux_untagged_legacy_window_is_ambiguous
 test_tmux_recorded_target_owner_mismatch_keeps_replacements
 test_tmux_moved_window_is_unknown_not_absent
 test_tmux_owned_kill_is_conditioned_inside_server_action
+test_herdr_owned_kill_refuses_same_label_duplicates
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
 test_symlinked_state_path_component_is_refused_before_enumeration

@@ -965,6 +965,10 @@ fm_backend_herdr_kill_owned() {  # <target> <workspace> <workspace-label> <tab-l
       | ($owned | length) == 1
       and ($owned[0].tab_id as $tab_id
         | [$tabs.result.tabs[]? | select(.tab_id == $tab_id and .label == $label)] | length) == 1)
+    and ([$panes.result.panes[]? as $candidate
+      | $tabs.result.tabs[]?
+      | select(.tab_id == $candidate.tab_id and .label == $label)
+      | $candidate.pane_id] == [$pane])
   ' >/dev/null 2>&1 || return 1
   fm_backend_herdr_cli "$session" pane close "$pane" >/dev/null 2>&1
 }

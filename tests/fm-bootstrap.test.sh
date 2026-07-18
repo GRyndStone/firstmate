@@ -506,7 +506,8 @@ test_standalone_mutators_validate_state_before_writes() {
   mkdir -p "$home" "$outside"
   ln -s "$outside" "$home/state"
   for script in fm-lock.sh fm-bootstrap.sh fm-config-push.sh fm-pr-check.sh \
-    fm-x-poll.sh fm-x-reply.sh fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
+    fm-merge-local.sh fm-update.sh fm-promote.sh fm-send.sh fm-x-poll.sh \
+    fm-x-reply.sh fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
     status=0
     out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/$script" 2>&1) || status=$?
     [ "$status" -ne 0 ] || fail "$script accepted a symlinked effective state root"
@@ -516,6 +517,23 @@ test_standalone_mutators_validate_state_before_writes() {
       || fail "$script wrote through a symlinked effective state root"
   done
   pass "standalone state mutators validate effective state first"
+}
+
+test_state_creation_rejects_a_raced_symlink() {
+  local home outside out status
+  home="$TMP_ROOT/state-create-race-home"
+  outside="$TMP_ROOT/state-create-race-outside"
+  mkdir -p "$home" "$outside"
+  status=0
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_STATE_INIT=skip \
+    bash -c '. "$1" || exit 1; ln -s "$2" "$STATE"; fm_prepare_effective_state_path' \
+      _ "$ROOT/bin/fm-wake-lib.sh" "$outside" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "state initialization followed a symlink inserted after admission"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "state initialization did not revalidate the created target"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "raced state initialization wrote through the foreign symlink"
+  pass "effective state creation remains no-follow across admission races"
 }
 
 test_bootstrap_rejects_symlinked_task_metadata_before_sync() {
@@ -533,6 +551,7 @@ test_bootstrap_rejects_symlinked_task_metadata_before_sync() {
   pass "bootstrap rejects symlinked task metadata before fleet mutation"
 }
 
+# shellcheck disable=SC2016 # Patterns intentionally match literal shell variables.
 test_session_lock_admission_serializes_before_owner_read() {
   local source acquire_line inspect_line write_line verify_line
   source=$(cat "$ROOT/bin/fm-lock.sh")
@@ -551,11 +570,37 @@ test_session_lock_admission_serializes_before_owner_read() {
 test_state_entrypoint_inventory_names_active_mutators() {
   local doc entry
   doc=$(cat "$ROOT/docs/configuration.md")
-  for entry in fm-config-push.sh fm-pr-check.sh fm-x-poll.sh fm-x-reply.sh \
-    fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
+  for entry in fm-config-push.sh fm-pr-check.sh fm-merge-local.sh fm-update.sh \
+    fm-promote.sh fm-send.sh fm-x-poll.sh fm-x-reply.sh fm-x-dismiss.sh \
+    fm-x-link.sh fm-x-followup.sh; do
     assert_contains "$doc" "bin/$entry" "state entry-point inventory omitted $entry"
   done
-  pass "state entry-point inventory includes config, PR, and X mutators"
+  pass "state entry-point inventory includes standalone metadata and X mutators"
+}
+
+test_config_push_rejects_redirected_secondmate_registry() {
+  local home outside out status
+  home="$TMP_ROOT/config-push-registry-parent"
+  outside="$TMP_ROOT/config-push-registry-outside"
+  mkdir -p "$home/state" "$outside"
+  printf '%s\n' '- legacy - charter (home: /foreign; scope: all; projects: p; added 2026-01-01)' \
+    > "$outside/secondmates.md"
+  ln -s "$outside" "$home/data"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "config-push followed a symlinked data parent"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "config-push did not validate the registry parent"
+
+  home="$TMP_ROOT/config-push-registry-file"
+  mkdir -p "$home/state" "$home/data"
+  ln -s "$outside/secondmates.md" "$home/data/secondmates.md"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "config-push followed a symlinked registry file"
+  assert_contains "$out" "home-scoped file is symlinked or non-regular" \
+    "config-push did not validate the registry file"
+  pass "config-push contains its registry and parent within FM_HOME"
 }
 
 test_state_mutators_reject_symlinked_task_metadata() {
@@ -578,6 +623,22 @@ test_state_mutators_reject_symlinked_task_metadata() {
   status=0
   FM_HOME="$home" "$ROOT/bin/fm-x-followup.sh" --check task-a >/dev/null 2>&1 || status=$?
   [ "$status" -ne 0 ] || fail "x-followup accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-merge-local.sh" task-a \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "merge-local accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" task-a \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "promote accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-send.sh" task-a message \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "send accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-update.sh" \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "update accepted symlinked task metadata"
   assert_contains "$(cat "$outside")" "x_request=req-foreign" \
     "state mutator changed foreign task metadata"
   pass "config, PR, and X mutators reject symlinked task metadata"
@@ -595,7 +656,9 @@ test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
 test_standalone_mutators_validate_state_before_writes
+test_state_creation_rejects_a_raced_symlink
 test_bootstrap_rejects_symlinked_task_metadata_before_sync
 test_session_lock_admission_serializes_before_owner_read
 test_state_entrypoint_inventory_names_active_mutators
+test_config_push_rejects_redirected_secondmate_registry
 test_state_mutators_reject_symlinked_task_metadata

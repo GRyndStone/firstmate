@@ -1528,6 +1528,126 @@ SH
   pass "teardown repeats duplicate auditing immediately before endpoint closure"
 }
 
+test_owned_close_refuses_duplicate_after_just_in_time_audit() {
+  local case_dir log count rc
+  case_dir=$(make_case herdr-duplicate-at-owned-close)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:w1:p2/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=herdr' 'herdr_session=default' 'herdr_workspace_id=w1' \
+    'herdr_pane_id=w1:p2' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/herdr.log"
+  count="$case_dir/tab-list-count"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace get")
+    printf '%s\n' '{"result":{"workspace":{"workspace_id":"w1","label":"firstmate"}}}'
+    ;;
+  "tab list")
+    current=0
+    [ ! -f "${FM_HERDR_COUNT:?}" ] || current=$(cat "$FM_HERDR_COUNT")
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FM_HERDR_COUNT"
+    if [ "$current" -lt 5 ]; then
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-task-x1"}]}}'
+    else
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task-x1"},{"tab_id":"w1:t2","label":"fm-task-x1"}]}}'
+    fi
+    ;;
+  "pane list")
+    if [ "$(cat "${FM_HERDR_COUNT:?}")" -lt 5 ]; then
+      printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'
+    else
+      printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"},{"pane_id":"w1:p2","tab_id":"w1:t2"}]}}'
+    fi
+    ;;
+  "pane close") exit 0 ;;
+  *) exit 99 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+
+  rc=0
+  FM_HERDR_LOG="$log" FM_HERDR_COUNT="$count" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "duplicate created at owned close"
+  assert_not_contains "$(cat "$log")" "pane close" \
+    "ownership-bound Herdr close ignored a new scoped duplicate"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "owned-close duplicate refusal removed lifecycle metadata"
+  pass "teardown owned close rechecks scoped Herdr duplicates"
+}
+
+test_herdr_secondmate_teardown_uses_meta_home_ownership() {
+  local case_dir home log closed rc
+  case_dir=$(make_case herdr-secondmate-owned-close)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    'backend=herdr' \
+    'window=default:secondw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=secondw' \
+    'herdr_pane_id=secondw:p2' \
+    "worktree=$home" \
+    "project=$home" \
+    'kind=secondmate' \
+    'mode=secondmate' \
+    "home=$home"
+  log="$case_dir/herdr.log"
+  closed="$case_dir/herdr-closed"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
+case "${1:-} ${2:-}" in
+  "workspace get")
+    if [ -e "${FM_HERDR_CLOSED:?}" ]; then
+      printf '%s\n' '{"error":{"code":"workspace_not_found"}}' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"result":{"workspace":{"workspace_id":"secondw","label":"2ndmate-task-x1"}}}'
+    ;;
+  "tab list")
+    if [ -e "${FM_HERDR_CLOSED:?}" ]; then
+      printf '%s\n' '{"result":{"tabs":[]}}'
+    else
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"secondw:t2","label":"fm-task-x1"}]}}'
+    fi
+    ;;
+  "pane list")
+    if [ -e "${FM_HERDR_CLOSED:?}" ]; then
+      printf '%s\n' '{"result":{"panes":[]}}'
+    else
+      printf '%s\n' '{"result":{"panes":[{"pane_id":"secondw:p2","tab_id":"secondw:t2"}]}}'
+    fi
+    ;;
+  "pane close")
+    : > "${FM_HERDR_CLOSED:?}"
+    ;;
+  "pane get")
+    printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
+    exit 1
+    ;;
+  *) exit 99 ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+
+  rc=0
+  FM_HERDR_LOG="$log" FM_HERDR_CLOSED="$closed" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "Herdr secondmate owned teardown"
+  assert_contains "$(cat "$log")" 'pane close secondw:p2' \
+    "Herdr secondmate teardown did not close its exact meta-owned pane"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "successful Herdr secondmate teardown retained metadata"
+  [ ! -e "$home" ] || fail "successful Herdr secondmate teardown retained its home"
+  pass "Herdr secondmate teardown derives every ownership probe from meta home"
+}
+
 test_secondmate_retirement_preflights_child_duplicates() {
   local case_dir home log rc
   case_dir=$(make_case secondmate-child-duplicate-refusal)
@@ -3462,6 +3582,8 @@ test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_herdr_duplicate_endpoints_refuse_teardown_without_closure
 test_endpoint_duplicate_created_after_preflight_blocks_close
+test_owned_close_refuses_duplicate_after_just_in_time_audit
+test_herdr_secondmate_teardown_uses_meta_home_ownership
 test_secondmate_retirement_preflights_child_duplicates
 test_secondmate_retirement_refuses_symlinked_child_metadata
 test_secondmate_child_endpoint_close_requires_confirmed_absence
