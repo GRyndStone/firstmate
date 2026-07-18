@@ -162,8 +162,16 @@ case "\${1:-}" in
     exit 0
     ;;
   display-message)
-    printf '%%1\n'
-    exit 0
+    case "\$*" in
+      *'#{session_name}'*)
+        case "\$*" in
+          *'@41'*) printf '@41\tfm-sess\tfm-task-live\t%s\n' "$identity"; exit 0 ;;
+          *) printf "can't find window\n" >&2; exit 1 ;;
+        esac
+        ;;
+      *'@41'*) printf '%%1\n'; exit 0 ;;
+      *) exit 1 ;;
+    esac
     ;;
 esac
 exit 1
@@ -489,10 +497,10 @@ EOF
     "session start probed a live Herdr endpoint after its ownership audit failed"
   assert_not_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" \
     "session start probed a dead Herdr endpoint after its ownership audit failed"
-  assert_contains "$out" "ALERT: same-home endpoint inventory could not be audited" \
-    "session start silently treated an unreadable Herdr inventory as duplicate-free"
+  assert_contains "$out" "Herdr meta lacks a consistent exact window/session/workspace/pane identity" \
+    "session start silently treated inconsistent Herdr ownership metadata as probe-safe"
 
-  pass "an unreadable Herdr ownership audit blocks later endpoint probes"
+  pass "inconsistent Herdr ownership metadata blocks later endpoint probes"
 }
 
 test_metadata_audit_precedes_fleet_projection() {
@@ -591,11 +599,10 @@ EOF
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
-  list-windows)
-    case "$*" in
-      *'#{window_id},@41}'*) printf '@41\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}" ;;
-    esac
+  display-message)
+    printf '@41\tfm-sess\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}"
     ;;
+  list-windows) ;;
   kill-window) exit 92 ;;
 esac
 exit 0
@@ -609,6 +616,57 @@ SH
   assert_not_contains "$out" "SECONDMATE_LIVENESS:" \
     "session start ran secondmate liveness cleanup with unverified ownership"
   pass "recorded endpoint ownership mismatches block automatic liveness cleanup"
+}
+
+test_bootstrap_reaudits_immediately_before_liveness_mutation() {
+  local rec root home fakebin out identity log counter
+  rec=$(new_world action-time-owner-audit)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  log="$home/tmux.log"
+  counter="$home/inventory-count"
+  printf '0\n' > "$counter"
+  fm_write_meta "$home/state/recovering.meta" \
+    'window=@41' \
+    'tmux_window_id=@41' \
+    'tmux_session=fm-sess' \
+    "tmux_home_identity=$identity" \
+    'kind=secondmate' \
+    'harness=codex'
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  display-message)
+    printf '@41\tfm-sess\tfm-recovering\t%s\n' "${FM_TMUX_OWNER:?}"
+    ;;
+  list-windows)
+    count=$(cat "${FM_TMUX_COUNTER:?}")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FM_TMUX_COUNTER"
+    if [ "$count" -eq 1 ]; then
+      printf '@41\tfm-recovering\t%s\t_\n' "$FM_TMUX_OWNER"
+    else
+      printf '@41\tfm-recovering\t%s\t_\n@42\tfm-recovering\t%s\t_\n' "$FM_TMUX_OWNER" "$FM_TMUX_OWNER"
+    fi
+    ;;
+  kill-window) exit 92 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux"
+  out=$(FM_TMUX_LOG="$log" FM_TMUX_COUNTER="$counter" FM_TMUX_OWNER="$identity" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" \
+    "SECONDMATE_LIVENESS: skipped: exact-home endpoint ownership is anomalous immediately before mutation" \
+    "bootstrap did not honor its action-adjacent endpoint re-audit"
+  assert_not_contains "$(cat "$log")" "kill-window" \
+    "bootstrap killed an endpoint after ownership changed post-lock"
+  pass "bootstrap re-audits ownership immediately before liveness mutation"
 }
 
 # --- composition: real scripts run, not reimplemented ------------------------
@@ -860,6 +918,7 @@ test_metadata_audit_precedes_fleet_projection
 test_state_validation_precedes_session_mutation
 test_endpoint_anomaly_suppresses_only_endpoint_mutation
 test_recorded_target_owner_mismatch_blocks_liveness_cleanup
+test_bootstrap_reaudits_immediately_before_liveness_mutation
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_durable_program_source_warns_beside_empty_queue

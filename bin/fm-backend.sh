@@ -701,7 +701,7 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
 fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-identity] [expected-worktree] [backend-container]
   local backend=$1 target=$2 expected_label=${3:-} backend_identity=${4:-} expected_worktree=${5:-}
-  local backend_container=${6:-} out code session pane state workspace tabs panes verdict home_identity filter count
+  local backend_container=${6:-} out code session pane state workspace workspace_label tabs panes verdict home_identity count
   : "$expected_worktree"
   if [ "$backend" = herdr ]; then
     fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
@@ -721,8 +721,10 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       esac
       return 0
     fi
-    printf '%s' "$out" | jq -e --arg workspace "$workspace" \
-      '.result.workspace.workspace_id == $workspace' >/dev/null 2>&1 \
+    workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    printf '%s' "$out" | jq -e --arg workspace "$workspace" --arg label "$workspace_label" \
+      '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 \
       || { printf 'unknown'; return 0; }
     tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>&1) \
       || { printf 'unknown'; return 0; }
@@ -776,22 +778,22 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       esac
       session=$backend_container
       [ -n "$session" ] && [ -n "$expected_label" ] || { printf 'unknown'; return 0; }
-      filter="#{==:#{window_id},$target}"
-      if out=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
+      if out=$(tmux display-message -p -t "$target" $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
         state=0
       else
         state=$?
       fi
       if [ "$state" -ne 0 ]; then
-        if printf '%s\n' "$out" | grep -Eqi "can't find session|no server running|failed to connect.*(no such file|connection refused)|no sessions"; then
+        if printf '%s\n' "$out" | grep -Eqi "can't find (window|session)|no server running|failed to connect.*(no such file|connection refused)|no sessions"; then
           printf 'absent'
         else
           printf 'unknown'
         fi
         return 0
       fi
-      if [ -n "$out" ] && ! printf '%s\n' "$out" | awk -F '\t' -v target="$target" -v label="$expected_label" -v owner="$home_identity" '
-        NF != 3 || $1 != target || $2 != label || $3 != owner { bad=1 }
+      [ -n "$out" ] || { printf 'unknown'; return 0; }
+      if ! printf '%s\n' "$out" | awk -F '\t' -v target="$target" -v session="$session" -v label="$expected_label" -v owner="$home_identity" '
+        NF != 4 || $1 != target || $2 != session || $3 != label || $4 != owner { bad=1 }
         END { exit bad ? 1 : 0 }
       '; then
         printf 'unknown'
@@ -840,7 +842,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
 }
 
 fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
-  local meta=$1 expected_label=${2:-} backend target backend_identity backend_container worktree
+  local meta=$1 expected_label=${2:-} backend target backend_identity backend_container worktree window pane
   [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
@@ -852,6 +854,13 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
       ;;
     herdr)
       backend_identity=$(fm_meta_get "$meta" herdr_workspace_id)
+      backend_container=$(fm_meta_get "$meta" herdr_session)
+      pane=$(fm_meta_get "$meta" herdr_pane_id)
+      window=$(fm_meta_get "$meta" window)
+      [ -n "$backend_identity" ] && [ -n "$backend_container" ] && [ -n "$pane" ] \
+        && [ "$window" = "$backend_container:$pane" ] \
+        && [ "$target" = "$window" ] \
+        || { printf 'unknown'; return 0; }
       ;;
     *)
       printf 'unknown'

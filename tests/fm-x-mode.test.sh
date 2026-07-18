@@ -443,7 +443,7 @@ test_bootstrap_reports_missing_x_dependency() {
   home="$TMP_ROOT/boot-missing-x"; mkdir -p "$home"
   fakebin=$(fm_fakebin "$home")
   fm_fake_exit0 "$fakebin" tmux node no-mistakes gh-axi chrome-devtools-axi lavish-axi curl
-  for tool in dirname grep tail; do
+  for tool in dirname grep tail uname; do
     tool_path=$(command -v "$tool") || fail "test host must provide $tool"
     ln -s "$tool_path" "$fakebin/$tool"
   done
@@ -606,6 +606,24 @@ SH
   assert_present "$home/state/x-watch.check.sh" "failed opt-out cleanup must leave the stale shim visible"
   assert_present "$home/config/x-mode.env" "failed opt-out cleanup must leave the stale cadence visible"
   pass "bootstrap reports failed X artifact cleanup on opt-out"
+}
+
+test_bootstrap_x_artifacts_reject_final_symlinks() {
+  local home outside out
+  home="$TMP_ROOT/boot-final-symlinks"
+  outside="$TMP_ROOT/boot-final-symlink-outside"
+  mkdir -p "$home/state" "$home/config"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$home/state/x-watch.check.sh"
+  ln -s "$outside" "$home/config/x-mode.env"
+  printf 'FMX_PAIRING_TOKEN=tok-scope\n' > "$home/.env"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim or 30s cadence" \
+    "bootstrap did not refuse unsafe X-mode publication targets"
+  [ "$(cat "$outside")" = sentinel ] || fail "bootstrap wrote through an X-mode artifact symlink"
+  assert_absent "$home/state/x-watch.check.sh" "failed X-mode activation did not safely remove the shim symlink"
+  assert_absent "$home/config/x-mode.env" "failed X-mode activation did not safely remove the cadence symlink"
+  pass "bootstrap X-mode publication and cleanup reject final symlinks"
 }
 
 test_reply_dry_run_records_not_posts() {
@@ -1932,3 +1950,4 @@ test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_inert_without_token
 test_bootstrap_opt_out_cleanup
 test_bootstrap_opt_out_reports_cleanup_failure
+test_bootstrap_x_artifacts_reject_final_symlinks

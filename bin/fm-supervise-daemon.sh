@@ -1471,7 +1471,7 @@ fm_super_main() {
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
-  local WATCHER_PID="" CUR_TMP=""
+  local WATCHER_PID="" CUR_TMP="" CUR_ERR=""
   cleanup() {
     trap - TERM INT
     wedge_alarm_stop_active_notifier
@@ -1482,6 +1482,9 @@ fm_super_main() {
     fi
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
+    fi
+    if [ -n "${CUR_ERR:-}" ]; then
+      rm -f "$CUR_ERR" 2>/dev/null || true
     fi
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
@@ -1512,11 +1515,18 @@ fm_super_main() {
 
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    fm_exec_stderr_append_no_follow "$WATCH_ERR" env \
+    CUR_ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-err.XXXXXX") || {
+      rm -f "$CUR_TMP" 2>/dev/null || true
+      CUR_TMP=""
+      log "error: stderr mktemp failed; retrying in 5s"
+      sleep 5
+      return 1
+    }
+    env \
       FM_WATCH_OWNER_KIND=daemon \
       FM_WATCH_OWNER_MODE=away-inject \
       FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
-      "$WATCH" >"$CUR_TMP" &
+      "$WATCH" >"$CUR_TMP" 2>"$CUR_ERR" &
     WATCHER_PID=$!
   }
 
@@ -1541,6 +1551,14 @@ fm_super_main() {
       if [ -n "${WATCHER_PID:-}" ]; then
         # child exited: reap + classify its wake reason
         if wait "${WATCHER_PID}"; then rc=0; else rc=$?; fi
+        if [ -n "${CUR_ERR:-}" ] && [ -s "${CUR_ERR:-}" ]; then
+          fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR" \
+            || log "warn: watcher stderr could not be appended safely"
+        fi
+        if [ -n "${CUR_ERR:-}" ]; then
+          rm -f "$CUR_ERR" 2>/dev/null || true
+        fi
+        CUR_ERR=""
         reason=""
         if [ -n "${CUR_TMP:-}" ] && [ -e "${CUR_TMP:-}" ]; then
           reason=$(<"${CUR_TMP}")

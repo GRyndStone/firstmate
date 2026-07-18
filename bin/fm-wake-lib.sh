@@ -130,26 +130,19 @@ fm_append_file_no_follow() {
   return 1
 }
 
-fm_exec_stderr_append_no_follow() {
+fm_remove_file_no_follow() {
   local destination=$1 parent
-  shift
-  [ "$#" -gt 0 ] || return 1
   parent=${destination%/*}
   [ -n "$parent" ] || parent=.
   [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
-  if [ -e "$destination" ] || [ -L "$destination" ]; then
-    [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+  if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+    return 0
   fi
-  command -v perl >/dev/null 2>&1 || return 1
-  exec perl -MFcntl -e '
-    my $path = shift @ARGV;
-    sysopen(STDERR, $path,
-      Fcntl::O_WRONLY() | Fcntl::O_APPEND() | Fcntl::O_CREAT() | Fcntl::O_NOFOLLOW(),
-      0600)
-      or die "cannot open no-follow stderr target $path: $!\n";
-    exec { $ARGV[0] } @ARGV;
-    die "cannot exec $ARGV[0]: $!\n";
-  ' "$destination" "$@"
+  if [ ! -L "$destination" ] && [ ! -f "$destination" ]; then
+    return 1
+  fi
+  rm -f -- "$destination" || return 1
+  [ ! -e "$destination" ] && [ ! -L "$destination" ]
 }
 
 if ! fm_validate_effective_state_path "$STATE" allow-missing-final; then

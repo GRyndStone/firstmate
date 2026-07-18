@@ -36,7 +36,8 @@ case "${1:-} ${2:-}" in
       printf '{"error":{"code":"workspace_not_found","message":"gone"}}\n' >&2
       exit 1
     fi
-    printf '{"result":{"workspace":{"workspace_id":"%s","label":"2ndmate-sub-a1"}}}\n' "${3:-}"
+    printf '{"result":{"workspace":{"workspace_id":"%s","label":"%s"}}}\n' \
+      "${3:-}" "${FM_HERDR_WORKSPACE_LABEL:-firstmate}"
     ;;
   "tab list")
     if [ "${FM_HERDR_PARTIAL_TAB:-0}" = 1 ]; then
@@ -45,7 +46,7 @@ case "${1:-} ${2:-}" in
     fi
     if [ "$workspace" = subw ]; then
       if [ "${FM_HERDR_RENAMED:-0}" = 1 ]; then
-        printf '{"result":{"tabs":[{"tab_id":"subw:t1","label":"fm-other-task"}]}}\n'
+        printf '{"result":{"tabs":[{"tab_id":"subw:t1","label":"fm-other-task"},{"tab_id":"subw:t2","label":"fm-dup-task"},{"tab_id":"subw:t3","label":"fm-dup-task"}]}}\n'
       elif [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
         printf '{"result":{"tabs":[{"tab_id":"subw:t1","label":"fm-dup-task"}]}}\n'
       else
@@ -65,7 +66,9 @@ case "${1:-} ${2:-}" in
       exit 0
     fi
     if [ "$workspace" = subw ]; then
-      if [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
+      if [ "${FM_HERDR_RENAMED:-0}" = 1 ]; then
+        printf '{"result":{"panes":[{"pane_id":"subw:p1","tab_id":"subw:t1"},{"pane_id":"subw:p2","tab_id":"subw:t2"},{"pane_id":"subw:p3","tab_id":"subw:t3"}]}}\n'
+      elif [ "${FM_HERDR_SINGLETON:-0}" = 1 ]; then
         printf '{"result":{"panes":[{"pane_id":"subw:p1","tab_id":"subw:t1"}]}}\n'
       else
         printf '{"result":{"panes":[{"pane_id":"subw:p1","tab_id":"subw:t1"},{"pane_id":"subw:p2","tab_id":"subw:t2"}]}}\n'
@@ -93,7 +96,8 @@ test_duplicate_is_reported_inside_owned_workspace_only() {
     'herdr_workspace_id=subw' \
     'herdr_pane_id=subw:p2' \
     'worktree=/owned/worktree'
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" "$AUDIT" --json)
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
+    FM_HERDR_WORKSPACE_LABEL=2ndmate-sub-a1 "$AUDIT" --json)
   printf '%s' "$out" | jq -e '
     . == [{
       kind:"duplicate_recovery_endpoints",
@@ -158,7 +162,7 @@ test_singleton_mismatch_is_reported() {
   pass "a singleton live endpoint differing from meta is an ownership anomaly"
 }
 
-test_herdr_recorded_target_owner_mismatch_is_unavailable() {
+test_herdr_recorded_target_owner_mismatch_keeps_replacements() {
   local home out
   home=$(make_fixture herdr-recorded-mismatch)
   fm_write_meta "$home/state/dup-task.meta" \
@@ -169,16 +173,58 @@ test_herdr_recorded_target_owner_mismatch_is_unavailable() {
     'herdr_pane_id=subw:p1' \
     'worktree=/owned/worktree'
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
-    FM_HERDR_RENAMED=1 FM_HERDR_SINGLETON=1 "$AUDIT" --json)
+    FM_HERDR_RENAMED=1 "$AUDIT" --json)
   printf '%s' "$out" | jq -e '
-    length == 1
-      and .[0].kind == "inventory_unavailable"
-      and .[0].task == "dup-task"
-      and (.[0].reason | contains("recorded Herdr pane ownership could not be confirmed"))
-  ' >/dev/null || fail "renamed Herdr target was not surfaced as unverified: $out"
+    length == 2
+      and .[0].kind == "duplicate_recovery_endpoints"
+      and .[0].live_endpoints == ["default:subw:p2","default:subw:p3"]
+      and .[1].kind == "endpoint_ownership_mismatch"
+      and .[1].live_endpoints == ["default:subw:p2","default:subw:p3"]
+      and (.[1].reason | contains("recorded Herdr pane ownership could not be confirmed"))
+  ' >/dev/null || fail "renamed Herdr target hid its scoped replacements: $out"
   assert_not_contains "$(cat "$home/herdr.log")" 'workspace list' \
     "recorded-target ownership check enumerated the shared Herdr session"
-  pass "recorded Herdr target ownership mismatches fail closed in the exact workspace"
+  pass "recorded Herdr mismatches preserve exact-workspace replacement duplicates"
+}
+
+test_herdr_workspace_label_must_match_home() {
+  local home out status
+  home=$(make_fixture workspace-owner-mismatch)
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'worktree=/owned/worktree'
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+    FM_HERDR_WORKSPACE_LABEL=foreign-home "$AUDIT" --json 2>&1) || status=$?
+  expect_code 1 "$status" "mismatched Herdr workspace home label"
+  assert_contains "$out" "invalid exact workspace response" \
+    "audit accepted a workspace that was not labeled for this home"
+  assert_not_contains "$(cat "$home/herdr.log")" 'tab list' \
+    "audit inventoried a workspace owned by another home"
+  pass "Herdr workspace inventory is bound to the home-derived label"
+}
+
+test_herdr_window_fields_must_be_consistent() {
+  local home out
+  home=$(make_fixture herdr-meta-consistency)
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=other:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'worktree=/owned/worktree'
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    length == 1 and .[0].kind == "inventory_unavailable"
+      and (.[0].reason | contains("consistent exact window/session/workspace/pane identity"))
+  ' >/dev/null || fail "inconsistent Herdr endpoint fields were accepted: $out"
+  [ ! -s "$home/herdr.log" ] || fail "inconsistent Herdr meta triggered a backend probe"
+  pass "Herdr endpoint fields must describe one exact recorded owner"
 }
 
 test_missing_owned_workspace_is_an_empty_inventory() {
@@ -255,11 +301,11 @@ test_tmux_duplicates_use_exact_recorded_session_and_task() {
 set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
+  display-message)
+    printf '@12\towned-session\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}"
+    ;;
   list-windows)
-    case "$*" in
-      *'#{window_id},@12}'*) printf '@12\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}" ;;
-      *) printf '@11\tfm-dup-task\t%s\t_\n@12\tfm-dup-task\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER" ;;
-    esac
+    printf '@11\tfm-dup-task\t%s\t_\n@12\tfm-dup-task\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
     ;;
   *) exit 8 ;;
 esac
@@ -323,7 +369,7 @@ SH
   pass "untagged legacy tmux labels are ambiguous for audit and creation"
 }
 
-test_tmux_recorded_target_owner_mismatch_is_unavailable() {
+test_tmux_recorded_target_owner_mismatch_keeps_replacements() {
   local home out identity
   home=$(make_fixture tmux-recorded-mismatch)
   identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
@@ -336,18 +382,41 @@ test_tmux_recorded_target_owner_mismatch_is_unavailable() {
   cat > "$home/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  list-windows) printf '@12\tfm-recycled-task\t%s\n' "${FM_TMUX_OWNER:?}" ;;
+  display-message) printf '@12\towned-session\tfm-recycled-task\t%s\n' "${FM_TMUX_OWNER:?}" ;;
+  list-windows) printf '@11\tfm-dup-task\t%s\t_\n@13\tfm-dup-task\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER" ;;
 esac
 SH
   chmod +x "$home/fakebin/tmux"
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_OWNER="$identity" "$AUDIT" --json)
   printf '%s' "$out" | jq -e '
-    length == 1
-      and .[0].kind == "inventory_unavailable"
-      and .[0].task == "dup-task"
-      and (.[0].reason | contains("recorded tmux window ownership could not be confirmed"))
-  ' >/dev/null || fail "recycled tmux target was not surfaced as unverified: $out"
-  pass "recorded tmux target ownership mismatches fail closed before label inventory"
+    length == 2
+      and .[0].kind == "duplicate_recovery_endpoints"
+      and .[0].live_endpoints == ["@11","@13"]
+      and .[1].kind == "endpoint_ownership_mismatch"
+      and .[1].live_endpoints == ["@11","@13"]
+      and (.[1].reason | contains("recorded tmux window ownership could not be confirmed"))
+  ' >/dev/null || fail "recycled tmux target hid its scoped replacements: $out"
+  pass "recorded tmux mismatches preserve exact-session replacement duplicates"
+}
+
+test_tmux_moved_window_is_unknown_not_absent() {
+  local home identity actual
+  home=$(make_fixture tmux-moved-window)
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = display-message ]; then
+  printf '@12\tmoved-session\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}"
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$home/fakebin/tmux"
+  actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_OWNER="$identity" \
+    bash -c '. "$1"; fm_backend_target_state tmux @12 fm-dup-task "$2" /owned/worktree owned-session' \
+      _ "$ROOT/bin/fm-backend.sh" "$identity")
+  [ "$actual" = unknown ] || fail "moved tmux window was misclassified as $actual"
+  pass "tmux container loss is unknown and cannot license a raw kill"
 }
 
 test_symlinked_meta_is_not_read_across_homes() {
@@ -559,13 +628,16 @@ test_herdr_endpoint_probe_distinguishes_absent_from_unreadable() {
 test_duplicate_is_reported_inside_owned_workspace_only
 test_inventory_failure_is_loud
 test_singleton_mismatch_is_reported
-test_herdr_recorded_target_owner_mismatch_is_unavailable
+test_herdr_recorded_target_owner_mismatch_keeps_replacements
+test_herdr_workspace_label_must_match_home
+test_herdr_window_fields_must_be_consistent
 test_missing_owned_workspace_is_an_empty_inventory
 test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
 test_tmux_duplicates_use_exact_recorded_session_and_task
 test_tmux_untagged_legacy_window_is_ambiguous
-test_tmux_recorded_target_owner_mismatch_is_unavailable
+test_tmux_recorded_target_owner_mismatch_keeps_replacements
+test_tmux_moved_window_is_unknown_not_absent
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
 test_symlinked_state_path_component_is_refused_before_enumeration

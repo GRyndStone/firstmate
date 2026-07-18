@@ -498,6 +498,25 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_standalone_mutators_validate_state_before_writes() {
+  local case_dir home outside out status script
+  case_dir="$TMP_ROOT/state-scope-mutators"
+  home="$case_dir/home"
+  outside="$case_dir/outside"
+  mkdir -p "$home" "$outside"
+  ln -s "$outside" "$home/state"
+  for script in fm-lock.sh fm-bootstrap.sh; do
+    status=0
+    out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/$script" 2>&1) || status=$?
+    [ "$status" -ne 0 ] || fail "$script accepted a symlinked effective state root"
+    assert_contains "$out" "symlinked effective state path component refused" \
+      "$script did not use centralized state admission"
+    [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+      || fail "$script wrote through a symlinked effective state root"
+  done
+  pass "standalone lock and bootstrap mutation validate effective state first"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -509,3 +528,4 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
+test_standalone_mutators_validate_state_before_writes

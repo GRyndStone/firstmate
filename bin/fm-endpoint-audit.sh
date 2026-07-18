@@ -103,6 +103,38 @@ append_anomaly() {
     >> "$ROWS"
 }
 
+append_recorded_mismatch() {
+  local backend=$1 meta=$2 live_json=$3 reason=$4 id worktree recorded
+  id=$(basename "$meta" .meta)
+  worktree=$(fm_meta_get "$meta" worktree)
+  recorded=$(fm_backend_target_of_meta "$meta")
+  jq -n \
+    --arg backend "$backend" \
+    --arg task "$id" \
+    --arg worktree "$worktree" \
+    --arg recorded "$recorded" \
+    --arg reason "$reason" \
+    --argjson live "$live_json" \
+    '{kind:"endpoint_ownership_mismatch",backend:$backend,task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:$live,reason:$reason,action:"inspect; do not auto-close"}' \
+    >> "$ROWS"
+}
+
+append_duplicate_anomaly() {
+  local backend=$1 meta=$2 live_json=$3 recorded=$4 count id worktree
+  count=$(printf '%s' "$live_json" | jq 'length') || return 1
+  [ "$count" -gt 1 ] || return 0
+  id=$(basename "$meta" .meta)
+  worktree=$(fm_meta_get "$meta" worktree)
+  jq -n \
+    --arg backend "$backend" \
+    --arg task "$id" \
+    --arg worktree "$worktree" \
+    --arg recorded "$recorded" \
+    --argjson live "$live_json" \
+    '{kind:"duplicate_recovery_endpoints",backend:$backend,task:$task,worktree:$worktree,recorded_endpoint:$recorded,live_endpoints:$live,action:"inspect; do not auto-close"}' \
+    >> "$ROWS"
+}
+
 append_inventory_unavailable() {
   local backend=$1 meta=$2 reason=$3 id worktree recorded
   id=$(basename "$meta" .meta)
@@ -148,20 +180,11 @@ for meta in "$STATE"/*.meta; do
   pane=$(fm_meta_get "$meta" herdr_pane_id)
   workspace=$(fm_meta_get "$meta" herdr_workspace_id)
   target=$(fm_backend_target_of_meta "$meta")
-  if [ -z "$session" ]; then
-    session=${target%%:*}
-  fi
-  if [ -z "$pane" ]; then
-    pane=${target#*:}
-  fi
-  if [ -z "$workspace" ]; then
-    case "$pane" in
-      *:*) workspace=${pane%%:*} ;;
-    esac
-  fi
-  if [ -z "$session" ] || [ -z "$workspace" ]; then
-    echo "fm-endpoint-audit: Herdr meta $meta lacks an exact session/workspace target" >&2
-    exit 1
+  window=$(fm_meta_get "$meta" window)
+  if [ -z "$session" ] || [ -z "$workspace" ] || [ -z "$pane" ] \
+     || [ "$window" != "$session:$pane" ] || [ "$target" != "$window" ]; then
+    append_inventory_unavailable herdr "$meta" "Herdr meta lacks a consistent exact window/session/workspace/pane identity"
+    continue
   fi
   printf '%s\t%s\n' "$session" "$workspace" >> "$TARGETS"
 done
@@ -181,8 +204,9 @@ while IFS=$'\t' read -r session workspace; do
     echo "fm-endpoint-audit: cannot read Herdr workspace $session:$workspace" >&2
     exit 1
   fi
-  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" \
-    '.result.workspace.workspace_id == $workspace' >/dev/null 2>&1 || {
+  expected_workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) || exit 1
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg label "$expected_workspace_label" \
+    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 || {
     echo "fm-endpoint-audit: invalid exact workspace response for $session:$workspace" >&2
     exit 1
   }
@@ -247,14 +271,24 @@ for meta in "$STATE"/*.meta; do
   id=$(basename "$meta" .meta)
   label="fm-$id"
   recorded=$(fm_backend_target_of_meta "$meta")
-  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
-  if [ "$recorded_state" = unknown ]; then
-    append_inventory_unavailable herdr "$meta" "recorded Herdr pane ownership could not be confirmed from its exact workspace"
+  session=$(fm_meta_get "$meta" herdr_session)
+  pane=$(fm_meta_get "$meta" herdr_pane_id)
+  workspace=$(fm_meta_get "$meta" herdr_workspace_id)
+  window=$(fm_meta_get "$meta" window)
+  if [ -z "$session" ] || [ -z "$workspace" ] || [ -z "$pane" ] \
+     || [ "$window" != "$session:$pane" ] || [ "$recorded" != "$window" ]; then
     continue
   fi
   live_json=$(awk -F '\t' -v label="$label" '$2 == label { print $1 }' "$LIVE" \
     | LC_ALL=C sort -u \
     | jq -R -s '[splits("\\n") | select(length > 0)]') || exit 1
+  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
+  if [ "$recorded_state" = unknown ]; then
+    append_recorded_mismatch herdr "$meta" "$live_json" \
+      "recorded Herdr pane ownership could not be confirmed from its exact workspace"
+    append_duplicate_anomaly herdr "$meta" "$live_json" "$recorded" || exit 1
+    continue
+  fi
   append_anomaly herdr "$meta" "$live_json" "$recorded" || exit 1
 done
 
@@ -291,11 +325,6 @@ audit_tmux_meta() {
       ;;
     *) append_inventory_unavailable tmux "$meta" "tmux meta has an invalid exact window identity"; return ;;
   esac
-  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
-  if [ "$recorded_state" = unknown ]; then
-    append_inventory_unavailable tmux "$meta" "recorded tmux window ownership could not be confirmed from its exact session and window id"
-    return
-  fi
   if ! command -v tmux >/dev/null 2>&1; then
     echo "fm-endpoint-audit: tmux not found" >&2
     return 1
@@ -322,6 +351,13 @@ audit_tmux_meta() {
   fi
   live_json=$(printf '%s\n' "$inventory" | awk -F '\t' -v owner="$identity" 'NF == 4 && $3 == owner { print $1 }' \
     | jq -R -s '[splits("\\n") | select(length > 0)] | unique | sort') || return 1
+  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
+  if [ "$recorded_state" = unknown ]; then
+    append_recorded_mismatch tmux "$meta" "$live_json" \
+      "recorded tmux window ownership could not be confirmed from its exact id, session, task label, and home identity"
+    append_duplicate_anomaly tmux "$meta" "$live_json" "$recorded" || return 1
+    return
+  fi
   append_anomaly tmux "$meta" "$live_json" "$recorded"
 }
 
@@ -349,7 +385,7 @@ for meta in "$STATE"/*.meta; do
 done
 
 if [ -s "$ROWS" ]; then
-  RESULT=$(jq -s 'sort_by(.task,.worktree,.recorded_endpoint)' "$ROWS") || exit 1
+  RESULT=$(jq -s 'sort_by(.task,.worktree,.recorded_endpoint,.kind)' "$ROWS") || exit 1
 else
   RESULT='[]'
 fi

@@ -155,34 +155,6 @@ pi_extension_loaded() {
   [ "$marker_version" = "$expected_version" ] && [ "$marker_pid" = "$lock_pid" ]
 }
 
-ENDPOINT_AUDIT_OK=1
-STATE_PROJECTION_SAFE=1
-STATE_METADATA_SAFE=1
-ENDPOINT_MUTATION_SAFE=1
-ENDPOINT_AUDIT_JSON=$(FM_ROOT_OVERRIDE="$FM_ROOT" \
-  FM_HOME="$FM_HOME" \
-  FM_STATE_OVERRIDE="$STATE" \
-  "$SCRIPT_DIR/fm-endpoint-audit.sh" --json 2>&1) || ENDPOINT_AUDIT_OK=0
-if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
-  if [ "$ENDPOINT_AUDIT_JSON" = '[]' ]; then
-    ENDPOINT_AUDIT_OUT='endpoint-audit: no same-home endpoint ownership anomalies found'
-  else
-    ENDPOINT_MUTATION_SAFE=0
-    ENDPOINT_AUDIT_OUT=$(printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -r \
-      '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
-  fi
-  if printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -e \
-    'any(.[]; .backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))' \
-    >/dev/null; then
-    STATE_PROJECTION_SAFE=0
-    STATE_METADATA_SAFE=0
-  fi
-else
-  ENDPOINT_AUDIT_OUT=$ENDPOINT_AUDIT_JSON
-  STATE_PROJECTION_SAFE=0
-  ENDPOINT_MUTATION_SAFE=0
-fi
-
 section "SESSION START - $FM_HOME"
 
 # --- 1. lock -----------------------------------------------------------
@@ -205,6 +177,37 @@ if [ "$LOCK_RC" -ne 0 ]; then
     printf '●  otherwise mutate fleet state from this session.\n'
     printf '%s\n' "$BAR"
   }
+fi
+
+ENDPOINT_AUDIT_OK=1
+STATE_PROJECTION_SAFE=1
+STATE_METADATA_SAFE=1
+ENDPOINT_MUTATION_SAFE=1
+ENDPOINT_AUDIT_JSON=$(FM_ROOT_OVERRIDE="$FM_ROOT" \
+  FM_HOME="$FM_HOME" \
+  FM_STATE_OVERRIDE="$STATE" \
+  "$SCRIPT_DIR/fm-endpoint-audit.sh" --json 2>&1) || ENDPOINT_AUDIT_OK=0
+if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
+  if [ "$ENDPOINT_AUDIT_JSON" = '[]' ]; then
+    ENDPOINT_AUDIT_OUT='endpoint-audit: no same-home endpoint ownership anomalies found'
+  else
+    ENDPOINT_MUTATION_SAFE=0
+    ENDPOINT_AUDIT_OUT=$(printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -r \
+      '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
+  fi
+  if printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -e \
+    'any(.[];
+      (.backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))
+      or (.backend == "herdr" and ((.reason // "") | contains("meta lacks a consistent exact")))
+    )' \
+    >/dev/null; then
+    STATE_PROJECTION_SAFE=0
+    STATE_METADATA_SAFE=0
+  fi
+else
+  ENDPOINT_AUDIT_OUT=$ENDPOINT_AUDIT_JSON
+  STATE_PROJECTION_SAFE=0
+  ENDPOINT_MUTATION_SAFE=0
 fi
 
 # --- 2. bootstrap --------------------------------------------------------

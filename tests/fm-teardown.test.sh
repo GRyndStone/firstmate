@@ -97,6 +97,10 @@ SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  display-message)
+    printf "can't find window: %s\n" "${4:-unknown}" >&2
+    exit 1
+    ;;
   list-windows)
     case "$*" in
       *' -f '*) ;;
@@ -1413,7 +1417,7 @@ test_herdr_teardown_clears_escalation_marker() {
     printf '%s\n' '{"error":{"code":"pane_not_found","message":"gone"}}'
     exit 1
   elif [ "${1:-} ${2:-}" = "workspace get" ]; then
-    printf '%s\n' '{"result":{"workspace":{"workspace_id":"wG"}}}'
+    printf '%s\n' '{"result":{"workspace":{"workspace_id":"wG","label":"firstmate"}}}'
   elif [ "${1:-} ${2:-}" = "tab list" ]; then
     printf '%s\n' '{"result":{"tabs":[]}}'
   elif [ "${1:-} ${2:-}" = "pane list" ]; then
@@ -1551,7 +1555,7 @@ test_secondmate_retirement_preflights_child_duplicates() {
 set -u
 printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
 case "${1:-} ${2:-}" in
-  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"child"}}}\n' "${3:-}" ;;
+  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"2ndmate-task-x1"}}}\n' "${3:-}" ;;
   "tab list") printf '%s\n' '{"result":{"tabs":[{"tab_id":"childw:t1","label":"fm-child-a1"},{"tab_id":"childw:t2","label":"fm-child-a1"}]}}' ;;
   "pane list") printf '%s\n' '{"result":{"panes":[{"pane_id":"childw:p1","tab_id":"childw:t1"},{"pane_id":"childw:p2","tab_id":"childw:t2"}]}}' ;;
   *) exit 99 ;;
@@ -1614,7 +1618,7 @@ test_secondmate_child_endpoint_close_requires_confirmed_absence() {
 set -u
 printf '%s\n' "$*" >> "${FM_HERDR_LOG:?}"
 case "${1:-} ${2:-}" in
-  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"child"}}}\n' "${3:-}" ;;
+  "workspace get") printf '{"result":{"workspace":{"workspace_id":"%s","label":"2ndmate-task-x1"}}}\n' "${3:-}" ;;
   "tab list") printf '%s\n' '{"result":{"tabs":[{"tab_id":"childw:t2","label":"fm-child-a1"}]}}' ;;
   "pane list") printf '%s\n' '{"result":{"panes":[{"pane_id":"childw:p2","tab_id":"childw:t2"}]}}' ;;
   "pane get") printf '%s\n' '{"result":{"pane":{"pane_id":"childw:p2","tab_id":"childw:t2"}}}' ;;
@@ -1660,6 +1664,7 @@ test_tmux_duplicate_endpoints_refuse_teardown_without_closure() {
 set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
+  display-message) printf '@42\tfirstmate\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
   list-windows)
     case "$*" in
       *'#{window_id},@42}'*) ;;
@@ -1854,6 +1859,7 @@ SH
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
+  display-message) printf '@42\tfirstmate\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" ;;
   list-windows)
     case "$*" in
       *'#{@firstmate_home}'$'\t_'*) printf '@42\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" ;;
@@ -1914,12 +1920,12 @@ SH
   rc=0
   FM_TMUX_OWNER="$identity" run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "unknown endpoint inventory"
-  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly: kind=inventory_unavailable" \
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly: kind=endpoint_ownership_mismatch" \
     "unreadable endpoint inventory was treated as confirmed absence"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "unknown endpoint state removed lifecycle metadata"
   [ -d "$case_dir/wt" ] || fail "unknown endpoint state removed worktree"
   assert_absent "$case_dir/state/task-x1.teardown-complete" "unknown endpoint state emitted a completion proof"
-  pass "unknown endpoint inventory fails closed and preserves retryable lifecycle state"
+  pass "unknown recorded ownership fails closed with scoped replacements visible"
 }
 
 test_completion_proof_write_failure_preserves_lifecycle() {
@@ -2352,11 +2358,11 @@ test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${FM_TMUX_STATE:?}" in
-  present) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
-  absent) exit 0 ;;
-  mismatch-name) printf '@42\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
-  mismatch-owner) printf '@42\tfm-task-x1\tother-home\n'; exit 0 ;;
-  duplicate) printf '@42\tfm-task-x1\t%s\n@43\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"; exit 0 ;;
+  present) printf '@42\towned-session\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
+  absent) echo "can't find window: @42" >&2; exit 1 ;;
+  mismatch-name) printf '@42\towned-session\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
+  mismatch-owner) printf '@42\towned-session\tfm-task-x1\tother-home\n'; exit 0 ;;
+  duplicate) printf '@42\towned-session\tfm-task-x1\t%s\n@43\towned-session\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"; exit 0 ;;
   no-server) echo 'no server running on /tmp/tmux-test/default' >&2; exit 1 ;;
   unknown) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
 esac
@@ -2996,7 +3002,7 @@ SH
     FM_TMUX_OWNER="$identity" \
     run_teardown "$case_dir" >/dev/null 2>"$case_dir/retry-stderr" || rc=$?
   expect_code 1 "$rc" "reappeared endpoint retry"
-  assert_contains "$(cat "$case_dir/retry-stderr")" 'no longer has confirmed endpoint and cleanup absence' \
+  assert_contains "$(cat "$case_dir/retry-stderr")" 'same-home endpoint ownership anomaly: kind=endpoint_ownership_mismatch' \
     "post-cleanup retry ignored a reappeared endpoint"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "reappeared endpoint removed lifecycle metadata"
   pass "post-cleanup phases re-confirm endpoint absence"
