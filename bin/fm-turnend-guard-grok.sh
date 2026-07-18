@@ -75,7 +75,7 @@ release_preparation() {
 }
 
 acquire_preparation() {
-  local attempt old_record old_pid old_identity
+  local attempt old_record old_pid old_identity old_state current_identity
   attempt=0
   while [ "$attempt" -lt 250 ]; do
     if mkdir "$PREPARE_LOCK" 2>/dev/null; then
@@ -85,6 +85,10 @@ acquire_preparation() {
       fi
       rmdir "$PREPARE_LOCK" 2>/dev/null || true
       return 1
+    fi
+    if [ ! -e "$PREPARE_LOCK" ] && [ ! -L "$PREPARE_LOCK" ]; then
+      attempt=$((attempt + 1))
+      continue
     fi
     [ -d "$PREPARE_LOCK" ] && [ ! -L "$PREPARE_LOCK" ] || return 1
     if [ ! -e "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ]; then
@@ -96,8 +100,17 @@ acquire_preparation() {
     old_record=$(cat "$PREPARE_OWNER" 2>/dev/null || true)
     old_pid=$(printf '%s\n' "$old_record" | sed -n '1p')
     old_identity=$(printf '%s\n' "$old_record" | sed '1d')
-    if ! fm_pid_alive "$old_pid" \
-      || [ "$(fm_pid_identity "$old_pid" 2>/dev/null || true)" != "$old_identity" ]; then
+    old_state=$(fm_pid_state "$old_pid")
+    current_identity=
+    if [ "$old_state" = alive ]; then
+      current_identity=$(fm_pid_identity "$old_pid" 2>/dev/null || true)
+    fi
+    if [ "$old_state" = dead ] \
+      || { [ "$old_state" = alive ] && [ -n "$current_identity" ] && [ "$current_identity" != "$old_identity" ]; }; then
+      if [ ! -e "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ]; then
+        attempt=$((attempt + 1))
+        continue
+      fi
       [ -f "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ] || return 1
       [ "$(cat "$PREPARE_OWNER" 2>/dev/null || true)" = "$old_record" ] || continue
       rm -f "$PREPARE_OWNER" 2>/dev/null || true
@@ -136,7 +149,7 @@ delivery_owner_alive() {
 }
 
 wait_for_delivery_owner_release() {
-  local attempt record owner_pid owner_identity
+  local attempt record owner_pid owner_identity owner_state current_identity
   attempt=0
   while [ "$attempt" -lt 100 ]; do
     [ -e "$PENDING.delivery" ] || return 0
@@ -150,8 +163,13 @@ wait_for_delivery_owner_release() {
         owner_identity=$(printf '%s\n' "$record" | sed '1d')
         ;;
     esac
-    if ! fm_pid_alive "$owner_pid" \
-      || [ "$(fm_pid_identity "$owner_pid" 2>/dev/null || true)" != "$owner_identity" ]; then
+    owner_state=$(fm_pid_state "$owner_pid")
+    current_identity=
+    if [ "$owner_state" = alive ]; then
+      current_identity=$(fm_pid_identity "$owner_pid" 2>/dev/null || true)
+    fi
+    if [ "$owner_state" = dead ] \
+      || { [ "$owner_state" = alive ] && [ -n "$current_identity" ] && [ "$current_identity" != "$owner_identity" ]; }; then
       [ "$(cat "$PENDING.delivery" 2>/dev/null || true)" = "$record" ] || continue
       rm -f "$PENDING.delivery" || return 1
       return 0
@@ -180,8 +198,11 @@ fi
   fi
 }
 delivery_owner_alive && exit 0
-wait_for_delivery_owner_release || exit 1
-TMP=$(mktemp "$HANDOFF_DIR/.grok-$KEY.XXXXXX.tmp") || exit 1
+if ! wait_for_delivery_owner_release; then
+  delivery_owner_alive && exit 0
+  exit 1
+fi
+TMP=$(mktemp "$HANDOFF_DIR/.grok-$KEY.tmp.XXXXXX") || exit 1
 TOKEN=$(basename "$TMP")
 {
   printf '%s\n' "$TOKEN"
