@@ -163,6 +163,7 @@ case "\${1:-}" in
     ;;
   display-message)
     case "\$*" in
+      *'@41'*'#{pane_current_command}'*) printf 'codex\n'; exit 0 ;;
       *'#{session_name}'*)
         case "\$*" in
           *'@41'*) printf '@41\tfm-sess\tfm-task-live\t%s\n' "$identity"; exit 0 ;;
@@ -561,27 +562,33 @@ EOF
 }
 
 test_endpoint_anomaly_suppresses_only_endpoint_mutation() {
-  local rec root home fakebin out
+  local rec root home fakebin out identity
   rec=$(new_world endpoint-anomaly-detect-only)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  make_fake_tmux "$fakebin" "$identity"
   printf 'backend=zellij\nwindow=fm-anomalous\nkind=secondmate\nharness=codex\n' > "$home/state/anomalous.meta"
+  printf 'window=@41\ntmux_window_id=@41\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=secondmate\nharness=codex\n' \
+    "$identity" > "$home/state/task-live.meta"
   printf 'stale\n' > "$home/state/x-watch.check.sh"
   printf 'stale\n' > "$home/config/x-mode.env"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" "ALERT endpoint-ownership: kind=inventory_unavailable task=anomalous" \
     "session start did not surface the endpoint ownership anomaly"
-  assert_not_contains "$out" "SECONDMATE_LIVENESS:" \
-    "session start ran automatic endpoint mutation after an ownership anomaly"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate anomalous: skipped: exact endpoint ownership is unavailable or anomalous" \
+    "session start did not isolate the anomalous secondmate"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate task-live: already-live" \
+    "one endpoint anomaly suppressed a safe secondmate liveness probe"
   assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
     "session start suppressed unrelated bootstrap mutation after an endpoint anomaly"
   assert_absent "$home/state/x-watch.check.sh" "endpoint anomaly suppressed X-mode cleanup"
   assert_absent "$home/config/x-mode.env" "endpoint anomaly suppressed cadence cleanup"
-  pass "endpoint anomalies suppress liveness mutation without disabling bootstrap"
+  pass "endpoint anomalies suppress only their own liveness mutation"
 }
 
 test_recorded_target_owner_mismatch_blocks_liveness_cleanup() {
@@ -619,8 +626,9 @@ SH
     "session start did not surface the recorded-target ownership mismatch"
   assert_not_contains "$(cat "$log")" "kill-window" \
     "session start automatically closed a recorded target with mismatched ownership"
-  assert_not_contains "$out" "SECONDMATE_LIVENESS:" \
-    "session start ran secondmate liveness cleanup with unverified ownership"
+  assert_contains "$out" \
+    "SECONDMATE_LIVENESS: secondmate recycled: skipped: exact endpoint ownership is unavailable or anomalous" \
+    "session start did not isolate the unverified secondmate endpoint"
   pass "recorded endpoint ownership mismatches block automatic liveness cleanup"
 }
 
@@ -668,7 +676,7 @@ SH
   out=$(FM_TMUX_LOG="$log" FM_TMUX_COUNTER="$counter" FM_TMUX_OWNER="$identity" \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" \
-    "SECONDMATE_LIVENESS: skipped: exact-home endpoint ownership is anomalous immediately before mutation" \
+    "SECONDMATE_LIVENESS: secondmate recovering: skipped: exact endpoint ownership is unavailable or anomalous" \
     "bootstrap did not honor its action-adjacent endpoint re-audit"
   assert_not_contains "$(cat "$log")" "kill-window" \
     "bootstrap killed an endpoint after ownership changed post-lock"

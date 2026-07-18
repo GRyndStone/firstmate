@@ -117,6 +117,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
 # shellcheck source=bin/fm-backend-hometag-lib.sh
 . "$FM_BACKEND_ZELLIJ_ROOT/bin/fm-backend-hometag-lib.sh"
+# shellcheck source=bin/fm-composer-lib.sh
+. "$FM_BACKEND_ZELLIJ_ROOT/bin/fm-composer-lib.sh"
 
 # Verified minimum: report.md recommends "likely Zellij 0.44 or newer" for
 # returned pane/tab IDs and dump-screen --pane-id; empirically verified
@@ -344,6 +346,7 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   esac
   pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
   if [ -z "$pane_id" ]; then
+    fm_backend_zellij_cli "$session" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
     echo "error: could not find a terminal pane for zellij tab $tab_id (session '$session')" >&2
     return 1
   fi
@@ -518,6 +521,33 @@ fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
   done
+}
+
+FM_BACKEND_ZELLIJ_COMPOSER_LINES=${FM_BACKEND_ZELLIJ_COMPOSER_LINES:-20}
+FM_BACKEND_ZELLIJ_IDLE_RE=${FM_BACKEND_ZELLIJ_IDLE_RE:-'^Type a message\.\.\.$'}
+
+fm_backend_zellij_composer_state() {  # <target> [expected-label] -> empty|pending|unknown
+  local target=$1 expected_label=${2:-} cap line trimmed stripped="" found=0
+  cap=$(fm_backend_zellij_capture "$target" "$FM_BACKEND_ZELLIJ_COMPOSER_LINES" "$expected_label") \
+    || { printf 'unknown'; return 0; }
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [ -n "$trimmed" ] || continue
+    case "$trimmed" in
+      '│'*'│'|'┃'*'┃'|'|'*'|') : ;;
+      *) continue ;;
+    esac
+    stripped=$trimmed
+    found=1
+  done < <(printf '%s\n' "$cap")
+  [ "$found" -eq 1 ] || { printf 'unknown'; return 0; }
+  stripped=${stripped//│/}
+  stripped=${stripped//┃/}
+  stripped=${stripped//|/}
+  stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+  stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  fm_composer_classify_content 1 "$stripped" "$FM_BACKEND_ZELLIJ_IDLE_RE"
 }
 
 # fm_backend_zellij_kill: remove the task's tab, best-effort (mirrors

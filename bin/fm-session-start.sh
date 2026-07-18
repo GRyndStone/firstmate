@@ -179,6 +179,10 @@ if [ "$LOCK_RC" -ne 0 ]; then
   }
 fi
 
+if [ "$READ_ONLY" -eq 0 ]; then
+  fm_backend_adopt_legacy_tmux_state "$STATE" >/dev/null 2>&1 || true
+fi
+
 ENDPOINT_AUDIT_OK=1
 STATE_PROJECTION_SAFE=1
 STATE_METADATA_SAFE=1
@@ -191,7 +195,6 @@ if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
   if [ "$ENDPOINT_AUDIT_JSON" = '[]' ]; then
     ENDPOINT_AUDIT_OUT='endpoint-audit: no same-home endpoint ownership anomalies found'
   else
-    ENDPOINT_MUTATION_SAFE=0
     ENDPOINT_AUDIT_OUT=$(printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -r \
       '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
   fi

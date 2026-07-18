@@ -284,15 +284,6 @@ secondmate_liveness_sweep() {
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
   local meta id window harness backend target verdict out ownership audit
-  audit=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-endpoint-audit.sh" --json 2>&1) || {
-    echo "SECONDMATE_LIVENESS: skipped: exact-home endpoint audit failed immediately before mutation"
-    return 0
-  }
-  if [ "$audit" != '[]' ]; then
-    echo "SECONDMATE_LIVENESS: skipped: exact-home endpoint ownership is anomalous immediately before mutation"
-    return 0
-  fi
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
@@ -303,6 +294,12 @@ secondmate_liveness_sweep() {
     backend=$(fm_backend_of_meta "$meta")
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
+    audit=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$id" 2>&1) || audit=unavailable
+    if [ "$audit" != '[]' ]; then
+      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: exact endpoint ownership is unavailable or anomalous"
+      continue
+    fi
     ownership=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
     case "$ownership" in
       present) verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown" ;;

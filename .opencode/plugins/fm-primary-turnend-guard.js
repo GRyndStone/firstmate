@@ -460,8 +460,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
     try {
       durable = persistFlight(root, handoff);
     } catch {
-      if (!readFlight(root, sessionID)) scheduleDelivery(sessionID);
-      else cancelRetryOwner(sessionID);
+      scheduleDelivery(sessionID);
       return;
     }
     const flight = {
@@ -535,8 +534,14 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       }
       return;
     }
-    if (readFlight(root, sessionID) || pathExists(handoffPaths.flight)) {
-      cancelRetryOwner(sessionID);
+    const durableFlight = readFlight(root, sessionID);
+    if (durableFlight) {
+      if (clearFlight(root, sessionID, durableFlight.record)) scheduleDelivery(sessionID, 0);
+      else scheduleDelivery(sessionID);
+      return;
+    }
+    if (pathExists(handoffPaths.flight)) {
+      scheduleDelivery(sessionID);
       return;
     }
     const handoff = ensureHandoff(sessionID);
@@ -569,7 +574,7 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
       }
       for (const sessionID of sessionIDs) {
         if (readAcknowledged(root, sessionID)) scheduleDelivery(sessionID, 0);
-        else if (!readFlight(root, sessionID) && readHandoff(root, sessionID)) scheduleDelivery(sessionID, 0);
+        else if (readHandoff(root, sessionID)) scheduleDelivery(sessionID, 0);
       }
     } catch {
     }

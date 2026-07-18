@@ -409,10 +409,10 @@ task_json_lines() {
         *) endpoint_exists=null ;;
       esac
     fi
-    if [ "$endpoint_state" = present ]; then
+    if [ -n "$target" ]; then
       current_json=$(crew_state_json "$id")
     else
-      current_json=$(jq -n --arg detail "exact-home endpoint ownership is $endpoint_state" \
+      current_json=$(jq -n --arg detail "task has no recorded endpoint target" \
         '{state:"unknown",source:"endpoint",detail:$detail,raw:""}')
     fi
     event_json=$(status_event_json "$status_log")

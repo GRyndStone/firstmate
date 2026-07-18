@@ -1821,6 +1821,42 @@ test_inject_msg_herdr_submits_through_backend_dispatch() {
   pass "inject_msg: dispatches busy-guard/composer-guard/submit through the herdr backend and succeeds on a confirmed empty composer"
 }
 
+test_away_injection_supports_every_runtime_backend() {
+  local dir state backend target out
+  dir=$(make_supercase inject-all-backends)
+  state="$dir/state"
+  afk_enter "$state"
+  for backend in zellij orca cmux; do
+    target="exact-$backend-target"
+    out=$(
+      fm_backend_target_exists() { [ "$1" = "$backend" ] && [ "$2" = "$target" ]; }
+      fm_backend_busy_state() { printf 'idle'; }
+      fm_backend_capture() { printf 'idle agent pane\n'; }
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() {
+        [ "$1" = "$backend" ] && [ "$2" = "$target" ] || return 1
+        printf 'empty'
+      }
+      FM_SUPERVISOR_BACKEND="$backend" FM_SUPERVISOR_TARGET="$target" \
+        inject_msg "backend $backend" "$state"
+    ) || fail "away injection failed through $backend"
+    [ -z "$out" ] || fail "away injection through $backend printed unexpected output: $out"
+    [ "$(canonical_supervisor_target "$backend" "$target")" = "$target" ] \
+      || fail "$backend supervisor target was not retained as an exact backend identity"
+  done
+  for backend in tmux herdr zellij orca cmux; do
+    fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$backend" \
+      || fail "away supervisor omitted supported runtime backend $backend"
+  done
+  fm_backend_source zellij || fail "could not load zellij composer classifier"
+  out=$(
+    fm_backend_zellij_capture() { printf '│ > │\n'; }
+    fm_backend_zellij_composer_state exact-zellij-target
+  )
+  [ "$out" = empty ] || fail "zellij agent composer was not safely classifiable: $out"
+  pass "away-mode injection covers every supported runtime backend"
+}
+
 # Safety-critical (task fm-composer-shellglyph-safety): the away-mode injector
 # must NEVER type an escalation into a dead-shell pane. A bare shell prompt
 # classifies `unknown` (not `pending`), and inject_msg now defers on anything
@@ -1946,4 +1982,5 @@ test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
+test_away_injection_supports_every_runtime_backend
 test_inject_msg_defers_on_dead_shell_unknown

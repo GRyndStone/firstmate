@@ -222,6 +222,4 @@ while [ "$attempt" -lt 100 ]; do
   sleep 0.02
   attempt=$((attempt + 1))
 done
-kill -TERM "$WORKER_PID" 2>/dev/null || true
-wait "$WORKER_PID" 2>/dev/null || true
 exit 1

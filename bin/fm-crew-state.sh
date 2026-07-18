@@ -405,7 +405,7 @@ nm_runs_record_for_branch() {  # <branch>
 
 recovery_context() {
   local line verb note token prefix id="" kind=""
-  [ -f "$LOG" ] || return 1
+  [ -f "$LOG" ] && [ ! -L "$LOG" ] || return 1
   while IFS= read -r line; do
     [ -n "$(trim "$line")" ] || continue
     verb=$(status_line_verb "$line")
@@ -619,7 +619,7 @@ if [ "$HAVE_RUN" = 1 ]; then
       elif [ "$CI_STEP_STATUS" = fixing ]; then
         CI_LOG_STATE=not-ready
       fi
-      if [ "$CI_LOG_STATE" != not-ready ] && [ "$CI_LOG_STATE" != zero-check ]; then
+      if [ "$CI_LOG_STATE" = green ]; then
         emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
       fi
     fi

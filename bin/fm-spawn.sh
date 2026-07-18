@@ -622,8 +622,9 @@ validate_firstmate_operational_dirs() {
 }
 
 if [ "$KIND" = secondmate ]; then
-  if [ -z "$FIRSTMATE_HOME" ] && [ -f "$STATE/$ID.meta" ]; then
-    FIRSTMATE_HOME=$(grep '^home=' "$STATE/$ID.meta" | cut -d= -f2- || true)
+  if [ -z "$FIRSTMATE_HOME" ] && { [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; }; then
+    fm_validate_task_meta_file "$STATE/$ID.meta" || exit 1
+    FIRSTMATE_HOME=$(fm_meta_get "$STATE/$ID.meta" home)
   fi
   if [ -z "$FIRSTMATE_HOME" ]; then
     FIRSTMATE_HOME=$(secondmate_registry_value "$ID" home || true)
@@ -776,6 +777,17 @@ spawn_backend_container() {
   esac
 }
 
+spawn_endpoint_identity_complete() {
+  case "$BACKEND" in
+    tmux) [ -n "${WID:-}" ] && [ "${T:-}" = "$WID" ] ;;
+    herdr) [ -n "${HERDR_TAB_ID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${T:-}" ] ;;
+    zellij) [ -n "${ZELLIJ_TAB_ID:-}" ] && [ -n "${ZELLIJ_PANE_ID:-}" ] && [ -n "${T:-}" ] ;;
+    orca) [ -n "${ORCA_WORKTREE_ID:-}" ] && [ -n "${ORCA_TERMINAL:-}" ] && [ -n "${T:-}" ] ;;
+    cmux) [ -n "${CMUX_WORKSPACE_ID:-}" ] && [ -n "${CMUX_SURFACE_ID:-}" ] && [ -n "${T:-}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 update_spawn_marker_endpoint() {
   local expected_worktree=$1 identity container marker_tmp
   spawn_marker_is_owned || return 1
@@ -863,7 +875,14 @@ rollback_failed_spawn() {
   identity=$(spawn_backend_identity)
   container=$(spawn_backend_container)
   expected_worktree=${WT:-$PROJ_ABS}
-  [ -n "$target" ] && [ -n "$identity" ] && [ -n "$container" ] || return 0
+  if ! spawn_endpoint_identity_complete \
+     || [ -z "$target" ] || [ -z "$identity" ] || [ -z "$container" ]; then
+    backlog_lock="$STATE/.backlog.lock"
+    fm_lock_acquire_wait "$backlog_lock"
+    remove_owned_spawn_marker || true
+    fm_lock_release "$backlog_lock"
+    return 0
+  fi
   if [ "$SPAWN_WORKTREE_REQUESTED" -eq 1 ]; then
     while [ "$attempt" -lt 20 ]; do
       observed=$(spawn_current_path "${WT_TARGET:-$target}" 2>/dev/null || true)
@@ -876,7 +895,6 @@ rollback_failed_spawn() {
       sleep 0.1
       attempt=$((attempt + 1))
     done
-    return 0
   fi
   if [ -n "${WT:-}" ] && [ "$(real_path_or_raw "$WT")" != "$PROJ_ABS_REAL" ]; then
     update_spawn_marker_endpoint "$WT" || return 0
@@ -912,15 +930,15 @@ rollback_failed_spawn() {
 backlog_allows_spawn_task() {
   local backlog="$DATA/backlog.md"
   [ ! -L "$backlog" ] || return 1
-  [ -f "$backlog" ] || return 0
+  [ -f "$backlog" ] || return 1
   awk -v id="$ID" '
     /^## / { section = $0; next }
     index($0, "- [ ] " id " - ") == 1 || index($0, "- [x] " id " - ") == 1 {
-      found = 1
+      found++
       if (section == "## In flight" && index($0, "- [ ] " id " - ") == 1)
-        in_flight = 1
+        in_flight++
     }
-    END { exit (in_flight || !found) ? 0 : 1 }
+    END { exit (found == 1 && in_flight == 1) ? 0 : 1 }
   ' "$backlog"
 }
 

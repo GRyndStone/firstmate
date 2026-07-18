@@ -151,6 +151,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 fm_lock_acquire_wait "$TEARDOWN_LOCK"
 TEARDOWN_LOCKED=1
+fm_backend_adopt_legacy_tmux_meta "$META" "fm-$ID" >/dev/null 2>&1 || true
 COMPLETION_PROOF="$STATE/$ID.teardown-complete"
 TEARDOWN_STAGE="$STATE/$ID.teardown-stage"
 AUX_OWNERS="$STATE/$ID.teardown-owners"
@@ -835,7 +836,7 @@ expected_backlog_mutation_cksum() {
 
 write_backlog_mutation_intent() {
   local action=$1 pre_cksum=$2 post_cksum=$3 tmp
-  tmp="$BACKLOG_MUTATION_INTENT.tmp.$$"
+  tmp=$(mktemp "$STATE/.$ID.backlog-mutation-intent.tmp.XXXXXXXX") || return 1
   if ! {
     printf 'version=1\n'
     printf 'task=%s\n' "$ID"
@@ -846,7 +847,7 @@ write_backlog_mutation_intent() {
     rm -f "$tmp"
     return 1
   fi
-  if [ -L "$BACKLOG_MUTATION_INTENT" ] || ! mv "$tmp" "$BACKLOG_MUTATION_INTENT"; then
+  if ! fm_publish_file_no_follow "$tmp" "$BACKLOG_MUTATION_INTENT" replace; then
     rm -f "$tmp"
     return 1
   fi
@@ -914,7 +915,7 @@ write_completion_proof() {
     delivered-report|delivered-local|delivered-pr|delivered-default) ;;
     *) return 0 ;;
   esac
-  tmp="$COMPLETION_PROOF.tmp.$$"
+  tmp=$(mktemp "$STATE/.$ID.teardown-complete.tmp.XXXXXXXX") || return 1
   if ! {
     printf 'version=2\n'
     printf 'task=%s\n' "$ID"
@@ -930,7 +931,7 @@ write_completion_proof() {
     rm -f "$tmp"
     return 1
   fi
-  if ! mv "$tmp" "$COMPLETION_PROOF"; then
+  if ! fm_publish_file_no_follow "$tmp" "$COMPLETION_PROOF" exclusive; then
     rm -f "$tmp"
     return 1
   fi
@@ -1074,7 +1075,7 @@ child_meta_is_regular() {
 
 prepare_auxiliary_owners() {
   local tmp index
-  tmp="$AUX_OWNERS.tmp.$$"
+  tmp=$(mktemp "$STATE/.$ID.teardown-owners.tmp.XXXXXXXX") || return 1
   : > "$tmp" || return 1
   if [ "$KIND" = secondmate ] && [ "$FORCE" = --force ]; then
     collect_child_auxiliary_owners "$HOME_PATH" "$tmp" || {
@@ -1089,7 +1090,7 @@ prepare_auxiliary_owners() {
       return 1
     }
   fi
-  if [ -L "$AUX_OWNERS" ] || ! mv "$tmp" "$AUX_OWNERS"; then
+  if ! fm_publish_file_no_follow "$tmp" "$AUX_OWNERS" replace; then
     rm -f "$tmp"
     return 1
   fi
@@ -1198,7 +1199,7 @@ remove_teardown_owner_marker() {
 
 write_teardown_stage() {
   local phase=$1 owner_identity=$2 tmp
-  tmp="$TEARDOWN_STAGE.tmp.$$"
+  tmp=$(mktemp "$STATE/.$ID.teardown-stage.tmp.XXXXXXXX") || return 1
   if ! {
     printf 'version=4\n'
     printf 'task=%s\n' "$ID"
@@ -1216,7 +1217,7 @@ write_teardown_stage() {
     rm -f "$tmp"
     return 1
   fi
-  if [ -L "$TEARDOWN_STAGE" ] || ! mv "$tmp" "$TEARDOWN_STAGE"; then
+  if ! fm_publish_file_no_follow "$tmp" "$TEARDOWN_STAGE" replace; then
     rm -f "$tmp"
     return 1
   fi
@@ -2083,6 +2084,40 @@ remove_firstmate_home() {
   safe_rm_rf "$abs_home_path" "$label" "$post_cleanup_check"
 }
 
+validate_firstmate_home_lifecycle_accounting() {
+  local home=$1 sub_state suffix artifact child_id child_meta owner
+  sub_state="$home/state"
+  if [ -e "$sub_state" ] || [ -L "$sub_state" ]; then
+    [ -d "$sub_state" ] && [ ! -L "$sub_state" ] || {
+      echo "REFUSED: secondmate state is symlinked or non-directory: $sub_state" >&2
+      return 1
+    }
+  else
+    return 0
+  fi
+  for suffix in spawning tearing-down teardown-stage teardown-final-cleanup backlog-mutation-intent teardown-owners; do
+    for artifact in "$sub_state"/*.$suffix; do
+      [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+      child_id=$(basename "$artifact" ".$suffix")
+      child_meta="$sub_state/$child_id.meta"
+      if [ ! -f "$child_meta" ] || [ -L "$child_meta" ]; then
+        echo "REFUSED: secondmate home has unaccounted child lifecycle authority: $artifact" >&2
+        return 1
+      fi
+    done
+  done
+  for owner in "$sub_state"/.*.teardown.lock "$sub_state"/.*.teardown.lock.owner.*; do
+    [ -e "$owner" ] || [ -L "$owner" ] || continue
+    echo "REFUSED: secondmate home has unresolved child teardown authority: $owner" >&2
+    return 1
+  done
+  for owner in "$sub_state/.backlog-mutation-owner" "$sub_state"/.backlog-receipts.claimed.*; do
+    [ -e "$owner" ] || [ -L "$owner" ] || continue
+    echo "REFUSED: secondmate home has unresolved backlog mutation authority: $owner" >&2
+    return 1
+  done
+}
+
 validate_firstmate_home_children_removal() {
   local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
   sub_state="$home/state"
@@ -2099,6 +2134,7 @@ validate_firstmate_home_children_removal() {
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
+      validate_firstmate_home_lifecycle_accounting "$child_home" || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
@@ -2300,7 +2336,11 @@ cleanup_firstmate_home_children() {
 
 remove_secondmate_registry_entry() {
   local id=$1 tmp line count=0 registered_home registered_abs expected_abs
-  [ -f "$SECONDMATE_REG" ] || return 0
+  if [ -e "$SECONDMATE_REG" ] || [ -L "$SECONDMATE_REG" ]; then
+    [ -f "$SECONDMATE_REG" ] && [ ! -L "$SECONDMATE_REG" ] || return 1
+  else
+    return 0
+  fi
   expected_abs=$(removal_target_abs_path "$HOME_PATH") || return 1
   while IFS= read -r line; do
     case "$line" in
@@ -2320,9 +2360,10 @@ remove_secondmate_registry_entry() {
     return 1
   }
   [ "$count" -eq 1 ] || return 0
-  tmp="$SECONDMATE_REG.tmp.$$"
+  [ -d "$DATA" ] && [ ! -L "$DATA" ] || return 1
+  tmp=$(mktemp "$DATA/.secondmates.md.tmp.XXXXXXXX") || return 1
   grep -vE "^- $id( |$)" "$SECONDMATE_REG" > "$tmp" || true
-  if ! mv "$tmp" "$SECONDMATE_REG"; then
+  if ! fm_publish_file_no_follow "$tmp" "$SECONDMATE_REG" replace; then
     rm -f "$tmp"
     return 1
   fi
@@ -2332,6 +2373,7 @@ remove_secondmate_registry_entry() {
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
+  validate_firstmate_home_lifecycle_accounting "$HOME_PATH" || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
     audit_firstmate_home_children_endpoints "$HOME_PATH" || exit 1

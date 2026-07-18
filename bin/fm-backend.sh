@@ -356,6 +356,76 @@ fm_backend_target_of_meta() {  # <meta-file>
   [ -n "$window" ] && printf '%s' "$window"
 }
 
+fm_backend_adopt_legacy_tmux_meta() {  # <meta-file> <expected-label>
+  local meta=$1 expected_label=$2 window session identity inventory wid owner confirmed before after parent tmp
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  [ "$(fm_backend_of_meta "$meta")" = tmux ] || return 0
+  if [ -n "$(fm_meta_get "$meta" tmux_home_identity)" ] \
+     && [ -n "$(fm_meta_get "$meta" tmux_session)" ] \
+     && [ -n "$(fm_meta_get "$meta" tmux_window_id)" ]; then
+    return 0
+  fi
+  [ -z "$(fm_meta_get "$meta" tmux_home_identity)" ] \
+    && [ -z "$(fm_meta_get "$meta" tmux_session)" ] \
+    && [ -z "$(fm_meta_get "$meta" tmux_window_id)" ] || return 1
+  window=$(fm_meta_get "$meta" window)
+  case "$window" in
+    *:*) session=${window%%:*} ;;
+    *) return 1 ;;
+  esac
+  [ -n "$session" ] && [ "$window" = "$session:$expected_label" ] || return 1
+  identity=$(fm_backend_home_identity) || return 1
+  fm_backend_source tmux >/dev/null 2>&1 || return 1
+  before=$(cksum "$meta" 2>/dev/null) || return 1
+  inventory=$(tmux list-windows -t "=$session" -f "#{==:#{window_name},$expected_label}" \
+    -F $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  printf '%s\n' "$inventory" | awk -F '\t' -v session="$session" -v label="$expected_label" -v identity="$identity" '
+    NF != 5 || $1 !~ /^@[0-9]+$/ || $2 != session || $3 != label || ($4 != "" && $4 != identity) || $5 != "_" { bad=1 }
+    { rows++ }
+    END { exit (bad || rows != 1) ? 1 : 0 }
+  ' || return 1
+  wid=$(printf '%s\n' "$inventory" | awk -F '\t' 'NR == 1 { print $1 }')
+  owner=$(printf '%s\n' "$inventory" | awk -F '\t' 'NR == 1 { print $4 }')
+  if [ -z "$owner" ]; then
+    tmux set-window-option -t "$wid" @firstmate_home "$identity" >/dev/null 2>&1 || return 1
+  fi
+  confirmed=$(tmux display-message -p -t "$wid" \
+    $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  printf '%s\n' "$confirmed" | awk -F '\t' -v wid="$wid" -v session="$session" -v label="$expected_label" -v identity="$identity" '
+    NR != 1 || NF != 5 || $1 != wid || $2 != session || $3 != label || $4 != identity || $5 != "_" { bad=1 }
+    END { exit bad ? 1 : 0 }
+  ' || return 1
+  after=$(cksum "$meta" 2>/dev/null) || return 1
+  [ "$before" = "$after" ] || return 1
+  declare -F fm_publish_file_no_follow >/dev/null 2>&1 || return 1
+  parent=${meta%/*}
+  tmp=$(mktemp "$parent/.legacy-tmux-meta.tmp.XXXXXXXX") || return 1
+  if ! awk -F= '$1 != "window" && $1 != "tmux_home_identity" && $1 != "tmux_session" && $1 != "tmux_window_id" { print }' "$meta" > "$tmp" \
+     || ! {
+       printf 'window=%s\n' "$wid"
+       printf 'tmux_home_identity=%s\n' "$identity"
+       printf 'tmux_session=%s\n' "$session"
+       printf 'tmux_window_id=%s\n' "$wid"
+     } >> "$tmp" \
+     || ! fm_publish_file_no_follow "$tmp" "$meta" replace; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+fm_backend_adopt_legacy_tmux_state() {  # <state-dir>
+  local state=$1 meta id status=0
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  for meta in "$state"/*.meta; do
+    [ -e "$meta" ] || [ -L "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    [ "$(fm_backend_of_meta "$meta")" = tmux ] || continue
+    id=$(basename "$meta" .meta)
+    fm_backend_adopt_legacy_tmux_meta "$meta" "fm-$id" || status=1
+  done
+  return "$status"
+}
+
 fm_backend_meta_for_window() {  # <target> <state-dir>
   local target=$1 state=$2 meta window terminal
   for meta in "$state"/*.meta; do
@@ -620,12 +690,7 @@ fm_backend_busy_state() {  # <backend> <target>
 # caller other than the send path (the away-mode daemon's supervisor-pane
 # pending-input guard, bin/fm-supervise-daemon.sh) can ask the same question
 # without duplicating per-backend composer-reading logic. tmux and herdr both
-# expose a named classifier already (fm_tmux_composer_state,
-# fm_backend_herdr_composer_state), as do orca and cmux
-# (fm_backend_orca_composer_state, fm_backend_cmux_composer_state); zellij's
-# submit path uses an internal content-diff approach with no separately named
-# classifier, so it reports unknown here - callers fall back to their own
-# policy, exactly as an unknown fm_backend_busy_state already does.
+# expose a named classifier already.
 fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   local backend=$1
   shift
@@ -633,6 +698,7 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   case "$backend" in
     tmux) fm_tmux_composer_state "$@" ;;
     herdr) fm_backend_herdr_composer_state "$@" ;;
+    zellij) fm_backend_zellij_composer_state "$@" ;;
     orca) fm_backend_orca_composer_state "$@" ;;
     cmux) fm_backend_cmux_composer_state "$@" ;;
     *) printf 'unknown' ;;

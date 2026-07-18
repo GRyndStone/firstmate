@@ -22,7 +22,7 @@ SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
-target="" format="" task=""
+target="" format="" task="" owner=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-t" ]; then target=$arg; fi
@@ -33,6 +33,7 @@ for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
   [ -f "$m" ] && [ ! -L "$m" ] || continue
   [ "$(sed -n 's/^window=//p' "$m" | tail -1)" = "$target" ] || continue
   task=$(basename "$m" .meta)
+  owner=$(sed -n 's/^tmux_home_identity=//p' "$m" | tail -1)
   break
 done
 case "${1:-}" in
@@ -53,6 +54,7 @@ case "${1:-}" in
     ;;
   display-message)
     case "$*" in
+      *'#{session_name}'*) printf '%s\tfirstmate\tfm-%s\t%s\n' "$target" "$task" "$owner" ;;
       *pane_current_command*)
         case "$task" in
           dead-secondmate) printf 'zsh\n' ;;
@@ -858,17 +860,18 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
-test_unknown_endpoint_ownership_skips_current_state_probe() {
+test_unknown_endpoint_ownership_still_reads_recorded_target() {
   local home fakebin log out
   home=$(make_home unknown-endpoint-probe)
   fakebin=$(make_fakebin "$home")
   log="$home/zellij.log"
+  mkdir "$home/worktree"
   fm_write_meta "$home/state/zellij-task.meta" \
     'backend=zellij' \
     'window=fm:42' \
     'zellij_session=fm' \
     'zellij_tab_id=7' \
-    'worktree=/owned/worktree' \
+    "worktree=$home/worktree" \
     'kind=ship'
   cat > "$fakebin/zellij" <<'SH'
 #!/usr/bin/env bash
@@ -881,10 +884,10 @@ SH
     .tasks[] | select(.id == "zellij-task")
     | .endpoint.exists == null
       and .current_state.state == "unknown"
-      and .current_state.source == "endpoint"
+      and .current_state.source == "none"
   ' >/dev/null || fail "unknown endpoint ownership did not produce an unknown current state: $out"
-  assert_absent "$log" "snapshot ran a shared Zellij probe without confirmed exact-home ownership"
-  pass "snapshot skips current-state backend probes when exact-home ownership is unknown"
+  assert_present "$log" "snapshot skipped the exact recorded Zellij target read"
+  pass "snapshot reads exact recorded targets without licensing endpoint mutation"
 }
 
 test_empty_fleet_json
@@ -896,7 +899,7 @@ test_secondmate_open_decision_survives_live_endpoint
 test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
-test_unknown_endpoint_ownership_skips_current_state_probe
+test_unknown_endpoint_ownership_still_reads_recorded_target
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot

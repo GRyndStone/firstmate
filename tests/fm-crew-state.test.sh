@@ -126,7 +126,7 @@ SH
 make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
   local dir=$1 tb="$1/notimeoutbin" tool real
   mkdir -p "$tb"
-  for tool in bash git grep sed head cut tail dirname perl; do
+  for tool in bash git grep sed head cut tail dirname perl uname; do
     real=$(command -v "$tool" || true)
     [ -n "$real" ] || fail "missing tool for no-timeout path: $tool"
     ln -s "$real" "$tb/$tool"
@@ -490,12 +490,13 @@ test_ci_ready_done_log_beats_monitoring_run() {
   fm_write_meta "$d/state/feat-ci.meta" "window=fm:fm-feat-ci" "worktree=$d/wt" "kind=ship"
   printf 'done: PR https://github.com/o/r/pull/2 checks green\n' > "$d/state/feat-ci.status"
   FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-ci)"
+  FM_FAKE_CI_LOGS="all CI checks passed - still monitoring until merged or closed"
   local out; out=$(run_crew_state "$d" feat-ci)
   assert_contains "$out" "state: done" "ci-ready status log -> done"
-  assert_contains "$out" "source: status-log" "ci-ready state comes from the status log"
+  assert_contains "$out" "source: run-step" "current green run remains the authoritative source"
   assert_contains "$out" "checks green" "ci-ready detail preserves the report"
   assert_not_contains "$out" "state: working" "ci-ready is not hidden by monitoring run"
-  pass "ci-ready status log beats monitoring run"
+  pass "ci-ready status agrees with current green monitoring evidence"
 }
 
 # Regression for the PR #252 incident: the crew's own status log never got a
@@ -948,6 +949,56 @@ EOF
   assert_contains "$out" "source: run-step" "relapsed ci run remains run-step sourced"
   assert_not_contains "$out" "state: done" "relapsed ci run with stale done log must not read as done"
   pass "stale checks-green status log does not mask CI relapse"
+}
+
+test_stale_done_requires_positive_green_ci_evidence() {
+  local d out
+  reset_fakes
+  d=$(new_case stale-done-empty-ci)
+  make_repo_on_branch "$d/wt" fm/feat-stale-done-empty
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-stale-done-empty.meta" "window=fm:fm-feat-stale-done-empty" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\n' > "$d/state/feat-stale-done-empty.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-stale-done-empty)"
+  FM_FAKE_CI_LOGS=""
+  out=$(run_crew_state "$d" feat-stale-done-empty)
+  assert_contains "$out" "state: working" "empty CI evidence promoted a stale done event"
+  assert_not_contains "$out" "state: done" "empty CI evidence was treated as green"
+
+  reset_fakes
+  d=$(new_case stale-done-unknown-ci)
+  make_repo_on_branch "$d/wt" fm/feat-stale-done-unknown
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-stale-done-unknown.meta" "window=fm:fm-feat-stale-done-unknown" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/3 checks green\n' > "$d/state/feat-stale-done-unknown.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-stale-done-unknown)"
+  FM_FAKE_CI_LOGS="provider returned an unclassified response"
+  out=$(run_crew_state "$d" feat-stale-done-unknown)
+  assert_contains "$out" "state: working" "unknown CI evidence promoted a stale done event"
+  assert_not_contains "$out" "state: done" "unknown CI evidence was treated as green"
+  pass "stale done events require current positively green CI evidence"
+}
+
+test_recovery_context_refuses_symlinked_status_log() {
+  local d outside out
+  reset_fakes
+  d=$(new_case recovery-status-symlink)
+  make_repo_on_branch "$d/wt" fm/feat-recovery-status-symlink
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-recovery-status-symlink.meta" \
+    "window=fm:fm-feat-recovery-status-symlink" "worktree=$d/wt" "kind=ship"
+  outside="$d/foreign.status"
+  printf 'working: after-run=01RUN injected foreign recovery evidence\n' > "$outside"
+  ln -s "$outside" "$d/state/feat-recovery-status-symlink.status"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-recovery-status-symlink)"
+  FM_FAKE_AXI_STATUS_RUN="$(run_failed fm/feat-recovery-status-symlink)"
+  FM_FAKE_RUNS_LIST="failed  fm/feat-recovery-status-symlink abc1234  2026-07-02 22:05"
+  FM_FAKE_BUSY=1
+  out=$(run_crew_state "$d" feat-recovery-status-symlink)
+  assert_contains "$out" "state: failed" "symlinked recovery status overrode the current terminal run"
+  assert_contains "$out" "source: run-step" "symlinked recovery status changed current-state precedence"
+  assert_not_contains "$out" "exact-run recovery" "foreign recovery evidence was consumed"
+  pass "recovery context never follows symlinked status logs"
 }
 
 test_ci_fixing_after_green_stays_working() {
@@ -1507,6 +1558,8 @@ test_ci_monitoring_no_checks_yet_stays_working
 test_ci_monitoring_still_waiting_stays_working
 test_ci_monitoring_green_then_new_issue_stays_working
 test_ci_ready_done_log_relapse_stays_working
+test_stale_done_requires_positive_green_ci_evidence
+test_recovery_context_refuses_symlinked_status_log
 test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working

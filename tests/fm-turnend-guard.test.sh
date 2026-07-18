@@ -114,6 +114,7 @@ make_primary_dir() {
   git -C "$dir" commit -q --allow-empty -m init
   : > "$dir/AGENTS.md"
   install_guard_scripts "$dir"
+  printf '%s\n' "$$" > "$dir/state/.lock"
   printf '%s\n' "$dir"
 }
 
@@ -398,11 +399,35 @@ test_hook_blocks_from_fm_home_state() {
   dir=$(make_primary_dir "$TMP_ROOT/hook-fm-home")
   home="$TMP_ROOT/hook-fm-home-op"
   mkdir -p "$home/state"
+  printf '%s\n' "$$" > "$home/state/.lock"
   : > "$home/state/task1.meta"
   out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
   expect_code 2 "$status" "hook must inspect the active FM_HOME state dir"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: blocks from active FM_HOME state, not only repo-root state"
+}
+
+test_hook_never_mutates_another_session_checkpoint() {
+  local dir orphan_pid orphan_identity holder_pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-readonly-checkpoint")
+  : > "$dir/state/task1.meta"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(FM_HOME="$dir" bash -c '. "$1"; fm_pid_birth_identity "$2"' _ \
+    "$dir/bin/fm-wake-lib.sh" "$orphan_pid") || fail "could not identify checkpoint fixture"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$dir/state/.watch-checkpoint-orphan"
+  sleep 30 &
+  holder_pid=$!
+  printf '%s\n' "$holder_pid" > "$dir/state/.lock"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "read-only turn-end guard"
+  [ -z "$out" ] || fail "read-only turn-end guard produced output: $out"
+  assert_present "$dir/state/.watch-checkpoint-orphan" \
+    "read-only turn-end guard consumed the lock owner's checkpoint authority"
+  kill -0 "$orphan_pid" 2>/dev/null || fail "read-only turn-end guard killed the lock owner's checkpoint"
+  kill "$orphan_pid" "$holder_pid" 2>/dev/null || true
+  wait "$orphan_pid" "$holder_pid" 2>/dev/null || true
+  pass "turn-end checkpoint reconciliation requires current session-lock ownership"
 }
 
 test_hook_x_mode_reason_sources_cadence() {
@@ -436,6 +461,7 @@ test_hook_uses_state_override() {
   home="$TMP_ROOT/hook-state-override-home"
   state="$TMP_ROOT/hook-state-override-active"
   mkdir -p "$home/state" "$state"
+  printf '%s\n' "$$" > "$state/.lock"
   : > "$state/task1.meta"
   out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" FM_STATE_OVERRIDE="$state" bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
   expect_code 2 "$status" "hook must let FM_STATE_OVERRIDE win over FM_HOME/state"
@@ -976,6 +1002,31 @@ SH
   [ -n "$(find "$dir/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null)" ] \
     || fail "Grok readiness failure discarded the durable handoff"
   pass "fm-turnend-guard-grok: worker launch requires a token-bound readiness acknowledgement"
+}
+
+test_grok_unready_worker_retains_delivery_ownership() {
+  local dir fakebin out status completed i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-unready-worker")
+  : > "$dir/state/task1.meta"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-unready-worker-fakebin")
+  completed="$dir/completed"
+  cat > "$dir/bin/fm-turnend-guard-grok-deliver.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 3
+printf 'completed\n' > "$2/completed"
+rm -f "$1"
+SH
+  chmod +x "$dir/bin/fm-turnend-guard-grok-deliver.sh"
+  status=0
+  out=$(printf '{"sessionId":"unready-owner","hookEventName":"stop"}' \
+    | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "Grok adapter accepted a worker without readiness acknowledgement"
+  for i in $(seq 1 100); do
+    [ ! -e "$completed" ] || break
+    sleep 0.05
+  done
+  assert_present "$completed" "Grok hook killed the only durable delivery owner after readiness timeout"
+  pass "Grok readiness timeout preserves the live delivery owner"
 }
 
 test_grok_worker_signal_reaps_delivery_children() {
@@ -2102,7 +2153,7 @@ EOF
   pass ".opencode primary plugin: acknowledged owner persists until cleanup is confirmed"
 }
 
-test_opencode_unresolved_flight_is_durably_quarantined() {
+test_opencode_unresolved_flight_is_recovered_by_retry_owner() {
   local plugin repo home out status
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
   repo="$TMP_ROOT/opencode-flight-quarantine-root"
@@ -2138,17 +2189,16 @@ writeFileSync(`${pending}.flight`, `${JSON.stringify({
 let prompts = 0;
 const client = { session: { promptAsync: async () => { prompts += 1; } } };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
-const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
-await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
-await new Promise((resolve) => setTimeout(resolve, 40));
-if (prompts !== 0) throw new Error("startup redelivered an unresolved cross-process flight");
-if (!existsSync(`${pending}.flight`)) throw new Error("unresolved flight lost its durable quarantine marker");
+await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+for (let i = 0; i < 50 && existsSync(pending); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (prompts !== 1) throw new Error(`startup recovery delivered ${prompts} continuations`);
+if (existsSync(pending) || existsSync(`${pending}.flight`)) throw new Error("recovered flight retained durable ownership");
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode unresolved delivery flights must remain quarantined across process handoff"
-  [ -z "$out" ] || fail "OpenCode flight-quarantine test printed output: $out"
-  pass ".opencode primary plugin: unresolved cross-process flights are generation-bound and never redelivered"
+  expect_code 0 "$status" "OpenCode unresolved delivery flight recovery"
+  [ -z "$out" ] || fail "OpenCode flight-recovery test printed output: $out"
+  pass ".opencode primary plugin: unresolved flights retain a live retry owner"
 }
 
 test_opencode_durable_acknowledgement_only_retries_cleanup() {
@@ -3138,6 +3188,7 @@ test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_reconciles_exact_checkpoint_orphan_before_guarding
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
+test_hook_never_mutates_another_session_checkpoint
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
@@ -3163,6 +3214,7 @@ test_grok_handoff_preparation_failure_is_nonzero
 test_grok_preparation_owner_never_follows_symlink
 test_grok_missing_session_is_loud_unsupported_exception
 test_grok_worker_launch_requires_token_readiness
+test_grok_unready_worker_retains_delivery_ownership
 test_grok_worker_signal_reaps_delivery_children
 test_grok_worker_quarantines_legacy_continue_handoff
 test_grok_acknowledged_cleanup_never_redelivers
@@ -3190,7 +3242,7 @@ test_opencode_crewmate_does_not_recover_primary_handoff
 test_opencode_readonly_session_does_not_recover_owner_handoff
 test_opencode_persistence_failure_retains_retry_owner
 test_opencode_cleanup_failure_retains_acknowledged_owner
-test_opencode_unresolved_flight_is_durably_quarantined
+test_opencode_unresolved_flight_is_recovered_by_retry_owner
 test_opencode_durable_acknowledgement_only_retries_cleanup
 test_opencode_unknown_lock_probe_retains_in_process_retry
 test_opencode_recovered_generation_does_not_cover_new_process_idle

@@ -451,6 +451,26 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_secondmate_recovery_refuses_symlinked_metadata() {
+  local rec id sm outside out status
+  id=profile-secondmate-meta-symlink-z17
+  rec=$(make_spawn_case profile-secondmate-meta-symlink codex "$id")
+  read_case_record "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  outside="$CASE_DIR/foreign.meta"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'home=%s\n' "$sm" > "$outside"
+  ln -s "$outside" "$HOME_DIR/state/$id.meta"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" --secondmate) || status=$?
+  expect_code 1 "$status" "secondmate recovery from symlinked metadata"
+  assert_contains "$out" "task metadata is symlinked or non-regular" \
+    "secondmate recovery parsed a symlinked metadata home"
+  assert_present "$outside" "secondmate recovery removed foreign metadata"
+  assert_absent "$CASE_DIR/endpoint.log" "secondmate recovery created an endpoint from foreign metadata"
+  pass "secondmate recovery rejects symlinked metadata before reading home ownership"
+}
+
 test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint() {
   local rec id out status claim endpoint_log
   id=profile-receipt-z19
@@ -538,6 +558,28 @@ test_spawn_lifecycle_claim_covers_endpoint_creation() {
   assert_absent "$endpoint_log" "spawn created an endpoint after backlog completion won the lock"
   assert_absent "$HOME_DIR/state/$id.spawning" "Done-first refusal retained spawn ownership"
 
+  id=profile-missing-backlog-z22a
+  rec=$(make_spawn_case profile-missing-backlog claude "$id")
+  read_case_record "$rec"
+  rm -f "$HOME_DIR/data/backlog.md"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn without durable backlog accounting"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn accepted a missing durable backlog program"
+  assert_absent "$HOME_DIR/state/$id.spawning" "missing backlog refusal retained spawn ownership"
+
+  id=profile-duplicate-backlog-z22aa
+  rec=$(make_spawn_case profile-duplicate-backlog claude "$id")
+  read_case_record "$rec"
+  printf -- '- [ ] %s - duplicate task\n' "$id" >> "$HOME_DIR/data/backlog.md"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with duplicate backlog accounting"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn accepted duplicate durable backlog records"
+  assert_absent "$HOME_DIR/state/$id.spawning" "duplicate backlog refusal retained spawn ownership"
+
   id=profile-final-cleanup-z22b
   rec=$(make_spawn_case profile-final-cleanup claude "$id")
   read_case_record "$rec"
@@ -558,9 +600,11 @@ test_spawn_lifecycle_claim_covers_endpoint_creation() {
   out=$(FM_FAKE_ENDPOINT_FAIL=1 \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
   expect_code 1 "$status" "endpoint creation failure"
-  assert_present "$HOME_DIR/state/$id.spawning" \
-    "endpoint failure without an exact returned identity erased lifecycle ownership"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "clean endpoint creation failure retained unrecoverable lifecycle ownership"
   assert_absent "$HOME_DIR/state/$id.meta" "failed endpoint creation published lifecycle metadata"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  assert_contains "$out" "spawned $id" "clean endpoint failure could not be retried"
 
   id=profile-endpoint-unknown-z24
   rec=$(make_spawn_case profile-endpoint-unknown claude "$id")
@@ -569,8 +613,8 @@ test_spawn_lifecycle_claim_covers_endpoint_creation() {
   out=$(FM_FAKE_ENDPOINT_FAIL=1 FM_FAKE_INVENTORY_UNKNOWN=1 \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
   expect_code 1 "$status" "endpoint creation failure with unknown rollback state"
-  assert_present "$HOME_DIR/state/$id.spawning" \
-    "unknown endpoint rollback erased the lifecycle claim and could authorize Done"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "failed endpoint command retained lifecycle ownership without an endpoint identity"
   assert_absent "$HOME_DIR/state/$id.meta" "unknown endpoint rollback published lifecycle metadata"
 
   id=profile-worktree-recovery-z25
@@ -653,6 +697,7 @@ test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_secondmate_recovery_refuses_symlinked_metadata
 test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint
 test_spawn_lifecycle_claim_covers_endpoint_creation
 test_spawn_waits_for_durable_backlog_mutation_owner

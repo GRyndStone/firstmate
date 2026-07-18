@@ -299,6 +299,45 @@ test_state_final_symlinks_are_never_written() {
   pass "watcher and wake drain reject symlinked durable state targets"
 }
 
+test_lock_cleanup_never_follows_foreign_owner_links() {
+  local dir state lock outside
+  dir=$(make_case foreign-lock-owner)
+  state="$dir/state"
+  lock="$state/.foreign.lock"
+  outside="$dir/foreign-owner"
+  mkdir "$outside"
+  printf 'sentinel-pid\n' > "$outside/pid"
+  printf 'sentinel-home\n' > "$outside/fm-home"
+  ln -s "$outside" "$lock"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_lock_remove_path "$2"' \
+    _ "$ROOT/bin/fm-wake-lib.sh" "$lock" || fail "foreign lock link removal failed"
+  assert_absent "$lock" "foreign lock symlink was retained"
+  [ "$(cat "$outside/pid")" = sentinel-pid ] || fail "lock cleanup removed a foreign pid marker"
+  [ "$(cat "$outside/fm-home")" = sentinel-home ] || fail "lock cleanup removed a foreign home marker"
+  pass "lock cleanup rejects owner directories outside its exact sibling namespace"
+}
+
+test_unknown_pid_state_never_steals_lock() {
+  local dir state lock owner status
+  dir=$(make_case unknown-pid-lock)
+  state="$dir/state"
+  lock="$state/.unknown.lock"
+  owner="$lock.owner.test"
+  mkdir "$owner"
+  printf '%s\n' "$$" > "$owner/pid"
+  ln -s "$owner" "$lock"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '
+    ps() { return 1; }
+    . "$1"
+    fm_lock_try_acquire "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$lock" || status=$?
+  [ "$status" -ne 0 ] || fail "lock acquisition stole an owner whose pid state was unknown"
+  assert_present "$lock" "unknown pid state removed the live lock"
+  [ "$(cat "$owner/pid")" = "$$" ] || fail "unknown pid state altered the existing owner"
+  pass "transient pid inspection failure keeps lock ownership fail-closed"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -310,3 +349,5 @@ test_drain_asserts_watcher_liveness
 test_no_follow_publish_rejects_darwin_directory_race
 test_no_follow_append_preserves_content
 test_state_final_symlinks_are_never_written
+test_lock_cleanup_never_follows_foreign_owner_links
+test_unknown_pid_state_never_steals_lock

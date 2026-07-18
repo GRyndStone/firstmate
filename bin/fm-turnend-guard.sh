@@ -73,6 +73,7 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 
 # --- the actual predicate ----------------------------------------------------
 [ -d "$STATE" ] || exit 0
+[ "$(fm_session_lock_ownership "$STATE")" = owned ] || exit 0
 
 CHECKPOINT_ORPHAN_UNRESOLVED=0
 fm_reconcile_checkpoint_orphan "$STATE" || CHECKPOINT_ORPHAN_UNRESOLVED=1
@@ -86,7 +87,7 @@ HARNESS=${FM_TURNEND_HARNESS:-}
 supervisor_target_injectable() {
   local backend=$1 target=$2 probe="$SCRIPT_DIR/fm-backend.sh"
   [ -r "$probe" ] || return 1
-  case "$backend" in tmux|herdr) ;; *) return 1 ;; esac
+  case "$backend" in tmux|herdr|zellij|orca|cmux) ;; *) return 1 ;; esac
   if [ "$backend" = tmux ]; then
     case "$target" in
       %*[!0-9]*|%|'') return 1 ;;
@@ -95,12 +96,12 @@ supervisor_target_injectable() {
     esac
   fi
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
+    timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ] || case "$(fm_backend_composer_state "$2" "$3")" in empty|pending) exit 0 ;; *) exit 1 ;; esac' _ "$probe" "$backend" "$target"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
+    gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ] || case "$(fm_backend_composer_state "$2" "$3")" in empty|pending) exit 0 ;; *) exit 1 ;; esac' _ "$probe" "$backend" "$target"
   elif command -v perl >/dev/null 2>&1; then
     perl -e '$seconds=shift; alarm $seconds; exec @ARGV' "$TARGET_PROBE_TIMEOUT" \
-      bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ]' _ "$probe" "$backend" "$target"
+      bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ] || case "$(fm_backend_composer_state "$2" "$3")" in empty|pending) exit 0 ;; *) exit 1 ;; esac' _ "$probe" "$backend" "$target"
   else
     return 1
   fi

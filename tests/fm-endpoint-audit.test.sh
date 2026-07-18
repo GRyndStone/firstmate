@@ -426,6 +426,48 @@ SH
   pass "untagged legacy tmux labels are ambiguous for audit and creation"
 }
 
+test_legacy_tmux_meta_is_adopted_inside_recorded_session() {
+  local home log identity status
+  home=$(make_fixture tmux-legacy-adoption)
+  log="$home/tmux.log"
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  fm_write_meta "$home/state/legacy-task.meta" \
+    'window=owned-session:fm-legacy-task' \
+    'worktree=/owned/worktree' \
+    'project=/owned/project' \
+    'kind=ship'
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  list-windows) printf '@12\towned-session\tfm-legacy-task\t\t_\n' ;;
+  set-window-option) exit 0 ;;
+  display-message) printf '@12\towned-session\tfm-legacy-task\t%s\t_\n' "${FM_TMUX_OWNER:?}" ;;
+  *) exit 9 ;;
+esac
+SH
+  chmod +x "$home/fakebin/tmux"
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_TMUX_LOG="$log" FM_TMUX_OWNER="$identity" bash -c '
+      . "$1/bin/fm-wake-lib.sh"
+      . "$1/bin/fm-backend.sh"
+      fm_backend_adopt_legacy_tmux_meta "$2" fm-legacy-task
+    ' _ "$ROOT" "$home/state/legacy-task.meta" || status=$?
+  expect_code 0 "$status" "legacy tmux metadata adoption"
+  assert_grep 'window=@12' "$home/state/legacy-task.meta" \
+    "legacy tmux adoption did not record the stable window id"
+  assert_grep "tmux_home_identity=$identity" "$home/state/legacy-task.meta" \
+    "legacy tmux adoption did not bind the exact home identity"
+  assert_grep 'tmux_session=owned-session' "$home/state/legacy-task.meta" \
+    "legacy tmux adoption lost the recorded session"
+  assert_contains "$(cat "$log")" 'list-windows -t =owned-session' \
+    "legacy tmux adoption did not stay inside the recorded session"
+  assert_not_contains "$(cat "$log")" ' -a ' \
+    "legacy tmux adoption swept other sessions"
+  pass "legacy tmux metadata adopts one exact-session window without sweeping"
+}
+
 test_tmux_recorded_target_owner_mismatch_keeps_replacements() {
   local home out identity
   home=$(make_fixture tmux-recorded-mismatch)
@@ -755,6 +797,7 @@ test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
 test_tmux_duplicates_use_exact_recorded_session_and_task
 test_tmux_untagged_legacy_window_is_ambiguous
+test_legacy_tmux_meta_is_adopted_inside_recorded_session
 test_tmux_recorded_target_owner_mismatch_keeps_replacements
 test_tmux_moved_window_is_unknown_not_absent
 test_tmux_owned_kill_is_conditioned_inside_server_action

@@ -94,6 +94,18 @@ EOF
 target=${!#}
 git -C "$target" worktree remove --force "$target"
 SH
+  cat > "$fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = -e ] && printf '%s' "${2:-}" | grep -Fq 'rename($ARGV[0], $ARGV[1])'; then
+  src=${@: -2:1}
+  dst=${@: -1}
+  if [ -x "$(dirname "$0")/mv" ]; then
+    exec "$(dirname "$0")/mv" "$src" "$dst"
+  fi
+fi
+exec /usr/bin/perl "$@"
+SH
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -156,7 +168,7 @@ case "${1:-} ${2:-}" in
 esac
 exit 0
 SH
-  chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/tasks-axi" "$fakebin/gh-axi" "$fakebin/gh"
+  chmod +x "$fakebin/treehouse" "$fakebin/perl" "$fakebin/tmux" "$fakebin/tasks-axi" "$fakebin/gh-axi" "$fakebin/gh"
 
   # Bare origin so the clone has an `origin` remote and origin/HEAD.
   git init -q --bare "$case_dir/origin.git"
@@ -1719,6 +1731,70 @@ test_secondmate_retirement_refuses_symlinked_child_metadata() {
   pass "forced secondmate retirement rejects symlinked child metadata before parsing"
 }
 
+test_secondmate_retirement_refuses_unaccounted_child_authority() {
+  local case_dir home rc artifact
+  case_dir=$(make_case secondmate-unaccounted-child-authority)
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf 'task-x1\n' > "$home/.fm-secondmate-home"
+  write_tmux_meta_at "$case_dir/state/task-x1.meta" "$case_dir/fm-home" @42 \
+    "worktree=$home" "project=$home" \
+    'kind=secondmate' 'mode=secondmate' "home=$home"
+
+  artifact="$home/state/child-a1.spawning"
+  : > "$artifact"
+  rc=0
+  run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "secondmate retirement with unaccounted spawn authority"
+  assert_contains "$(cat "$case_dir/stderr")" "unaccounted child lifecycle authority" \
+    "ordinary retirement erased a child spawn without metadata"
+  [ -d "$home" ] || fail "ordinary retirement erased the secondmate home"
+
+  for artifact in child-a1.spawning child-a1.teardown-stage child-a1.backlog-mutation-intent; do
+    rm -f "$home/state"/* 2>/dev/null || true
+    : > "$home/state/$artifact"
+    rc=0
+    run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "forced retirement with $artifact"
+    assert_contains "$(cat "$case_dir/stderr")" "unaccounted child lifecycle authority" \
+      "forced retirement erased $artifact without metadata"
+    [ -e "$home/state/$artifact" ] || fail "forced retirement removed $artifact"
+  done
+
+  rm -f "$home/state"/* 2>/dev/null || true
+  mkdir "$home/state/.child-a1.teardown.lock.owner.test"
+  ln -s "$home/state/.child-a1.teardown.lock.owner.test" "$home/state/.child-a1.teardown.lock"
+  rc=0
+  run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "forced retirement with child teardown lock"
+  assert_contains "$(cat "$case_dir/stderr")" "unresolved child teardown authority" \
+    "forced retirement erased child teardown ownership"
+  assert_present "$home/state/.child-a1.teardown.lock" "forced retirement removed the child teardown lock"
+  rm -f "$home/state/.child-a1.teardown.lock"
+  rmdir "$home/state/.child-a1.teardown.lock.owner.test"
+
+  mkdir "$home/state/.backlog-mutation-owner"
+  rc=0
+  run_teardown "$case_dir" --force >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "forced retirement with backlog mutation owner"
+  assert_contains "$(cat "$case_dir/stderr")" "unresolved backlog mutation authority" \
+    "forced retirement erased child backlog mutation ownership"
+  [ -d "$home/state/.backlog-mutation-owner" ] || fail "forced retirement removed mutation ownership"
+  pass "secondmate retirement requires metadata for every child lifecycle authority"
+}
+
+test_teardown_publications_use_owned_random_temporaries() {
+  local source
+  source=$(cat "$TEARDOWN")
+  assert_not_contains "$source" '.tmp.$$' \
+    "teardown still publishes through predictable process-id temporaries"
+  assert_contains "$source" 'fm_publish_file_no_follow "$tmp" "$TEARDOWN_STAGE" replace' \
+    "teardown stage does not use the shared no-follow publisher"
+  assert_contains "$source" 'fm_publish_file_no_follow "$tmp" "$COMPLETION_PROOF" exclusive' \
+    "completion proof does not use exclusive no-follow publication"
+  pass "teardown lifecycle publications use owned random no-follow temporaries"
+}
+
 test_secondmate_child_endpoint_close_requires_confirmed_absence() {
   local case_dir home log rc
   case_dir=$(make_case secondmate-child-close-noop)
@@ -2063,7 +2139,7 @@ target=${!#}
 "${REAL_GIT_FOR_TEST:?}" -C "$target" worktree remove --force "$target"
 SH
   chmod +x "$case_dir/fakebin/treehouse"
-  cat > "$case_dir/fakebin/mv" <<'SH'
+  cat > "$case_dir/fakebin/ln" <<'SH'
 #!/usr/bin/env bash
 set -u
 for arg in "$@"; do
@@ -2071,9 +2147,19 @@ for arg in "$@"; do
     exit 1
   fi
 done
-exec /bin/mv "$@"
+exec /bin/ln "$@"
 SH
-  chmod +x "$case_dir/fakebin/mv"
+  cat > "$case_dir/fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  if [ "$arg" = "${FM_PROOF_BLOCK_PATH:?}" ]; then
+    exit 1
+  fi
+done
+exec /usr/bin/perl "$@"
+SH
+  chmod +x "$case_dir/fakebin/ln" "$case_dir/fakebin/perl"
 
   rc=0
   FM_PROOF_BLOCK_PATH="$proof" FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" run_teardown "$case_dir" \
@@ -2098,7 +2184,7 @@ SH
     assert_not_contains "$(cat "$log")" "done task-x1" \
       "proof persistence failure recorded backlog completion"
   fi
-  rm -f "$case_dir/fakebin/mv"
+  rm -f "$case_dir/fakebin/ln" "$case_dir/fakebin/perl"
   rc=0
   FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" run_teardown "$case_dir" \
     > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
@@ -3586,6 +3672,8 @@ test_owned_close_refuses_duplicate_after_just_in_time_audit
 test_herdr_secondmate_teardown_uses_meta_home_ownership
 test_secondmate_retirement_preflights_child_duplicates
 test_secondmate_retirement_refuses_symlinked_child_metadata
+test_secondmate_retirement_refuses_unaccounted_child_authority
+test_teardown_publications_use_owned_random_temporaries
 test_secondmate_child_endpoint_close_requires_confirmed_absence
 test_tmux_duplicate_endpoints_refuse_teardown_without_closure
 test_zellij_inventory_unavailable_refuses_teardown_without_sweep

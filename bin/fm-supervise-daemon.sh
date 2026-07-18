@@ -66,20 +66,17 @@
 #                                   auto-discovered per backend - $TMUX_PANE
 #                                   under tmux, "<session>:<pane-id>" from
 #                                   $HERDR_PANE_ID under herdr - then
-#                                   firstmate:0 fallback). Accepts either a
-#                                   tmux target or a herdr "<session>:<pane-id>"
-#                                   target; which one it's read as is decided by
-#                                   FM_SUPERVISOR_BACKEND (below), independently.
-#          FM_SUPERVISOR_BACKEND    supervisor pane BACKEND (tmux|herdr;
+#                                   firstmate:0 fallback). The exact target
+#                                   shape is decided by FM_SUPERVISOR_BACKEND.
+#          FM_SUPERVISOR_BACKEND    supervisor pane BACKEND
+#                                   (tmux|herdr|zellij|orca|cmux;
 #                                   override; otherwise auto-discovered the same
 #                                   way bin/fm-backend.sh's fm_backend_detect
 #                                   resolves the runtime firstmate itself is
 #                                   executing inside - $TMUX_PANE selects tmux,
 #                                   $HERDR_ENV=1 selects herdr - falling back to
-#                                   tmux). zellij, orca, and cmux are not yet
-#                                   supported as supervisor backends; the daemon
-#                                   refuses loudly at startup rather than trying
-#                                   tmux primitives against a non-tmux pane.
+#                                   tmux). Backends without ambient discovery
+#                                   require an explicit backend and exact target.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -176,14 +173,7 @@ FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
 # detected) assumes tmux - matching this daemon's pre-herdr-support behavior
 # byte-for-byte when run outside both tmux and herdr.
 FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
-# Supervisor backends this daemon knows how to inject into today. zellij, orca,
-# and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# daemon has no verified composer/busy primitives wired up for them yet - see
-# docs/herdr-backend.md and AGENTS.md section 4's
-# harness-verification discipline. Selecting one refuses loudly at startup
-# instead of silently running tmux primitives against a pane that is not a tmux
-# pane.
-FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr"
+FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr zellij orca cmux"
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
 ESCALATE_BATCH_SECS_DEFAULT=90
@@ -359,7 +349,7 @@ canonical_supervisor_target() {  # <backend> <target>
         *) return 1 ;;
       esac
       ;;
-    herdr) printf '%s' "$target" ;;
+    herdr|zellij|orca|cmux) printf '%s' "$target" ;;
     *) return 1 ;;
   esac
 }
@@ -1394,13 +1384,9 @@ fm_super_main() {
   FM_SUPERVISOR_BACKEND="$discovered_backend"
   local BACKEND="$FM_SUPERVISOR_BACKEND"
 
-  # --- refuse an unsupported supervisor backend loudly, before ever trying a
-  # tmux/herdr-specific call against it (zellij, orca, and cmux have no verified
-  # composer/busy primitives wired up for this daemon yet - AGENTS.md section 4
-  # harness-verification discipline). This is the clear refusal the task calls
-  # for, instead of a confusing "does not resolve to a tmux pane" error.
+  # --- refuse an unsupported supervisor backend loudly before target probing.
   if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND and FM_SUPERVISOR_TARGET to an exact supported endpoint" >&2
     log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
