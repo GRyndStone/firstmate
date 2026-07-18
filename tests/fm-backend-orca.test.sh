@@ -75,6 +75,11 @@ SH
   chmod +x "$fb/tmux"
 }
 
+seed_spawn_backlog() {  # <data-dir> <task-id>
+  local data=$1 id=$2
+  printf '## In flight\n- [ ] %s - Orca spawn test\n\n## Queued\n' "$id" > "$data/backlog.md"
+}
+
 test_capture_reads_terminal_tail_json() {
   local out
   orca_case capture-tail
@@ -444,6 +449,7 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case pathless-cleanup-fail
   printf '1\n' > "$RESP/1.exit"
@@ -480,6 +486,7 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case spawn
   log="$LOG"
@@ -545,6 +552,7 @@ test_spawn_refuses_orca_when_runtime_not_ready() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case runtime-down-spawn
   printf '{"ok":true,"result":{"runtime":{"reachable":false,"state":"starting"}}}\n' > "$RESP/1.out"
@@ -574,6 +582,7 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case bad-spawn
   printf '1\n' > "$RESP/1.exit"
@@ -608,6 +617,7 @@ test_spawn_removes_orca_worktree_when_terminal_create_fails() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case terminal-fail
   printf '1\n' > "$RESP/1.exit"
@@ -641,6 +651,7 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case cleanup-fail
   printf '1\n' > "$RESP/1.exit"
@@ -664,7 +675,7 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
 }
 
-test_spawn_releases_orca_resources_when_metadata_write_fails() {
+test_spawn_rejects_invalid_state_before_orca_resources() {
   local proj wt data state_file config id out status
   id="orcametafailz9"
   proj="$TMP_ROOT/meta-fail-project"
@@ -676,6 +687,7 @@ test_spawn_releases_orca_resources_when_metadata_write_fails() {
   mkdir -p "$data/$id" "$config"
   : > "$state_file"
   printf 'brief\n' > "$data/$id/brief.md"
+  seed_spawn_backlog "$data" "$id"
   orca_case meta-fail
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-meta-fail"}}}\n' > "$RESP/2.out"
@@ -687,13 +699,12 @@ test_spawn_releases_orca_resources_when_metadata_write_fails() {
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
-  assert_contains "$out" "File exists" "spawn should fail at the state directory creation point"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
-    "Orca spawn should close the recorded terminal when a later abort occurs"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-meta-fail'$'\x1f''--force'$'\x1f''--json' \
-    "Orca spawn should remove the recorded worktree when a later abort occurs"
-  assert_absent "$state_file/$id.meta" "metadata-write abort should not leave metadata after successful cleanup"
-  pass "fm-spawn.sh --backend orca: releases terminal and worktree on later aborts"
+  assert_contains "$out" "non-directory effective state path component refused" \
+    "spawn should reject an invalid effective state path explicitly"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''repo' \
+    "Orca spawn should validate effective state before creating any external resource"
+  assert_absent "$state_file/$id.meta" "state-admission refusal unexpectedly wrote metadata"
+  pass "fm-spawn.sh --backend orca: validates state before external mutation"
 }
 
 test_peek_send_and_crew_state_route_through_orca_meta() {
@@ -773,7 +784,7 @@ test_target_exists_rejects_orca_error_json() {
   pass "fm_backend_target_exists: Orca ok:false read JSON is not live"
 }
 
-test_scout_teardown_removes_orca_worktree_via_helper() {
+test_teardown_refuses_orca_without_exact_inventory() {
   local proj wt data state config id out rc neutral
   id="orcateardownz3"
   proj="$TMP_ROOT/teardown-project"
@@ -798,13 +809,17 @@ test_scout_teardown_removes_orca_worktree_via_helper() {
     "$ROOT/bin/fm-teardown.sh" "$id" 2>&1 )
   rc=$?
   set -e
-  expect_code 0 "$rc" "Orca scout teardown should succeed once report exists"$'\n'"$out"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-teardown'$'\x1f''--json' \
-    "teardown did not close the recorded Orca terminal"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-teardown'$'\x1f''--force'$'\x1f''--json' \
-    "teardown did not remove the Orca worktree through orca worktree rm"
-  assert_absent "$state/$id.meta" "teardown should remove task metadata"
-  pass "fm-teardown.sh backend=orca: scout report gate then helper-backed worktree removal"
+  [ "$rc" -ne 0 ] || fail "Orca teardown should fail closed without exact same-home inventory"
+  assert_contains "$out" "endpoint ownership anomaly" \
+    "Orca teardown refusal should name the endpoint ownership anomaly"
+  assert_contains "$out" "kind=inventory_unavailable" \
+    "Orca teardown refusal should preserve the typed inventory-unavailable reason"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close' \
+    "inventory refusal should occur before closing the Orca terminal"
+  assert_not_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm' \
+    "inventory refusal should occur before removing the Orca worktree"
+  assert_present "$state/$id.meta" "inventory refusal should preserve lifecycle metadata"
+  pass "fm-teardown.sh backend=orca: unavailable exact inventory fails closed"
 }
 
 test_scout_teardown_refuses_orca_id_path_mismatch() {
@@ -1304,21 +1319,11 @@ test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
-test_spawn_releases_orca_resources_when_metadata_write_fails
+test_spawn_rejects_invalid_state_before_orca_resources
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json
 test_target_exists_rejects_orca_error_json
-test_scout_teardown_removes_orca_worktree_via_helper
-test_scout_teardown_refuses_orca_id_path_mismatch
-test_teardown_removes_orca_worktree_when_path_missing
-test_teardown_preserves_metadata_when_orca_remove_error_json
-test_scout_teardown_refuses_orca_missing_report_when_path_missing
-test_ship_teardown_refuses_orca_missing_worktree_path
-test_ship_teardown_removes_orca_worktree_when_id_path_matches
-test_ship_teardown_refuses_orca_unresolvable_worktree_id
-test_ship_teardown_refuses_orca_id_path_mismatch
-test_teardown_refuses_orca_missing_worktree_id
-test_teardown_removes_orca_worktree_without_terminal_handle
-test_secondmate_force_teardown_removes_orca_child_via_orca
-test_secondmate_force_teardown_refuses_orca_child_id_path_mismatch
-test_secondmate_force_teardown_removes_partial_orca_child
+test_teardown_refuses_orca_without_exact_inventory
+# Orca has no verified exact-home inventory primitive, so legacy success/path-order
+# teardown scenarios cannot safely pass admission.  The full retry, missing-path,
+# reused-id, and secondmate refusal matrix lives in tests/fm-teardown.test.sh.

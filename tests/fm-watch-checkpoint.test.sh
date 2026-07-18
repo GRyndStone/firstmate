@@ -93,7 +93,7 @@ test_interrupted_checkpoint_reaps_only_its_watcher() {
   i=0
   while [ "$i" -lt 100 ]; do
     watcher_pid=$(cat "$home/state/.watch.lock/pid" 2>/dev/null || true)
-    [ -n "$watcher_pid" ] && break
+    [ -n "$watcher_pid" ] && [ -s "$home/state/.watch.lock/owner-identity" ] && break
     sleep 0.05
     i=$((i + 1))
   done

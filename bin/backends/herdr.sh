@@ -97,9 +97,19 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
 fm_backend_herdr_validate_home_path() {
-  local home=$1 suffix component cursor=/
+  local home=$1 suffix component cursor=/ alias_root
   FM_BACKEND_HERDR_VALIDATED_HOME=
   case "$home" in /*) ;; *) return 1 ;; esac
+  case "$home" in
+    /var/*)
+      alias_root=$(cd /var 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/var ] || home="/private$home"
+      ;;
+    /tmp/*)
+      alias_root=$(cd /tmp 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/tmp ] || home="/private$home"
+      ;;
+  esac
   suffix=${home#/}
   while [ -n "$suffix" ]; do
     component=${suffix%%/*}
@@ -121,6 +131,12 @@ fm_backend_herdr_workspace_label_for_home() {
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
     id=$(cat "$marker" 2>/dev/null) || return 1
+    while [ -n "$id" ]; do
+      case "$id" in [[:space:]]*) id=${id#?} ;; *) break ;; esac
+    done
+    while [ -n "$id" ]; do
+      case "$id" in *[[:space:]]) id=${id%?} ;; *) break ;; esac
+    done
     case "$id" in
       ''|.*|*[!A-Za-z0-9._-]*|*$'\n'*) return 1 ;;
     esac
@@ -959,11 +975,11 @@ fm_backend_herdr_kill_owned() {  # <target> <workspace> <workspace-label> <tab-l
   pane=${target#*:}
   [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
   workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1) || return 1
-  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg label "$workspace_label" \
-    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 || return 1
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg want_label "$workspace_label" \
+    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $want_label' >/dev/null 2>&1 || return 1
   tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>/dev/null) || return 1
   panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$workspace" 2>/dev/null) || return 1
-  jq -en --arg pane "$pane" --arg label "$tab_label" --argjson tabs "$tabs" --argjson panes "$panes" '
+  jq -en --arg pane "$pane" --arg want_label "$tab_label" --argjson tabs "$tabs" --argjson panes "$panes" '
     (($tabs.result.tabs | type) == "array")
     and (($panes.result.panes | type) == "array")
     and all($tabs.result.tabs[]?;
@@ -979,10 +995,10 @@ fm_backend_herdr_kill_owned() {  # <target> <workspace> <workspace-label> <tab-l
     and ([$panes.result.panes[]? | select(.pane_id == $pane)] as $owned
       | ($owned | length) == 1
       and ($owned[0].tab_id as $tab_id
-        | [$tabs.result.tabs[]? | select(.tab_id == $tab_id and .label == $label)] | length) == 1)
+        | [$tabs.result.tabs[]? | select(.tab_id == $tab_id and .label == $want_label)] | length) == 1)
     and ([$panes.result.panes[]? as $candidate
       | $tabs.result.tabs[]?
-      | select(.tab_id == $candidate.tab_id and .label == $label)
+      | select(.tab_id == $candidate.tab_id and .label == $want_label)
       | $candidate.pane_id] == [$pane])
   ' >/dev/null 2>&1 || return 1
   fm_backend_herdr_cli "$session" pane close "$pane" >/dev/null 2>&1

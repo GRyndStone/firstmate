@@ -205,14 +205,60 @@ make_liveness_tmux() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+state_dir=$(cd "$(dirname "$0")/.." && pwd)
+gone="$state_dir/endpoint.gone"
+fresh="$state_dir/endpoint.fresh"
+meta="$FM_HOME/state/sm1.meta"
+wid=$(grep '^tmux_window_id=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+name=fm-sm1
+owner=$(grep '^tmux_home_identity=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+if [ -f "$fresh" ]; then wid=@2; fi
 case "${1:-}" in
   display-message)
-    for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
-    exit 0 ;;
-  new-window|kill-window|send-keys)
+    for a in "$@"; do
+      case "$a" in
+        *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;;
+        *window_id*)
+          if [ -f "$gone" ]; then printf "can't find window\n" >&2; exit 1; fi
+          printf '%s\tfirstmate\t%s\t%s\n' "$wid" "$name" "$owner"
+          exit 0
+          ;;
+      esac
+    done
+    printf 'firstmate\n'
+    exit 0
+    ;;
+  if-shell|kill-window)
+    : > "$gone"
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
     exit 0 ;;
-  list-windows|has-session) exit 0 ;;
+  new-window)
+    : > "$fresh"
+    rm -f "$gone"
+    printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    printf '@2\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    exit 0
+    ;;
+  set-window-option|has-session) exit 0 ;;
+  list-windows)
+    [ ! -f "$gone" ] || exit 0
+    format=
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = -F ]; then format=$arg; fi
+      prev=$arg
+    done
+    case "$format" in
+      *'#{@firstmate_home}'*) printf '%s\t%s\t%s\t_\n' "$wid" "$name" "$owner" ;;
+      '#{window_id} #{window_name}') printf '%s %s\n' "$wid" "$name" ;;
+      '#{window_id}') printf '%s\n' "$wid" ;;
+    esac
+    exit 0
+    ;;
 esac
 exit 0
 SH
@@ -244,13 +290,17 @@ new_world() {
 # harmless "not a git repo" skip.
 add_sm_home() {
   local w=$1 id=$2 window=$3 harness=${4:-claude}
-  local home="$w/$id"
+  local home="$w/$id" identity
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
   printf '# Firstmate\n' > "$home/AGENTS.md"
   printf 'charter\n' > "$home/data/charter.md"
+  identity=$(FM_HOME="$w/home" bash -c '. "$1/bin/fm-backend.sh"; fm_backend_home_identity' _ "$ROOT")
   {
-    printf 'window=%s\n' "$window"
+    printf 'window=@1\n'
+    printf 'tmux_home_identity=%s\n' "$identity"
+    printf 'tmux_session=firstmate\n'
+    printf 'tmux_window_id=@1\n'
     printf 'kind=secondmate\n'
     printf 'harness=%s\n' "$harness"
     printf 'home=%s\n' "$home"
@@ -275,7 +325,7 @@ test_sweep_respawns_confirmed_dead_secondmate() {
 
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "a bare-shell (dead) secondmate should be reported as respawned"
-  assert_contains "$(cat "$log")" "kill-window -t firstmate:fm-sm1" \
+  assert_contains "$(cat "$log")" "kill-window -t @1" \
     "the stale endpoint must be killed before respawn (tmux refuses a same-named window over a live one)"
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"

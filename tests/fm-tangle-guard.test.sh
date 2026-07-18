@@ -190,6 +190,7 @@ test_spawn_isolation_abort() {
   local home proj fakebin out status
   home="$TMP_ROOT/spawn-home"
   mkdir -p "$home/data"
+  printf '## In flight\n- [ ] abort-notgit-dd4 - non-worktree abort\n- [ ] abort-primary-ee5 - primary checkout abort\n- [ ] ok-isolated-ff6 - isolated spawn\n\n## Queued\n' > "$home/data/backlog.md"
   proj=$(make_repo "$TMP_ROOT/spawn-proj")
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake")
   # A genuine isolated linked worktree of the project, detached on the default.
@@ -271,6 +272,7 @@ test_spawn_tmux_window_construction() {
   local home proj fakebin rec wt out status
   home="$TMP_ROOT/spawn-rec-home"
   mkdir -p "$home/data"
+  printf '## In flight\n- [ ] rec-win-gg7 - window construction\n\n## Queued\n' > "$home/data/backlog.md"
   proj=$(make_repo "$TMP_ROOT/spawn-rec-proj")
   fakebin=$(make_spawn_record_fakebin "$TMP_ROOT/spawn-rec-fake")
   rec="$TMP_ROOT/spawn-rec.log"

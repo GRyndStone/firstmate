@@ -466,13 +466,13 @@ test_section_caps_and_expansion_flags() {
     run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.in_flight|length) == 2 and (.decisions_open|length) == 2 and (.gates|length) == 2
-    and (.reports|length) == 2 and (.recorded_prs|length) == 2 and (.unhealthy_endpoints|length) == 2
+    and (.reports|length) == 2 and (.recorded_prs|length) == 2 and (.duplicate_endpoints|length) == 2
     and ([.omitted[].surface] | index("in_flight showing 2 of 5") != null)
     and ([.omitted[].surface] | index("decisions_open showing 2 of 5") != null)
     and ([.omitted[].surface] | index("gates showing 2 of 5") != null)
     and ([.omitted[].surface] | index("reports showing 2 of 5") != null)
     and ([.omitted[].surface] | index("recorded_prs showing 2 of 5") != null)
-    and ([.omitted[].surface] | index("unhealthy_endpoints showing 2 of 5") != null)
+    and ([.omitted[].surface] | index("duplicate_endpoints showing 2 of 5") != null)
   ' >/dev/null || fail "section caps or counted omissions are wrong: $json"
   expanded=$(FM_BEARINGS_IN_FLIGHT=2 FM_BEARINGS_DECISIONS=2 FM_BEARINGS_GATES=2 \
     FM_BEARINGS_REPORTS=2 FM_BEARINGS_RECORDED_PRS=2 FM_BEARINGS_UNHEALTHY=2 \
@@ -480,7 +480,7 @@ test_section_caps_and_expansion_flags() {
       --all-reports --all-recorded-prs --all-unhealthy)
   printf '%s' "$expanded" | jq -e '
     (.in_flight|length) == 5 and (.decisions_open|length) == 5 and (.gates|length) == 5
-    and (.reports|length) == 5 and (.recorded_prs|length) == 5 and (.unhealthy_endpoints|length) == 5
+    and (.reports|length) == 5 and (.recorded_prs|length) == 5 and (.duplicate_endpoints|length) == 5
   ' >/dev/null || fail "section expansion flags did not reveal full sets: $expanded"
   pass "all fleet-sized sections are capped with counted opt-in expansion"
 }

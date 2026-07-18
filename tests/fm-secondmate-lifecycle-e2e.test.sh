@@ -143,7 +143,7 @@ phase_spawn() {
 
 phase_send() {
   : > "$LOG"
-  # The meta window (firstmate:fm-design) must win over a foreign same-named
+  # The stable meta window id must win over a foreign same-named
   # window returned by list-windows.
   PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_WINDOW="other-session:fm-design" \
     FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
@@ -152,7 +152,7 @@ phase_send() {
   # design is a kind=secondmate target, so the request is prefixed with the
   # from-firstmate marker (bin/fm-marker-lib.sh): the send targets the meta window
   # AND carries the marker label, and the original payload still follows it.
-  assert_grep 'send-keys -t firstmate:fm-design -l [fm-from-firstmate]' "$LOG" "send did not use the window recorded in this home's meta, or did not mark the secondmate request"
+  assert_grep 'send-keys -t @1 -l [fm-from-firstmate]' "$LOG" "send did not use the window recorded in this home's meta, or did not mark the secondmate request"
   assert_grep 'route this work' "$LOG" "the original request text did not survive the marker"
   assert_no_grep 'send-keys -t other-session:fm-design' "$LOG" "send targeted a foreign same-named window"
   pass "send: a bare fm-<id> secondmate routes to the meta window with the from-firstmate marker"
@@ -204,7 +204,9 @@ EOF
 
 phase_recovery() {
   # Simulate a restart: drop the live meta, then respawn from the registry +
-  # persistent home (no explicit home argument).
+  # persistent home (no explicit home argument). The prior endpoint is gone;
+  # leaving it alive without metadata would correctly make respawn ambiguous.
+  PATH="$FAKEBIN:$PATH" FM_FAKE_TMUX_LOG="$LOG" tmux kill-window -t @1
   rm -f "$HOME_DIR/state/design.meta"
   PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-spawn.sh" design "echo relaunch" --secondmate >/dev/null 2>&1 \
@@ -212,7 +214,7 @@ phase_recovery() {
   local meta="$HOME_DIR/state/design.meta"
   assert_grep "home=$SUB_ABS" "$meta" "respawn did not preserve the persistent home from the registry"
   assert_grep 'projects=alpha, beta, gamma' "$meta" "respawn did not preserve the project list from the registry"
-  assert_grep 'window=firstmate:fm-design' "$meta" "respawn did not reconstruct the direct-report window"
+  assert_grep 'window=@1' "$meta" "respawn did not reconstruct the stable direct-report window id"
   pass "recovery: respawns from the durable registry and persistent home"
 }
 

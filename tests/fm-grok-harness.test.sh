@@ -19,14 +19,51 @@ case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  display-message)
+    case "$*" in
+      *'#{window_id}'*)
+        [ -e "${FM_FAKE_TMUX_STATE:?}" ] || { printf 'can\x27t find window\n' >&2; exit 1; }
+        printf '@1\tfirstmate\tfm-%s\t%s\n' "${FM_FAKE_TASK_ID:?}" "$(cat "${FM_FAKE_TMUX_OWNER_FILE:?}")"
+        ;;
+      *) printf 'firstmate\n' ;;
+    esac
+    ;;
+  list-windows)
+    [ -e "${FM_FAKE_TMUX_STATE:?}" ] || exit 0
+    printf '@1\tfm-%s\t%s\t_\n' "${FM_FAKE_TASK_ID:?}" "$(cat "${FM_FAKE_TMUX_OWNER_FILE:?}")"
+    ;;
+  new-window) : > "${FM_FAKE_TMUX_STATE:?}"; printf '@1\n' ;;
+  set-window-option)
+    if [ "${4:-}" = @firstmate_home ]; then
+      printf '%s\n' "${5:-}" > "${FM_FAKE_TMUX_OWNER_FILE:?}"
+    fi
+    ;;
+  if-shell) unlink "${FM_FAKE_TMUX_STATE:?}" ;;
+  kill-window) [ ! -e "${FM_FAKE_TMUX_STATE:?}" ] || unlink "${FM_FAKE_TMUX_STATE:?}" ;;
+  has-session|new-session|send-keys) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse gh-axi gh
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  git -C "${FM_FAKE_PROJECT:?}" worktree remove --force "${FM_FAKE_TREEHOUSE_WT:?}"
+fi
+exit 0
+SH
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "--version ") printf 'tasks-axi 0.2.2\n'; exit 0 ;;
+  "update --help") printf '%s\n' '--archive-body'; exit 0 ;;
+  "mv --help") printf '%s\n' '[<id>...]'; exit 0 ;;
+esac
+if [ "${1:-}" = show ]; then printf 'code: NOT_FOUND\n'; exit 1; fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse" "$fakebin/tasks-axi"
+  fm_fake_exit0 "$fakebin" gh-axi gh
   printf '%s\n' "$fakebin"
 }
 
@@ -40,7 +77,9 @@ make_spawn_case() {
   grok_home="$case_dir/grok"
   id="grok-$name-x1"
   mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config" "$grok_home"
+  cp "$ROOT/.tasks.toml" "$home/.tasks.toml"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  printf '## In flight\n- [ ] %s - grok harness test\n\n## Queued\n' "$id" > "$home/data/backlog.md"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$grok_home|$id"
@@ -52,6 +91,8 @@ run_grok_spawn() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_FAKE_TMUX_STATE="$home/tmux-live" FM_FAKE_TMUX_OWNER_FILE="$home/tmux-owner" \
+    FM_FAKE_TASK_ID="$id" FM_FAKE_PROJECT="$proj" FM_FAKE_TREEHOUSE_WT="$wt" \
     GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$id" "$proj" grok 2>&1
 }
@@ -107,6 +148,8 @@ EOF
   token=$(sed -n 's/^token=//p' "$wt/.fm-grok-turnend")
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_FAKE_TMUX_STATE="$home/tmux-live" FM_FAKE_TMUX_OWNER_FILE="$home/tmux-owner" \
+    FM_FAKE_TASK_ID="$id" FM_FAKE_PROJECT="$proj" FM_FAKE_TREEHOUSE_WT="$wt" \
     GROK_HOME="$grok_home" PATH="$fakebin:$PATH" \
     "$TEARDOWN" "$id" --force >/dev/null 2>&1 \
     || fail "grok teardown failed"

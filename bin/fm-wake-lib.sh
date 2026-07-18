@@ -10,14 +10,19 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 
 FM_VALIDATED_STATE_PATH=
 fm_validate_effective_state_path() {
-  local path=$1 mode=${2:-allow-missing-final} component suffix cursor=/ parent
+  local path=$1 mode=${2:-allow-missing-final} component suffix cursor=/ parent alias_root
   FM_VALIDATED_STATE_PATH=
   case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
-  if [ "$(uname)" = Darwin ]; then
-    case "$path" in
-      /var/*|/tmp/*) path="/private$path" ;;
-    esac
-  fi
+  case "$path" in
+    /var/*)
+      alias_root=$(cd /var 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/var ] || path="/private$path"
+      ;;
+    /tmp/*)
+      alias_root=$(cd /tmp 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/tmp ] || path="/private$path"
+      ;;
+  esac
   suffix=${path#/}
   while [ -n "$suffix" ]; do
     component=${suffix%%/*}

@@ -366,8 +366,9 @@ test_bootstrap_sweep_nudges_only_instruction_change() {
 # (default:wA:p2), so fm-send with the printed target fell back to tmux and failed
 # while fm-<id> resolved through current meta.
 make_nudge_herdr_fake() {
-  local dir=$1 stale=$2 fresh=$3 fakebin
+  local dir=$1 stale=$2 fresh=$3 fakebin closed
   fakebin=$(fm_fakebin "$dir")
+  closed="$dir/stale-closed"
   cat > "$fakebin/herdr" <<SH
 #!/usr/bin/env bash
 set -u
@@ -377,7 +378,7 @@ case "\$cmd \$sub" in
     printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
     ;;
   "pane get")
-    if [ "\$arg" = "${stale#*:}" ]; then
+    if [ "\$arg" = "${stale#*:}" ] && [ ! -f "$closed" ]; then
       printf '{"result":{"pane":{"pane_id":"${stale#*:}"}}}\n'
     elif [ "\$arg" = "${fresh#*:}" ]; then
       printf '{"result":{"pane":{"pane_id":"${fresh#*:}"}}}\n'
@@ -385,6 +386,32 @@ case "\$cmd \$sub" in
       printf '{"error":{"code":"pane_not_found","message":"missing"}}\n' >&2
       exit 0
     fi
+    ;;
+  "workspace get")
+    if [ "\$arg" = "w9" ]; then
+      printf '{"result":{"workspace":{"workspace_id":"w9","label":"2ndmate-sm-instr"}}}\n'
+    else
+      printf '{"error":{"code":"workspace_not_found","message":"missing"}}\n' >&2
+      exit 1
+    fi
+    ;;
+  "tab list")
+    if [ -f "$closed" ]; then
+      printf '{"result":{"tabs":[]}}\n'
+    else
+      printf '{"result":{"tabs":[{"tab_id":"t1","label":"fm-sm-instr"}]}}\n'
+    fi
+    ;;
+  "pane list")
+    if [ -f "$closed" ]; then
+      printf '{"result":{"panes":[]}}\n'
+    else
+      printf '{"result":{"panes":[{"pane_id":"${stale#*:}","tab_id":"t1"}]}}\n'
+    fi
+    ;;
+  "pane close")
+    [ "\$arg" = "${stale#*:}" ] || exit 1
+    : > "$closed"
     ;;
   "agent get")
     if [ "\$arg" = "${stale#*:}" ]; then
@@ -421,6 +448,10 @@ test_nudge_selector_stable_after_herdr_respawn() {
   {
     printf 'window=%s\n' "$stale"
     printf 'backend=herdr\n'
+    printf 'herdr_session=default\n'
+    printf 'herdr_workspace_id=w9\n'
+    printf 'herdr_tab_id=t1\n'
+    printf 'herdr_pane_id=%s\n' "${stale#*:}"
     printf 'kind=secondmate\n'
     printf 'harness=claude\n'
     printf 'home=%s/sm-instr\n' "$w"
@@ -435,6 +466,12 @@ meta="\$FM_HOME/state/\$id.meta"
 [ -f "\$meta" ] || exit 1
 sed -i.bak "s/^window=.*/window=$fresh/" "\$meta" 2>/dev/null || \
   sed -i "s/^window=.*/window=$fresh/" "\$meta"
+sed -i.bak "s/^herdr_workspace_id=.*/herdr_workspace_id=wA/" "\$meta" 2>/dev/null || \
+  sed -i "s/^herdr_workspace_id=.*/herdr_workspace_id=wA/" "\$meta"
+sed -i.bak "s/^herdr_tab_id=.*/herdr_tab_id=t2/" "\$meta" 2>/dev/null || \
+  sed -i "s/^herdr_tab_id=.*/herdr_tab_id=t2/" "\$meta"
+sed -i.bak "s/^herdr_pane_id=.*/herdr_pane_id=${fresh#*:}/" "\$meta" 2>/dev/null || \
+  sed -i "s/^herdr_pane_id=.*/herdr_pane_id=${fresh#*:}/" "\$meta"
 rm -f "\$meta.bak"
 exit 0
 SH

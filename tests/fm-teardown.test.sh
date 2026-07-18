@@ -2221,13 +2221,13 @@ SH
     "cleanup path reuse was not refused before finalization"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "cleanup absence refusal removed task meta"
   [ -f "$case_dir/wt/reused-by-another-task" ] || fail "fixture did not model immediate worktree-path reuse"
-  [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] || fail "first cleanup did not return the worktree exactly once"
+  [ "$(grep -c '^return --force ' "$return_log")" = 1 ] || fail "first cleanup did not return the worktree exactly once"
 
   rc=0
   FM_TASKS_LOG="$log" FM_TREEHOUSE_LOG="$return_log" \
     run_teardown "$case_dir" > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr" || rc=$?
   expect_code 1 "$rc" "cleanup reuse retry with lost ownership"
-  [ "$(wc -l < "$return_log" | tr -d ' ')" = 1 ] \
+  [ "$(grep -c '^return --force ' "$return_log")" = 1 ] \
     || fail "retry re-ran destructive cleanup against a reused worktree path"
   [ -f "$case_dir/wt/reused-by-another-task" ] || fail "retry modified the reused worktree path"
   assert_contains "$(cat "$case_dir/retry-stderr")" "teardown ownership is lost" \
@@ -3657,6 +3657,56 @@ test_effective_state_is_validated_before_teardown_lock_mutation() {
   pass "teardown validates effective state before every lock, read, and mutation"
 }
 
+test_treehouse_available_release_is_exact_project_and_path() {
+  local case_dir project target other replacement alias_target fakebin
+  case_dir="$TMP_ROOT/treehouse-available-release"
+  project="$case_dir/project"
+  target="$case_dir/target"
+  other="$case_dir/other"
+  replacement="$case_dir/replacement"
+  fakebin="$case_dir/fakebin"
+  mkdir -p "$project" "$target" "$other" "$fakebin"
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+[ "$PWD" = "${FM_EXPECTED_PROJECT:?}" ] || exit 1
+[ "${1:-}" = status ] || exit 1
+printf '1     available    %s\n' "${FM_AVAILABLE_PATH:?}"
+SH
+  chmod +x "$fakebin/treehouse"
+  PATH="$fakebin:$PATH" FM_EXPECTED_PROJECT="$project" FM_AVAILABLE_PATH="$target" \
+    bash -c '. "$1"; fm_treehouse_worktree_available_for_project "$2" "$3"' \
+      _ "$ROOT/bin/fm-treehouse-lib.sh" "$project" "$target" \
+    || fail "exact Treehouse available release was not accepted"
+  if PATH="$fakebin:$PATH" FM_EXPECTED_PROJECT="$project" FM_AVAILABLE_PATH="$other" \
+    bash -c '. "$1"; fm_treehouse_worktree_available_for_project "$2" "$3"' \
+      _ "$ROOT/bin/fm-treehouse-lib.sh" "$project" "$target"; then
+    fail "a different available Treehouse path satisfied exact release proof"
+  fi
+  if PATH="$fakebin:$PATH" FM_EXPECTED_PROJECT="$other" FM_AVAILABLE_PATH="$target" \
+    bash -c '. "$1"; fm_treehouse_worktree_available_for_project "$2" "$3"' \
+      _ "$ROOT/bin/fm-treehouse-lib.sh" "$project" "$target"; then
+    fail "Treehouse status from a different project satisfied exact release proof"
+  fi
+  ln -s "$target" "$replacement"
+  if PATH="$fakebin:$PATH" FM_EXPECTED_PROJECT="$project" FM_AVAILABLE_PATH="$target" \
+    bash -c '. "$1"; fm_treehouse_worktree_available_for_project "$2" "$3"' \
+      _ "$ROOT/bin/fm-treehouse-lib.sh" "$project" "$replacement"; then
+    fail "a replacement symlink satisfied exact Treehouse available-release proof"
+  fi
+  case "$target" in
+    /private/var/*)
+      if [ "$(cd /var 2>/dev/null && pwd -P)" = /private/var ]; then
+        alias_target=${target#/private}
+        PATH="$fakebin:$PATH" FM_EXPECTED_PROJECT="$project" FM_AVAILABLE_PATH="$target" \
+          bash -c '. "$1"; fm_treehouse_worktree_available_for_project "$2" "$3"' \
+            _ "$ROOT/bin/fm-treehouse-lib.sh" "$project" "$alias_target" \
+          || fail "verified macOS /var alias did not preserve exact Treehouse release proof"
+      fi
+      ;;
+  esac
+  pass "Treehouse release proof binds exact paths, rejects symlinks, and preserves system aliases"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_records_tasks_axi_done_after_cleanup_when_compatible
 test_teardown_manual_backend_uses_receipt_gated_done
@@ -3722,6 +3772,7 @@ test_child_treehouse_retry_revalidates_auxiliary_authority
 test_finalizing_retry_rechecks_current_record
 test_concurrent_force_retry_cannot_replace_staged_outcome
 test_effective_state_is_validated_before_teardown_lock_mutation
+test_treehouse_available_release_is_exact_project_and_path
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

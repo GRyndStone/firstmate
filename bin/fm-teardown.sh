@@ -98,6 +98,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-treehouse-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lib.sh"
 fm_validate_effective_state_path "$STATE" existing || exit 1
 STATE=$FM_VALIDATED_STATE_PATH
 [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$STATE
@@ -1378,6 +1380,11 @@ $listed
 EOF
 }
 
+worktree_released_from_project() {
+  worktree_absent_from_project "$1" "$2" \
+    || fm_treehouse_worktree_available_for_project "$1" "$2"
+}
+
 inspectable_git_worktree() {
   local target=$1 top
   [ -n "$target" ] || return 1
@@ -2568,6 +2575,12 @@ perform_owned_cleanup() {
     auxiliary_owner_matches_target "$TASK_TMP" || return 1
     safe_rm_rf "$TASK_TMP" "task temp root" || return 1
   fi
+  cleanup_backend_release_confirmed || {
+    echo "REFUSED: cleanup command completed, but the exact worktree is not confirmed absent or returned available for $ID." >&2
+    return 1
+  }
+  auxiliary_targets_absent || return 1
+  remove_teardown_owner_marker || return 1
 }
 
 auxiliary_targets_absent() {
@@ -2578,18 +2591,23 @@ auxiliary_targets_absent() {
   done < "$AUX_OWNERS"
 }
 
-cleanup_backend_absence_confirmed() {
-  local owner probe
-  owner=$(teardown_owner_path)
-  [ -z "$owner" ] || { [ ! -e "$owner" ] && [ ! -L "$owner" ]; } || return 1
+cleanup_backend_release_confirmed() {
+  local probe
   if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     probe=$(orca_worktree_probe "$ORCA_WORKTREE_ID") || return 1
     [ "$probe" = absent ]
   elif [ "$KIND" = secondmate ]; then
-    worktree_absent_from_project "$FM_ROOT" "$HOME_PATH"
+    worktree_released_from_project "$FM_ROOT" "$HOME_PATH"
   else
-    worktree_absent_from_project "$PROJ" "$WT"
+    worktree_released_from_project "$PROJ" "$WT"
   fi
+}
+
+cleanup_backend_absence_confirmed() {
+  if [ "$STAGE_OWNER_MARKER" != none ]; then
+    [ ! -e "$STAGE_OWNER_MARKER" ] && [ ! -L "$STAGE_OWNER_MARKER" ] || return 1
+  fi
+  cleanup_backend_release_confirmed
 }
 
 endpoint_absence_confirmed() {
@@ -2638,7 +2656,7 @@ if [ "$STAGE_PHASE" = endpoint-closed ]; then
 fi
 if [ "$STAGE_PHASE" = worktree-cleanup-started ]; then
   if ! revalidate_owned_cleanup; then
-    if cleanup_backend_absence_confirmed && auxiliary_targets_absent; then
+    if cleanup_backend_release_confirmed && auxiliary_targets_absent; then
       cleanup_retryable_residual_state || {
         echo "REFUSED: cleanup is confirmed complete, but exact residual teardown state could not be removed for $ID; preserving retry authority." >&2
         exit 1

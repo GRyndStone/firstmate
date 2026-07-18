@@ -57,6 +57,8 @@ STATE=$FM_VALIDATED_STATE_PATH
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-treehouse-lib.sh
+. "$SCRIPT_DIR/fm-treehouse-lib.sh"
 
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 BACKLOG_SOURCE="$DATA/backlog.md"
@@ -362,7 +364,7 @@ recover_existing_completion_claim() {
 }
 
 finalizing_stage_is_owned() {  # <stage-path> <task-id>
-  local stage=$1 id=$2 meta meta_cksum aux aux_cksum owner kind target backend endpoint endpoint_state audit
+  local stage=$1 id=$2 meta meta_cksum aux aux_cksum owner kind target project endpoint endpoint_state
   [ ! -L "$stage" ] && [ -f "$stage" ] || return 1
   [ ! -e "$STATE/$id.teardown-final-cleanup" ] \
     && [ ! -L "$STATE/$id.teardown-final-cleanup" ] || return 1
@@ -417,24 +419,18 @@ finalizing_stage_is_owned() {  # <stage-path> <task-id>
   if [ "$kind" = secondmate ]; then
     target=$(sed -n 's/^home=//p' "$meta" | tail -1)
     [ -n "$target" ] || target=$(sed -n 's/^worktree=//p' "$meta" | tail -1)
+    project=$FM_ROOT
   else
     target=$(sed -n 's/^worktree=//p' "$meta" | tail -1)
+    project=$(sed -n 's/^project=//p' "$meta" | tail -1)
   fi
-  [ -z "$target" ] || { [ ! -e "$target" ] && [ ! -L "$target" ]; } || return 1
-  backend=$(fm_backend_of_meta "$meta")
+  [ -z "$target" ] \
+    || { [ ! -e "$target" ] && [ ! -L "$target" ]; } \
+    || fm_treehouse_worktree_available_for_project "$project" "$target" \
+    || return 1
   endpoint=$(fm_backend_target_of_meta "$meta")
   [ -n "$endpoint" ] || return 1
-  audit=$(
-    FM_ROOT_OVERRIDE="$FM_ROOT" \
-      FM_HOME="$FM_HOME" \
-      FM_STATE_OVERRIDE="$STATE" \
-      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$id"
-  ) || return 1
-  printf '%s' "$audit" | jq -e --arg id "$id" \
-    '[.[] | select(.task == $id)] | length == 0' >/dev/null || return 1
-  endpoint_state=$(fm_backend_target_state "$backend" "$endpoint" "fm-$id" \
-    "$(fm_backend_target_identity_of_meta "$meta")" "$(fm_meta_get "$meta" worktree)" \
-    "$(fm_backend_target_container_of_meta "$meta")") || return 1
+  endpoint_state=$(fm_backend_closed_target_state_of_meta "$meta" "fm-$id") || return 1
   [ "$endpoint_state" = absent ]
 }
 

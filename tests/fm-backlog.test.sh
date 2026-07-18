@@ -162,6 +162,14 @@ case "${1:-} ${2:-}" in
   "pane list")
     printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}'
     ;;
+  "pane get")
+    if [ "${FM_FAKE_ENDPOINT_PRESENT:-0}" = 1 ]; then
+      printf '%s\n' '{"result":{"pane":{"pane_id":"w1:p1"}}}'
+      exit 0
+    fi
+    printf '%s\n' '{"error":{"code":"pane_not_found","message":"gone"}}' >&2
+    exit 1
+    ;;
 esac
 exit 0
 SH

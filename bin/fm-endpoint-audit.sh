@@ -221,8 +221,8 @@ while IFS=$'\t' read -r session workspace expected_workspace_label; do
     echo "fm-endpoint-audit: cannot read Herdr workspace $session:$workspace" >&2
     exit 1
   fi
-  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg label "$expected_workspace_label" \
-    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 || {
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg want_label "$expected_workspace_label" \
+    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $want_label' >/dev/null 2>&1 || {
     echo "fm-endpoint-audit: invalid exact workspace response for $session:$workspace" >&2
     exit 1
   }

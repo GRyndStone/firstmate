@@ -792,8 +792,8 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) \
         || { printf 'unknown'; return 0; }
     fi
-    printf '%s' "$out" | jq -e --arg workspace "$workspace" --arg label "$workspace_label" \
-      '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 \
+    printf '%s' "$out" | jq -e --arg workspace "$workspace" --arg want_label "$workspace_label" \
+      '.result.workspace.workspace_id == $workspace and .result.workspace.label == $want_label' >/dev/null 2>&1 \
       || { printf 'unknown'; return 0; }
     tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>&1) \
       || { printf 'unknown'; return 0; }
@@ -801,7 +801,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       || { printf 'unknown'; return 0; }
     verdict=$(jq -ren \
       --arg pane "$pane" \
-      --arg label "$expected_label" \
+      --arg want_label "$expected_label" \
       --argjson tabs "$tabs" \
       --argjson panes "$panes" '
         if (($tabs.result.tabs | type) != "array")
@@ -819,7 +819,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
             elif ($owned | length) != 1 then "unknown"
             else $owned[0].tab_id as $tab_id
               | [$tabs.result.tabs[]? | select(.tab_id == $tab_id)] as $owners
-              | if (($owners | length) == 1 and $owners[0].label == $label)
+              | if (($owners | length) == 1 and $owners[0].label == $want_label)
                 then "present" else "unknown" end
             end
         end

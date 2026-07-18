@@ -313,6 +313,10 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))
        | {id, path} ]) as $reports_all
   | ([ .tasks[] | select(.pr.url != null and .pr.source == "meta") | {id, url:.pr.url} ]) as $recorded_prs_all
+  | ([ .endpoint_anomalies[]
+       | {id:.task,kind,backend,recorded:.recorded_endpoint,
+          live:(.live_endpoints | join("|")),worktree,
+          reason:(.reason // "-"),action} ]) as $duplicate_endpoints_all
   | . as $snap
   | {
       schema: "fm-bearings.v1",
@@ -340,7 +344,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       }],
       reports: (if $all_reports == 1 then $reports_all else $reports_all[:$reports_n] end),
       recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end),
-      duplicate_endpoints:($snap.endpoint_anomalies | map({id:.task,kind,backend,recorded:.recorded_endpoint,live:(.live_endpoints | join("|")),worktree,reason:(.reason // "-"),action}))
+      duplicate_endpoints:(if $all_unhealthy == 1 then $duplicate_endpoints_all else $duplicate_endpoints_all[:$unhealthy_n] end)
     }
   | . + (if ($unhealthy_all | length) > 0 then
            {unhealthy_endpoints:(if $all_unhealthy == 1 then $unhealthy_all else $unhealthy_all[:$unhealthy_n] end)}
@@ -363,6 +367,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $all_reports == 0 and ($reports_all | length) > $reports_n then {surface:("reports showing \($reports_n) of \($reports_all | length)"), reveal:"--all-reports"} else empty end),
         (if $all_recorded_prs == 0 and ($recorded_prs_all | length) > $recorded_prs_n then {surface:("recorded_prs showing \($recorded_prs_n) of \($recorded_prs_all | length)"), reveal:"--all-recorded-prs"} else empty end),
         (if $all_unhealthy == 0 and ($unhealthy_all | length) > $unhealthy_n then {surface:("unhealthy_endpoints showing \($unhealthy_n) of \($unhealthy_all | length)"), reveal:"--all-unhealthy"} else empty end),
+        (if $all_unhealthy == 0 and ($duplicate_endpoints_all | length) > $unhealthy_n then {surface:("duplicate_endpoints showing \($unhealthy_n) of \($duplicate_endpoints_all | length)"), reveal:"--all-unhealthy"} else empty end),
         (if ($snap.program_sources | length) > $program_sources_n then {surface:("program sources showing \($program_sources_n) of \($snap.program_sources | length)"), reveal:"raise FM_BEARINGS_PROGRAM_SOURCES"} else empty end),
         (if $include_prs == 1 and $pr_repos_total > $pr_repos_shown then {surface:("PR repositories showing \($pr_repos_shown) of \($pr_repos_total)"), reveal:"--all-pr-repos"} else empty end),
         (if $include_prs == 1 and $pr_rows_capped > 0 then {surface:("candidate_prs showing \($candidate_prs | length) of at least \($pr_rows_min_total); capped in \($pr_rows_capped) repo(s)"), reveal:"raise FM_BEARINGS_PR_LIMIT"} else empty end),
