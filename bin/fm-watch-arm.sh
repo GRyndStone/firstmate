@@ -190,7 +190,8 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-FM_WATCH_OWNER_KIND=arm FM_WATCH_OWNER_PID="${BASHPID:-$$}" "$WATCH" >"$child_out" &
+arm_owner_pid=${BASHPID:-$$}
+FM_WATCH_OWNER_KIND=arm FM_WATCH_OWNER_PID="$arm_owner_pid" "$WATCH" >"$child_out" &
 child=$!
 child_done=0
 
