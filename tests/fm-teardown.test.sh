@@ -2252,8 +2252,8 @@ test_teardown_stage_does_not_dirty_retry_target() {
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
    && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
@@ -2296,8 +2296,8 @@ test_absent_staged_target_retries_only_while_still_absent() {
     cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
    && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
@@ -2358,7 +2358,7 @@ test_secondmate_registry_cleanup_retries_after_home_removal() {
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-dst=${2:-}
+dst=${@: -1}
 if [ "$dst" = "${FM_REGISTRY_PATH:?}" ] && [ ! -e "${FM_REGISTRY_FAIL_FLAG:?}" ]; then
   touch "$FM_REGISTRY_FAIL_FLAG"
   exit 1
@@ -2406,8 +2406,8 @@ SH
     cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
    && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src" 2>/dev/null; then
@@ -2487,8 +2487,8 @@ SH
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
    && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src" 2>/dev/null; then
@@ -2526,8 +2526,8 @@ test_staged_teardown_refuses_changed_backlog_record() {
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] \
    && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=endpoint-closed$' "$src" 2>/dev/null; then
@@ -2674,8 +2674,8 @@ test_forced_staged_retry_cannot_reuse_delivery_proof() {
   log="$case_dir/tasks.log"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -2710,8 +2710,8 @@ test_task_owned_marker_rejects_recreated_worktree() {
   return_log="$case_dir/treehouse.log"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -2852,8 +2852,8 @@ test_confirmed_cleanup_retries_after_phase_write_failure() {
 SH
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleaned$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -2964,8 +2964,8 @@ test_done_record_retries_after_finalization_phase_failure() {
   log="$case_dir/tasks.log"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=backlog-recorded$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -3119,8 +3119,8 @@ test_interrupted_truthful_hold_binds_exact_result() {
   log="$case_dir/tasks.log"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=backlog-held$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -3151,8 +3151,8 @@ SH
   stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=backlog-held$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -3249,8 +3249,8 @@ test_tasktmp_replacement_loses_auxiliary_cleanup_authority() {
   stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -3293,8 +3293,8 @@ test_child_worktree_replacement_loses_auxiliary_cleanup_authority() {
   stage_fail="$case_dir/stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=worktree-cleanup-started$' "$src"; then
   touch "$FM_STAGE_FAIL_FLAG"
@@ -3329,8 +3329,8 @@ test_interrupted_stage_preparation_is_retryable() {
   fail_flag="$case_dir/prepared-stage-failed"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=prepared$' "$src"; then
   : > "$FM_STAGE_FAIL_FLAG"
@@ -3365,8 +3365,8 @@ test_orphan_auxiliary_plan_without_markers_is_recoverable() {
   fail_flag="$case_dir/aux-move-killed"
   cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_AUX_PATH:?}" ] && [ ! -e "${FM_AUX_FAIL_FLAG:?}" ]; then
   /bin/mv "$src" "$dst" || exit
   : > "$FM_AUX_FAIL_FLAG"
@@ -3439,8 +3439,8 @@ test_staged_outcome_requires_valid_context() {
     fail_flag="$case_dir/endpoint-stage-failed"
     cat > "$case_dir/fakebin/mv" <<'SH'
 #!/usr/bin/env bash
-src=${1:-}
-dst=${2:-}
+src=${@: -2:1}
+dst=${@: -1}
 if [ "$dst" = "${FM_STAGE_PATH:?}" ] && [ ! -e "${FM_STAGE_FAIL_FLAG:?}" ] \
    && grep -q '^phase=endpoint-closed$' "$src"; then
   : > "$FM_STAGE_FAIL_FLAG"
