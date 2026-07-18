@@ -1327,12 +1327,12 @@ trim_log() {
 fm_super_main() {
   local STATE
   STATE="$(_state_root)"
-  mkdir -p "$STATE"
 
   # Source the portable lock helpers (works on macOS where flock is absent).
   # Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
   # shellcheck source=bin/fm-wake-lib.sh
-  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
+  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh" || return 1
+  STATE=$FM_VALIDATED_STATE_PATH
 
   local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
   local LOG="$STATE/.supervise-daemon.log"

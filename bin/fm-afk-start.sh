@@ -18,7 +18,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-LOCK="$STATE/.supervise-daemon.lock"
 DAEMON="$SCRIPT_DIR/fm-supervise-daemon.sh"
 
 usage() {
@@ -31,11 +30,11 @@ case "${1:-}" in
   * ) echo "usage: $(basename "$0")" >&2; exit 2 ;;
 esac
 
-mkdir -p "$STATE"
-date '+%s' > "$STATE/.afk"
-
 # shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+
+LOCK="$STATE/.supervise-daemon.lock"
+date '+%s' > "$STATE/.afk"
 
 daemon_lock_owner() {
   local owner

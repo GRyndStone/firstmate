@@ -12,6 +12,7 @@ set -u
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
+WATCH="$ROOT/bin/fm-watch.sh"
 # Source the daemon's pure functions once. Its main loop is skipped under sourcing
 # via a BASH_SOURCE guard, so only classify_*/housekeeping/escalate_*/afk_* and the
 # pane/submit helpers become defined.
@@ -89,6 +90,51 @@ test_daemon_state_root_uses_fm_home() {
   [ "$out" = "$override" ] || fail "daemon state root ignored FM_STATE_OVERRIDE: $out"
 
   pass "supervise daemon state root is scoped by FM_HOME"
+}
+
+test_state_mutating_entrypoints_validate_before_access() {
+  local dir outside state fakebin mkdir_log real_mkdir out status
+  dir="$TMP_ROOT/state-entrypoint-validation"
+  outside="$dir/outside"
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  mkdir_log="$dir/state-mkdir.log"
+  real_mkdir=$(command -v mkdir) || fail "state-entrypoint test requires mkdir"
+  mkdir -p "$outside" "$fakebin"
+  ln -s "$outside" "$state"
+  cat > "$fakebin/mkdir" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = "$state" ]; then
+    printf 'state mkdir\n' >> "$mkdir_log"
+  fi
+done
+exec "$real_mkdir" "\$@"
+EOF
+  chmod +x "$fakebin/mkdir"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-afk-start.sh accessed effective state before shared validation"
+  assert_absent "$outside/.afk" "fm-afk-start.sh wrote the away flag through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-afk-start.sh did not surface state validation failure"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$DAEMON" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-supervise-daemon.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-supervise-daemon.sh accessed effective state before shared validation"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "fm-supervise-daemon.sh wrote through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-supervise-daemon.sh did not surface state validation failure"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-watch.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-watch.sh accessed effective state before shared validation"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "fm-watch.sh wrote through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-watch.sh did not surface state validation failure"
+
+  pass "state-mutating supervision entrypoints validate effective state before first access"
 }
 
 test_classify_routine_signal_self() {
@@ -1726,6 +1772,7 @@ test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
+test_state_mutating_entrypoints_validate_before_access
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate

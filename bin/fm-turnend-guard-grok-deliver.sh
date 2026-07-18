@@ -11,20 +11,26 @@ case "$PENDING" in /*) ;; *) PENDING="$PWD/$PENDING" ;; esac
 [ -L "$PENDING" ] && exit 1
 HANDOFF_DIR=${PENDING%/*}
 STATE_DIR=${HANDOFF_DIR%/*}
+PENDING_NAME=${PENDING##*/}
 EFFECTIVE_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$ROOT}}
 EFFECTIVE_STATE=${FM_STATE_OVERRIDE:-$EFFECTIVE_HOME/state}
 case "$EFFECTIVE_STATE" in /*) ;; *) EFFECTIVE_STATE="$PWD/$EFFECTIVE_STATE" ;; esac
 case "$EXPECTED_STATE" in /*) ;; *) EXPECTED_STATE="$PWD/$EXPECTED_STATE" ;; esac
-[ "$EXPECTED_STATE" = "$EFFECTIVE_STATE" ] || exit 1
-[ "$STATE_DIR" = "$EXPECTED_STATE" ] || exit 1
-FM_STATE_OVERRIDE=$EXPECTED_STATE
+FM_STATE_OVERRIDE=$EFFECTIVE_STATE
 # shellcheck source=bin/fm-wake-lib.sh
 FM_WAKE_STATE_INIT=skip
 . "$ROOT/bin/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
+EFFECTIVE_STATE=$FM_VALIDATED_STATE_PATH
 fm_validate_effective_state_path "$EXPECTED_STATE" existing || exit 1
 EXPECTED_STATE=$FM_VALIDATED_STATE_PATH
-STATE_DIR=$EXPECTED_STATE
+fm_validate_effective_state_path "$STATE_DIR" existing || exit 1
+STATE_DIR=$FM_VALIDATED_STATE_PATH
+[ "$EXPECTED_STATE" = "$EFFECTIVE_STATE" ] || exit 1
+[ "$STATE_DIR" = "$EXPECTED_STATE" ] || exit 1
+[ "${HANDOFF_DIR##*/}" = .turnend-handoffs ] || exit 1
+HANDOFF_DIR="$EXPECTED_STATE/.turnend-handoffs"
+PENDING="$HANDOFF_DIR/$PENDING_NAME"
 [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
 case "$PENDING" in "$HANDOFF_DIR"/grok-*.pending) ;; *) exit 1 ;; esac
 ACKNOWLEDGED="$PENDING.acknowledged"
@@ -52,6 +58,7 @@ LOCK_IDENTITY=$(fm_pid_identity "$LOCK_PID") || exit 1
 LOCK_RECORD=$(printf '%s\n%s\n%s' "$EXPECTED_TOKEN" "$LOCK_PID" "$LOCK_IDENTITY")
 READY="$PENDING.ready"
 READY_RECORD=$(printf '%s\n%s\n%s' "$EXPECTED_TOKEN" "$LOCK_PID" "$LOCK_IDENTITY")
+READY_TMP=
 DELIVERY_PID=
 TIMER_PID=
 DELIVERY_IDENTITY=
@@ -79,6 +86,9 @@ if ! acquire_delivery_lock; then
   acquire_delivery_lock || exit 0
 fi
 cleanup() {
+  if [ -n "$READY_TMP" ] && [ -f "$READY_TMP" ] && [ ! -L "$READY_TMP" ]; then
+    rm -f "$READY_TMP" 2>/dev/null || true
+  fi
   if [ -f "$READY" ] && [ ! -L "$READY" ] \
     && [ "$(cat "$READY" 2>/dev/null || true)" = "$READY_RECORD" ]; then
     rm -f "$READY" 2>/dev/null || true
@@ -136,10 +146,11 @@ trap cleanup EXIT
 trap handle_signal TERM INT
 
 [ "$(sed -n '1p' "$PENDING" 2>/dev/null || true)" = "$EXPECTED_TOKEN" ] || exit 0
-READY_TMP="$READY.tmp.$LOCK_PID"
+READY_TMP=$(mktemp "$HANDOFF_DIR/.grok-ready.XXXXXX") || exit 1
 printf '%s\n' "$READY_RECORD" > "$READY_TMP" || exit 1
 chmod 600 "$READY_TMP" 2>/dev/null || true
 mv -f "$READY_TMP" "$READY" || { rm -f "$READY_TMP"; exit 1; }
+READY_TMP=
 
 run_delivery() {
   local rc deadline term_deadline

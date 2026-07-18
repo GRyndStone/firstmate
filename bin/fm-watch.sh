@@ -55,10 +55,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.

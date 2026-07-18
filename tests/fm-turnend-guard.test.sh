@@ -1075,6 +1075,91 @@ EOF
   pass "fm-turnend-guard-grok: worker binds pending delivery to exact validated effective state"
 }
 
+test_grok_worker_normalizes_mac_state_aliases() {
+  local dir state canonical_state alias_state canonical_root fakebin calls pending out status
+  [ "$(uname)" = Darwin ] || {
+    pass "fm-turnend-guard-grok: state-alias regression is macOS-specific"
+    return
+  }
+  dir=$(make_primary_dir "$TMP_ROOT/grok-state-alias-code")
+  state="$dir/state"
+  canonical_state=$(cd "$state" && pwd -P)
+  canonical_root=$(cd "$dir" && pwd -P)
+  case "$canonical_state" in
+    /private/var/*|/private/tmp/*) alias_state=${canonical_state#/private} ;;
+    *) fail "Grok state-alias test requires a /private/var or /private/tmp fixture: $canonical_state" ;;
+  esac
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-state-alias-fakebin")
+  calls="$TMP_ROOT/grok-state-alias-calls"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$fakebin/grok"
+  mkdir -p "$canonical_state/.turnend-handoffs"
+  pending="$canonical_state/.turnend-handoffs/grok-state-alias.pending"
+  printf '%s\n' alias-token 999999 alias-identity alias-session 'alias reason' > "$pending"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$alias_state" FM_GROK_TURNEND_DELAY=0 \
+    bash "$canonical_root/bin/fm-turnend-guard-grok-deliver.sh" \
+      "$pending" "$canonical_root" alias-token "$canonical_state" 2>&1) || status=$?
+  expect_code 0 "$status" "Grok worker macOS state alias binding"
+  [ -z "$out" ] || fail "Grok state-alias worker printed output: $out"
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] || fail "Grok state-alias worker did not deliver exactly once"
+  assert_absent "$pending" "Grok state-alias worker retained its acknowledged handoff"
+  pass "fm-turnend-guard-grok: worker canonicalizes macOS state aliases before binding"
+}
+
+test_grok_worker_readiness_temp_never_follows_symlink() {
+  local dir fakebin real_ps calls marker release outside pending out worker status i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-ready-temp-symlink")
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-ready-temp-symlink-fakebin")
+  real_ps=$(command -v ps) || fail "Grok readiness-temp test requires ps"
+  calls="$TMP_ROOT/grok-ready-temp-symlink-calls"
+  marker="$TMP_ROOT/grok-ready-temp-symlink-marker"
+  release="$TMP_ROOT/grok-ready-temp-symlink-release"
+  outside="$TMP_ROOT/grok-ready-temp-symlink-outside"
+  printf 'sentinel\n' > "$outside"
+  cat > "$fakebin/ps" <<EOF
+#!/usr/bin/env bash
+if [ ! -e "$release" ]; then
+  : > "$marker"
+  while [ ! -e "$release" ]; do sleep 0.01; done
+fi
+exec "$real_ps" "\$@"
+EOF
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$fakebin/ps" "$fakebin/grok"
+  mkdir -p "$dir/state/.turnend-handoffs"
+  pending="$dir/state/.turnend-handoffs/grok-ready-temp.pending"
+  printf '%s\n' ready-token 999999 ready-identity ready-session 'ready reason' > "$pending"
+
+  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" \
+      "$pending" "$dir" ready-token "$dir/state" > "$TMP_ROOT/grok-ready-temp.out" 2>&1 &
+  worker=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -e "$marker" ] && break
+    sleep 0.05
+  done
+  [ -e "$marker" ] || fail "Grok readiness-temp worker did not reach identity capture"
+  ln -s "$outside" "$pending.ready.tmp.$worker"
+  : > "$release"
+  status=0
+  wait "$worker" || status=$?
+  out=$(cat "$TMP_ROOT/grok-ready-temp.out")
+  expect_code 0 "$status" "Grok readiness-temp no-follow publication"
+  [ -z "$out" ] || fail "Grok readiness-temp worker printed output: $out"
+  [ "$(cat "$outside")" = sentinel ] || fail "Grok readiness publication followed the deterministic temp symlink"
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] || fail "Grok readiness-temp worker did not deliver exactly once"
+  assert_absent "$pending" "Grok readiness-temp worker retained its acknowledged handoff"
+  pass "fm-turnend-guard-grok: readiness publication uses an exclusive in-directory temp"
+}
+
 test_grok_hook_and_worker_share_root_override_state_fallback() {
   local dir operational fakebin calls out status i
   dir=$(make_primary_dir "$TMP_ROOT/grok-root-override-code")
@@ -2943,6 +3028,8 @@ test_grok_worker_signal_reaps_delivery_children
 test_grok_worker_quarantines_legacy_continue_handoff
 test_grok_acknowledged_cleanup_never_redelivers
 test_grok_worker_binds_pending_to_exact_external_state
+test_grok_worker_normalizes_mac_state_aliases
+test_grok_worker_readiness_temp_never_follows_symlink
 test_grok_hook_and_worker_share_root_override_state_fallback
 test_grok_delivery_log_never_follows_symlink
 test_settings_hook_uses_claude_project_dir
