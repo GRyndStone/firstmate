@@ -26,23 +26,17 @@ if [ -z "$SESSION_ID" ]; then
   printf '%s\n' 'FIRSTMATE TURN-END GUARD UNSUPPORTED: Grok Stop payload omitted its exact sessionId; the passive hook cannot safely resume the originating session, so no continuation was scheduled.' >&2
   exit 0
 fi
-STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
-case "$STATE" in /*) ;; *) STATE="$PWD/$STATE" ;; esac
-COMPONENT_PATH=/
-COMPONENT_SUFFIX=${STATE#/}
-while [ -n "$COMPONENT_SUFFIX" ]; do
-  COMPONENT=${COMPONENT_SUFFIX%%/*}
-  if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
-  [ -n "$COMPONENT" ] || continue
-  case "$COMPONENT" in .|..) exit 1 ;; esac
-  COMPONENT_PATH=${COMPONENT_PATH%/}/$COMPONENT
-  [ ! -L "$COMPONENT_PATH" ] || exit 1
-  if [ -n "$COMPONENT_SUFFIX" ] && [ -e "$COMPONENT_PATH" ]; then
-    [ -d "$COMPONENT_PATH" ] || exit 1
-  fi
-done
+EFFECTIVE_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$ROOT}}
+STATE=${FM_STATE_OVERRIDE:-$EFFECTIVE_HOME/state}
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$ROOT/bin/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+fm_validate_effective_state_path "$STATE" allow-missing-final || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
 [ ! -e "$STATE" ] && exit 0
-[ -d "$STATE" ] && [ ! -L "$STATE" ] || exit 1
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
 HANDOFF_DIR="$STATE/.turnend-handoffs"
 if [ -e "$HANDOFF_DIR" ]; then
   [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
@@ -61,7 +55,6 @@ else
 fi
 [ -n "$KEY" ] || exit 1
 PENDING="$HANDOFF_DIR/grok-$KEY.pending"
-. "$ROOT/bin/fm-wake-lib.sh" || exit 1
 HOOK_PID=${BASHPID:-$$}
 HOOK_IDENTITY=$(fm_pid_identity "$HOOK_PID") || exit 1
 PREPARE_LOCK="$PENDING.prepare"

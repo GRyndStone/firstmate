@@ -23,13 +23,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
-# shellcheck source=bin/fm-tasks-axi-lib.sh
-. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-# shellcheck source=bin/fm-backend.sh
-. "$SCRIPT_DIR/fm-backend.sh"
-
 usage() {
   cat <<'EOF'
 Usage: fm-backlog.sh <tasks-axi-command> [args...]
@@ -55,6 +48,16 @@ FM_HOME=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || {
 }
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+[ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$STATE
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
+
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 BACKLOG_SOURCE="$DATA/backlog.md"
 BACKLOG_LOCK="$STATE/.backlog.lock"

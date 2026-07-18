@@ -96,42 +96,10 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 
-validate_effective_state_path() {
-  local path=$1 component suffix cursor=/ home_abs parent_abs
-  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
-  suffix=${path#/}
-  while [ -n "$suffix" ]; do
-    component=${suffix%%/*}
-    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
-    [ -n "$component" ] || continue
-    case "$component" in .|..) echo "REFUSED: unsafe effective state path component: $component" >&2; return 1 ;; esac
-    cursor=${cursor%/}/$component
-    [ ! -L "$cursor" ] || {
-      echo "REFUSED: symlinked effective state path component: $cursor" >&2
-      return 1
-    }
-    if [ -e "$cursor" ] && [ ! -d "$cursor" ]; then
-      echo "REFUSED: non-directory effective state path component: $cursor" >&2
-      return 1
-    fi
-  done
-  if [ -z "${FM_STATE_OVERRIDE:-}" ]; then
-    home_abs=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || {
-      echo "REFUSED: cannot resolve Firstmate home before teardown state validation: $FM_HOME" >&2
-      return 1
-    }
-    parent_abs=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || {
-      echo "REFUSED: cannot resolve default teardown state parent: $path" >&2
-      return 1
-    }
-    [ "$parent_abs" = "$home_abs" ] && [ "$(basename "$path")" = state ] || {
-      echo "REFUSED: default teardown state must remain inside the selected Firstmate home: $path" >&2
-      return 1
-    }
-  fi
-  STATE=$path
-}
-validate_effective_state_path "$STATE" || exit 1
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
 [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$STATE
 
 # shellcheck source=bin/fm-tasks-axi-lib.sh
@@ -140,8 +108,6 @@ validate_effective_state_path "$STATE" || exit 1
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1

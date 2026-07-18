@@ -753,6 +753,79 @@ EOF
   pass "idempotent and mixed committed handoffs reconcile every requested receipt in both homes"
 }
 
+test_handoff_refuses_current_lifecycle_before_receipt_cleanup_or_move() {
+  local home sub before_main before_sub out status
+  home="$TMP_ROOT/current-lifecycle-main"
+  sub="$TMP_ROOT/current-lifecycle-sub"
+  setup_homes "$home" "$sub"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] newly-moved - must remain queued while another requested key is finalizing (repo: alpha)
+
+## Done
+EOF
+  cat > "$sub/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+- [ ] already-there - lifecycle-owned destination item (repo: alpha)
+
+## Done
+EOF
+  printf 'current-proof\n' > "$sub/state/already-there.teardown-complete"
+  printf 'version=1\nphase=backlog-done-started\n' > "$sub/state/already-there.teardown-stage"
+  before_main=$(cksum "$home/data/backlog.md")
+  before_sub=$(cksum "$sub/data/backlog.md")
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design already-there 2>&1) || status=$?
+  expect_code 1 "$status" "idempotent handoff with current lifecycle state"
+  assert_contains "$out" "current lifecycle state for already-there" \
+    "idempotent handoff did not explain its lifecycle refusal"
+  assert_present "$sub/state/already-there.teardown-complete" \
+    "idempotent lifecycle refusal deleted the live completion proof"
+  assert_present "$sub/state/already-there.teardown-stage" \
+    "idempotent lifecycle refusal deleted the live teardown stage"
+  [ "$(cksum "$home/data/backlog.md")" = "$before_main" ] \
+    || fail "idempotent lifecycle refusal changed the source backlog"
+  [ "$(cksum "$sub/data/backlog.md")" = "$before_sub" ] \
+    || fail "idempotent lifecycle refusal changed the destination backlog"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design newly-moved already-there 2>&1) || status=$?
+  expect_code 1 "$status" "mixed handoff with current lifecycle state"
+  assert_contains "$out" "current lifecycle state for already-there" \
+    "mixed handoff did not refuse before its move"
+  assert_present "$sub/state/already-there.teardown-complete" \
+    "mixed lifecycle refusal deleted the live completion proof"
+  [ "$(cksum "$home/data/backlog.md")" = "$before_main" ] \
+    || fail "mixed lifecycle refusal moved the queued source item"
+  [ "$(cksum "$sub/data/backlog.md")" = "$before_sub" ] \
+    || fail "mixed lifecycle refusal changed the destination backlog"
+  pass "handoffs preserve current lifecycle proof and backlog state before idempotent or mixed work"
+}
+
+test_handoff_refuses_symlinked_active_state_before_locking() {
+  local home sub outside out status
+  home="$TMP_ROOT/symlinked-active-state-main"
+  sub="$TMP_ROOT/symlinked-active-state-sub"
+  setup_homes "$home" "$sub"
+  outside="$TMP_ROOT/symlinked-active-state-outside"
+  mkdir -p "$outside"
+  rm -rf "$home/state"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design body-item 2>&1) || status=$?
+  expect_code 1 "$status" "handoff with symlinked active state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "handoff did not reject foreign active state before locking"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "handoff mutated foreign active state before validation"
+  pass "handoff validates active state before locks and receipt mutation"
+}
+
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole
@@ -769,5 +842,7 @@ test_handoff_child_owns_both_homes_after_wrapper_death
 test_handoff_refuses_interrupted_receipt_transactions_in_either_home
 test_committed_handoff_preserves_destination_when_owner_cleanup_fails
 test_idempotent_and_mixed_handoffs_reconcile_all_completion_receipts
+test_handoff_refuses_current_lifecycle_before_receipt_cleanup_or_move
+test_handoff_refuses_symlinked_active_state_before_locking
 
 echo "ALL TESTS PASSED"

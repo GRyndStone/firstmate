@@ -47,6 +47,16 @@ esac
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+
+CHECKPOINT_PID=${BASHPID:-$$}
+CHECKPOINT_IDENTITY=$(fm_pid_birth_identity "$CHECKPOINT_PID") || {
+  echo "checkpoint: exact checkpoint process identity could not be captured" >&2
+  exit 1
+}
+fm_reserve_checkpoint_orphan "$STATE" "$CHECKPOINT_PID" "$CHECKPOINT_IDENTITY" || exit 1
+CHECKPOINT_RECORD=$FM_CHECKPOINT_ORPHAN_RECORD
 
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
@@ -69,10 +79,10 @@ ABORT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.abort.XXXXXX") || {
 rm -f "$START_MARKER" "$ABORT_MARKER"
 WATCH_PID=
 WATCH_IDENTITY=
-CHECKPOINT_PID=${BASHPID:-$$}
 TIMER_PID=
 CLEANED=0
 TIMED_OUT=0
+OWNERSHIP_FAILURE=0
 
 watch_birth_identity() {
   fm_pid_birth_identity "$1"
@@ -111,6 +121,12 @@ watch_child_state() {
   printf '%s\n' alive
 }
 
+release_checkpoint_authority() {
+  [ -n "$CHECKPOINT_RECORD" ] || return 0
+  fm_clear_checkpoint_orphan "$STATE" "$CHECKPOINT_RECORD" || return 1
+  CHECKPOINT_RECORD=
+}
+
 reap_watch_child_bounded() {
   local limit=$1 i=0 child_state
   [ -n "$WATCH_PID" ] || return 0
@@ -120,12 +136,10 @@ reap_watch_child_bounded() {
       dead)
         wait "$WATCH_PID" 2>/dev/null || true
         WATCH_PID=
-        return 0
+        release_checkpoint_authority
+        return
         ;;
-      mismatch)
-        WATCH_PID=
-        return 0
-        ;;
+      mismatch) return 1 ;;
     esac
     sleep 0.05
     i=$((i + 1))
@@ -141,10 +155,11 @@ signal_watch_child() {
 
 retain_watch_child() {
   [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || return 1
-  fm_record_checkpoint_orphan "$STATE" "$WATCH_PID" "$WATCH_IDENTITY" || {
+  fm_record_checkpoint_orphan "$STATE" "$CHECKPOINT_RECORD" "$WATCH_PID" "$WATCH_IDENTITY" || {
     echo "checkpoint: FAILED - exact watcher pid=$WATCH_PID remains live but durable orphan ownership could not be recorded" >&2
     return 1
   }
+  CHECKPOINT_RECORD=
   echo "checkpoint: ORPHANED exact watcher pid=$WATCH_PID; durable ownership retained at $(fm_checkpoint_orphan_path "$STATE")" >&2
   WATCH_PID=
   return 0
@@ -156,8 +171,12 @@ stop_watch_child() {
   while [ "$i" -lt "$limit" ]; do
     child_state=$(watch_child_state)
     case "$child_state" in
-      dead|mismatch)
+      dead)
         reap_watch_child_bounded 1 && return 0
+        retain_watch_child
+        return
+        ;;
+      mismatch)
         retain_watch_child
         return
         ;;
@@ -170,8 +189,12 @@ stop_watch_child() {
   done
   child_state=$(watch_child_state)
   case "$child_state" in
-    dead|mismatch)
+    dead)
       reap_watch_child_bounded 1 && return 0
+      retain_watch_child
+      return
+      ;;
+    mismatch)
       retain_watch_child
       return
       ;;
@@ -192,7 +215,14 @@ cleanup_owned_children() {
   fi
   [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
   TIMER_PID=
-  stop_watch_child 20 || retain_watch_child || true
+  if ! stop_watch_child 20; then
+    OWNERSHIP_FAILURE=1
+  fi
+  if [ -z "$WATCH_PID" ] && [ -n "$CHECKPOINT_RECORD" ] \
+    && ! release_checkpoint_authority; then
+    echo "checkpoint: FAILED - reserved checkpoint orphan authority could not be released" >&2
+    OWNERSHIP_FAILURE=1
+  fi
   rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER" "$ABORT_MARKER"
 }
 
@@ -201,6 +231,9 @@ checkpoint_interrupted() {
   local code=$1
   trap - HUP INT TERM
   cleanup_owned_children
+  if [ "$OWNERSHIP_FAILURE" -ne 0 ]; then
+    exit 1
+  fi
   exit "$code"
 }
 
@@ -241,9 +274,21 @@ if ! capture_watch_identity; then
     echo "checkpoint: exact wrapper exit could not be confirmed after its abort gate closed" >&2
   fi
   WATCH_PID=
+  release_checkpoint_authority || {
+    echo "checkpoint: reserved orphan authority could not be released after startup abort" >&2
+    exit 1
+  }
   echo "checkpoint: exact watcher child identity could not be captured; watcher was not started" >&2
   exit 1
 fi
+if ! fm_activate_checkpoint_orphan_reservation "$STATE" "$CHECKPOINT_RECORD" \
+  "$CHECKPOINT_PID" "$CHECKPOINT_IDENTITY" "$WATCH_PID" "$WATCH_IDENTITY"; then
+  : > "$ABORT_MARKER"
+  stop_watch_child 40 || OWNERSHIP_FAILURE=1
+  echo "checkpoint: exact watcher ownership could not be bound before startup" >&2
+  exit 1
+fi
+CHECKPOINT_RECORD=$FM_CHECKPOINT_ORPHAN_RECORD
 : > "$START_MARKER"
 (
   sleep "$SECONDS_ARG"
@@ -259,7 +304,7 @@ while [ ! -e "$TIMEOUT_MARKER" ]; do
 done
 if [ -e "$TIMEOUT_MARKER" ]; then
   TIMED_OUT=1
-  stop_watch_child 20 || retain_watch_child || true
+  stop_watch_child 20 || OWNERSHIP_FAILURE=1
 fi
 set +e
 RC=1
@@ -272,7 +317,7 @@ elif [ "$WATCH_FINISHED" -eq 1 ] && [ "$(watch_child_state)" = dead ]; then
 elif reap_watch_child_bounded 40; then
   RC=0
 else
-  retain_watch_child || true
+  retain_watch_child || OWNERSHIP_FAILURE=1
 fi
 set -e
 if kill -0 "$TIMER_PID" 2>/dev/null; then
@@ -280,6 +325,11 @@ if kill -0 "$TIMER_PID" 2>/dev/null; then
 fi
 wait "$TIMER_PID" 2>/dev/null || true
 TIMER_PID=
+
+if [ "$OWNERSHIP_FAILURE" -ne 0 ]; then
+  echo "checkpoint: FAILED - exact watcher ownership could not be finalized" >&2
+  exit 1
+fi
 
 if [ -e "$TIMEOUT_MARKER" ]; then
   RC=124

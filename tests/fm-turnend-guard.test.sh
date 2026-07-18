@@ -1075,6 +1075,49 @@ EOF
   pass "fm-turnend-guard-grok: worker binds pending delivery to exact validated effective state"
 }
 
+test_grok_hook_and_worker_share_root_override_state_fallback() {
+  local dir operational fakebin calls out status i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-root-override-code")
+  operational="$TMP_ROOT/grok-root-override-home"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-root-override-fakebin")
+  calls="$TMP_ROOT/grok-root-override-calls"
+  mkdir -p "$operational/state"
+  cat > "$dir/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'blind supervision\n' >&2
+exit 2
+SH
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$dir/bin/fm-turnend-guard.sh" "$fakebin/grok"
+  status=0
+  out=$(printf '{"sessionId":"root-override-session"}' | env -u FM_HOME -u FM_STATE_OVERRIDE \
+    PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_ROOT_OVERRIDE="$operational" \
+    FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1) || status=$?
+  expect_code 0 "$status" "Grok root-override state fallback"
+  [ -z "$out" ] || fail "Grok root-override adapter printed output: $out"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$calls" ] && break
+    sleep 0.1
+  done
+  assert_present "$calls" "Grok worker did not deliver from the shared root-override state"
+  [ ! -e "$dir/state/.turnend-handoffs" ] \
+    || fail "Grok hook wrote handoff state under its code root instead of FM_ROOT_OVERRIDE"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    find "$operational/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null \
+      | grep -q . || break
+    sleep 0.1
+  done
+  if find "$operational/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null \
+    | grep -q .; then
+    fail "Grok worker retained a root-override pending record after delivery"
+  fi
+  pass "fm-turnend-guard-grok: hook and worker share the FM_ROOT_OVERRIDE state fallback"
+}
+
 test_settings_hook_uses_claude_project_dir() {
   local settings command
   settings="$ROOT/.claude/settings.json"
@@ -2900,6 +2943,7 @@ test_grok_worker_signal_reaps_delivery_children
 test_grok_worker_quarantines_legacy_continue_handoff
 test_grok_acknowledged_cleanup_never_redelivers
 test_grok_worker_binds_pending_to_exact_external_state
+test_grok_hook_and_worker_share_root_override_state_fallback
 test_grok_delivery_log_never_follows_symlink
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard

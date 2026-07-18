@@ -916,6 +916,23 @@ test_help_does_not_require_home_configuration() {
   pass "wrapper and verb-scoped help preserve lifecycle receipts"
 }
 
+test_backlog_refuses_symlinked_state_before_mutation() {
+  local home outside out status
+  home=$(make_home symlinked-state)
+  outside="$TMP_ROOT/symlinked-state-outside"
+  mkdir -p "$outside"
+  rm -rf "$home/state"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" update task-a --title unsafe 2>&1) || status=$?
+  expect_code 1 "$status" "backlog mutation with symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "backlog wrapper did not reject foreign state before mutation admission"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "backlog wrapper mutated foreign state before validation"
+  pass "backlog mutations validate home-scoped state before locks and receipts"
+}
+
 test_interrupted_mutation_receipt_claims_reconcile_from_files() {
   local home marker release wrapper_pid status out claim backend_pid recorded_identity current_identity i
   home=$(make_home interrupted-mutation-claim-unchanged)
@@ -1164,6 +1181,7 @@ test_done_rejects_noncanonical_id_before_proof_access
 test_completion_and_move_aliases_cannot_bypass_guards
 test_tasks_axi_is_scoped_to_selected_home
 test_help_does_not_require_home_configuration
+test_backlog_refuses_symlinked_state_before_mutation
 test_interrupted_mutation_receipt_claims_reconcile_from_files
 test_interrupted_done_backend_retains_mutation_ownership
 test_documented_overrides_remain_compatible

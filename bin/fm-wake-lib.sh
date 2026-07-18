@@ -6,10 +6,67 @@ FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
+FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
+
+FM_VALIDATED_STATE_PATH=
+fm_validate_effective_state_path() {
+  local path=$1 mode=${2:-allow-missing-final} component suffix cursor=/ parent
+  FM_VALIDATED_STATE_PATH=
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  if [ "$(uname)" = Darwin ]; then
+    case "$path" in
+      /var/*|/tmp/*) path="/private$path" ;;
+    esac
+  fi
+  suffix=${path#/}
+  while [ -n "$suffix" ]; do
+    component=${suffix%%/*}
+    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
+    [ -n "$component" ] || continue
+    case "$component" in
+      .|..)
+        echo "error: unsafe effective state path component: $component" >&2
+        return 1
+        ;;
+    esac
+    cursor=${cursor%/}/$component
+    if [ -L "$cursor" ]; then
+      echo "error: symlinked effective state path component refused: $cursor" >&2
+      return 1
+    fi
+    if [ -e "$cursor" ] && [ ! -d "$cursor" ]; then
+      echo "error: non-directory effective state path component refused: $cursor" >&2
+      return 1
+    fi
+    if [ ! -e "$cursor" ] && [ -n "$suffix" ]; then
+      echo "error: missing effective state path parent: $cursor" >&2
+      return 1
+    fi
+  done
+  if [ ! -e "$path" ]; then
+    [ "$mode" = allow-missing-final ] || {
+      echo "error: effective state directory does not exist: $path" >&2
+      return 1
+    }
+    parent=${path%/*}
+    [ -n "$parent" ] || parent=/
+    [ -d "$parent" ] && [ ! -L "$parent" ] || {
+      echo "error: effective state parent is not a regular directory: $parent" >&2
+      return 1
+    }
+  fi
+  FM_VALIDATED_STATE_PATH=$path
+}
+
+if ! fm_validate_effective_state_path "$STATE" allow-missing-final; then
+  return 1 2>/dev/null || exit 1
+fi
+STATE=$FM_VALIDATED_STATE_PATH
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
-FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
-mkdir -p "$STATE"
+if [ "${FM_WAKE_STATE_INIT:-create}" != skip ] && [ ! -d "$STATE" ]; then
+  mkdir "$STATE" || { return 1 2>/dev/null || exit 1; }
+fi
 
 fm_current_pid() {
   printf '%s\n' "${BASHPID:-$$}"
@@ -55,29 +112,84 @@ fm_checkpoint_orphan_path() {
   printf '%s/.watch-checkpoint-orphan\n' "$1"
 }
 
-fm_record_checkpoint_orphan() {
-  local state=$1 pid=$2 identity=$3 path tmp
-  [ -n "$identity" ] || return 1
+FM_CHECKPOINT_ORPHAN_RECORD=
+fm_create_checkpoint_orphan_record() {
+  local state=$1 record=$2 path tmp
   path=$(fm_checkpoint_orphan_path "$state")
   [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
   tmp=$(mktemp "$state/.watch-checkpoint-orphan.tmp.XXXXXX") || return 1
-  if ! printf '%s\n%s\n' "$pid" "$identity" > "$tmp" || ! ln "$tmp" "$path"; then
+  if ! printf '%s\n' "$record" > "$tmp" || ! ln "$tmp" "$path"; then
     rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
   rm -f "$tmp" 2>/dev/null || true
 }
 
+fm_replace_checkpoint_orphan_record() {
+  local state=$1 expected=$2 replacement=$3 path tmp
+  path=$(fm_checkpoint_orphan_path "$state")
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(cat "$path" 2>/dev/null || true)" = "$expected" ] || return 1
+  tmp=$(mktemp "$state/.watch-checkpoint-orphan.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$replacement" > "$tmp" \
+    || [ "$(cat "$path" 2>/dev/null || true)" != "$expected" ] \
+    || ! mv "$tmp" "$path"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
 fm_clear_checkpoint_orphan() {
-  local path=$1 record=$2
+  local state=$1 record=$2 path
+  fm_validate_effective_state_path "$state" existing || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  path=$(fm_checkpoint_orphan_path "$state")
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
   [ "$(cat "$path" 2>/dev/null || true)" = "$record" ] || return 1
   rm -f "$path" || return 1
   [ ! -e "$path" ] && [ ! -L "$path" ]
 }
 
+fm_reserve_checkpoint_orphan() {
+  local state=$1 pid=$2 identity=$3 record
+  FM_CHECKPOINT_ORPHAN_RECORD=
+  [ -n "$identity" ] || return 1
+  fm_validate_effective_state_path "$state" existing || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  fm_reconcile_checkpoint_orphan "$state" || return 1
+  record=$(printf 'reservation\n%s\n%s' "$pid" "$identity")
+  fm_create_checkpoint_orphan_record "$state" "$record" || {
+    echo "watcher: FAILED - checkpoint orphan authority could not be reserved at $(fm_checkpoint_orphan_path "$state")" >&2
+    return 1
+  }
+  FM_CHECKPOINT_ORPHAN_RECORD=$record
+}
+
+fm_activate_checkpoint_orphan_reservation() {
+  local state=$1 expected=$2 checkpoint_pid=$3 checkpoint_identity=$4 watch_pid=$5 watch_identity=$6 record
+  [ -n "$checkpoint_identity" ] && [ -n "$watch_identity" ] || return 1
+  fm_validate_effective_state_path "$state" existing || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  record=$(printf 'active\n%s\n%s\n%s\n%s' \
+    "$checkpoint_pid" "$checkpoint_identity" "$watch_pid" "$watch_identity")
+  fm_replace_checkpoint_orphan_record "$state" "$expected" "$record" || return 1
+  FM_CHECKPOINT_ORPHAN_RECORD=$record
+}
+
+fm_record_checkpoint_orphan() {
+  local state=$1 expected=$2 pid=$3 identity=$4 record
+  [ -n "$identity" ] || return 1
+  fm_validate_effective_state_path "$state" existing || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  record=$(printf 'orphan\n%s\n%s' "$pid" "$identity")
+  fm_replace_checkpoint_orphan_record "$state" "$expected" "$record" || return 1
+  FM_CHECKPOINT_ORPHAN_RECORD=$record
+}
+
 fm_reconcile_checkpoint_orphan() {
-  local state=$1 path record pid identity pid_state current_identity i signal_sent=0
+  local state=$1 path record kind owner_pid owner_identity pid identity pid_state current_identity i signal_sent=0
+  fm_validate_effective_state_path "$state" existing || return 1
+  state=$FM_VALIDATED_STATE_PATH
   path=$(fm_checkpoint_orphan_path "$state")
   [ -e "$path" ] || [ -L "$path" ] || return 0
   if [ ! -f "$path" ] || [ -L "$path" ]; then
@@ -88,8 +200,69 @@ fm_reconcile_checkpoint_orphan() {
     echo "watcher: FAILED - unreadable checkpoint orphan ownership record at $path" >&2
     return 1
   }
-  pid=$(printf '%s\n' "$record" | sed -n '1p')
-  identity=$(printf '%s\n' "$record" | sed '1d')
+  kind=$(printf '%s\n' "$record" | sed -n '1p')
+  case "$kind" in
+    reservation)
+      owner_pid=$(printf '%s\n' "$record" | sed -n '2p')
+      owner_identity=$(printf '%s\n' "$record" | sed '1,2d')
+      pid=
+      identity=
+      ;;
+    active)
+      owner_pid=$(printf '%s\n' "$record" | sed -n '2p')
+      owner_identity=$(printf '%s\n' "$record" | sed -n '3p')
+      pid=$(printf '%s\n' "$record" | sed -n '4p')
+      identity=$(printf '%s\n' "$record" | sed '1,4d')
+      ;;
+    orphan)
+      owner_pid=
+      owner_identity=
+      pid=$(printf '%s\n' "$record" | sed -n '2p')
+      identity=$(printf '%s\n' "$record" | sed '1,2d')
+      ;;
+    *)
+      owner_pid=
+      owner_identity=
+      pid=$kind
+      identity=$(printf '%s\n' "$record" | sed '1d')
+      kind=orphan
+      ;;
+  esac
+  if [ -n "$owner_pid" ]; then
+    case "$owner_pid" in
+      ''|*[!0-9]*)
+        echo "watcher: FAILED - invalid checkpoint orphan ownership record at $path" >&2
+        return 1
+        ;;
+    esac
+    [ -n "$owner_identity" ] || {
+      echo "watcher: FAILED - invalid checkpoint orphan ownership record at $path" >&2
+      return 1
+    }
+    pid_state=$(fm_pid_state "$owner_pid")
+    if [ "$pid_state" = unknown ]; then
+      echo "watcher: FAILED - checkpoint reservation owner could not be verified at $path" >&2
+      return 1
+    fi
+    if [ "$pid_state" = alive ]; then
+      current_identity=$(fm_pid_birth_identity "$owner_pid" 2>/dev/null || true)
+      if [ -z "$current_identity" ]; then
+        echo "watcher: FAILED - checkpoint reservation owner identity could not be verified at $path" >&2
+        return 1
+      fi
+      if [ "$current_identity" = "$owner_identity" ]; then
+        echo "watcher: FAILED - another foreground checkpoint owns orphan authority at $path" >&2
+        return 1
+      fi
+    fi
+    if [ "$kind" = reservation ]; then
+      fm_clear_checkpoint_orphan "$state" "$record" || {
+        echo "watcher: FAILED - checkpoint reservation changed during cleanup at $path" >&2
+        return 1
+      }
+      return 0
+    fi
+  fi
   case "$pid" in
     ''|*[!0-9]*)
       echo "watcher: FAILED - invalid checkpoint orphan ownership record at $path" >&2
@@ -105,7 +278,7 @@ fm_reconcile_checkpoint_orphan() {
     pid_state=$(fm_pid_state "$pid")
     case "$pid_state" in
       dead)
-        fm_clear_checkpoint_orphan "$path" "$record" || {
+        fm_clear_checkpoint_orphan "$state" "$record" || {
           echo "watcher: FAILED - checkpoint orphan ownership changed during cleanup at $path" >&2
           return 1
         }
@@ -124,7 +297,7 @@ fm_reconcile_checkpoint_orphan() {
       continue
     fi
     if [ "$current_identity" != "$identity" ]; then
-      fm_clear_checkpoint_orphan "$path" "$record" || {
+      fm_clear_checkpoint_orphan "$state" "$record" || {
         echo "watcher: FAILED - checkpoint orphan ownership changed during cleanup at $path" >&2
         return 1
       }

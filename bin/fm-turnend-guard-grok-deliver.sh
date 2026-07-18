@@ -11,24 +11,20 @@ case "$PENDING" in /*) ;; *) PENDING="$PWD/$PENDING" ;; esac
 [ -L "$PENDING" ] && exit 1
 HANDOFF_DIR=${PENDING%/*}
 STATE_DIR=${HANDOFF_DIR%/*}
-EFFECTIVE_STATE=${FM_STATE_OVERRIDE:-${FM_HOME:-$ROOT}/state}
+EFFECTIVE_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$ROOT}}
+EFFECTIVE_STATE=${FM_STATE_OVERRIDE:-$EFFECTIVE_HOME/state}
 case "$EFFECTIVE_STATE" in /*) ;; *) EFFECTIVE_STATE="$PWD/$EFFECTIVE_STATE" ;; esac
 case "$EXPECTED_STATE" in /*) ;; *) EXPECTED_STATE="$PWD/$EXPECTED_STATE" ;; esac
 [ "$EXPECTED_STATE" = "$EFFECTIVE_STATE" ] || exit 1
 [ "$STATE_DIR" = "$EXPECTED_STATE" ] || exit 1
 FM_STATE_OVERRIDE=$EXPECTED_STATE
-COMPONENT_PATH=/
-COMPONENT_SUFFIX=${EXPECTED_STATE#/}
-while [ -n "$COMPONENT_SUFFIX" ]; do
-  COMPONENT=${COMPONENT_SUFFIX%%/*}
-  if [ "$COMPONENT_SUFFIX" = "$COMPONENT" ]; then COMPONENT_SUFFIX=; else COMPONENT_SUFFIX=${COMPONENT_SUFFIX#*/}; fi
-  [ -n "$COMPONENT" ] || continue
-  case "$COMPONENT" in .|..) exit 1 ;; esac
-  COMPONENT_PATH=${COMPONENT_PATH%/}/$COMPONENT
-  [ ! -L "$COMPONENT_PATH" ] || exit 1
-  [ ! -e "$COMPONENT_PATH" ] || [ -d "$COMPONENT_PATH" ] || exit 1
-done
-[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || exit 1
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$ROOT/bin/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+fm_validate_effective_state_path "$EXPECTED_STATE" existing || exit 1
+EXPECTED_STATE=$FM_VALIDATED_STATE_PATH
+STATE_DIR=$EXPECTED_STATE
 [ -d "$HANDOFF_DIR" ] && [ ! -L "$HANDOFF_DIR" ] || exit 1
 case "$PENDING" in "$HANDOFF_DIR"/grok-*.pending) ;; *) exit 1 ;; esac
 ACKNOWLEDGED="$PENDING.acknowledged"
@@ -40,7 +36,6 @@ if [ ! -f "$PENDING" ]; then
 fi
 [ -n "$EXPECTED_TOKEN" ] || EXPECTED_TOKEN=$(sed -n '1p' "$PENDING" 2>/dev/null || true)
 [ -n "$EXPECTED_TOKEN" ] || exit 1
-. "$ROOT/bin/fm-wake-lib.sh" || exit 1
 
 DELAY=${FM_GROK_TURNEND_DELAY:-1}
 RETRY_DELAY=${FM_GROK_TURNEND_RETRY_DELAY:-5}

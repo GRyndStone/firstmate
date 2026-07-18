@@ -223,7 +223,8 @@ SH
   assert_absent "$signaled" "checkpoint signaled its watcher after birth identity capture failed"
   assert_absent "$launched" "checkpoint launched the real watcher without exact child identity"
   [ "$elapsed" -lt 5 ] || fail "identity capture failure waited indefinitely (${elapsed}s)"
-  assert_contains "$(cat "$err")" "watcher was not started" "identity failure was not explained"
+  assert_contains "$(cat "$err")" "exact checkpoint process identity could not be captured" \
+    "identity failure was not explained"
   pass "birth-identity capture failure aborts before watcher launch without fallback signaling"
 }
 
@@ -380,6 +381,88 @@ SH
   pass "persistent checkpoint uncertainty transfers durable exact ownership to the next watcher arm"
 }
 
+test_checkpoint_admission_reconciles_retained_orphan_before_reserving() {
+  local home orphan_pid orphan_identity out err status
+  home=$(make_home admission-reconcile)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(FM_HOME="$home" bash -c '. "$1"; fm_pid_birth_identity "$2"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "$orphan_pid") || fail "could not capture retained orphan identity"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$home/state/.watch-checkpoint-orphan"
+  printf 'done: admission reconciliation\n' > "$home/state/admission.status"
+  status=0
+  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 5 > "$out" 2> "$err" || status=$?
+  expect_code 0 "$status" "checkpoint admission after retained orphan"
+  kill -0 "$orphan_pid" 2>/dev/null && fail "checkpoint admission left the retained exact orphan alive"
+  wait "$orphan_pid" 2>/dev/null || true
+  assert_absent "$home/state/.watch-checkpoint-orphan" \
+    "checkpoint admission did not release its reconciled reservation"
+  assert_contains "$(cat "$out")" "signal:" \
+    "checkpoint did not start after admission-time orphan reconciliation"
+  pass "checkpoint admission reconciles retained exact ownership before reserving a new watcher"
+}
+
+test_concurrent_checkpoint_cannot_share_orphan_authority() {
+  local home first_out first_err second_out first_pid status i record_kind
+  home=$(make_home concurrent-reservation)
+  first_out="$home/first-out.txt"
+  first_err="$home/first-err.txt"
+  FM_HOME="$home" FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 30 > "$first_out" 2> "$first_err" &
+  first_pid=$!
+  i=0
+  record_kind=
+  while [ "$i" -lt 100 ]; do
+    record_kind=$(sed -n '1p' "$home/state/.watch-checkpoint-orphan" 2>/dev/null || true)
+    [ "$record_kind" = active ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ "$record_kind" = active ] || fail "first checkpoint never activated its orphan reservation"
+  status=0
+  second_out=$(FM_HOME="$home" "$CHECKPOINT" --seconds 1 2>&1) || status=$?
+  expect_code 1 "$status" "concurrent checkpoint reservation"
+  assert_contains "$second_out" "another foreground checkpoint owns orphan authority" \
+    "concurrent checkpoint did not fail closed on the live reservation"
+  kill -TERM "$first_pid"
+  status=0
+  wait "$first_pid" || status=$?
+  expect_code 143 "$status" "reserved checkpoint interruption"
+  assert_absent "$home/state/.watch-checkpoint-orphan" \
+    "interrupted checkpoint retained its reservation after exact reap"
+  pass "one checkpoint atomically owns orphan authority from admission through exact reap"
+}
+
+test_checkpoint_refuses_symlinked_state_before_orphan_reconciliation() {
+  local home outside orphan_pid orphan_identity out status
+  home=$(make_home symlinked-orphan-state)
+  outside="$TMP_ROOT/symlinked-orphan-state-outside"
+  mkdir -p "$outside"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(LC_ALL=C ps -p "$orphan_pid" -o lstart= 2>/dev/null \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$orphan_identity" ] || fail "could not capture foreign orphan identity"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$outside/.watch-checkpoint-orphan"
+  rm -rf "$home/state"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(FM_HOME="$home" "$CHECKPOINT" --seconds 1 2>&1) || status=$?
+  expect_code 1 "$status" "checkpoint with symlinked orphan state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "checkpoint did not reject foreign orphan authority before reconciliation"
+  kill -0 "$orphan_pid" 2>/dev/null \
+    || fail "checkpoint signaled another home's orphan through symlinked state"
+  assert_present "$outside/.watch-checkpoint-orphan" \
+    "checkpoint cleared another home's orphan authority"
+  kill -TERM "$orphan_pid" 2>/dev/null || true
+  wait "$orphan_pid" 2>/dev/null || true
+  pass "checkpoint orphan authority rejects symlinked cross-home state"
+}
+
 test_term_delivery_is_recorded_only_after_exact_signal_succeeds() {
   local home out err watcher fakebin launched count term_seen status
   home=$(make_home term-retry)
@@ -429,4 +512,7 @@ test_checkpoint_polls_process_identity_coarsely
 test_transient_identity_probe_failure_remains_bounded
 test_transient_liveness_probe_failure_is_not_treated_as_exit
 test_persistent_identity_uncertainty_is_durable_and_reconciled_by_arm
+test_checkpoint_admission_reconciles_retained_orphan_before_reserving
+test_concurrent_checkpoint_cannot_share_orphan_authority
+test_checkpoint_refuses_symlinked_state_before_orphan_reconciliation
 test_term_delivery_is_recorded_only_after_exact_signal_succeeds

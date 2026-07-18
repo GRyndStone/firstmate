@@ -19,6 +19,12 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+fm_validate_effective_state_path "$STATE" allow-missing-final || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 
@@ -42,42 +48,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 command -v jq >/dev/null 2>&1 || { echo "fm-endpoint-audit: jq not found" >&2; exit 1; }
-
-validate_state_path() {
-  local path=$1 component suffix cursor=/
-  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
-  suffix=${path#/}
-  while [ -n "$suffix" ]; do
-    component=${suffix%%/*}
-    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
-    [ -n "$component" ] || continue
-    case "$component" in
-      .|..)
-        echo "fm-endpoint-audit: unsafe effective state path component: $component" >&2
-        return 1
-        ;;
-    esac
-    cursor=${cursor%/}/$component
-    if [ -L "$cursor" ]; then
-      echo "fm-endpoint-audit: symlinked effective state path component refused: $cursor" >&2
-      return 1
-    fi
-    if [ -n "$suffix" ] && [ -e "$cursor" ] && [ ! -d "$cursor" ]; then
-      echo "fm-endpoint-audit: non-directory effective state path component refused: $cursor" >&2
-      return 1
-    fi
-  done
-  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-    STATE=$path
-    return 0
-  fi
-  [ -d "$path" ] && [ ! -L "$path" ] || {
-    echo "fm-endpoint-audit: effective state path is not a regular directory: $path" >&2
-    return 1
-  }
-  STATE=$path
-}
-validate_state_path "$STATE" || exit 1
 
 if [ ! -d "$STATE" ]; then
   if [ "$FORMAT" = json ]; then

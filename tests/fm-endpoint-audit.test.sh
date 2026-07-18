@@ -336,6 +336,18 @@ test_absent_final_state_directory_is_an_empty_read_only_audit() {
   pass "endpoint audit accepts an absent final state directory after validating its ancestors"
 }
 
+test_absent_state_requires_an_existing_home_parent() {
+  local home out status
+  home="$TMP_ROOT/missing-home/never-created"
+  status=0
+  out=$(FM_HOME="$home" "$AUDIT" --json 2>&1) || status=$?
+  expect_code 1 "$status" "absent state with missing home"
+  assert_contains "$out" "missing effective state path parent" \
+    "audit treated a missing home as an empty scoped fleet"
+  assert_absent "$home" "read-only endpoint audit created a missing home"
+  pass "endpoint audit accepts only a missing final state under an existing home"
+}
+
 test_tmux_unscoped_meta_reports_inventory_unavailable() {
   local home log out
   home=$(make_fixture tmux-unscoped)
@@ -496,6 +508,7 @@ test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
 test_symlinked_state_path_component_is_refused_before_enumeration
 test_absent_final_state_directory_is_an_empty_read_only_audit
+test_absent_state_requires_an_existing_home_parent
 test_zellij_reports_unavailable_without_cross_home_inventory
 test_cmux_reports_unavailable_without_cross_home_inventory
 test_orca_reports_unavailable_without_app_global_inventory

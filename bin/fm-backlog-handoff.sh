@@ -56,10 +56,13 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 REG=
 MAIN_BACKLOG=
-# shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
-. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+[ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$STATE
+# shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 
 [ $# -ge 2 ] || { echo "usage: fm-backlog-handoff.sh <secondmate-id> <item-key>..." >&2; exit 1; }
 ID=$1
@@ -293,12 +296,14 @@ RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
 SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
+fm_validate_effective_state_path "$SUB_HOME/state" allow-missing-final || exit 1
+SUB_STATE=$FM_VALIDATED_STATE_PATH
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
 
 MAIN_LOCK="$STATE/.backlog.lock"
-SUB_LOCK="$SUB_HOME/state/.backlog.lock"
-mkdir -p "$STATE" "$SUB_HOME/state"
+SUB_LOCK="$SUB_STATE/.backlog.lock"
+[ -d "$SUB_STATE" ] || mkdir "$SUB_STATE"
 if [ "$MAIN_LOCK" = "$SUB_LOCK" ]; then
   FIRST_LOCK=$MAIN_LOCK
   SECOND_LOCK=
@@ -327,8 +332,8 @@ if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
   echo "error: the active home still has live or unreadable durable backlog mutation ownership" >&2
   exit 1
 fi
-if [ "$SUB_HOME/state" != "$STATE" ] \
-   && ! fm_tasks_axi_reconcile_mutation_owner "$SUB_HOME/state"; then
+if [ "$SUB_STATE" != "$STATE" ] \
+   && ! fm_tasks_axi_reconcile_mutation_owner "$SUB_STATE"; then
   echo "error: secondmate $ID still has live or unreadable durable backlog mutation ownership" >&2
   exit 1
 fi
@@ -341,8 +346,8 @@ refuse_receipt_transactions() {
   done
 }
 refuse_receipt_transactions "the active home" "$STATE" || exit 1
-if [ "$SUB_HOME/state" != "$STATE" ]; then
-  refuse_receipt_transactions "secondmate $ID" "$SUB_HOME/state" || exit 1
+if [ "$SUB_STATE" != "$STATE" ]; then
+  refuse_receipt_transactions "secondmate $ID" "$SUB_STATE" || exit 1
 fi
 
 # Classify every key before changing anything: move-from-main, already-in-sub, or
@@ -390,11 +395,34 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+refuse_current_lifecycle() {
+  local label=$1 state_dir=$2 key marker
+  shift 2
+  for key in "$@"; do
+    for marker in \
+      "$state_dir/$key.meta" \
+      "$state_dir/$key.spawning" \
+      "$state_dir/$key.tearing-down" \
+      "$state_dir/$key.teardown-stage" \
+      "$state_dir/$key.teardown-final-cleanup"; do
+      if [ -e "$marker" ] || [ -L "$marker" ]; then
+        echo "error: refusing backlog handoff while $label has current lifecycle state for $key: $marker" >&2
+        return 1
+      fi
+    done
+  done
+}
+
+refuse_current_lifecycle "the active home" "$STATE" "$@" || exit 1
+if [ "$SUB_STATE" != "$STATE" ]; then
+  refuse_current_lifecycle "secondmate $ID" "$SUB_STATE" "$@" || exit 1
+fi
+
 invalidate_requested_receipts() {
   local key failed=0
   for key in "$@"; do
     fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || failed=1
-    fm_tasks_axi_invalidate_completion_receipt "$SUB_HOME/state" "$key" || failed=1
+    fm_tasks_axi_invalidate_completion_receipt "$SUB_STATE" "$key" || failed=1
   done
   [ "$failed" -eq 0 ]
 }
@@ -483,8 +511,8 @@ run_owned_handoff_mutation() {
     return 1
   fi
   published_main=1
-  if [ "$SUB_HOME/state" != "$STATE" ]; then
-    if ! fm_tasks_axi_publish_mutation_owner "$SUB_HOME/state" "$worker_pid" "$worker_identity" "$mutation_token"; then
+  if [ "$SUB_STATE" != "$STATE" ]; then
+    if ! fm_tasks_axi_publish_mutation_owner "$SUB_STATE" "$worker_pid" "$worker_identity" "$mutation_token"; then
       current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
       [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
       wait "$worker_pid" 2>/dev/null || true
@@ -492,11 +520,11 @@ run_owned_handoff_mutation() {
       return 1
     fi
     published_sub=1
-    if ! fm_tasks_axi_start_mutation_owner "$SUB_HOME/state" "$mutation_token"; then
+    if ! fm_tasks_axi_start_mutation_owner "$SUB_STATE" "$mutation_token"; then
       current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
       [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
       wait "$worker_pid" 2>/dev/null || true
-      fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" 2>/dev/null || true
       fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
       return 1
     fi
@@ -505,7 +533,7 @@ run_owned_handoff_mutation() {
     current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
     [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
-    [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" 2>/dev/null || true
+    [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" 2>/dev/null || true
     [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
     return 1
   fi
@@ -515,7 +543,7 @@ run_owned_handoff_mutation() {
   else
     printf '%s\n' failed > "$MOVE_RESULT" || return 1
   fi
-  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_HOME/state" "$mutation_token" || status=70
+  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" || status=70
   [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || status=70
   return "$status"
 }
