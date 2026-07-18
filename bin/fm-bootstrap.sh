@@ -73,6 +73,10 @@
 #          secondmate homes, X-mode artifacts, project clones, or repair
 #          instructions. Unset/0 (the default) runs every sweep exactly as
 #          before - this flag is purely additive.
+#          Set FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 to skip only the
+#          secondmate liveness sweep while retaining secondmate sync, X-mode
+#          setup, and fleet sync. Session start uses it when exact endpoint
+#          ownership is anomalous or unavailable.
 #        fm-bootstrap.sh install <tool>...
 #          Install the named tools (only ones the captain approved).
 set -u
@@ -589,7 +593,9 @@ if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
-  secondmate_liveness_sweep
+  if [ "${FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION:-0}" != 1 ]; then
+    secondmate_liveness_sweep
+  fi
   x_mode_setup
   fleet_sync
 fi

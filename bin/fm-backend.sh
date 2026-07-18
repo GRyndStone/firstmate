@@ -776,7 +776,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       esac
       session=$backend_container
       [ -n "$session" ] && [ -n "$expected_label" ] || { printf 'unknown'; return 0; }
-      filter="#{&&:#{==:#{window_id},$target},#{&&:#{==:#{window_name},$expected_label},#{==:#{@firstmate_home},$home_identity}}}"
+      filter="#{==:#{window_id},$target}"
       if out=$(tmux list-windows -t "=$session" -f "$filter" -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
         state=0
       else
@@ -790,8 +790,8 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
         fi
         return 0
       fi
-      if [ -n "$out" ] && ! printf '%s\n' "$out" | awk -F '\t' -v label="$expected_label" -v owner="$home_identity" '
-        NF != 3 || $1 !~ /^@[0-9]+$/ || $2 != label || $3 != owner { bad=1 }
+      if [ -n "$out" ] && ! printf '%s\n' "$out" | awk -F '\t' -v target="$target" -v label="$expected_label" -v owner="$home_identity" '
+        NF != 3 || $1 != target || $2 != label || $3 != owner { bad=1 }
         END { exit bad ? 1 : 0 }
       '; then
         printf 'unknown'

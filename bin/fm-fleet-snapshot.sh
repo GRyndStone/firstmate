@@ -399,7 +399,22 @@ task_json_lines() {
       pr_source=absent
     fi
 
-    current_json=$(crew_state_json "$id")
+    endpoint_exists=null
+    endpoint_state=unknown
+    if [ -n "$target" ]; then
+      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+      case "$endpoint_state" in
+        present) endpoint_exists=true ;;
+        absent) endpoint_exists=false ;;
+        *) endpoint_exists=null ;;
+      esac
+    fi
+    if [ "$endpoint_state" = present ]; then
+      current_json=$(crew_state_json "$id")
+    else
+      current_json=$(jq -n --arg detail "exact-home endpoint ownership is $endpoint_state" \
+        '{state:"unknown",source:"endpoint",detail:$detail,raw:""}')
+    fi
     event_json=$(status_event_json "$status_log")
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
     current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
@@ -436,16 +451,6 @@ task_json_lines() {
     pending_decision=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "needs-decision") then 1 else 0 end')
     blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end')
 
-    endpoint_exists=null
-    endpoint_state=unknown
-    if [ -n "$target" ]; then
-      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
-      case "$endpoint_state" in
-        present) endpoint_exists=true ;;
-        absent) endpoint_exists=false ;;
-        *) endpoint_exists=null ;;
-      esac
-    fi
     agent_alive=not_checked
     if [ "$kind" = secondmate ] && [ "${endpoint_state:-unknown}" = present ]; then
       agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)

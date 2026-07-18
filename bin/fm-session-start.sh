@@ -16,9 +16,10 @@
 # stays local to this file. Those three scripts remain fully working
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
 # install <tools> after consent, /updatefirstmate, the afk daemon, existing
-# tests) still call them directly. The one seam this script needed -
-# bootstrap running its detect-only diagnostics without its four mutating
-# sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
+# tests) still call them directly. The bootstrap composition seams are the
+# opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag for a read-only session and the
+# narrower FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 flag when endpoint ownership
+# cannot license automatic liveness cleanup. Both live in fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
 #
 # ORDERING, and why LOCK now runs before BOOTSTRAP (the old AGENTS.md order
@@ -156,6 +157,7 @@ pi_extension_loaded() {
 
 ENDPOINT_AUDIT_OK=1
 STATE_PROJECTION_SAFE=1
+STATE_METADATA_SAFE=1
 ENDPOINT_MUTATION_SAFE=1
 ENDPOINT_AUDIT_JSON=$(FM_ROOT_OVERRIDE="$FM_ROOT" \
   FM_HOME="$FM_HOME" \
@@ -173,6 +175,7 @@ if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
     'any(.[]; .backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))' \
     >/dev/null; then
     STATE_PROJECTION_SAFE=0
+    STATE_METADATA_SAFE=0
   fi
 else
   ENDPOINT_AUDIT_OUT=$ENDPOINT_AUDIT_JSON
@@ -206,8 +209,10 @@ fi
 
 # --- 2. bootstrap --------------------------------------------------------
 subsection "BOOTSTRAP"
-if [ "$READ_ONLY" -eq 1 ] || [ "$ENDPOINT_MUTATION_SAFE" -eq 0 ]; then
+if [ "$READ_ONLY" -eq 1 ] || [ "$STATE_METADATA_SAFE" -eq 0 ]; then
   BOOT_OUT=$(FM_BOOTSTRAP_DETECT_ONLY=1 "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
+elif [ "$ENDPOINT_MUTATION_SAFE" -eq 0 ]; then
+  BOOT_OUT=$(FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
 else
   BOOT_OUT=$("$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
 fi

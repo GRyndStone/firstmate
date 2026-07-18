@@ -44,7 +44,7 @@ case "${1:-}" in
       [ -n "$identity" ] && [ -n "$window" ] || continue
       id=$(basename "$m" .meta)
       label="fm-$id"
-      case "$*" in *"$label"*) ;; *) continue ;; esac
+      case "$*" in *"$label"*|*"$window"*) ;; *) continue ;; esac
       case "$format" in
         *$'\t_') printf '%s\t%s\t%s\t_\n' "$window" "$label" "$identity" ;;
         *) printf '%s\t%s\t%s\n' "$window" "$label" "$identity" ;;
@@ -64,7 +64,7 @@ case "${1:-}" in
     ;;
   capture-pane)
     case "$task:$target" in
-      ship-task:*|active-secondmate:*|*:*ship-task*) printf 'work in progress\nesc to interrupt\n' ;;
+      ship-task:*|stale-decision:*|stale-blocked:*|active-secondmate:*|*:*ship-task*) printf 'work in progress\nesc to interrupt\n' ;;
       *) printf 'all quiet\n> \n' ;;
     esac
     ;;
@@ -86,6 +86,18 @@ SH
 
 tmux_home_identity() {
   FM_HOME="$1" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh"
+}
+
+write_scoped_tmux_meta() {
+  local home=$1 meta=$2 window_id=$3 identity
+  shift 3
+  identity=$(tmux_home_identity "$home")
+  fm_write_meta "$meta" \
+    "window=@$window_id" \
+    "tmux_window_id=@$window_id" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
+    "$@"
 }
 
 make_home() {  # <name>
@@ -270,32 +282,28 @@ test_event_hints_follow_reconciled_current_state() {
     "$home/projects/active-blocked" \
     "$home/projects/stale-decision" \
     "$home/projects/stale-blocked"
-  fm_write_meta "$home/state/active-decision.meta" \
-    "window=firstmate:fm-active-decision" \
+  write_scoped_tmux_meta "$home" "$home/state/active-decision.meta" 201 \
     "worktree=$home/projects/active-decision" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'needs-decision: choose an API shape\n' > "$home/state/active-decision.status"
-  fm_write_meta "$home/state/active-blocked.meta" \
-    "window=firstmate:fm-active-blocked" \
+  write_scoped_tmux_meta "$home" "$home/state/active-blocked.meta" 202 \
     "worktree=$home/projects/active-blocked" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'blocked: waiting on access\n' > "$home/state/active-blocked.status"
-  fm_write_meta "$home/state/stale-decision.meta" \
-    "window=firstmate:fm-stale-decision-ship-task" \
+  write_scoped_tmux_meta "$home" "$home/state/stale-decision.meta" 203 \
     "worktree=$home/projects/stale-decision" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'needs-decision: already answered\n' > "$home/state/stale-decision.status"
-  fm_write_meta "$home/state/stale-blocked.meta" \
-    "window=firstmate:fm-stale-blocked-ship-task" \
+  write_scoped_tmux_meta "$home" "$home/state/stale-blocked.meta" 204 \
     "worktree=$home/projects/stale-blocked" \
     "project=alpha" \
     "harness=codex" \
@@ -362,8 +370,7 @@ test_backlog_tasks_axi_forms_and_overrides() {
 - [x] done-note - Done Note local main (repo: delta, done 2026-07-11) (kind: ship)
 EOF
   printf '# Bold Scout\n' > "$data/bold-task/report.md"
-  fm_write_meta "$home/state/bold-task.meta" \
-    "window=firstmate:fm-bold-task" \
+  write_scoped_tmux_meta "$home" "$home/state/bold-task.meta" 205 \
     "worktree=$projects/bold-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -440,7 +447,7 @@ EOF
       and .paths.report.present == true
   ' >/dev/null || fail "bold task did not join to override-backed backlog and report"
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$VIEW")
-  assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | unknown | $data/bold-task/report.md" \
+  assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | present | $data/bold-task/report.md" \
     "view should render bold in-flight row from snapshot"
   assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | - | queued-comma - waits on queued-comma | - |" \
     "view should render blocked reason without title metadata"
@@ -802,8 +809,7 @@ test_completed_scout_report_is_pointer_not_pending() {
   local home fakebin out
   home=$(make_home completed-scout)
   mkdir -p "$home/projects/scout-wt" "$home/data/lavish-103"
-  fm_write_meta "$home/state/lavish-103.meta" \
-    "window=firstmate:fm-lavish-103" \
+  write_scoped_tmux_meta "$home" "$home/state/lavish-103.meta" 210 \
     "worktree=$home/projects/scout-wt" \
     "project=firstmate" \
     "harness=codex" \
@@ -852,6 +858,35 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_unknown_endpoint_ownership_skips_current_state_probe() {
+  local home fakebin log out
+  home=$(make_home unknown-endpoint-probe)
+  fakebin=$(make_fakebin "$home")
+  log="$home/zellij.log"
+  fm_write_meta "$home/state/zellij-task.meta" \
+    'backend=zellij' \
+    'window=fm:42' \
+    'zellij_session=fm' \
+    'zellij_tab_id=7' \
+    'worktree=/owned/worktree' \
+    'kind=ship'
+  cat > "$fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
+exit 99
+SH
+  chmod +x "$fakebin/zellij"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ZELLIJ_LOG="$log" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "zellij-task")
+    | .endpoint.exists == null
+      and .current_state.state == "unknown"
+      and .current_state.source == "endpoint"
+  ' >/dev/null || fail "unknown endpoint ownership did not produce an unknown current state: $out"
+  assert_absent "$log" "snapshot ran a shared Zellij probe without confirmed exact-home ownership"
+  pass "snapshot skips current-state backend probes when exact-home ownership is unknown"
+}
+
 test_empty_fleet_json
 test_metadata_audit_precedes_task_projection
 test_fixture_snapshot_json
@@ -861,6 +896,7 @@ test_secondmate_open_decision_survives_live_endpoint
 test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
+test_unknown_endpoint_ownership_skips_current_state_probe
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot

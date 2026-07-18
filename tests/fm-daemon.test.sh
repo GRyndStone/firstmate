@@ -683,6 +683,37 @@ test_daemon_durable_writers_reject_final_symlinks() {
   pass "daemon durable writers reject symlinked final targets"
 }
 
+test_daemon_watcher_stderr_uses_no_follow_open() {
+  local dir state outside target status source
+  dir=$(make_supercase daemon-watcher-stderr)
+  state="$dir/state"
+  outside="$dir/outside"
+  target="$state/.supervise-daemon.watcher.err"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$target"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_exec_stderr_append_no_follow "$2" sh -c "printf escaped >&2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$target" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "no-follow stderr opener accepted a symlinked target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher stderr escaped through a final symlink"
+  rm "$target"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_exec_stderr_append_no_follow "$2" sh -c "printf watcher-error >&2; exit 7"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$target" >/dev/null 2>&1 || status=$?
+  expect_code 7 "$status" "no-follow watcher stderr command status"
+  [ "$(cat "$target")" = watcher-error ] || fail "no-follow watcher stderr opener lost output"
+  source=$(cat "$DAEMON")
+  assert_contains "$source" 'fm_exec_stderr_append_no_follow "$WATCH_ERR"' \
+    "daemon watcher stderr is not wired through the shared no-follow opener"
+  assert_not_contains "$source" '2>>"$WATCH_ERR"' \
+    "daemon still opens watcher stderr through a symlink-following redirection"
+  pass "daemon watcher stderr uses a final-component no-follow open"
+}
+
 test_escalate_batch_age_uses_first_append() {
   local dir state fakebin sent capture
   dir=$(make_supercase batch-age)
@@ -1842,6 +1873,7 @@ test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
 test_daemon_durable_writers_reject_final_symlinks
+test_daemon_watcher_stderr_uses_no_follow_open
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate

@@ -47,6 +47,7 @@ It deliberately does not interpret prose plans into obligations: when any source
 `bin/fm-wake-lib.sh` owns effective-state path validation and portable final-component no-follow publication for shell entry points.
 The audited state entry-point inventory is `bin/fm-afk-start.sh`, `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-watch-checkpoint.sh`, `bin/fm-supervise-daemon.sh`, `bin/fm-guard.sh`, `bin/fm-wake-drain.sh`, `bin/fm-turnend-guard.sh`, `bin/fm-turnend-guard-grok.sh`, `bin/fm-turnend-guard-grok-deliver.sh`, `bin/fm-crew-state.sh`, `bin/fm-backlog.sh`, `bin/fm-backlog-handoff.sh`, `bin/fm-spawn.sh`, `bin/fm-teardown.sh`, `bin/fm-endpoint-audit.sh`, `bin/fm-fleet-snapshot.sh`, `bin/fm-session-start.sh`, `.opencode/plugins/fm-primary-watch-arm.js`, `.opencode/plugins/fm-primary-turnend-guard.js`, `.pi/extensions/fm-primary-pi-watch.ts`, and `.pi/extensions/fm-primary-turnend-guard.ts`.
 Every listed entry point must reject symlinked effective-state path components before its first state read or mutation, reject symlinked or non-regular task metadata before parsing or backend lookup, and use no-follow publication for durable final targets it owns.
+The daemon's live watcher stderr target `state/.supervise-daemon.watcher.err` uses the shared no-follow stderr opener so the watcher remains the directly supervised child while the final path cannot escape through a symlink.
 
 ## Runtime backend (config/backend / FM_BACKEND)
 

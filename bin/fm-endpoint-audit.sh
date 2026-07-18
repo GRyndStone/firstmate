@@ -8,9 +8,10 @@
 # shared namespaces.
 # It never closes or mutates an endpoint.
 #
-# A task label with more than one live endpoint, or one live endpoint that does
-# not match the recorded endpoint, is reported deterministically with the
-# meta-owned worktree, recorded endpoint, and sorted live endpoints.
+# A task label with more than one live endpoint, one live endpoint that does
+# not match the recorded endpoint, or a recorded target whose exact ownership
+# cannot be confirmed is reported deterministically with the meta-owned
+# worktree, recorded endpoint, and sorted live endpoints.
 # Usage: fm-endpoint-audit.sh [--json] [--task <id>]
 set -u
 
@@ -246,6 +247,11 @@ for meta in "$STATE"/*.meta; do
   id=$(basename "$meta" .meta)
   label="fm-$id"
   recorded=$(fm_backend_target_of_meta "$meta")
+  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
+  if [ "$recorded_state" = unknown ]; then
+    append_inventory_unavailable herdr "$meta" "recorded Herdr pane ownership could not be confirmed from its exact workspace"
+    continue
+  fi
   live_json=$(awk -F '\t' -v label="$label" '$2 == label { print $1 }' "$LIVE" \
     | LC_ALL=C sort -u \
     | jq -R -s '[splits("\\n") | select(length > 0)]') || exit 1
@@ -258,7 +264,7 @@ audit_zellij_meta() {
 }
 
 audit_tmux_meta() {
-  local meta=$1 id label recorded session window_id inventory live_json identity current_identity filter
+  local meta=$1 id label recorded session window_id inventory live_json identity current_identity filter recorded_state
   id=$(basename "$meta" .meta)
   label="fm-$id"
   recorded=$(fm_backend_target_of_meta "$meta")
@@ -285,6 +291,11 @@ audit_tmux_meta() {
       ;;
     *) append_inventory_unavailable tmux "$meta" "tmux meta has an invalid exact window identity"; return ;;
   esac
+  recorded_state=$(fm_backend_target_state_of_meta "$meta" "$label")
+  if [ "$recorded_state" = unknown ]; then
+    append_inventory_unavailable tmux "$meta" "recorded tmux window ownership could not be confirmed from its exact session and window id"
+    return
+  fi
   if ! command -v tmux >/dev/null 2>&1; then
     echo "fm-endpoint-audit: tmux not found" >&2
     return 1

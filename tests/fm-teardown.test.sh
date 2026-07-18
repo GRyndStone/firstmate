@@ -1661,7 +1661,10 @@ set -u
 printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   list-windows)
-    printf '@7\tfm-task-x1\t%s\t_\n@8\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"
+    case "$*" in
+      *'#{window_id},@42}'*) ;;
+      *) printf '@7\tfm-task-x1\t%s\t_\n@8\tfm-task-x1\t%s\t_\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER" ;;
+    esac
     ;;
   kill-window) exit 0 ;;
   *) exit 8 ;;
@@ -1911,7 +1914,7 @@ SH
   rc=0
   FM_TMUX_OWNER="$identity" run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 1 "$rc" "unknown endpoint inventory"
-  assert_contains "$(cat "$case_dir/stderr")" "endpoint state for @42 is unknown" \
+  assert_contains "$(cat "$case_dir/stderr")" "same-home endpoint ownership anomaly: kind=inventory_unavailable" \
     "unreadable endpoint inventory was treated as confirmed absence"
   [ -f "$case_dir/state/task-x1.meta" ] || fail "unknown endpoint state removed lifecycle metadata"
   [ -d "$case_dir/wt" ] || fail "unknown endpoint state removed worktree"
@@ -2351,13 +2354,15 @@ test_tmux_endpoint_probe_distinguishes_absent_unknown_and_mismatch() {
 case "${FM_TMUX_STATE:?}" in
   present) printf '@42\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
   absent) exit 0 ;;
+  mismatch-name) printf '@42\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}"; exit 0 ;;
+  mismatch-owner) printf '@42\tfm-task-x1\tother-home\n'; exit 0 ;;
   duplicate) printf '@42\tfm-task-x1\t%s\n@43\tfm-task-x1\t%s\n' "${FM_TMUX_OWNER:?}" "$FM_TMUX_OWNER"; exit 0 ;;
   no-server) echo 'no server running on /tmp/tmux-test/default' >&2; exit 1 ;;
   unknown) echo 'permission denied while reading tmux inventory' >&2; exit 2 ;;
 esac
 SH
   chmod +x "$fakebin/tmux"
-  for state in present absent duplicate no-server unknown; do
+  for state in present absent mismatch-name mismatch-owner duplicate no-server unknown; do
     actual=$(PATH="$fakebin:$PATH" FM_TMUX_STATE="$state" FM_TMUX_OWNER="$identity" \
       FM_HOME="$case_dir" FM_ROOT_OVERRIDE="$ROOT" \
       bash -c '. "$1"; fm_backend_target_state tmux @42 fm-task-x1 "$2" /owned/worktree owned-session' \
@@ -2365,7 +2370,7 @@ SH
     case "$state" in
       present) [ "$actual" = present ] || fail "present tmux endpoint read $actual" ;;
       absent|no-server) [ "$actual" = absent ] || fail "$state tmux endpoint read $actual" ;;
-      duplicate|unknown) [ "$actual" = unknown ] || fail "$state tmux endpoint read $actual" ;;
+      mismatch-name|mismatch-owner|duplicate|unknown) [ "$actual" = unknown ] || fail "$state tmux endpoint read $actual" ;;
     esac
   done
   pass "tmux endpoint probe uses exact-home identity and rejects duplicates or unreadability"
