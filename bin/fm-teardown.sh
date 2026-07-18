@@ -980,6 +980,18 @@ teardown_owner_path() {
   fi
 }
 
+directory_device_inode() {
+  local canonical=$1 identity
+  if identity=$(stat -f '%d:%i' "$canonical" 2>/dev/null) \
+     && [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s\n' "$identity"
+    return 0
+  fi
+  identity=$(stat -c '%d:%i' "$canonical" 2>/dev/null) || return 1
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s\n' "$identity"
+}
+
 teardown_owner_identity() {
   local owner canonical inode path_cksum
   owner=$(teardown_owner_path)
@@ -988,8 +1000,7 @@ teardown_owner_identity() {
     return 0
   }
   canonical=$(cd "$owner" 2>/dev/null && pwd -P) || return 1
-  inode=$(stat -f '%d:%i' "$canonical" 2>/dev/null \
-    || stat -c '%d:%i' "$canonical" 2>/dev/null) || return 1
+  inode=$(directory_device_inode "$canonical") || return 1
   path_cksum=$(printf '%s' "$canonical" | cksum | awk '{print $1 ":" $2}') || return 1
   printf '%s:%s\n' "$inode" "$path_cksum"
 }
@@ -1031,8 +1042,7 @@ auxiliary_target_canonical() {
 auxiliary_target_identity() {
   local target=$1 canonical inode path_cksum
   canonical=$(auxiliary_target_canonical "$target") || return 1
-  inode=$(stat -f '%d:%i' "$canonical" 2>/dev/null \
-    || stat -c '%d:%i' "$canonical" 2>/dev/null) || return 1
+  inode=$(directory_device_inode "$canonical") || return 1
   path_cksum=$(printf '%s' "$canonical" | cksum | awk '{print $1 ":" $2}') || return 1
   printf '%s:%s\n' "$inode" "$path_cksum"
 }

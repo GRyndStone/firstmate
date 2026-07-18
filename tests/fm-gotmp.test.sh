@@ -104,6 +104,27 @@ run_fake_teardown() {  # <home> <task-id>
     "$TEARDOWN" "$id" --force
 }
 
+add_gnu_stat_emulator() {
+  local fake=$1
+  cat > "$fake/fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -f ] && [ "${2:-}" = '%d:%i' ]; then
+  # GNU stat treats the BSD format as an operand, emits output for the valid
+  # path operand, and then exits non-zero because the format operand is absent.
+  printf '  File: "%s"\n    ID: leaked-gnu-filesystem-output\n' "${3:-}"
+  exit 1
+fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = '%d:%i' ]; then
+  case "$(uname -s)" in
+    Darwin) exec /usr/bin/stat -f '%d:%i' "${3:-}" ;;
+    *) exec /usr/bin/stat -c '%d:%i' "${3:-}" ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+SH
+  chmod +x "$fake/fakebin/stat"
+}
+
 # --- fm-spawn side ---
 
 test_spawn_contract_and_mkdir_pattern() {
@@ -148,6 +169,7 @@ test_teardown_removes_tasktmp_dir() {
   printf 'leftover\n' > "$task_tmp/gotmp/build-artifact"
   local fake
   fake=$(make_fake_root "$id" "$task_tmp")
+  add_gnu_stat_emulator "$fake"
   # Sanity: dir + contents exist before teardown.
   [ -d "$task_tmp/gotmp" ] || fail "precondition: gotmp missing before teardown"
   # Run the REAL teardown against the fake root.
@@ -155,7 +177,7 @@ test_teardown_removes_tasktmp_dir() {
   [ "$status" -eq 0 ] || fail "teardown exited non-zero with a valid tasktmp: $out"
   [ ! -e "$task_tmp" ] \
     || fail "teardown did not remove the tasktmp dir ($task_tmp still exists)"
-  pass "fm-teardown removes the dir pointed to by tasktmp= in meta"
+  pass "fm-teardown removes tasktmp with GNU stat fallback output"
 }
 
 test_teardown_skips_gracefully_without_tasktmp() {

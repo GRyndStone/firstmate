@@ -230,30 +230,27 @@ test_drain_asserts_watcher_liveness() {
 }
 
 test_no_follow_publish_rejects_darwin_directory_race() {
-  local dir state fakebin counter source destination status
+  local dir state fakebin source destination status real_perl
   dir=$(make_case darwin-directory-race)
   state="$dir/state"
-  fakebin="$dir/fake-uname"
-  counter="$dir/uname-count"
+  fakebin="$dir/fakebin"
   source="$state/source"
   destination="$state/destination"
   mkdir -p "$fakebin"
   printf 'payload\n' > "$source"
   cat > "$fakebin/uname" <<'SH'
 #!/usr/bin/env bash
-count=$(cat "${FM_UNAME_COUNT:?}" 2>/dev/null || printf 0)
-count=$((count + 1))
-printf '%s\n' "$count" > "$FM_UNAME_COUNT"
-if [ "$count" -ge 2 ]; then
-  /bin/mkdir -p "${FM_RACE_DESTINATION:?}"
-  printf 'Darwin\n'
-else
-  printf 'Linux\n'
-fi
+printf 'Darwin\n'
 SH
-  chmod +x "$fakebin/uname"
+  cat > "$fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+/bin/mkdir -p "${FM_RACE_DESTINATION:?}"
+exec "${FM_REAL_PERL:?}" "$@"
+SH
+  chmod +x "$fakebin/uname" "$fakebin/perl"
+  real_perl=$(command -v perl) || fail "Perl is required for the Darwin publication fixture"
   status=0
-  PATH="$fakebin:$PATH" FM_UNAME_COUNT="$counter" FM_RACE_DESTINATION="$destination" \
+  PATH="$fakebin:$PATH" FM_REAL_PERL="$real_perl" FM_RACE_DESTINATION="$destination" \
     FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_publish_file_no_follow "$2" "$3" replace' \
       _ "$ROOT/bin/fm-wake-lib.sh" "$source" "$destination" || status=$?
   [ "$status" -ne 0 ] || fail "Darwin exact-target publisher accepted a raced directory"
