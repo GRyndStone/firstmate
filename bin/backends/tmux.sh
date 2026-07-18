@@ -4,8 +4,8 @@
 # Reference backend (AGENTS.md section 8; data/fm-backend-design-d7). P1 moves
 # the tmux command sequences that fm-send.sh, fm-peek.sh, fm-watch.sh,
 # fm-spawn.sh, and fm-teardown.sh already ran inline into named functions
-# here, running the EXACT same commands in the EXACT same order, so the
-# default (tmux, `backend=` absent) path stays byte-identical. Sourced only
+# here. That extraction preserved the original command order; later lifecycle
+# hardening added stable window ids and exact-home ownership tags. Sourced only
 # through bin/fm-backend.sh's fm_backend_source, never directly.
 #
 # Worktree acquisition (running `treehouse get` inside the pane, and polling
@@ -153,8 +153,8 @@ fm_backend_tmux_strict_miss() {  # <target> <expected-label>
 # fm_backend_tmux_create_task's duplicate check - never a target-resolution
 # probe. Recognized shapes, matched strictly: a pane id (%N - the away-mode
 # daemon's TMUX_PANE supervisor target), a window id (@N - fm-spawn's stable
-# window handle), session:name or session:index (fm-spawn's recorded window=
-# meta, the daemon's firstmate:0 default), a bare window name, a
+# window handle), session:name or session:index (supported explicit or legacy
+# targets, including the daemon's firstmate:0 default), a bare window name, a
 # session-qualified pane id (session:%N), and a pane-qualified window
 # (session:window.pane, the window by exact name or index and the pane by
 # index or %id, matched as one composite line against the pane inventory so a

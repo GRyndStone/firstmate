@@ -95,7 +95,7 @@ state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
-  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
+  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; the runtime backend may record further identity fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   <id>.spawning      script-owned endpoint-creation admission claim; bin/fm-spawn.sh owns its retry semantics, and fm-backlog treats its presence as unresolved lifecycle state
   <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
@@ -507,8 +507,8 @@ The script refuses if the worktree holds uncommitted changes or committed work t
 `bin/fm-teardown.sh`'s header owns the full landed-work definition (remote-reachable, merged-PR-head containment for the squash-merge-then-delete-branch flow, content already in the default branch, local-only merges) and the `pr=` discovery fallback for merges that skipped `bin/fm-pr-check.sh`.
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 A successful PR-based teardown also refreshes that project's clone through `bin/fm-fleet-sync.sh`, best-effort.
-Successful teardown records Done through `bin/fm-backlog.sh` after owned endpoint absence and cleanup release are verified; `docs/configuration.md` "Backlog backend" owns the retained lifecycle-finalization details.
-If teardown says the task was untracked or lacked a recorded PR, follow its serialized backlog instruction only after teardown has succeeded.
+Successful delivered ship/scout teardown records Done through `bin/fm-backlog.sh` after owned endpoint absence and cleanup release are verified; `docs/configuration.md` "Backlog backend" owns truthful outcomes and retained lifecycle-finalization details.
+If backlog finalization fails, rerun the same teardown so its retained phase can resume; an untracked task remains outside Done.
 Never hand-edit a task into Done; `bin/fm-teardown.sh` and the receipt-gated backlog wrapper own completion in every backlog mode.
 Re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
@@ -581,7 +581,7 @@ On wake, in order of cheapness:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
 2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
-   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
+   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, whose header owns evidence freshness and exact-run recovery, and never `tail` the status log as the current-state source.
 3. `stale:` the crewmate stopped without reporting; peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
    If the stale reason includes `endpoint-gone` or `agent-dead`, the crew's endpoint or agent process is confirmed dead, not merely quiet - load `stuck-crewmate-recovery` directly instead of treating it as a routine stall (`docs/architecture.md` "Event-driven supervision" owns the detection rules).
@@ -620,7 +620,7 @@ Do not assume one primary harness can use another harness's foreground or backgr
 For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.
 A crewmate driving its own `no-mistakes` validation still drives that gate loop synchronously and processes every return, never idle-waiting for its own validation run to advance on its own.
 
-Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
+Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>` and let its header own evidence precedence and same-pane recovery; default peeks to 40 lines, never stream a pane repeatedly through yourself, and batch what you tell the captain.
 The context-% shown in a peek is not actionable as crew health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
 
 ### Away-mode stub
@@ -706,7 +706,7 @@ Map firstmate's real backlog operations to the approved commands:
 
 - File an item: `bin/fm-backlog.sh add <id> "<one line>" --kind <ship|scout> --repo <name>`, plus `--start` for immediate dispatch (In flight) or the default queue placement, and `--blocked-by <id>` (repeatable) when it waits on another task.
 - Start an existing queued item: `bin/fm-backlog.sh start <id>` before dispatching work from Queued, after checking that blockers and holds are gone and any time/date gate has arrived.
-- Move a finished task to Done: let successful `bin/fm-teardown.sh <id>` record it after lifecycle cleanup; only use its printed `bin/fm-backlog.sh done` recovery command when teardown succeeded but a required artifact link was not yet recorded.
+- Move a finished task to Done: let `bin/fm-teardown.sh <id>` record it after lifecycle cleanup, and rerun teardown to resume a retained finalization failure instead of invoking `bin/fm-backlog.sh done` directly.
 - Update task notes: inspect first with `bin/fm-backlog.sh show <id> --full`, then replace the considered body with `bin/fm-backlog.sh update <id> --body-file <path>`.
   Add `--archive-body` to that update command when superseding prior state should remain recoverable.
 - Manage dependencies: `bin/fm-backlog.sh block <id> --by <other>` and `bin/fm-backlog.sh unblock <id> --by <other>`, then `bin/fm-backlog.sh ready` to list queued work with no unresolved blockers.

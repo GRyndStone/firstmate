@@ -99,10 +99,11 @@ It additionally proves forced secondmate retirement surfaces a child-home duplic
 Before the fix, captain-facing accounting omitted held tasks and treated a sparse queue as the whole program.
 After the fix, `tests/fm-fleet-snapshot-view.test.sh` and `tests/fm-bearings-snapshot.test.sh` prove held work remains visible and a zero-candidate queue with a durable program source reports `requires_supervisor_judgment`.
 
-## Validation
+## Initial validation evidence
 
-The exact full-suite command `rc=0; for t in tests/*.test.sh; do bash "$t" || rc=1; done; exit "$rc"` exited 0 after the guardrails and regressions were in place.
-The exact lint command `bin/fm-lint.sh` exited 0 with the repository-pinned ShellCheck 0.11.0.
+At guardrail revision `8dcbc1d`, the exact full-suite command `rc=0; for t in tests/*.test.sh; do bash "$t" || rc=1; done; exit "$rc"` exited 0.
+At that same revision, the exact lint command `bin/fm-lint.sh` exited 0 with the repository-pinned ShellCheck 0.11.0.
+These results describe that initial revision, not the later lifecycle-hardening commits.
 The suite reported its existing environment-dependent skips for the opt-in interactive Pi live test, Pi typechecking when `tsc` is absent, and the Zellij smoke test when Zellij is absent.
 All other test scripts, including real Herdr and tmux backend smoke and safety coverage, passed.
 

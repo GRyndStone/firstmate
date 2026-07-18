@@ -60,7 +60,7 @@
 #   Backend endpoint creation claims state/<id>.spawning under the backlog lock
 #   before invalidating every same-id completion receipt.
 #   The claim remains until metadata is atomically published, so Done cannot race
-#   a new endpoint or reuse a prior delivery proof or interrupted claim.
+#   a new endpoint or reuse a prior completion binding or interrupted claim.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -175,7 +175,7 @@ esac
 # non-spawn-capable backends. The resolved value is
 # recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
 # window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
-# so the default path's meta stays byte-identical.
+# preserving the backend discriminator contract while tmux identity fields evolve.
 if [ "$BACKEND_SET" -eq 1 ]; then
   BACKEND=$BACKEND_ARG
 else
@@ -1333,9 +1333,8 @@ if ! {
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
-  # backend= is written only for a non-default (non-tmux) backend, so the
-  # default path's meta stays byte-identical (absent backend= means tmux;
-  # data/fm-backend-design-d7's P1 compatibility contract).
+  # backend= is written only for a non-default (non-tmux) backend.
+  # Absent backend= still means tmux; the identity fields below are additive.
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
   if [ "$BACKEND" = tmux ]; then
     echo "tmux_home_identity=$TMUX_HOME_ID"

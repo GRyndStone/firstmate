@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Tear down a finished task: return the treehouse worktree, release the Orca
-# worktree, or retire a secondmate home; kill the recorded runtime endpoint,
-# clear volatile state, refresh/prune the project's clone for PR-based ship
-# tasks, then record backlog completion through the serialized backlog wrapper
-# for ship and scout teardowns through the configured serialized backlog path.
+# Tear down a finished task through exact-home endpoint ownership preflight,
+# then release its backend/worktree resources or retire a secondmate home.
+# Backends without verified exact-home inventories fail closed before closure.
+# Successful PR-based ship paths refresh/prune the project's clone.
+# Ship and scout paths record backlog completion through the configured
+# serialized backlog wrapper.
 # Completion happens only from the durable finalizing phase after endpoint and
 # cleanup ownership are closed; meta and phase state remain until the serialized
 # backlog mutation succeeds.
@@ -43,14 +44,16 @@
 # for the common case where there is no remote at all.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
-# product - teardown proceeds once the report exists, and refuses without it.
-# Orca tasks use the same safety checks, then close the recorded terminal and
-# remove the recorded worktree through `orca worktree rm`; teardown never guesses
-# an Orca target from ambient CLI state.
+# product. Non-forced teardown requires it, and all endpoint ownership
+# preflights still apply.
+# Orca worktree and terminal release primitives remain bound to recorded identity,
+# but current teardown fails closed before either cleanup because Orca lacks a
+# verified exact-home duplicate inventory; it never guesses from ambient CLI state.
 # Secondmates (kind=secondmate in meta) are retired explicitly. Normal
 # teardown refuses while their home has in-flight crewmate meta files; --force
-# is the approved discard path that prevalidates child removal targets, discards
-# child work, kills child runtime endpoints, and removes the retired home. Removing a
+# is the approved discard path that preflights exact-home child endpoint ownership
+# and removal targets, then discards child work, kills child runtime endpoints,
+# and removes the retired home. Removing a
 # leased home releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.

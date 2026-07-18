@@ -6,8 +6,8 @@
 # data/fm-backend-design-d7/herdr-addendum.md ("Events as the core
 # abstraction"). P1 extracted the tmux command sequences that fm-send.sh,
 # fm-peek.sh, fm-watch.sh, fm-spawn.sh, and fm-teardown.sh already ran inline
-# into bin/backends/tmux.sh, with those SAME command sequences, so the default
-# (tmux) path stays byte-identical. P2 adds bin/backends/herdr.sh, an
+# into bin/backends/tmux.sh with those same command sequences. Later lifecycle
+# hardening added stable tmux identity and exact-home ownership metadata. P2 adds bin/backends/herdr.sh, an
 # EXPERIMENTAL spawn-capable backend behind `--backend herdr`/`FM_BACKEND=herdr`/
 # `config/backend`, and behind runtime auto-detection when firstmate itself is
 # running inside herdr with no explicit backend setting; see herdr-addendum.md and
@@ -31,8 +31,8 @@
 #
 # Compatibility contract: a task's meta may omit `backend=`; every reader here
 # treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
-# `backend=tmux` for a default-backend task, so existing and newly spawned
-# default-path metas stay byte-identical. Only a task spawned on a non-tmux
+# `backend=tmux` for a default-backend task. New tmux metas may still carry
+# stable-id and exact-home ownership fields. Only a task spawned on a non-tmux
 # spawn-capable backend, currently experimental herdr, zellij, orca, or cmux,
 # carries an explicit `backend=` line.
 #

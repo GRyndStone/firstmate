@@ -7,9 +7,9 @@
 # last EVENT, not the current STATE. After firstmate resolves a needs-decision
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
-# current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else the pane
-# busy-signature) and reconciles the possibly-stale log against it.
+# current state from a tail of the log: it reconciles branch-matched
+# no-mistakes run evidence, exact-run recovery context, and live pane evidence
+# before using the status log as a fallback.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -30,6 +30,10 @@
 #      start a new run. A working event plus a readable busy pane can therefore
 #      supersede a recoverable terminal classification when that event names
 #      the exact terminal run as `after-run=<id>`; passed stays final.
+#      While that exact recovery context remains open, a later
+#      needs-decision, blocked, or paused event supersedes the same named
+#      recoverable terminal as status-log evidence; resolved returns it to
+#      working, while done or failed closes the recovery context.
 #      A coarse runs-list entry carries no run id and cannot be superseded.
 #      Before recovered work starts a new run, its brief requires a distinct
 #      `working: validating-after-run=<id>` event. During that handoff the named
