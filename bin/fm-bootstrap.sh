@@ -92,6 +92,7 @@ FM_WAKE_STATE_INIT=skip
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
+fm_validate_task_meta_files "$STATE" || exit 1
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh disable=SC1091
@@ -325,7 +326,7 @@ secondmate_liveness_sweep() {
           continue
         fi
         if [ "$ownership" = present ]; then
-          if ! fm_backend_kill "$backend" "$target" 2>/dev/null \
+          if ! fm_backend_kill_owned_meta "$meta" "fm-$id" 2>/dev/null \
              || [ "$(fm_backend_target_state_of_meta "$meta" "fm-$id")" != absent ]; then
             echo "SECONDMATE_LIVENESS: secondmate $id: skipped: endpoint closure was not confirmed"
             continue
@@ -445,8 +446,14 @@ x_mode_setup() {
   [ -f "$env_file" ] && token=$(fmx_env_get FMX_PAIRING_TOKEN "$env_file")
 
   x_mode_remove_artifacts() {
-    fm_remove_file_no_follow "$shim" \
-      && fm_remove_file_no_follow "$cadence"
+    local rc=0
+    if [ -e "$shim" ] || [ -L "$shim" ]; then
+      fm_remove_file_no_follow "$shim" || rc=1
+    fi
+    if [ -e "$cadence" ] || [ -L "$cadence" ]; then
+      fm_remove_file_no_follow "$cadence" || rc=1
+    fi
+    return "$rc"
   }
 
   x_mode_supervision_repair() {

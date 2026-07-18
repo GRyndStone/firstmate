@@ -699,9 +699,9 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
 # fm_backend_target_state: teardown-grade endpoint existence probe.
 # Prints present, absent, or unknown; backend inventory/read failures are
 # unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
-fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-identity] [expected-worktree] [backend-container]
+fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-identity] [expected-worktree] [backend-container] [expected-workspace-label]
   local backend=$1 target=$2 expected_label=${3:-} backend_identity=${4:-} expected_worktree=${5:-}
-  local backend_container=${6:-} out code session pane state workspace workspace_label tabs panes verdict home_identity count
+  local backend_container=${6:-} expected_workspace_label=${7:-} out code session pane state workspace workspace_label tabs panes verdict home_identity count
   : "$expected_worktree"
   if [ "$backend" = herdr ]; then
     fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
@@ -716,13 +716,16 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
     if ! out=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1); then
       code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
       case "$code" in
-        workspace_not_found) printf 'absent' ;;
+        workspace_not_found) printf 'unknown' ;;
         *) printf 'unknown' ;;
       esac
       return 0
     fi
-    workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) \
-      || { printf 'unknown'; return 0; }
+    workspace_label=$expected_workspace_label
+    if [ -z "$workspace_label" ]; then
+      workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+    fi
     printf '%s' "$out" | jq -e --arg workspace "$workspace" --arg label "$workspace_label" \
       '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 \
       || { printf 'unknown'; return 0; }
@@ -843,6 +846,7 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
 
 fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
   local meta=$1 expected_label=${2:-} backend target backend_identity backend_container worktree window pane
+  local kind meta_home task_id workspace_label
   [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
@@ -861,6 +865,16 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
         && [ "$window" = "$backend_container:$pane" ] \
         && [ "$target" = "$window" ] \
         || { printf 'unknown'; return 0; }
+      kind=$(fm_meta_get "$meta" kind)
+      task_id=$(basename "$meta" .meta)
+      if [ "$kind" = secondmate ]; then
+        meta_home=$(fm_meta_get "$meta" home)
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$meta_home" "$task_id" 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+      else
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$FM_HOME" 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+      fi
       ;;
     *)
       printf 'unknown'
@@ -868,7 +882,44 @@ fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
       ;;
   esac
   [ -n "$target" ] || { printf 'unknown'; return 0; }
-  fm_backend_target_state "$backend" "$target" "$expected_label" "$backend_identity" "$worktree" "$backend_container"
+  fm_backend_target_state "$backend" "$target" "$expected_label" "$backend_identity" "$worktree" "$backend_container" "${workspace_label:-}"
+}
+
+fm_backend_kill_owned_meta() {  # <meta-file> <expected-label>
+  local meta=$1 expected_label=$2 before after backend target state tab_id session identity workspace workspace_label kind meta_home task_id
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  before=$(cksum "$meta" 2>/dev/null) || return 1
+  state=$(fm_backend_target_state_of_meta "$meta" "$expected_label")
+  [ "$state" = present ] || return 1
+  after=$(cksum "$meta" 2>/dev/null) || return 1
+  [ "$before" = "$after" ] || return 1
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux)
+      session=$(fm_meta_get "$meta" tmux_session)
+      identity=$(fm_meta_get "$meta" tmux_home_identity)
+      fm_backend_tmux_kill_owned "$target" "$session" "$expected_label" "$identity"
+      ;;
+    herdr)
+      workspace=$(fm_meta_get "$meta" herdr_workspace_id)
+      kind=$(fm_meta_get "$meta" kind)
+      task_id=$(basename "$meta" .meta)
+      if [ "$kind" = secondmate ]; then
+        meta_home=$(fm_meta_get "$meta" home)
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$meta_home" "$task_id" 2>/dev/null) || return 1
+      else
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$FM_HOME" 2>/dev/null) || return 1
+      fi
+      fm_backend_herdr_kill_owned "$target" "$workspace" "$workspace_label" "$expected_label"
+      ;;
+    zellij)
+      tab_id=$(fm_meta_get "$meta" zellij_tab_id)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_zellij_kill "$target" "$tab_id" "$expected_label"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS

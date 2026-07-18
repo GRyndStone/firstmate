@@ -26,27 +26,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 
 fmx_load_config
 # Hard no-op when X mode is off: this is what keeps the check shim inert.
 [ -n "$FMX_TOKEN" ] || exit 0
+fm_ensure_dir_no_follow "$STATE" || exit 1
 
 ERROR_FILE="$STATE/x-poll.error"
 
 emit_error_once() {
   local msg=$1
-  mkdir -p "$STATE" 2>/dev/null || true
-  if [ -f "$ERROR_FILE" ] && [ "$(cat "$ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
+  if [ -f "$ERROR_FILE" ] && [ ! -L "$ERROR_FILE" ] && [ "$(cat "$ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
     return 0
   fi
-  printf '%s\n' "$msg" > "$ERROR_FILE" 2>/dev/null || true
+  printf '%s\n' "$msg" | fm_write_file_no_follow "$ERROR_FILE" 2>/dev/null || true
   printf 'x-mode-error %s\n' "$msg"
 }
 
 clear_error() {
-  rm -f "$ERROR_FILE" 2>/dev/null || true
+  if [ -e "$ERROR_FILE" ] || [ -L "$ERROR_FILE" ]; then
+    fm_remove_file_no_follow "$ERROR_FILE" 2>/dev/null || true
+  fi
 }
 
 command -v curl >/dev/null 2>&1 || { emit_error_once "missing curl"; exit 0; }
@@ -92,17 +99,18 @@ case "$REQ" in
 esac
 
 INBOX="$STATE/x-inbox"
-mkdir -p "$INBOX" 2>/dev/null || { emit_error_once "cannot create inbox"; exit 0; }
+fm_ensure_dir_no_follow "$INBOX" || { emit_error_once "cannot create inbox"; exit 0; }
 # Stash the full mention object atomically so a concurrent reader never sees a
 # half-written file.
-if jq '.' "$BODY_FILE" > "$INBOX/$REQ.json.tmp" 2>/dev/null; then
-  if ! mv -f "$INBOX/$REQ.json.tmp" "$INBOX/$REQ.json" 2>/dev/null; then
-    rm -f "$INBOX/$REQ.json.tmp"
+INBOX_TMP=$(mktemp "$INBOX/.fm-x-poll.XXXXXX") || { emit_error_once "cannot write inbox"; exit 0; }
+if jq '.' "$BODY_FILE" > "$INBOX_TMP" 2>/dev/null; then
+  if ! fm_publish_file_no_follow "$INBOX_TMP" "$INBOX/$REQ.json" replace; then
+    rm -f "$INBOX_TMP"
     emit_error_once "cannot write inbox"
     exit 0
   fi
 else
-  rm -f "$INBOX/$REQ.json.tmp"
+  rm -f "$INBOX_TMP"
   emit_error_once "cannot write inbox"
   exit 0
 fi

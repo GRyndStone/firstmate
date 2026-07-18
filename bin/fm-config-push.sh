@@ -57,6 +57,11 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="$FM_HOME/data"
 SECONDMATES_MD="$DATA/secondmates.md"
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+fm_validate_task_meta_files "$STATE" || exit 1
+
 "$SCRIPT_DIR/fm-guard.sh" || true
 
 # shellcheck source=bin/fm-ff-lib.sh

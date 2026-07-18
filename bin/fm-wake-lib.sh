@@ -112,6 +112,36 @@ fm_touch_file_no_follow() {
   fm_write_file_no_follow "$1" </dev/null
 }
 
+fm_ensure_dir_no_follow() {
+  local directory=$1 parent
+  parent=${directory%/*}
+  [ -n "$parent" ] || parent=.
+  [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  if [ -e "$directory" ] || [ -L "$directory" ]; then
+    [ -d "$directory" ] && [ ! -L "$directory" ]
+    return
+  fi
+  mkdir "$directory" 2>/dev/null || return 1
+  [ -d "$directory" ] && [ ! -L "$directory" ]
+}
+
+fm_validate_task_meta_file() {
+  local meta=$1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || {
+    echo "error: task metadata is symlinked or non-regular: $meta" >&2
+    return 1
+  }
+}
+
+fm_validate_task_meta_files() {
+  local state=$1 meta
+  [ -d "$state" ] || return 0
+  for meta in "$state"/*.meta; do
+    [ -e "$meta" ] || [ -L "$meta" ] || continue
+    fm_validate_task_meta_file "$meta" || return 1
+  done
+}
+
 fm_append_file_no_follow() {
   local destination=$1 parent tmp
   parent=${destination%/*}

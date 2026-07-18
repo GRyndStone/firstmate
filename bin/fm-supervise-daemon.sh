@@ -1480,6 +1480,10 @@ fm_super_main() {
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
     fi
+    if [ -n "${CUR_ERR:-}" ] && [ -s "${CUR_ERR:-}" ]; then
+      fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR" \
+        || log "warn: watcher stderr could not be appended safely during shutdown"
+    fi
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
     fi

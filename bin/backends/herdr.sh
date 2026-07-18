@@ -96,16 +96,44 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # that home. fm-spawn.sh briefly shadows FM_HOME to a secondmate's own home
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
-fm_backend_herdr_workspace_label() {
-  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
-  if [ -f "$marker" ]; then
-    id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
-    if [ -n "$id" ]; then
-      printf '2ndmate-%s' "$id"
-      return 0
-    fi
+fm_backend_herdr_validate_home_path() {
+  local home=$1 suffix component cursor=/
+  FM_BACKEND_HERDR_VALIDATED_HOME=
+  case "$home" in /*) ;; *) return 1 ;; esac
+  suffix=${home#/}
+  while [ -n "$suffix" ]; do
+    component=${suffix%%/*}
+    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
+    [ -n "$component" ] || continue
+    case "$component" in .|..) return 1 ;; esac
+    cursor=${cursor%/}/$component
+    [ ! -L "$cursor" ] || return 1
+    [ -d "$cursor" ] || return 1
+  done
+  FM_BACKEND_HERDR_VALIDATED_HOME=$home
+}
+
+fm_backend_herdr_workspace_label_for_home() {
+  local home=$1 expected_id=${2:-} marker id
+  fm_backend_herdr_validate_home_path "$home" || return 1
+  home=$FM_BACKEND_HERDR_VALIDATED_HOME
+  marker="$home/$FM_BACKEND_HERDR_SECONDMATE_MARKER"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    id=$(cat "$marker" 2>/dev/null) || return 1
+    case "$id" in
+      ''|.*|*[!A-Za-z0-9._-]*|*$'\n'*) return 1 ;;
+    esac
+    [ -z "$expected_id" ] || [ "$id" = "$expected_id" ] || return 1
+    printf '2ndmate-%s' "$id"
+    return 0
   fi
+  [ -z "$expected_id" ] || return 1
   printf 'firstmate'
+}
+
+fm_backend_herdr_workspace_label() {
+  fm_backend_herdr_workspace_label_for_home "$FM_HOME"
 }
 
 # fm_backend_herdr_cli: run `herdr <args...>` scoped to <session>, setting
@@ -908,6 +936,37 @@ fm_backend_herdr_kill() {  # <target>
   else
     fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
   fi
+}
+
+fm_backend_herdr_kill_owned() {  # <target> <workspace> <workspace-label> <tab-label>
+  local target=$1 workspace=$2 workspace_label=$3 tab_label=$4 session pane workspace_info tabs panes
+  session=${target%%:*}
+  pane=${target#*:}
+  [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
+  workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1) || return 1
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg label "$workspace_label" \
+    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 || return 1
+  tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>/dev/null) || return 1
+  panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$workspace" 2>/dev/null) || return 1
+  jq -en --arg pane "$pane" --arg label "$tab_label" --argjson tabs "$tabs" --argjson panes "$panes" '
+    (($tabs.result.tabs | type) == "array")
+    and (($panes.result.panes | type) == "array")
+    and all($tabs.result.tabs[]?;
+      ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+      and ((.label | type) == "string")
+    )
+    and all($panes.result.panes[]?;
+      ((.pane_id | type) == "string") and ((.pane_id | length) > 0)
+      and ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+    )
+    and (($tabs.result.tabs | map(.tab_id)) as $tab_ids
+      | all($panes.result.panes[]?; .tab_id as $tab_id | ($tab_ids | index($tab_id)) != null))
+    and ([$panes.result.panes[]? | select(.pane_id == $pane)] as $owned
+      | ($owned | length) == 1
+      and ($owned[0].tab_id as $tab_id
+        | [$tabs.result.tabs[]? | select(.tab_id == $tab_id and .label == $label)] | length) == 1)
+  ' >/dev/null 2>&1 || return 1
+  fm_backend_herdr_cli "$session" pane close "$pane" >/dev/null 2>&1
 }
 
 # fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status

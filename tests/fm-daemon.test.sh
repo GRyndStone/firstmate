@@ -684,7 +684,7 @@ test_daemon_durable_writers_reject_final_symlinks() {
 }
 
 test_daemon_watcher_stderr_uses_buffered_no_follow_append() {
-  local dir state outside target status source
+  local dir state outside target status source append_count
   dir=$(make_supercase daemon-watcher-stderr)
   state="$dir/state"
   outside="$dir/outside"
@@ -710,6 +710,8 @@ test_daemon_watcher_stderr_uses_buffered_no_follow_append() {
     "daemon watcher stderr is not buffered by its directly supervised child"
   assert_contains "$source" 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"' \
     "daemon watcher stderr buffer is not published through the no-follow helper"
+  append_count=$(printf '%s\n' "$source" | grep -c 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"')
+  [ "$append_count" -ge 2 ] || fail "daemon shutdown does not flush the active watcher stderr buffer"
   assert_not_contains "$source" 'fm_exec_stderr_append_no_follow' \
     "daemon watcher launch still depends on the Perl stderr opener"
   assert_not_contains "$source" '2>>"$WATCH_ERR"' \

@@ -15,6 +15,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 STATE=$FM_VALIDATED_STATE_PATH
 LOCK="$STATE/.lock"
+ACQUIRE_LOCK="$STATE/.lock.acquire"
 
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|^pi$'
@@ -53,6 +54,8 @@ if [ "${1:-}" = "status" ]; then
 fi
 
 me=$(harness_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
+fm_lock_acquire_wait "$ACQUIRE_LOCK"
+trap 'fm_lock_release "$ACQUIRE_LOCK" 2>/dev/null || true' EXIT
 if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
   [ -f "$LOCK" ] && [ ! -L "$LOCK" ] \
     || { echo "error: unsafe session lock record refused" >&2; exit 1; }
@@ -64,4 +67,8 @@ if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
 fi
 printf '%s\n' "$me" | fm_write_file_no_follow "$LOCK" \
   || { echo "error: could not persist session lock safely" >&2; exit 1; }
+[ "$(cat "$LOCK" 2>/dev/null || true)" = "$me" ] \
+  || { echo "error: session lock ownership could not be verified" >&2; exit 1; }
+fm_lock_release "$ACQUIRE_LOCK"
+trap - EXIT
 echo "lock acquired: harness pid $me"

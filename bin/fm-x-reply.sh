@@ -71,6 +71,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 
@@ -243,7 +248,7 @@ fi
 if [ -n "$FMX_DRY" ]; then
   outbox_dir="$STATE/x-outbox"
   outbox_file="$outbox_dir/$REQ.json"
-  mkdir -p "$outbox_dir" 2>/dev/null || {
+  fm_ensure_dir_no_follow "$STATE" && fm_ensure_dir_no_follow "$outbox_dir" || {
     echo "fm-x-reply: cannot create dry-run outbox: $outbox_dir" >&2
     exit 1
   }
@@ -252,7 +257,7 @@ if [ -n "$FMX_DRY" ]; then
   # "endpoint":"followup" marker so an outbox record is self-describing.
   OUTREC=$(fmx_reply_outbox_json "$REQ" "$CHUNKS" "$N" "$FOLLOWUP" "$IMAGE_PREVIEW") || {
     echo "fm-x-reply: failed to build dry-run outbox record" >&2; exit 1; }
-  printf '%s\n' "$OUTREC" > "$outbox_file" 2>/dev/null || {
+  printf '%s\n' "$OUTREC" | fm_write_file_no_follow "$outbox_file" 2>/dev/null || {
     echo "fm-x-reply: cannot write dry-run outbox: $outbox_file" >&2
     exit 1
   }

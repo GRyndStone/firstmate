@@ -57,6 +57,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 
@@ -140,6 +145,9 @@ case "$ID" in
 esac
 
 META="$STATE/$ID.meta"
+if [ -e "$META" ] || [ -L "$META" ]; then
+  fm_validate_task_meta_file "$META" || exit 1
+fi
 RID=$(fmx_meta_get "$META" x_request)
 TS=$(fmx_meta_get "$META" x_request_ts)
 COUNT=$(fmx_meta_get "$META" x_followups)

@@ -63,11 +63,13 @@ TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-endpoint-audit.XXXXXX") || exit 1
 LIVE="$TMP_ROOT/live.tsv"
 ROWS="$TMP_ROOT/rows.jsonl"
 TARGETS="$TMP_ROOT/targets.tsv"
+UNAVAILABLE="$TMP_ROOT/unavailable.tsv"
 : > "$LIVE"
 : > "$ROWS"
 : > "$TARGETS"
+: > "$UNAVAILABLE"
 cleanup() {
-  rm -f "$LIVE" "$ROWS" "$TARGETS"
+  rm -f "$LIVE" "$ROWS" "$TARGETS" "$UNAVAILABLE"
   rmdir "$TMP_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -181,16 +183,30 @@ for meta in "$STATE"/*.meta; do
   workspace=$(fm_meta_get "$meta" herdr_workspace_id)
   target=$(fm_backend_target_of_meta "$meta")
   window=$(fm_meta_get "$meta" window)
+  id=$(basename "$meta" .meta)
+  kind=$(fm_meta_get "$meta" kind)
   if [ -z "$session" ] || [ -z "$workspace" ] || [ -z "$pane" ] \
      || [ "$window" != "$session:$pane" ] || [ "$target" != "$window" ]; then
     append_inventory_unavailable herdr "$meta" "Herdr meta lacks a consistent exact window/session/workspace/pane identity"
     continue
   fi
-  printf '%s\t%s\n' "$session" "$workspace" >> "$TARGETS"
+  if [ "$kind" = secondmate ]; then
+    home=$(fm_meta_get "$meta" home)
+    expected_workspace_label=$(fm_backend_herdr_workspace_label_for_home "$home" "$id" 2>/dev/null) || {
+      append_inventory_unavailable herdr "$meta" "Herdr secondmate home marker is unsafe or does not match the task identity"
+      continue
+    }
+  else
+    expected_workspace_label=$(fm_backend_herdr_workspace_label_for_home "$FM_HOME" 2>/dev/null) || {
+      append_inventory_unavailable herdr "$meta" "Herdr home marker is unsafe or invalid"
+      continue
+    }
+  fi
+  printf '%s\t%s\t%s\n' "$session" "$workspace" "$expected_workspace_label" >> "$TARGETS"
 done
 
 LC_ALL=C sort -u "$TARGETS" -o "$TARGETS"
-while IFS=$'\t' read -r session workspace; do
+while IFS=$'\t' read -r session workspace expected_workspace_label; do
   [ -n "$session" ] && [ -n "$workspace" ] || continue
   workspace_read=0
   if workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1); then
@@ -198,13 +214,13 @@ while IFS=$'\t' read -r session workspace; do
   fi
   workspace_code=$(printf '%s' "$workspace_info" | jq -r '.error.code // empty' 2>/dev/null)
   if [ "$workspace_code" = workspace_not_found ]; then
+    printf '%s\t%s\n' "$session" "$workspace" >> "$UNAVAILABLE"
     continue
   fi
   if [ "$workspace_read" -ne 1 ]; then
     echo "fm-endpoint-audit: cannot read Herdr workspace $session:$workspace" >&2
     exit 1
   fi
-  expected_workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) || exit 1
   printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg label "$expected_workspace_label" \
     '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' >/dev/null 2>&1 || {
     echo "fm-endpoint-audit: invalid exact workspace response for $session:$workspace" >&2
@@ -275,8 +291,21 @@ for meta in "$STATE"/*.meta; do
   pane=$(fm_meta_get "$meta" herdr_pane_id)
   workspace=$(fm_meta_get "$meta" herdr_workspace_id)
   window=$(fm_meta_get "$meta" window)
+  kind=$(fm_meta_get "$meta" kind)
   if [ -z "$session" ] || [ -z "$workspace" ] || [ -z "$pane" ] \
      || [ "$window" != "$session:$pane" ] || [ "$recorded" != "$window" ]; then
+    continue
+  fi
+  if [ "$kind" = secondmate ]; then
+    home=$(fm_meta_get "$meta" home)
+    fm_backend_herdr_workspace_label_for_home "$home" "$id" >/dev/null 2>&1 || continue
+  else
+    fm_backend_herdr_workspace_label_for_home "$FM_HOME" >/dev/null 2>&1 || continue
+  fi
+  if awk -F '\t' -v session="$session" -v workspace="$workspace" \
+    '$1 == session && $2 == workspace { found=1 } END { exit found ? 0 : 1 }' "$UNAVAILABLE"; then
+    append_inventory_unavailable herdr "$meta" \
+      "recorded Herdr workspace is missing; exact-home replacement inventory is unavailable"
     continue
   fi
   live_json=$(awk -F '\t' -v label="$label" '$2 == label { print $1 }' "$LIVE" \
@@ -347,7 +376,6 @@ audit_tmux_meta() {
   fi
   if printf '%s\n' "$inventory" | awk -F '\t' 'NF == 4 && $3 == "" { found=1 } END { exit found ? 0 : 1 }'; then
     append_inventory_unavailable tmux "$meta" "untagged legacy tmux window has ambiguous Firstmate-home ownership"
-    return
   fi
   live_json=$(printf '%s\n' "$inventory" | awk -F '\t' -v owner="$identity" 'NF == 4 && $3 == owner { print $1 }' \
     | jq -R -s '[splits("\\n") | select(length > 0)] | unique | sort') || return 1

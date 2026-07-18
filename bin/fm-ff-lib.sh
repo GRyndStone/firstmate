@@ -253,7 +253,7 @@ live_secondmate_meta_records() {
   local state=$1 registry=${2:-} meta id home window
   [ -d "$state" ] || return 0
   for meta in "$state"/*.meta; do
-    [ -f "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
     id=$(basename "$meta" .meta)
     home=$(grep '^home=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)

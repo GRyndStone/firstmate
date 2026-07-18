@@ -298,6 +298,14 @@ fm_backend_tmux_kill() {  # <target>
   fi
 }
 
+fm_backend_tmux_kill_owned() {  # <target> <session> <expected-label> <home-identity>
+  local target=$1 session=$2 expected_label=$3 home_identity=$4 condition out
+  condition="#{&&:#{==:#{window_id},$target},#{&&:#{==:#{session_name},$session},#{&&:#{==:#{window_name},$expected_label},#{==:#{@firstmate_home},$home_identity}}}}"
+  out=$(tmux if-shell -F -t "$target" "$condition" \
+    "kill-window -t $target" "display-message -p ownership-mismatch" 2>&1) || return 1
+  [ -z "$out" ]
+}
+
 # fm_backend_tmux_current_command: <target>'s live foreground process name -
 # tmux's own `#{pane_current_command}`, already resolved from the pty's
 # foreground process group (verified empirically with real tmux 3.6a: a

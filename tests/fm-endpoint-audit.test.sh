@@ -227,7 +227,7 @@ test_herdr_window_fields_must_be_consistent() {
   pass "Herdr endpoint fields must describe one exact recorded owner"
 }
 
-test_missing_owned_workspace_is_an_empty_inventory() {
+test_missing_owned_workspace_is_inventory_unavailable() {
   local home log out
   home=$(make_fixture missing-workspace)
   log="$home/herdr.log"
@@ -240,11 +240,64 @@ test_missing_owned_workspace_is_an_empty_inventory() {
     'worktree=/owned/worktree'
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
     FM_HERDR_WORKSPACE_NOT_FOUND=1 "$AUDIT" --json)
-  [ "$out" = '[]' ] || fail "missing owned workspace was not treated as an empty inventory: $out"
+  printf '%s' "$out" | jq -e '
+    length == 1 and .[0].kind == "inventory_unavailable"
+      and (.[0].reason | contains("recorded Herdr workspace is missing"))
+  ' >/dev/null || fail "missing owned workspace licensed a clean inventory: $out"
   assert_contains "$(cat "$log")" 'workspace get subw' "missing workspace did not use exact workspace get"
   assert_not_contains "$(cat "$log")" 'workspace list' "missing workspace path enumerated the shared session"
   assert_not_contains "$(cat "$log")" 'tab list' "missing workspace still queried tabs"
-  pass "structured workspace_not_found is an absent owned workspace"
+  pass "a missing Herdr workspace cannot license replacement cleanup"
+}
+
+test_herdr_secondmate_workspace_uses_validated_meta_home() {
+  local home secondmate_home out
+  home=$(make_fixture herdr-secondmate-home)
+  secondmate_home="$home/secondmate-home"
+  mkdir -p "$secondmate_home"
+  printf 'dup-task\n' > "$secondmate_home/.fm-secondmate-home"
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'kind=secondmate' \
+    "home=$secondmate_home" \
+    'worktree=/owned/worktree'
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" \
+    FM_HERDR_WORKSPACE_LABEL=2ndmate-dup-task "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    length == 1 and .[0].kind == "duplicate_recovery_endpoints"
+      and .[0].task == "dup-task"
+  ' >/dev/null || fail "valid primary-owned Herdr secondmate was rejected: $out"
+  pass "Herdr secondmate ownership derives from its validated meta home"
+}
+
+test_herdr_secondmate_marker_must_be_safe_and_exact() {
+  local home secondmate_home outside out
+  home=$(make_fixture herdr-secondmate-marker)
+  secondmate_home="$home/secondmate-home"
+  outside="$home/foreign-marker"
+  mkdir -p "$secondmate_home"
+  printf 'dup-task\n' > "$outside"
+  ln -s "$outside" "$secondmate_home/.fm-secondmate-home"
+  fm_write_meta "$home/state/dup-task.meta" \
+    'backend=herdr' \
+    'window=default:subw:p2' \
+    'herdr_session=default' \
+    'herdr_workspace_id=subw' \
+    'herdr_pane_id=subw:p2' \
+    'kind=secondmate' \
+    "home=$secondmate_home" \
+    'worktree=/owned/worktree'
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$home/herdr.log" "$AUDIT" --json)
+  printf '%s' "$out" | jq -e '
+    length == 1 and .[0].kind == "inventory_unavailable"
+      and (.[0].reason | contains("home marker is unsafe"))
+  ' >/dev/null || fail "unsafe Herdr secondmate marker authorized inventory: $out"
+  [ ! -s "$home/herdr.log" ] || fail "unsafe Herdr marker triggered an endpoint query"
+  pass "Herdr secondmate markers are regular and task-identity bound"
 }
 
 test_partial_herdr_inventory_fails_closed() {
@@ -343,21 +396,25 @@ test_tmux_untagged_legacy_window_is_ambiguous() {
   cat > "$home/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  display-message) printf '@12\towned-session\tfm-dup-task\t%s\n' "${FM_TMUX_OWNER:?}" ;;
   list-windows)
     case "$*" in
       *'#{window_id},@12}'*) ;;
-      *) printf '@11\tfm-dup-task\t\t_\n' ;;
+      *) printf '@11\tfm-dup-task\t\t_\n@13\tfm-dup-task\t%s\t_\n@14\tfm-dup-task\t%s\t_\n' "$FM_TMUX_OWNER" "$FM_TMUX_OWNER" ;;
     esac
     ;;
   new-window) printf 'unexpected endpoint creation\n' >&2; exit 91 ;;
 esac
 SH
   chmod +x "$home/fakebin/tmux"
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$AUDIT" --json)
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_OWNER="$identity" "$AUDIT" --json)
   printf '%s' "$out" | jq -e '
-    length == 1 and .[0].kind == "inventory_unavailable" and
-    (.[0].reason | contains("untagged legacy tmux window"))
-  ' >/dev/null || fail "untagged tmux audit did not fail closed: $out"
+    length == 2
+      and .[0].kind == "duplicate_recovery_endpoints"
+      and .[0].live_endpoints == ["@13","@14"]
+      and .[1].kind == "inventory_unavailable"
+      and (.[1].reason | contains("untagged legacy tmux window"))
+  ' >/dev/null || fail "untagged tmux ambiguity hid tagged duplicates: $out"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" bash -c '
     FM_BACKEND_LIB_DIR="$1/bin"; . "$1/bin/fm-backend.sh"
@@ -417,6 +474,39 @@ SH
       _ "$ROOT/bin/fm-backend.sh" "$identity")
   [ "$actual" = unknown ] || fail "moved tmux window was misclassified as $actual"
   pass "tmux container loss is unknown and cannot license a raw kill"
+}
+
+test_tmux_owned_kill_is_conditioned_inside_server_action() {
+  local home identity log status
+  home=$(make_fixture tmux-owned-kill)
+  identity=$(FM_HOME="$home" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  log="$home/tmux.log"
+  fm_write_meta "$home/state/owned.meta" \
+    'window=@12' \
+    'tmux_window_id=@12' \
+    'tmux_session=owned-session' \
+    "tmux_home_identity=$identity" \
+    'kind=secondmate'
+  cat > "$home/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  display-message) printf '@12\towned-session\tfm-owned\t%s\n' "${FM_TMUX_OWNER:?}" ;;
+  if-shell) printf 'ownership-mismatch\n' ;;
+  kill-window) exit 97 ;;
+esac
+SH
+  chmod +x "$home/fakebin/tmux"
+  status=0
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_TMUX_LOG="$log" FM_TMUX_OWNER="$identity" \
+    bash -c '. "$1"; fm_backend_kill_owned_meta "$2" fm-owned' \
+      _ "$ROOT/bin/fm-backend.sh" "$home/state/owned.meta" || status=$?
+  [ "$status" -ne 0 ] || fail "an action-time tmux ownership mismatch licensed closure"
+  assert_contains "$(cat "$log")" 'if-shell -F -t @12' \
+    "owned tmux close did not bind validation and kill in one server action"
+  [ "$(grep -c '^kill-window ' "$log")" -eq 0 ] \
+    || fail "owned tmux close fell back to a raw kill command"
+  pass "tmux liveness cleanup binds ownership inside the close action"
 }
 
 test_symlinked_meta_is_not_read_across_homes() {
@@ -622,6 +712,9 @@ test_herdr_endpoint_probe_distinguishes_absent_from_unreadable() {
   actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" \
     bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-wrong-task subw' _ "$ROOT/bin/fm-backend.sh")
   [ "$actual" = unknown ] || fail "mismatched-owner Herdr endpoint read $actual"
+  actual=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_HERDR_LOG="$log" FM_HERDR_WORKSPACE_NOT_FOUND=1 \
+    bash -c '. "$1"; fm_backend_target_state herdr default:subw:p2 fm-dup-task subw' _ "$ROOT/bin/fm-backend.sh")
+  [ "$actual" = unknown ] || fail "missing Herdr workspace was misclassified as $actual"
   pass "Herdr endpoint probe binds the recorded pane to its exact workspace and task label"
 }
 
@@ -631,13 +724,16 @@ test_singleton_mismatch_is_reported
 test_herdr_recorded_target_owner_mismatch_keeps_replacements
 test_herdr_workspace_label_must_match_home
 test_herdr_window_fields_must_be_consistent
-test_missing_owned_workspace_is_an_empty_inventory
+test_missing_owned_workspace_is_inventory_unavailable
+test_herdr_secondmate_workspace_uses_validated_meta_home
+test_herdr_secondmate_marker_must_be_safe_and_exact
 test_partial_herdr_inventory_fails_closed
 test_unresolved_herdr_pane_tab_fails_closed
 test_tmux_duplicates_use_exact_recorded_session_and_task
 test_tmux_untagged_legacy_window_is_ambiguous
 test_tmux_recorded_target_owner_mismatch_keeps_replacements
 test_tmux_moved_window_is_unknown_not_absent
+test_tmux_owned_kill_is_conditioned_inside_server_action
 test_tmux_unscoped_meta_reports_inventory_unavailable
 test_symlinked_meta_is_not_read_across_homes
 test_symlinked_state_path_component_is_refused_before_enumeration

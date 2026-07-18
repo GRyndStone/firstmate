@@ -505,7 +505,8 @@ test_standalone_mutators_validate_state_before_writes() {
   outside="$case_dir/outside"
   mkdir -p "$home" "$outside"
   ln -s "$outside" "$home/state"
-  for script in fm-lock.sh fm-bootstrap.sh; do
+  for script in fm-lock.sh fm-bootstrap.sh fm-config-push.sh fm-pr-check.sh \
+    fm-x-poll.sh fm-x-reply.sh fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
     status=0
     out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/$script" 2>&1) || status=$?
     [ "$status" -ne 0 ] || fail "$script accepted a symlinked effective state root"
@@ -514,7 +515,72 @@ test_standalone_mutators_validate_state_before_writes() {
     [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
       || fail "$script wrote through a symlinked effective state root"
   done
-  pass "standalone lock and bootstrap mutation validate effective state first"
+  pass "standalone state mutators validate effective state first"
+}
+
+test_bootstrap_rejects_symlinked_task_metadata_before_sync() {
+  local home outside out status
+  home="$TMP_ROOT/bootstrap-symlink-meta"
+  outside="$TMP_ROOT/bootstrap-foreign-meta"
+  mkdir -p "$home/state"
+  printf 'kind=secondmate\nhome=/foreign\n' > "$outside"
+  ln -s "$outside" "$home/state/foreign.meta"
+  status=0
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-bootstrap.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "bootstrap accepted symlinked task metadata"
+  assert_contains "$out" "task metadata is symlinked or non-regular" \
+    "bootstrap did not reject foreign metadata before secondmate sync"
+  pass "bootstrap rejects symlinked task metadata before fleet mutation"
+}
+
+test_session_lock_admission_serializes_before_owner_read() {
+  local source acquire_line inspect_line write_line verify_line
+  source=$(cat "$ROOT/bin/fm-lock.sh")
+  acquire_line=$(printf '%s\n' "$source" | grep -n 'fm_lock_acquire_wait "$ACQUIRE_LOCK"' | cut -d: -f1)
+  inspect_line=$(printf '%s\n' "$source" | grep -n 'if \[ -e "$LOCK" \]' | tail -1 | cut -d: -f1)
+  write_line=$(printf '%s\n' "$source" | grep -n 'fm_write_file_no_follow "$LOCK"' | cut -d: -f1)
+  verify_line=$(printf '%s\n' "$source" | grep -n 'session lock ownership could not be verified' | cut -d: -f1)
+  [ -n "$acquire_line" ] && [ -n "$inspect_line" ] && [ -n "$write_line" ] && [ -n "$verify_line" ] \
+    || fail "session lock admission transaction is incomplete"
+  [ "$acquire_line" -lt "$inspect_line" ] && [ "$inspect_line" -lt "$write_line" ] \
+    && [ "$write_line" -lt "$verify_line" ] \
+    || fail "session lock owner read/write is not serialized and verified"
+  pass "session lock admission serializes owner read, write, and verification"
+}
+
+test_state_entrypoint_inventory_names_active_mutators() {
+  local doc entry
+  doc=$(cat "$ROOT/docs/configuration.md")
+  for entry in fm-config-push.sh fm-pr-check.sh fm-x-poll.sh fm-x-reply.sh \
+    fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
+    assert_contains "$doc" "bin/$entry" "state entry-point inventory omitted $entry"
+  done
+  pass "state entry-point inventory includes config, PR, and X mutators"
+}
+
+test_state_mutators_reject_symlinked_task_metadata() {
+  local home outside status
+  home="$TMP_ROOT/state-mutator-symlink-meta"
+  outside="$TMP_ROOT/state-mutator-foreign-meta"
+  mkdir -p "$home/state"
+  printf 'kind=secondmate\nwindow=@9\nx_request=req-foreign\n' > "$outside"
+  ln -s "$outside" "$home/state/task-a.meta"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "config-push accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-pr-check.sh" task-a https://example.test/pr/1 \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "pr-check accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "x-link accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-followup.sh" --check task-a >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "x-followup accepted symlinked task metadata"
+  assert_contains "$(cat "$outside")" "x_request=req-foreign" \
+    "state mutator changed foreign task metadata"
+  pass "config, PR, and X mutators reject symlinked task metadata"
 }
 
 test_bootstrap_reporting
@@ -529,3 +595,7 @@ test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
 test_standalone_mutators_validate_state_before_writes
+test_bootstrap_rejects_symlinked_task_metadata_before_sync
+test_session_lock_admission_serializes_before_owner_read
+test_state_entrypoint_inventory_names_active_mutators
+test_state_mutators_reject_symlinked_task_metadata

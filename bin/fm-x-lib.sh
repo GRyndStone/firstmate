@@ -115,7 +115,7 @@ fmx_load_config() {
 fmx_request_inbox_context() {
   local state=$1 rid=$2 inbox
   inbox="$state/x-inbox/$rid.json"
-  if [ ! -f "$inbox" ]; then
+  if [ ! -f "$inbox" ] || [ -L "$inbox" ]; then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi
@@ -492,7 +492,7 @@ fmx_post_json() (
 # empty output as "unset".
 fmx_meta_get() {
   local meta=$1 key=$2 line
-  [ -f "$meta" ] || return 0
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
   line=$(grep -E "^${key}=" "$meta" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   printf '%s' "${line#*=}"
@@ -516,7 +516,7 @@ fmx_meta_tmp() {
 # <meta> is missing or the rewrite fails.
 fmx_meta_link_set() {
   local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp
-  [ -f "$meta" ] || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   tmp=$(fmx_meta_tmp "$meta") || return 1
   if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
     rm -f "$tmp"; return 1
@@ -531,7 +531,7 @@ fmx_meta_link_set() {
     ''|*[!0-9]*) ;;
     *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
   esac
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  fm_publish_file_no_follow "$tmp" "$meta" replace || { rm -f "$tmp"; return 1; }
 }
 
 # fmx_meta_followups_set <meta> <n>: atomically rewrite just the x_followups
@@ -539,13 +539,13 @@ fmx_meta_link_set() {
 # Returns non-zero if <meta> is missing or the rewrite fails.
 fmx_meta_followups_set() {
   local meta=$1 n=$2 tmp
-  [ -f "$meta" ] || return 1
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
   tmp=$(fmx_meta_tmp "$meta") || return 1
   if ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
     rm -f "$tmp"; return 1
   fi
   printf 'x_followups=%s\n' "$n" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  fm_publish_file_no_follow "$tmp" "$meta" replace || { rm -f "$tmp"; return 1; }
 }
 
 # fmx_meta_link_clear <meta>: atomically remove the x_request/x_request_ts/
@@ -554,10 +554,14 @@ fmx_meta_followups_set() {
 # missing.
 fmx_meta_link_clear() {
   local meta=$1 tmp
-  [ -f "$meta" ] || return 0
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  else
+    return 0
+  fi
   tmp=$(fmx_meta_tmp "$meta") || return 1
   if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
     rm -f "$tmp"; return 1
   fi
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  fm_publish_file_no_follow "$tmp" "$meta" replace || { rm -f "$tmp"; return 1; }
 }

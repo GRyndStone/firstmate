@@ -196,10 +196,7 @@ if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
       '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
   fi
   if printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -e \
-    'any(.[];
-      (.backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))
-      or (.backend == "herdr" and ((.reason // "") | contains("meta lacks a consistent exact")))
-    )' \
+    'any(.[]; .backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))' \
     >/dev/null; then
     STATE_PROJECTION_SAFE=0
     STATE_METADATA_SAFE=0

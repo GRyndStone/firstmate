@@ -246,13 +246,8 @@ test_poll_preserves_conversation_context() {
 
 test_poll_inbox_commit_failure_reports_error() {
   local home fakebin out rc body
-  home="$TMP_ROOT/poll-mv-fail"; mkdir -p "$home"
+  home="$TMP_ROOT/poll-publish-fail"; mkdir -p "$home/state/x-inbox/req-rename.json"
   fakebin=$(make_fake_curl "$home")
-  cat > "$fakebin/mv" <<'SH'
-#!/usr/bin/env bash
-exit 1
-SH
-  chmod +x "$fakebin/mv"
   printf 'FMX_PAIRING_TOKEN=tok-q\n' > "$home/.env"
   body='{"request_id":"req-rename","tweet_id":"555","author_id":"42","text":"what are you building?"}'
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
@@ -261,15 +256,16 @@ SH
   expect_code 0 "$rc" "poll inbox commit failure exit"
   [ "$out" = "x-mode-error cannot write inbox" ] \
     || fail "poll inbox commit failure must emit an error, not a wake marker (got: $out)"
-  assert_absent "$home/state/x-inbox/req-rename.json" "poll must not report a committed inbox file that was not created"
-  assert_absent "$home/state/x-inbox/req-rename.json.tmp" "poll must clean up the failed inbox temp file"
+  [ -d "$home/state/x-inbox/req-rename.json" ] || fail "poll replaced an unsafe inbox target"
+  [ -z "$(find "$home/state/x-inbox" -name '.fm-x-poll.*' -print -quit)" ] \
+    || fail "poll did not clean up the failed inbox temp file"
   assert_present "$home/state/x-poll.error" "poll inbox commit failure must write a dedupe marker"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
     "$ROOT/bin/fm-x-poll.sh"); rc=$?
   expect_code 0 "$rc" "poll repeated inbox commit failure exit"
   [ -z "$out" ] || fail "repeated poll inbox commit failure must be quiet after the first diagnostic (got: $out)"
-  rm -f "$fakebin/mv"
+  rmdir "$home/state/x-inbox/req-rename.json"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
     "$ROOT/bin/fm-x-poll.sh"); rc=$?
@@ -608,6 +604,18 @@ SH
   pass "bootstrap reports failed X artifact cleanup on opt-out"
 }
 
+test_bootstrap_opt_out_removes_cadence_without_state_directory() {
+  local home out
+  home="$TMP_ROOT/boot-optout-no-state"
+  mkdir -p "$home/config"
+  printf 'stale\n' > "$home/config/x-mode.env"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
+    "missing volatile state prevented independent cadence cleanup"
+  assert_absent "$home/config/x-mode.env" "opt-out left the cadence file when state was absent"
+  pass "bootstrap removes X cadence independently when volatile state is absent"
+}
+
 test_bootstrap_x_artifacts_reject_final_symlinks() {
   local home outside out
   home="$TMP_ROOT/boot-final-symlinks"
@@ -624,6 +632,38 @@ test_bootstrap_x_artifacts_reject_final_symlinks() {
   assert_absent "$home/state/x-watch.check.sh" "failed X-mode activation did not safely remove the shim symlink"
   assert_absent "$home/config/x-mode.env" "failed X-mode activation did not safely remove the cadence symlink"
   pass "bootstrap X-mode publication and cleanup reject final symlinks"
+}
+
+test_x_state_publications_reject_final_symlinks() {
+  local home fakebin outside out status
+  home="$TMP_ROOT/x-state-final-symlinks"
+  fakebin=$(make_fake_curl "$home")
+  outside="$home/outside"
+  mkdir -p "$home/state/x-outbox" "$home/state/x-inbox"
+  printf 'sentinel\n' > "$outside"
+
+  ln -s "$outside" "$home/state/x-outbox/req-reply.json"
+  status=0
+  FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-reply.sh" req-reply preview \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "reply dry-run followed an outbox symlink"
+  [ "$(cat "$outside")" = sentinel ] || fail "reply dry-run escaped the state home"
+
+  ln -s "$outside" "$home/state/x-outbox/req-dismiss.json"
+  status=0
+  FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-dismiss.sh" req-dismiss \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "dismiss dry-run followed an outbox symlink"
+  [ "$(cat "$outside")" = sentinel ] || fail "dismiss dry-run escaped the state home"
+
+  ln -s "$outside" "$home/state/x-inbox/req-poll.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_PAIRING_TOKEN=token \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY='{"request_id":"req-poll","text":"hello"}' \
+    "$ROOT/bin/fm-x-poll.sh")
+  assert_contains "$out" "x-mode-error cannot write inbox" \
+    "poll did not surface refused inbox publication"
+  [ "$(cat "$outside")" = sentinel ] || fail "poll escaped through an inbox symlink"
+  pass "X state publications reject symlinked final targets"
 }
 
 test_reply_dry_run_records_not_posts() {
@@ -1728,7 +1768,7 @@ test_followup_post_failure_keeps_link() {
 }
 
 test_followup_post_record_failure_clears_link() {
-  local home fakebin out rc meta err flag mvflag
+  local home fakebin out rc meta err flag mvflag real_perl
   home="$TMP_ROOT/fu-post-record-fail"; mkdir -p "$home/state"
   fakebin=$(make_fake_curl "$home")
   flag="$home/fail-followups-write"
@@ -1746,6 +1786,19 @@ fi
 exec /bin/mv "$@"
 SH
   chmod +x "$fakebin/mv"
+  real_perl=$(command -v perl)
+  cat > "$fakebin/perl" <<SH
+#!/usr/bin/env bash
+if [ -n "\${FAKE_MV_FAIL_AFTER_FLAG:-}" ] \
+  && [ -f "\$FAKE_MV_FAIL_AFTER_FLAG" ] \
+  && [ -n "\${FAKE_MV_FAILED_ONCE:-}" ] \
+  && [ ! -f "\$FAKE_MV_FAILED_ONCE" ]; then
+  : > "\$FAKE_MV_FAILED_ONCE"
+  exit 2
+fi
+exec "$real_perl" "\$@"
+SH
+  chmod +x "$fakebin/perl"
   printf 'FMX_PAIRING_TOKEN=tok-fu\n' > "$home/.env"
   mk_linked_task "$home" task-rf req-rf 1700000000
   meta="$home/state/task-rf.meta"
@@ -1950,4 +2003,6 @@ test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_inert_without_token
 test_bootstrap_opt_out_cleanup
 test_bootstrap_opt_out_reports_cleanup_failure
+test_bootstrap_opt_out_removes_cadence_without_state_directory
 test_bootstrap_x_artifacts_reject_final_symlinks
+test_x_state_publications_reject_final_symlinks

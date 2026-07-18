@@ -489,18 +489,24 @@ EOF
 
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-live.meta"
   printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
+  printf 'stale\n' > "$home/state/x-watch.check.sh"
+  printf 'stale\n' > "$home/config/x-mode.env"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "skipped - endpoint ownership audit failed before metadata projection" \
-    "session start continued task probes after its Herdr ownership audit failed"
+  assert_contains "$out" "endpoint: unknown (backend=herdr window=sess:p-live; exact-home probe unavailable)" \
+    "session start did not preserve a regular anomalous Herdr meta as unknown"
   assert_not_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" \
     "session start probed a live Herdr endpoint after its ownership audit failed"
   assert_not_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" \
     "session start probed a dead Herdr endpoint after its ownership audit failed"
   assert_contains "$out" "Herdr meta lacks a consistent exact window/session/workspace/pane identity" \
     "session start silently treated inconsistent Herdr ownership metadata as probe-safe"
+  assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
+    "Herdr ownership inconsistency disabled unrelated bootstrap mutation"
+  assert_absent "$home/state/x-watch.check.sh" "Herdr endpoint anomaly suppressed X-mode cleanup"
+  assert_absent "$home/config/x-mode.env" "Herdr endpoint anomaly suppressed cadence cleanup"
 
-  pass "inconsistent Herdr ownership metadata blocks later endpoint probes"
+  pass "inconsistent Herdr ownership blocks endpoint action without disabling bootstrap"
 }
 
 test_metadata_audit_precedes_fleet_projection() {
