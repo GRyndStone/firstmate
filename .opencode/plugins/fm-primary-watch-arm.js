@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { effectivePrimaryPaths, sessionOwnsLock } from "../lib/fm-primary-session-lock.js";
+import { effectivePrimaryPaths, sessionOwnsLock, validateEffectiveState } from "../lib/fm-primary-session-lock.js";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
 const ARM_READY_TIMEOUT_MS = Number(process.env.FM_OPENCODE_ARM_READY_TIMEOUT_MS || 12000);
@@ -199,6 +199,8 @@ async function ensureArm(paths, sessionID, client) {
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {
   const root = worktree ? resolvePath(worktree) : await resolveRoot(directory);
   const paths = effectivePrimaryPaths(root);
+  const validation = await validateEffectiveState(paths);
+  if (!validation.ok) throw new Error(`Firstmate watcher state validation failed: ${validation.error || "unknown error"}`);
   globalThis[COORDINATOR_KEY] = {
     ensureArmed: (sessionID, activeClient) => ensureArm(paths, sessionID, activeClient ?? client),
   };

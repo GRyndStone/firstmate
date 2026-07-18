@@ -359,7 +359,7 @@ fm_backend_target_of_meta() {  # <meta-file>
 fm_backend_meta_for_window() {  # <target> <state-dir>
   local target=$1 state=$2 meta window terminal
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     window=$(fm_meta_get "$meta" window)
     terminal=$(fm_meta_get "$meta" terminal)
     { [ -n "$window" ] && [ "$window" = "$target" ]; } || { [ -n "$terminal" ] && [ "$terminal" = "$target" ]; } || continue
@@ -837,6 +837,29 @@ fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-iden
       ;;
     *) printf 'unknown' ;;
   esac
+}
+
+fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
+  local meta=$1 expected_label=${2:-} backend target backend_identity backend_container worktree
+  [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  worktree=$(fm_meta_get "$meta" worktree)
+  case "$backend" in
+    tmux)
+      backend_identity=$(fm_meta_get "$meta" tmux_home_identity)
+      backend_container=$(fm_meta_get "$meta" tmux_session)
+      ;;
+    herdr)
+      backend_identity=$(fm_meta_get "$meta" herdr_workspace_id)
+      ;;
+    *)
+      printf 'unknown'
+      return 0
+      ;;
+  esac
+  [ -n "$target" ] || { printf 'unknown'; return 0; }
+  fm_backend_target_state "$backend" "$target" "$expected_label" "$backend_identity" "$worktree" "$backend_container"
 }
 
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS

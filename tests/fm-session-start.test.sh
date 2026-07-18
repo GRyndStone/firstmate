@@ -142,20 +142,23 @@ SH
   chmod +x "$fakebin/ps"
 }
 
-# make_fake_tmux <fakebin> <live-target>: list-windows lists only the given
-# "session:window" target - the exact inventory read
-# fm_backend_target_exists's strict tmux probe uses for an endpoint liveness
-# read (docs/tmux-backend.md "Strict window-existence probe"). display-message
-# stays lenient for any target, mirroring real tmux's target resolution, so
-# these cases also regress a liveness read ever falling back to it.
+# make_fake_tmux <fakebin> <home-identity>: list-windows exposes only the
+# exact, tagged task-live window in the requested session.
 make_fake_tmux() {
-  local fakebin=$1 live=$2
+  local fakebin=$1 identity=$2
   cat > "$fakebin/tmux" <<SH
 #!/usr/bin/env bash
 set -u
 case "\${1:-}" in
   list-windows)
-    printf '%s\n' "$live"
+    case "\$*" in
+      *fm-task-live*)
+        case "\$*" in
+          *'#{@firstmate_home}'*'_') printf '@41\tfm-task-live\t%s\t_\n' "$identity" ;;
+          *) printf '@41\tfm-task-live\t%s\n' "$identity" ;;
+        esac
+        ;;
+    esac
     exit 0
     ;;
   display-message)
@@ -446,21 +449,22 @@ EOF
 # --- endpoint liveness: tmux and herdr, live and dead ------------------------
 
 test_endpoint_liveness_tmux() {
-  local rec root home fakebin out
+  local rec root home fakebin out identity
   rec=$(new_world liveness-tmux)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  make_fake_tmux "$fakebin" "fm-sess:live-window"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  make_fake_tmux "$fakebin" "$identity"
 
-  printf 'window=fm-sess:live-window\nkind=ship\n' > "$home/state/task-live.meta"
-  printf 'window=fm-sess:dead-window\nkind=ship\n' > "$home/state/task-dead.meta"
+  printf 'window=@41\ntmux_window_id=@41\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=ship\n' "$identity" > "$home/state/task-live.meta"
+  printf 'window=@42\ntmux_window_id=@42\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=ship\n' "$identity" > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:live-window)" "live tmux endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:dead-window)" "dead tmux endpoint not reported dead"
+  assert_contains "$out" "endpoint: alive (backend=tmux window=@41)" "live tmux endpoint not reported alive"
+  assert_contains "$out" "endpoint: dead (backend=tmux window=@42)" "dead tmux endpoint not reported dead"
 
   pass "tmux endpoint liveness is reported per task: alive for a live window, dead for a gone one"
 }
@@ -532,7 +536,7 @@ EOF
   ln -s "$outside" "$home/state"
   status=0
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH" 2>&1) || status=$?
-  expect_code 0 "$status" "session start invalid effective state report"
+  expect_code 1 "$status" "session start invalid effective state report"
   assert_contains "$out" "symlinked effective state path component refused" \
     "session start did not surface shared state validation failure"
   assert_contains "$out" "lock, bootstrap, recovery, and fleet probes were skipped" \
@@ -540,6 +544,24 @@ EOF
   [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
     || fail "session start wrote through symlinked effective state before validation"
   pass "session start validates effective state before lock or fleet access"
+}
+
+test_endpoint_anomaly_suppresses_bootstrap_mutation() {
+  local rec root home fakebin out
+  rec=$(new_world endpoint-anomaly-detect-only)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf 'backend=zellij\nwindow=fm-anomalous\nkind=secondmate\nharness=codex\n' > "$home/state/anomalous.meta"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "ALERT endpoint-ownership: kind=inventory_unavailable task=anomalous" \
+    "session start did not surface the endpoint ownership anomaly"
+  assert_not_contains "$out" "SECONDMATE_LIVENESS:" \
+    "session start ran automatic endpoint mutation after an ownership anomaly"
+  pass "endpoint ownership anomalies force detect-only bootstrap"
 }
 
 # --- composition: real scripts run, not reimplemented ------------------------
@@ -789,6 +811,7 @@ test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
 test_metadata_audit_precedes_fleet_projection
 test_state_validation_precedes_session_mutation
+test_endpoint_anomaly_suppresses_bootstrap_mutation
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_durable_program_source_warns_beside_empty_queue

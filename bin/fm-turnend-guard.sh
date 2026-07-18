@@ -36,6 +36,12 @@ WATCH="$SCRIPT_DIR/fm-watch.sh"
 TARGET_PROBE_TIMEOUT=${FM_TURNEND_TARGET_PROBE_TIMEOUT:-2}
 case "$TARGET_PROBE_TIMEOUT" in ''|*[!0-9]*|0) TARGET_PROBE_TIMEOUT=2 ;; esac
 
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
+
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 
@@ -66,10 +72,6 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 [ -d "$FM_ROOT/bin" ] || exit 0
 
 # --- the actual predicate ----------------------------------------------------
-# shellcheck source=bin/fm-wake-lib.sh
-FM_WAKE_STATE_INIT=skip
-. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
-unset FM_WAKE_STATE_INIT
 [ -d "$STATE" ] || exit 0
 
 CHECKPOINT_ORPHAN_UNRESOLVED=0
@@ -185,14 +187,24 @@ attention_detail() {
   local meta id line state scanned=0 shown=0 scan_limit detail="" total=0 unprobed omitted_nonworking=0
   scan_limit=$((DETAIL_LIMIT * 2))
   for meta in "$STATE"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -e "$meta" ] || [ -L "$meta" ] || continue
     total=$((total + 1))
   done
   for meta in "$STATE"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -e "$meta" ] || [ -L "$meta" ] || continue
     [ "$scanned" -lt "$scan_limit" ] || break
     scanned=$((scanned + 1))
     id=$(basename "$meta" .meta)
+    if [ ! -f "$meta" ] || [ -L "$meta" ]; then
+      if [ "$shown" -lt "$DETAIL_LIMIT" ]; then
+        [ -z "$detail" ] || detail="$detail, "
+        detail="$detail${id:0:48}=unsafe-metadata"
+        shown=$((shown + 1))
+      else
+        omitted_nonworking=$((omitted_nonworking + 1))
+      fi
+      continue
+    fi
     line=$(crew_state_bounded "$id" || true)
     read -r _ state _ <<< "$line"
     [ -n "$state" ] || state=unknown

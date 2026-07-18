@@ -44,15 +44,15 @@ fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=true
 
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
-  : > "$FM_WAKE_QUEUE"
+  fm_touch_file_no_follow "$FM_WAKE_QUEUE" || exit 1
   assert_watcher_liveness
   exit 0
 fi
 
 DRAIN_TMP="$STATE/.wake-queue.drain.$(fm_current_pid)"
 rm -f "$DRAIN_TMP"
-mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
-: > "$FM_WAKE_QUEUE" || exit 1
+fm_publish_file_no_follow "$FM_WAKE_QUEUE" "$DRAIN_TMP" exclusive || exit 1
+fm_touch_file_no_follow "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
 rm -f "$DRAIN_TMP"

@@ -67,10 +67,10 @@
 # below are always read-only, so they run unconditionally in both modes.
 #
 # Usage: fm-session-start.sh
-#   Prints the full ordered digest to stdout and always exits 0: this is a
-#   reporting command, not a gate. A lock refusal is reported as a loud
-#   banner inline, never a silent failure or a non-zero exit that would make
-#   an agent skip the rest of the digest.
+#   Prints the full ordered digest to stdout. Ordinary reporting and lock
+#   refusal exit 0; unsafe effective-state admission exits non-zero before any
+#   lock, bootstrap, recovery, or fleet access. A lock refusal is reported as
+#   a loud banner inline so the read-only digest still completes.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,7 +79,6 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
-PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-wake-lib.sh
 FM_WAKE_STATE_INIT=skip
@@ -87,10 +86,11 @@ if ! . "$SCRIPT_DIR/fm-wake-lib.sh"; then
   unset FM_WAKE_STATE_INIT
   printf 'SESSION START - %s\n' "$FM_HOME"
   printf 'ALERT: effective state failed strict home-scoping validation; lock, bootstrap, recovery, and fleet probes were skipped.\n'
-  exit 0
+  exit 1
 fi
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
+PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -156,6 +156,7 @@ pi_extension_loaded() {
 
 ENDPOINT_AUDIT_OK=1
 STATE_PROJECTION_SAFE=1
+ENDPOINT_MUTATION_SAFE=1
 ENDPOINT_AUDIT_JSON=$(FM_ROOT_OVERRIDE="$FM_ROOT" \
   FM_HOME="$FM_HOME" \
   FM_STATE_OVERRIDE="$STATE" \
@@ -164,6 +165,7 @@ if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
   if [ "$ENDPOINT_AUDIT_JSON" = '[]' ]; then
     ENDPOINT_AUDIT_OUT='endpoint-audit: no same-home endpoint ownership anomalies found'
   else
+    ENDPOINT_MUTATION_SAFE=0
     ENDPOINT_AUDIT_OUT=$(printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -r \
       '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
   fi
@@ -175,6 +177,7 @@ if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
 else
   ENDPOINT_AUDIT_OUT=$ENDPOINT_AUDIT_JSON
   STATE_PROJECTION_SAFE=0
+  ENDPOINT_MUTATION_SAFE=0
 fi
 
 section "SESSION START - $FM_HOME"
@@ -203,7 +206,7 @@ fi
 
 # --- 2. bootstrap --------------------------------------------------------
 subsection "BOOTSTRAP"
-if [ "$READ_ONLY" -eq 1 ] || [ "$STATE_PROJECTION_SAFE" -eq 0 ]; then
+if [ "$READ_ONLY" -eq 1 ] || [ "$ENDPOINT_MUTATION_SAFE" -eq 0 ]; then
   BOOT_OUT=$(FM_BOOTSTRAP_DETECT_ONLY=1 "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
 else
   BOOT_OUT=$("$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
@@ -305,11 +308,12 @@ if [ "$STATE_PROJECTION_SAFE" -eq 1 ]; then
     target=$(fm_backend_target_of_meta "$meta")
     if [ -n "$window" ]; then
       backend=$(fm_backend_of_meta "$meta")
-      if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
-        printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
-      else
-        printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
-      fi
+      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+      case "$endpoint_state" in
+        present) printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window" ;;
+        absent) printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window" ;;
+        *) printf 'endpoint: unknown (backend=%s window=%s; exact-home probe unavailable)\n' "$backend" "$window" ;;
+      esac
     else
       printf 'endpoint: unknown (no window recorded)\n'
     fi

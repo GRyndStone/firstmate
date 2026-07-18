@@ -407,6 +407,7 @@ test_housekeeping_paused_resurfaces_and_resets() {
   dir=$(make_supercase paused-resurface)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w11"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w11.meta"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w11.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
@@ -428,6 +429,7 @@ test_housekeeping_paused_resumed_cleared() {
   dir=$(make_supercase paused-resumed)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w12"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w12.meta"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w12.status"
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
@@ -447,6 +449,7 @@ test_housekeeping_paused_unpaused_cleared() {
   dir=$(make_supercase paused-unpaused)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w13"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w13.meta"
   printf 'paused: holding for the upstream release\nworking: resumed, upstream landed\n' > "$state/held-w13.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w13" | tr ':/.' '___')
@@ -462,6 +465,7 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-to-paused)
   state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w14"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w14.meta"
   printf 'paused: awaiting the upstream tool release\n' > "$state/held-w14.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w14" | tr ':/.' '___')
@@ -478,6 +482,7 @@ test_housekeeping_pause_marker_transitions_to_clear() {
   local dir state fakebin win pane key
   dir=$(make_supercase paused-to-stale)
   state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w15"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w15.meta"
   printf 'working: upstream landed, resuming\n' > "$state/held-w15.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w15" | tr ':/.' '___')
@@ -497,6 +502,7 @@ test_housekeeping_persistent_stale_escalates() {
   fakebin="$dir/fakebin"
   win="sess:fm-pers-w5"
   pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/pers-w5.meta"
   printf 'working\n' > "$state/pers-w5.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "pers-w5" | tr ':/.' '___')
@@ -515,6 +521,7 @@ test_housekeeping_resumed_stale_cleared() {
   fakebin="$dir/fakebin"
   win="sess:fm-res-w6"
   pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/res-w6.meta"
   printf 'working\n' > "$state/res-w6.status"
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "res-w6" | tr ':/.' '___')
@@ -660,6 +667,20 @@ test_escalate_batches_into_one_digest() {
   n=$(grep -c '\[ENTER\]' "$sent")
   [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
   pass "multiple escalations flush as a single batched digest"
+}
+
+test_daemon_durable_writers_reject_final_symlinks() {
+  local dir state outside status
+  dir=$(make_supercase daemon-final-symlink)
+  state="$dir/state"
+  outside="$dir/outside"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$state/.subsuper-escalations"
+  status=0
+  escalate_add "$state" "done: must not escape" || status=$?
+  [ "$status" -ne 0 ] || fail "daemon accepted a symlinked escalation buffer"
+  [ "$(cat "$outside")" = sentinel ] || fail "daemon wrote through a symlinked escalation buffer"
+  pass "daemon durable writers reject symlinked final targets"
 }
 
 test_escalate_batch_age_uses_first_append() {
@@ -1820,6 +1841,7 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale
 test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
+test_daemon_durable_writers_reject_final_symlinks
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate

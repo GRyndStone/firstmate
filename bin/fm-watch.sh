@@ -175,12 +175,16 @@ afk_present() { [ -e "$STATE/.afk" ]; }
 # size-capped so a long benign stretch cannot grow it without bound. Best-effort:
 # a logging hiccup never affects supervision.
 triage_log() {
-  local sz
-  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$TRIAGE_LOG" 2>/dev/null || return 0
+  local sz tmp
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" \
+    | fm_append_file_no_follow "$TRIAGE_LOG" 2>/dev/null || return 0
   sz=$(wc -c < "$TRIAGE_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$sz" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$sz" -ge "$TRIAGE_LOG_MAX_BYTES" ]; then
-    tail -n 2000 "$TRIAGE_LOG" > "$TRIAGE_LOG.tmp" 2>/dev/null && mv -f "$TRIAGE_LOG.tmp" "$TRIAGE_LOG" 2>/dev/null
+    tmp=$(mktemp "$STATE/.watch-triage.XXXXXX") || return 0
+    tail -n 2000 "$TRIAGE_LOG" | fm_write_file_no_follow "$tmp" 2>/dev/null \
+      && fm_publish_file_no_follow "$tmp" "$TRIAGE_LOG" replace 2>/dev/null
+    rm -f "$tmp" 2>/dev/null || true
     rm -f "$TRIAGE_LOG.tmp" 2>/dev/null || true
   fi
 }
@@ -245,7 +249,7 @@ window_label() {
 recorded_windows() {
   local meta w seen=
   for meta in "$STATE"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     w=$(fm_backend_target_of_meta "$meta")
     [ -n "$w" ] || continue
     case "$seen" in
@@ -261,8 +265,8 @@ recorded_windows() {
 # (base * 2^streak, capped at HEARTBEAT_MAX); any real wake resets the cadence.
 wake() {
   case "$1" in
-    heartbeat*) echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak" ;;
-    *) echo 0 > "$STATE/.heartbeat-streak" ;;
+    heartbeat*) printf '%s\n' "$(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 ))" | fm_write_file_no_follow "$STATE/.heartbeat-streak" || exit 1 ;;
+    *) printf '0\n' | fm_write_file_no_follow "$STATE/.heartbeat-streak" || exit 1 ;;
   esac
   echo "$1"
   exit 0
@@ -300,14 +304,14 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
-      date +%s > "$since_file"
+      date +%s | fm_write_file_no_follow "$since_file" || exit 1
       triage_log "absorbed $label timer reset: $win"
       ;;
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
-        echo "$n" > "$escalation_file"
+        printf '%s\n' "$n" | fm_write_file_no_follow "$escalation_file" || exit 1
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
@@ -335,8 +339,8 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
 handle_paused_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
   key=$(window_key "$win")
-  printf '%s' "$h" > "$STATE/.stale-$key"
-  : > "$STATE/.paused-$key"
+  printf '%s' "$h" | fm_write_file_no_follow "$STATE/.stale-$key" || exit 1
+  fm_touch_file_no_follow "$STATE/.paused-$key" || exit 1
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
@@ -347,7 +351,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
     reason="stale: $win (paused ${age}s, awaiting external - declared pause or green-run merge park, rechecked on a long cadence not a wedge; confirm the wait still holds)"
     fm_wake_append stale "$win" "$reason" || exit 1
-    date +%s > "$rf"
+    date +%s | fm_write_file_no_follow "$rf" || exit 1
     wake "$reason"
   fi
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
@@ -414,7 +418,7 @@ handle_gone_endpoint() {  # <window>
   fi
   reason="stale: $w endpoint-gone (recorded backend endpoint no longer exists - the crew is dead, not quiet, whatever its last status says; recover it instead of resuming routine supervision)"
   fm_wake_append stale "$w" "$reason" || exit 1
-  : > "$marker"
+  fm_touch_file_no_follow "$marker" || exit 1
   clear_pause_tracking "$w"
   wake "$reason"
 }
@@ -450,19 +454,19 @@ handle_dead_agent() {  # <window> <hash>
   local win=$1 h=$2 key reason
   key=$(window_key "$win")
   if [ -e "$STATE/.agent-dead-$key" ]; then
-    printf '%s' "$h" > "$STATE/.stale-$key"
-    : > "$STATE/.paused-$key"
-    date +%s > "$STATE/.paused-rechecked-$key"
+    printf '%s' "$h" | fm_write_file_no_follow "$STATE/.stale-$key" || exit 1
+    fm_touch_file_no_follow "$STATE/.paused-$key" || exit 1
+    date +%s | fm_write_file_no_follow "$STATE/.paused-rechecked-$key" || exit 1
     triage_log "absorbed agent-dead (already surfaced): $win"
     return 0
   fi
   reason="stale: $win agent-dead (endpoint exists but the agent process is confidently dead - the crew died in its declared wait; recover it instead of resuming routine supervision)"
   fm_wake_append stale "$win" "$reason" || exit 1
-  printf '%s' "$h" > "$STATE/.stale-$key"
-  : > "$STATE/.paused-$key"
-  date +%s > "$STATE/.paused-rechecked-$key"
+  printf '%s' "$h" | fm_write_file_no_follow "$STATE/.stale-$key" || exit 1
+  fm_touch_file_no_follow "$STATE/.paused-$key" || exit 1
+  date +%s | fm_write_file_no_follow "$STATE/.paused-rechecked-$key" || exit 1
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
-  : > "$STATE/.agent-dead-$key"
+  fm_touch_file_no_follow "$STATE/.agent-dead-$key" || exit 1
   wake "$reason"
 }
 
@@ -489,13 +493,13 @@ pause_state_class() {  # <window> <task>
   # waiting. Secondmate agent-process liveness stays owned by the session-start
   # sweep (docs/architecture.md "Event-driven supervision").
   if [ "$(window_kind "$win")" != secondmate ] && paused_agent_is_dead "$win"; then
-    date +%s > "$recheck_file"
+    date +%s | fm_write_file_no_follow "$recheck_file" || exit 1
     printf 'dead'
     return
   fi
   class=$(crew_absorb_class "$task")
   case "$class" in
-    paused) date +%s > "$recheck_file" ;;
+    paused) date +%s | fm_write_file_no_follow "$recheck_file" || exit 1 ;;
     *) rm -f "$recheck_file" ;;
   esac
   printf '%s' "$class"
@@ -505,7 +509,7 @@ surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key
   key=$(window_key "$win")
   fm_wake_append stale "$win" "stale: $win" || exit 1
-  printf '%s' "$h" > "$STATE/.stale-$key"
+  printf '%s' "$h" | fm_write_file_no_follow "$STATE/.stale-$key" || exit 1
   rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
   wake "stale: $win"
 }
@@ -570,7 +574,7 @@ mark_surfaced() {  # <status-file>
   last=$(last_status_line "$f")
   [ -n "$last" ] || return 0
   status_is_captain_relevant "$last" || return 0
-  printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+  printf '%s' "$last" | fm_write_file_no_follow "$(_hb_surfaced_path "$task")" || exit 1
 }
 
 # Mark every current captain-relevant status as surfaced. Called after the
@@ -580,7 +584,7 @@ mark_all_captain_relevant_surfaced() {
   local f task last
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
-    printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+    printf '%s' "$last" | fm_write_file_no_follow "$(_hb_surfaced_path "$task")" || exit 1
   done < <(scan_captain_relevant_statuses "$STATE")
 }
 
@@ -756,7 +760,7 @@ if fm_pid_alive "$WATCH_OWNER_PID"; then
   fm_pid_identity "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-identity" 2>/dev/null || true
 fi
 
-[ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
+[ -e "$STATE/.last-heartbeat" ] || fm_touch_file_no_follow "$STATE/.last-heartbeat" || exit 1
 
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -771,7 +775,7 @@ while :; do
 
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  touch "$STATE/.last-watcher-beat"
+  fm_touch_file_no_follow "$STATE/.last-watcher-beat" || exit 1
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -787,11 +791,11 @@ while :; do
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
-        touch "$STATE/.last-check"
+        fm_touch_file_no_follow "$STATE/.last-check" || exit 1
         wake "$reason"
       fi
     done
-    touch "$STATE/.last-check"
+    fm_touch_file_no_follow "$STATE/.last-check" || exit 1
   fi
 
   # On the first changed signal, linger one grace period and re-scan before
@@ -834,7 +838,7 @@ $pending
 EOF
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
+        printf '%s' "$sig" | fm_write_file_no_follow "$sf" || exit 1
         mark_surfaced "$f"
       done <<EOF
 $pending
@@ -843,7 +847,7 @@ EOF
     else
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
+        printf '%s' "$sig" | fm_write_file_no_follow "$sf" || exit 1
       done <<EOF
 $pending
 EOF
@@ -889,7 +893,7 @@ EOF
     prev=$(cat "$hf" 2>/dev/null || true)
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
-      echo "$n" > "$cf"
+      printf '%s\n' "$n" | fm_write_file_no_follow "$cf" || exit 1
       # Busy match: a backend's native semantic state when available (herdr),
       # else the last 6 non-blank lines only (the TUI footer area, where every
       # verified harness renders its busy indicator) so busy-looking strings
@@ -913,17 +917,17 @@ EOF
           # hand off only the plain stale.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             if status_is_paused "$last"; then
-              date +%s > "$STATE/.paused-rechecked-$key"
+              date +%s | fm_write_file_no_follow "$STATE/.paused-rechecked-$key" || exit 1
               if paused_agent_is_dead "$w"; then
                 handle_dead_agent "$w" "$h"
                 continue
               fi
             fi
             fm_wake_append stale "$w" "stale: $w" || exit 1
-            printf '%s' "$h" > "$sf"
+            printf '%s' "$h" | fm_write_file_no_follow "$sf" || exit 1
             wake "stale: $w"
           elif status_is_paused "$last" && [ "$(age_of "$STATE/.paused-rechecked-$key")" -ge "$STALE_ESCALATE_SECS" ]; then
-            date +%s > "$STATE/.paused-rechecked-$key"
+            date +%s | fm_write_file_no_follow "$STATE/.paused-rechecked-$key" || exit 1
             if paused_agent_is_dead "$w"; then
               handle_dead_agent "$w" "$h"
             fi
@@ -945,12 +949,12 @@ EOF
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
-              printf '%s' "$h" > "$sf"
-              date +%s > "$ssf"
+              printf '%s' "$h" | fm_write_file_no_follow "$sf" || exit 1
+              date +%s | fm_write_file_no_follow "$ssf" || exit 1
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1
-              printf '%s' "$h" > "$sf"
+              printf '%s' "$h" | fm_write_file_no_follow "$sf" || exit 1
               rm -f "$ssf"
               mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
               wake "stale: $w"
@@ -987,8 +991,8 @@ EOF
             case "$(crew_absorb_class "$task")" in
               working)
                 clear_pause_tracking "$w"
-                printf '%s' "$h" > "$sf"
-                date +%s > "$ssf"
+                printf '%s' "$h" | fm_write_file_no_follow "$sf" || exit 1
+                date +%s | fm_write_file_no_follow "$ssf" || exit 1
                 triage_log "absorbed non-terminal stale (provably working): $w"
                 ;;
               paused)
@@ -1012,7 +1016,7 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 dead)    handle_dead_agent "$w" "$h" ;;
                 working) clear_pause_state "$w"
-                         printf '%s' "$h" > "$sf"
+                         printf '%s' "$h" | fm_write_file_no_follow "$sf" || exit 1
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       surface_nonterminal_stale "$w" "$h" ;;
@@ -1038,8 +1042,8 @@ EOF
         fi
       fi
     else
-      printf '%s' "$h" > "$hf"
-      echo 0 > "$cf"
+      printf '%s' "$h" | fm_write_file_no_follow "$hf" || exit 1
+      printf '0\n' | fm_write_file_no_follow "$cf" || exit 1
       # A changed hash alone does not clear .agent-dead-<key>: a dead pane can
       # still churn cosmetically, and clearing here would re-surface the same
       # death once per recheck window. The marker resets only on positive
@@ -1055,7 +1059,7 @@ EOF
         # re-surface per recheck window; pause re-surfacing itself stays
         # daemon-owned.
         if [ "$kind" != secondmate ] && [ "$(age_of "$STATE/.paused-rechecked-$key")" -ge "$STALE_ESCALATE_SECS" ]; then
-          date +%s > "$STATE/.paused-rechecked-$key"
+          date +%s | fm_write_file_no_follow "$STATE/.paused-rechecked-$key" || exit 1
           if paused_agent_is_dead "$w"; then
             handle_dead_agent "$w" "$h"
           fi
@@ -1086,19 +1090,19 @@ EOF
     # every heartbeat.
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      fm_touch_file_no_follow "$STATE/.last-heartbeat" || exit 1
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      touch "$STATE/.last-heartbeat"
+      fm_touch_file_no_follow "$STATE/.last-heartbeat" || exit 1
       mark_all_captain_relevant_surfaced
       wake "heartbeat"
     else
-      touch "$STATE/.last-heartbeat"
-      echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
+      fm_touch_file_no_follow "$STATE/.last-heartbeat" || exit 1
+      printf '%s\n' "$(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 ))" | fm_write_file_no_follow "$STATE/.heartbeat-streak" || exit 1
       triage_log "absorbed heartbeat (no captain-relevant change)"
     fi
   fi

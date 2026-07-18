@@ -459,6 +459,21 @@ test_hook_fails_closed_on_invalid_effective_state() {
   pass "fm-turnend-guard: invalid effective state fails before task scanning"
 }
 
+test_hook_never_projects_symlinked_task_metadata() {
+  local dir outside out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-symlink-meta")
+  outside="$TMP_ROOT/hook-symlink-meta-outside"
+  printf 'window=foreign:fm-foreign\nkind=ship\n' > "$outside"
+  ln -s "$outside" "$dir/state/foreign.meta"
+  : > "$dir/state/real.meta"
+  status=0
+  out=$(run_hook "$dir" false) || status=$?
+  expect_code 2 "$status" "turn-end guard with symlinked task metadata"
+  assert_contains "$out" "foreign=unsafe-metadata" \
+    "turn-end guard did not surface symlinked metadata without projecting it"
+  pass "turn-end guard refuses symlinked task metadata before crew probes"
+}
+
 test_hook_retry_requires_durable_ownership() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-loopguard")
@@ -892,6 +907,34 @@ SH
   status=$?
   [ "$status" -ne 0 ] || fail "Grok handoff preparation failure exited healthy"
   pass "fm-turnend-guard-grok: handoff preparation failure is conservatively nonzero"
+}
+
+test_grok_preparation_owner_never_follows_symlink() {
+  local dir handoff key owner outside out status session
+  dir=$(make_primary_dir "$TMP_ROOT/grok-prepare-owner-symlink")
+  : > "$dir/state/task1.meta"
+  session=session-prepare-owner-symlink
+  if command -v shasum >/dev/null 2>&1; then
+    key=$(printf '%s' "$session" | shasum -a 256 | awk '{print substr($1,1,24)}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    key=$(printf '%s' "$session" | sha256sum | awk '{print substr($1,1,24)}')
+  else
+    key=$(printf '%s' "$session" | cksum | awk '{print $1 "-" $2}')
+  fi
+  handoff="$dir/state/.turnend-handoffs/grok-$key.pending.prepare"
+  owner="$handoff/owner"
+  outside="$TMP_ROOT/grok-prepare-owner-outside"
+  mkdir -p "$handoff"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$owner"
+  status=0
+  out=$(printf '{"sessionId":"%s"}' "$session" \
+    | GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1) || status=$?
+  expect_code 1 "$status" "Grok symlinked preparation owner"
+  [ "$(cat "$outside")" = sentinel ] || fail "Grok modified a symlinked preparation owner"
+  [ -L "$owner" ] || fail "Grok removed a foreign preparation owner symlink"
+  [ -z "$out" ] || fail "Grok symlinked preparation owner printed unexpected output: $out"
+  pass "fm-turnend-guard-grok: preparation ownership never follows symlinks"
 }
 
 test_grok_missing_session_is_loud_unsupported_exception() {
@@ -3099,6 +3142,7 @@ test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
 test_hook_fails_closed_on_invalid_effective_state
+test_hook_never_projects_symlinked_task_metadata
 test_hook_retry_requires_durable_ownership
 test_hook_surfaces_bounded_parked_and_idle_tasks
 test_hook_silent_in_secondmate_home
@@ -3116,6 +3160,7 @@ test_grok_live_owner_must_match_current_pending_token
 test_grok_healthy_stop_invalidates_stale_pending
 test_grok_missing_guard_fails_closed_through_retry_owner
 test_grok_handoff_preparation_failure_is_nonzero
+test_grok_preparation_owner_never_follows_symlink
 test_grok_missing_session_is_loud_unsupported_exception
 test_grok_worker_launch_requires_token_readiness
 test_grok_worker_signal_reaps_delivery_children

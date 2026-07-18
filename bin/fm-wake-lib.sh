@@ -73,29 +73,61 @@ fm_publish_file_no_follow() {
   fi
   platform=$(uname)
   case "$mode:$platform" in
-    exclusive:Darwin)
-      [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
-      ln -h "$source" "$destination" || return 1
-      ;;
     exclusive:Linux)
       [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
       ln -T "$source" "$destination" || return 1
       ;;
-    replace:Darwin)
-      mv -fh "$source" "$destination" || return 1
-      ;;
     replace:Linux)
       mv -fT "$source" "$destination" || return 1
+      ;;
+    exclusive:Darwin)
+      [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+      perl -e 'link($ARGV[0], $ARGV[1]) or exit 1' "$source" "$destination" || return 1
+      ;;
+    replace:Darwin)
+      perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$source" "$destination" || return 1
       ;;
     *)
       echo "error: unsupported no-follow publication platform: $platform" >&2
       return 1
       ;;
   esac
-  if [ "$mode" = exclusive ]; then
-    rm -f "$source" 2>/dev/null || true
+  [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+  [ ! -e "$source" ] || rm -f "$source" || return 1
+}
+
+fm_write_file_no_follow() {
+  local destination=$1 parent tmp
+  parent=${destination%/*}
+  [ -n "$parent" ] || parent=.
+  [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  tmp=$(mktemp "$parent/.fm-write.XXXXXX") || return 1
+  if ! cat > "$tmp" || ! fm_publish_file_no_follow "$tmp" "$destination" replace; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
   fi
-  [ -f "$destination" ] && [ ! -L "$destination" ]
+}
+
+fm_touch_file_no_follow() {
+  fm_write_file_no_follow "$1" </dev/null
+}
+
+fm_append_file_no_follow() {
+  local destination=$1 parent tmp
+  parent=${destination%/*}
+  [ -n "$parent" ] || parent=.
+  [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+  fi
+  tmp=$(mktemp "$parent/.fm-append.XXXXXX") || return 1
+  if { [ ! -e "$destination" ] || cat "$destination" > "$tmp"; } \
+    && cat >> "$tmp" \
+    && fm_publish_file_no_follow "$tmp" "$destination" replace; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
 }
 
 if ! fm_validate_effective_state_path "$STATE" allow-missing-final; then
@@ -173,7 +205,7 @@ fm_replace_checkpoint_orphan_record() {
   tmp=$(mktemp "$state/.watch-checkpoint-orphan.tmp.XXXXXX") || return 1
   if ! printf '%s\n' "$replacement" > "$tmp" \
     || [ "$(cat "$path" 2>/dev/null || true)" != "$expected" ] \
-    || ! mv "$tmp" "$path"; then
+    || ! fm_publish_file_no_follow "$tmp" "$path" replace; then
     rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -741,9 +773,10 @@ fm_wake_append() {
     ''|*[!0-9]*) seq=0 ;;
   esac
   seq=$((seq + 1))
-  printf '%s\n' "$seq" > "$seq_file" || status=$?
+  printf '%s\n' "$seq" | fm_write_file_no_follow "$seq_file" || status=$?
   if [ "$status" -eq 0 ]; then
-    printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
+    printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" \
+      | fm_append_file_no_follow "$FM_WAKE_QUEUE" || status=$?
   fi
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   return "$status"
@@ -752,10 +785,13 @@ fm_wake_append() {
 fm_wake_restore_queue() {
   local drained=$1 restore
   restore="$STATE/.wake-queue.restore.$(fm_current_pid)"
+  [ -f "$drained" ] && [ ! -L "$drained" ] || return 1
   if [ -e "$FM_WAKE_QUEUE" ]; then
-    cat "$drained" "$FM_WAKE_QUEUE" > "$restore" && mv "$restore" "$FM_WAKE_QUEUE"
+    [ -f "$FM_WAKE_QUEUE" ] && [ ! -L "$FM_WAKE_QUEUE" ] || return 1
+    cat "$drained" "$FM_WAKE_QUEUE" | fm_write_file_no_follow "$restore" \
+      && fm_publish_file_no_follow "$restore" "$FM_WAKE_QUEUE" replace
   else
-    mv "$drained" "$FM_WAKE_QUEUE"
+    fm_publish_file_no_follow "$drained" "$FM_WAKE_QUEUE" exclusive
   fi
 }
 

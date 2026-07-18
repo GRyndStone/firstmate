@@ -22,31 +22,40 @@ SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
-target=""
+target="" format="" task=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-t" ]; then target=$arg; fi
+  if [ "$prev" = "-F" ]; then format=$arg; fi
   prev=$arg
+done
+for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
+  [ -f "$m" ] && [ ! -L "$m" ] || continue
+  [ "$(sed -n 's/^window=//p' "$m" | tail -1)" = "$target" ] || continue
+  task=$(basename "$m" .meta)
+  break
 done
 case "${1:-}" in
   list-windows)
-    case "$*" in
-      *' -f '*) exit 0 ;;
-    esac
-    # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
-    # probe"): every recorded window is live in this suite; deadness is
-    # expressed through agent_alive (a zsh pane_current_command), not a gone
-    # endpoint.
     for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
-      [ -e "$m" ] || continue
-      sed -n 's/^window=//p' "$m"
+      [ -f "$m" ] && [ ! -L "$m" ] || continue
+      identity=$(sed -n 's/^tmux_home_identity=//p' "$m" | tail -1)
+      window=$(sed -n 's/^tmux_window_id=//p' "$m" | tail -1)
+      [ -n "$identity" ] && [ -n "$window" ] || continue
+      id=$(basename "$m" .meta)
+      label="fm-$id"
+      case "$*" in *"$label"*) ;; *) continue ;; esac
+      case "$format" in
+        *$'\t_') printf '%s\t%s\t%s\t_\n' "$window" "$label" "$identity" ;;
+        *) printf '%s\t%s\t%s\n' "$window" "$label" "$identity" ;;
+      esac
     done
     ;;
   display-message)
     case "$*" in
       *pane_current_command*)
-        case "$target" in
-          *dead-secondmate*) printf 'zsh\n' ;;
+        case "$task" in
+          dead-secondmate) printf 'zsh\n' ;;
           *) printf 'codex\n' ;;
         esac
         ;;
@@ -54,8 +63,8 @@ case "${1:-}" in
     esac
     ;;
   capture-pane)
-    case "$target" in
-      *ship-task*|*active-secondmate*) printf 'work in progress\nesc to interrupt\n' ;;
+    case "$task:$target" in
+      ship-task:*|active-secondmate:*|*:*ship-task*) printf 'work in progress\nesc to interrupt\n' ;;
       *) printf 'all quiet\n> \n' ;;
     esac
     ;;
@@ -75,6 +84,10 @@ SH
   printf '%s\n' "$fb"
 }
 
+tmux_home_identity() {
+  FM_HOME="$1" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh"
+}
+
 make_home() {  # <name>
   local home=$TMP_ROOT/$1
   mkdir -p "$home/state" "$home/data" "$home/projects" "$home/config"
@@ -82,7 +95,8 @@ make_home() {  # <name>
 }
 
 write_fixture() {  # <home>
-  local home=$1
+  local home=$1 identity
+  identity=$(tmux_home_identity "$home")
   mkdir -p "$home/projects/alpha-worktree" "$home/projects/scout-worktree" "$home/secondmate-home"
   cat > "$home/data/backlog.md" <<EOF
 ## In flight
@@ -100,7 +114,10 @@ EOF
   mkdir -p "$home/data/scout-task"
   printf '# Scout\n' > "$home/data/scout-task/report.md"
   fm_write_meta "$home/state/ship-task.meta" \
-    "window=firstmate:fm-ship-task" \
+    "window=@101" \
+    "tmux_window_id=@101" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/projects/alpha-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -110,7 +127,10 @@ EOF
     "pr=https://github.com/kunchenguid/firstmate/pull/9"
   printf 'needs-decision: choose an API shape\n' > "$home/state/ship-task.status"
   fm_write_meta "$home/state/scout-task.meta" \
-    "window=firstmate:fm-scout-task" \
+    "window=@102" \
+    "tmux_window_id=@102" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/projects/scout-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -119,7 +139,10 @@ EOF
     "yolo=off"
   printf 'done: report ready\n' > "$home/state/scout-task.status"
   fm_write_meta "$home/state/secondmate-task.meta" \
-    "window=firstmate:fm-secondmate-task" \
+    "window=@103" \
+    "tmux_window_id=@103" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/secondmate-home" \
     "project=$home/secondmate-home" \
     "harness=codex" \
@@ -224,6 +247,8 @@ test_fixture_snapshot_json() {
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "cmux-task")
     | .backend == "cmux"
+      and .endpoint.exists == null
+      and .endpoint.agent_alive == "not_checked"
       and .paths.worktree.present == false
       and .current_state.state == "unknown"
   ' >/dev/null || fail "cmux missing-file row missing"
@@ -415,7 +440,7 @@ EOF
       and .paths.report.present == true
   ' >/dev/null || fail "bold task did not join to override-backed backlog and report"
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$VIEW")
-  assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | present | $data/bold-task/report.md" \
+  assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | unknown | $data/bold-task/report.md" \
     "view should render bold in-flight row from snapshot"
   assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | - | queued-comma - waits on queued-comma | - |" \
     "view should render blocked reason without title metadata"
@@ -651,10 +676,14 @@ test_program_sources_stay_inside_selected_home() {
 }
 
 test_view_renders_dead_secondmate_agent_status() {
-  local home fakebin view
+  local home fakebin view identity
   home=$(make_home dead-secondmate)
+  identity=$(tmux_home_identity "$home")
   fm_write_meta "$home/state/dead-secondmate.meta" \
-    "window=firstmate:fm-dead-secondmate" \
+    "window=@104" \
+    "tmux_window_id=@104" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "project=$home/secondmate-home" \
     "harness=codex" \
     "kind=secondmate" \
@@ -705,11 +734,15 @@ test_open_decision_survives_later_unrelated_event() {
 }
 
 test_secondmate_open_decision_survives_live_endpoint() {
-  local home fakebin out
+  local home fakebin out identity
   home=$(make_home active-secondmate)
+  identity=$(tmux_home_identity "$home")
   mkdir -p "$home/secondmate-home"
   fm_write_meta "$home/state/active-secondmate.meta" \
-    "window=firstmate:fm-active-secondmate" \
+    "window=@105" \
+    "tmux_window_id=@105" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/secondmate-home" \
     "project=$home/secondmate-home" \
     "harness=codex" \

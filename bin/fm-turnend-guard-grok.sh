@@ -65,6 +65,7 @@ PREPARE_HELD=false
 release_preparation() {
   [ "$PREPARE_HELD" = true ] || return 0
   if [ -d "$PREPARE_LOCK" ] && [ ! -L "$PREPARE_LOCK" ] \
+    && [ -f "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ] \
     && [ "$(cat "$PREPARE_OWNER" 2>/dev/null || true)" = "$PREPARE_RECORD" ]; then
     rm -f "$PREPARE_OWNER" 2>/dev/null || true
     rmdir "$PREPARE_LOCK" 2>/dev/null || true
@@ -77,7 +78,7 @@ acquire_preparation() {
   attempt=0
   while [ "$attempt" -lt 250 ]; do
     if mkdir "$PREPARE_LOCK" 2>/dev/null; then
-      if printf '%s\n' "$PREPARE_RECORD" > "$PREPARE_OWNER"; then
+      if printf '%s\n' "$PREPARE_RECORD" | fm_write_file_no_follow "$PREPARE_OWNER"; then
         PREPARE_HELD=true
         return 0
       fi
@@ -85,11 +86,18 @@ acquire_preparation() {
       return 1
     fi
     [ -d "$PREPARE_LOCK" ] && [ ! -L "$PREPARE_LOCK" ] || return 1
+    if [ ! -e "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ]; then
+      sleep 0.02
+      attempt=$((attempt + 1))
+      continue
+    fi
+    [ -f "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ] || return 1
     old_record=$(cat "$PREPARE_OWNER" 2>/dev/null || true)
     old_pid=$(printf '%s\n' "$old_record" | sed -n '1p')
     old_identity=$(printf '%s\n' "$old_record" | sed '1d')
     if ! fm_pid_alive "$old_pid" \
       || [ "$(fm_pid_identity "$old_pid" 2>/dev/null || true)" != "$old_identity" ]; then
+      [ -f "$PREPARE_OWNER" ] && [ ! -L "$PREPARE_OWNER" ] || return 1
       [ "$(cat "$PREPARE_OWNER" 2>/dev/null || true)" = "$old_record" ] || continue
       rm -f "$PREPARE_OWNER" 2>/dev/null || true
       rmdir "$PREPARE_LOCK" 2>/dev/null || true

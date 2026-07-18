@@ -229,6 +229,76 @@ test_drain_asserts_watcher_liveness() {
   pass "drain asserts watcher liveness: warns on a lapse, stays silent right after a fire"
 }
 
+test_no_follow_publish_rejects_darwin_directory_race() {
+  local dir state fakebin counter source destination status
+  dir=$(make_case darwin-directory-race)
+  state="$dir/state"
+  fakebin="$dir/fake-uname"
+  counter="$dir/uname-count"
+  source="$state/source"
+  destination="$state/destination"
+  mkdir -p "$fakebin"
+  printf 'payload\n' > "$source"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+count=$(cat "${FM_UNAME_COUNT:?}" 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s\n' "$count" > "$FM_UNAME_COUNT"
+if [ "$count" -ge 2 ]; then
+  /bin/mkdir -p "${FM_RACE_DESTINATION:?}"
+  printf 'Darwin\n'
+else
+  printf 'Linux\n'
+fi
+SH
+  chmod +x "$fakebin/uname"
+  status=0
+  PATH="$fakebin:$PATH" FM_UNAME_COUNT="$counter" FM_RACE_DESTINATION="$destination" \
+    FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_publish_file_no_follow "$2" "$3" replace' \
+      _ "$ROOT/bin/fm-wake-lib.sh" "$source" "$destination" || status=$?
+  [ "$status" -ne 0 ] || fail "Darwin exact-target publisher accepted a raced directory"
+  assert_present "$source" "failed exact-target publication consumed its source"
+  [ -d "$destination" ] || fail "Darwin publication race fixture did not create its directory target"
+  [ -z "$(find "$destination" -mindepth 1 -print -quit)" ] \
+    || fail "Darwin publication moved its source inside a raced directory"
+  pass "no-follow publication preserves its source across a Darwin directory race"
+}
+
+test_no_follow_append_preserves_content() {
+  local dir state target
+  dir=$(make_case append-preserves-content)
+  state="$dir/state"
+  target="$state/log"
+  printf 'first\n' > "$target"
+  printf 'second\n' | FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_append_file_no_follow "$2"' \
+    _ "$ROOT/bin/fm-wake-lib.sh" "$target" || fail "no-follow append failed"
+  [ "$(cat "$target")" = $'first\nsecond' ] || fail "no-follow append lost existing content"
+  pass "no-follow append preserves existing state content"
+}
+
+test_state_final_symlinks_are_never_written() {
+  local dir state fakebin outside status
+  dir=$(make_case final-symlink-writes)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  outside="$dir/outside"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$state/.wake-queue"
+  status=0
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "wake drain accepted a symlinked queue target"
+  [ "$(cat "$outside")" = sentinel ] || fail "wake drain wrote through a symlinked queue"
+
+  rm -f "$state/.wake-queue"
+  ln -s "$outside" "$state/.last-watcher-beat"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "watcher accepted a symlinked beacon target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher wrote through a symlinked beacon"
+  pass "watcher and wake drain reject symlinked durable state targets"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -237,3 +307,6 @@ test_check_output_is_queued
 test_atomic_double_drain
 test_drain_dedupes_obvious_duplicates
 test_drain_asserts_watcher_liveness
+test_no_follow_publish_rejects_darwin_directory_race
+test_no_follow_append_preserves_content
+test_state_final_symlinks_are_never_written

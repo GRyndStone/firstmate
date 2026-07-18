@@ -193,7 +193,7 @@ quarantine_legacy_pending() {
   quarantine=$(mktemp "$PENDING.legacy-continue.quarantined.XXXXXX") || return 1
   rm -f "$quarantine" || return 1
   [ "$(cat "$PENDING" 2>/dev/null || true)" = "$record" ] || return 0
-  mv "$PENDING" "$quarantine"
+  fm_publish_file_no_follow "$PENDING" "$quarantine" exclusive
 }
 
 acknowledged_matches() {

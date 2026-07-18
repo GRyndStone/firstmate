@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const stateValidator = fileURLToPath(new URL("../../bin/fm-wake-lib.sh", import.meta.url));
 
 function parentPid(pid) {
   return new Promise((resolve) => {
@@ -32,6 +35,26 @@ export function effectivePrimaryPaths(root) {
   const state = process.env.FM_STATE_OVERRIDE || `${home}/state`;
   const config = process.env.FM_CONFIG_OVERRIDE || `${home}/config`;
   return { root: fmRoot, home, state, config };
+}
+
+export function validateEffectiveState(paths) {
+  return new Promise((resolve) => {
+    const child = spawn("bash", ["-c", 'FM_WAKE_STATE_INIT=skip; . "$1"', "_", stateValidator], {
+      env: {
+        ...process.env,
+        FM_ROOT_OVERRIDE: paths.root,
+        FM_HOME: paths.home,
+        FM_STATE_OVERRIDE: paths.state,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => resolve({ ok: false, error: String(error?.message ?? error) }));
+    child.on("close", (code) => resolve({ ok: code === 0, error: stderr.trim() }));
+  });
 }
 
 export async function sessionLockOwnership(paths) {

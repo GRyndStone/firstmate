@@ -49,6 +49,12 @@ PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 BACKLOG="$DATA/backlog.md"
 TODAY=${FM_FLEET_SNAPSHOT_TODAY:-$(date +%Y-%m-%d)}
 
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
+
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -362,7 +368,7 @@ backlog_json() {
 
 task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
-  local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
+  local pr pr_source event_json current_json endpoint_exists endpoint_state agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
@@ -431,15 +437,17 @@ task_json_lines() {
     blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end')
 
     endpoint_exists=null
+    endpoint_state=unknown
     if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
-        endpoint_exists=true
-      else
-        endpoint_exists=false
-      fi
+      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+      case "$endpoint_state" in
+        present) endpoint_exists=true ;;
+        absent) endpoint_exists=false ;;
+        *) endpoint_exists=null ;;
+      esac
     fi
     agent_alive=not_checked
-    if [ "$kind" = secondmate ] && [ -n "$target" ]; then
+    if [ "$kind" = secondmate ] && [ "${endpoint_state:-unknown}" = present ]; then
       agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)
     fi
 

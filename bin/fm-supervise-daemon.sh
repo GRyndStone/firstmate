@@ -144,6 +144,13 @@ set -u
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_DAEMON_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$FM_DAEMON_DIR/fm-wake-lib.sh" || { return 1 2>/dev/null || exit 1; }
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 
 # Shared tmux pane primitives for supervisor injection (busy/composer detection
 # + verify-retry submit). Sourced at top level so BOTH the executed daemon and
@@ -248,8 +255,11 @@ afk_active() {  # <state>
 # skill (enter) and by firstmate on user return (exit). Durable: a plain file,
 # so recovery (§5) re-enters afk if it is present after a restart.
 afk_enter() {  # <state>
-  mkdir -p "$1"
-  date '+%s' > "$1/$AFK_FLAG_NAME"
+  local state=$1
+  fm_validate_effective_state_path "$state" allow-missing-final || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  [ -d "$state" ] || mkdir "$state" || return 1
+  date '+%s' | fm_write_file_no_follow "$state/$AFK_FLAG_NAME"
 }
 
 afk_exit() {  # <state>
@@ -480,7 +490,11 @@ stale_marker_record() {  # <window> <state>  — create if absent
   local win=$1 state=$2 key marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-stale-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ]
+    return
+  fi
+  _now | fm_write_file_no_follow "$marker"
 }
 
 stale_marker_remove() {  # <window> <state>
@@ -498,7 +512,11 @@ pause_marker_record() {  # <window> <state> - create if absent
   local win=$1 state=$2 key marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-paused-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ]
+    return
+  fi
+  _now | fm_write_file_no_follow "$marker"
 }
 
 pause_marker_remove() {  # <window> <state>
@@ -534,7 +552,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
 migrate_watcher_pause_markers() {  # <state>
   local state=$1 meta win task key last watcher_key
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
     [ -n "$win" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
@@ -568,7 +586,7 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
 # escalate path and the catch-all scan.
 mark_status_seen() {  # <state> <task> <last-line>
   local state=$1 task=$2 line=$3
-  printf '%s' "$line" > "$state/.subsuper-seen-status-$(_stale_key "$task")"
+  printf '%s' "$line" | fm_write_file_no_follow "$state/.subsuper-seen-status-$(_stale_key "$task")"
 }
 
 # Mark every captain-relevant status line a per-wake classification escalated as
@@ -664,8 +682,8 @@ stale_window_is_busy() {  # <window> <state>
 escalate_add() {  # <state> <distilled-item>
   local state=$1 item=$2 buf
   buf="$state/.subsuper-escalations"
-  [ -s "$buf" ] || _now > "${buf}.since"
-  printf '%s\n' "$item" >> "$buf"
+  [ -s "$buf" ] || _now | fm_write_file_no_follow "${buf}.since" || return 1
+  printf '%s\n' "$item" | fm_append_file_no_follow "$buf"
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
@@ -681,7 +699,7 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  if inject_msg "$msg" "$state"; then fm_touch_file_no_follow "$buf" || return 1; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
 
@@ -942,7 +960,7 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
     cat "$state/.subsuper-escalations" 2>/dev/null
-  } 2>/dev/null > "$marker" || true
+  } 2>/dev/null | fm_write_file_no_follow "$marker" || true
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   # Best-effort status-line flash. tmux's display-message is a client-side OSD
@@ -1080,7 +1098,7 @@ housekeeping() {  # <state>
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
-          _now > "$marker"
+          _now | fm_write_file_no_follow "$marker" || return 1
         else
           rm -f "$marker"
         fi
@@ -1093,7 +1111,7 @@ housekeeping() {  # <state>
   #     captain-relevant filtering is the shared classifier's
   #     scan_captain_relevant_statuses; the daemon layers its digest dedup on top.
   if [ "$(_file_age "$state/.subsuper-last-scan")" -ge "${FM_HEARTBEAT_SCAN_SECS:-$HEARTBEAT_SCAN_SECS_DEFAULT}" ]; then
-    _now > "$state/.subsuper-last-scan"
+    _now | fm_write_file_no_follow "$state/.subsuper-last-scan" || return 1
     local seen
     while IFS="$(printf '\t')" read -r f task last; do
       [ -n "$f" ] || continue
@@ -1107,17 +1125,13 @@ housekeeping() {  # <state>
 
 # Find a recorded or live window target whose task id matches the marker key.
 window_for_task() {  # <task-key> [state]
-  local key=$1 state=${2:-$(_state_root)} meta task w t
+  local key=$1 state=${2:-$(_state_root)} meta task w
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
     [ "$(_stale_key "$task")" = "$key" ] || continue
     w=$(fm_backend_target_of_meta "$meta")
     [ -n "$w" ] && { printf '%s' "$w"; return 0; }
-  done
-  for w in $(tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep ':fm-' || true); do
-    t=$(window_to_task "$w" "$state")
-    [ "$(_stale_key "$t")" = "$key" ] && { printf '%s' "$w"; return 0; }
   done
   return 1
 }
@@ -1308,15 +1322,15 @@ handle_wake() {  # <reason> <state>
 # --- log --------------------------------------------------------------------
 # Uses LOG set by fm_super_main; harmless no-op-ish if unset (tests source fns
 # directly and pass state explicitly, so they do not call log).
-log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG"; }
+log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | fm_append_file_no_follow "$LOG"; }
 
 trim_log() {
-  local sz tmp
+  local sz
   [ -n "${LOG:-}" ] || return 0
   sz=$(wc -c < "$LOG" 2>/dev/null) || return 0
   [ "$sz" -ge "${FM_LOG_MAX_BYTES:-$LOG_MAX_BYTES_DEFAULT}" ] || return 0
-  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-daemon-log.XXXXXX") || return 0
-  tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
+  tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" \
+    | fm_write_file_no_follow "$LOG" 2>/dev/null
 }
 
 # ============================================================================
@@ -1328,11 +1342,9 @@ fm_super_main() {
   local STATE
   STATE="$(_state_root)"
 
-  # Source the portable lock helpers (works on macOS where flock is absent).
-  # Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
-  # shellcheck source=bin/fm-wake-lib.sh
-  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh" || return 1
+  fm_validate_effective_state_path "$STATE" allow-missing-final || return 1
   STATE=$FM_VALIDATED_STATE_PATH
+  [ -d "$STATE" ] || mkdir "$STATE" || return 1
 
   local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
   local LOG="$STATE/.supervise-daemon.log"
@@ -1356,7 +1368,7 @@ fm_super_main() {
     fi
     exit 1
   fi
-  echo "$$" > "$PIDFILE"
+  printf '%s\n' "$$" | fm_write_file_no_follow "$PIDFILE" || exit 1
   fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
@@ -1564,7 +1576,7 @@ fm_super_main() {
     # cadence. Gating keeps a large fleet cheap between ticks.
     sleep 1
     if [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
-      _now > "$STATE/.subsuper-last-housekeep"
+      _now | fm_write_file_no_follow "$STATE/.subsuper-last-housekeep" || exit 1
       housekeeping "$STATE"
     fi
   done

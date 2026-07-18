@@ -59,6 +59,12 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-wake-lib.sh
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
+
 # shellcheck source=bin/fm-tmux-lib.sh
 . "$SCRIPT_DIR/fm-tmux-lib.sh"
 # shellcheck source=bin/fm-backend.sh
@@ -91,7 +97,7 @@ emit() {  # <state> <source> [detail]
 
 # --- meta resolution --------------------------------------------------------
 
-[ -f "$META" ] || emit unknown none "no metadata for $ID"
+[ -f "$META" ] && [ ! -L "$META" ] || emit unknown none "no regular metadata for $ID"
 
 meta_value() {  # <key>
   grep "^$1=" "$META" 2>/dev/null | tail -1 | cut -d= -f2- || true
@@ -110,7 +116,7 @@ fi
 
 # Last non-empty status line, and its leading verb (the word before the colon).
 log_last_line() {
-  [ -f "$LOG" ] || return 1
+  [ -f "$LOG" ] && [ ! -L "$LOG" ] || return 1
   grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -1
 }
 # Map a status-log verb onto a canonical state for the fallback path. `paused` is
