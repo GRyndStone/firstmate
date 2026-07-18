@@ -204,6 +204,16 @@ run_bootstrap_timeout_case() {
   )
 }
 
+assert_timeout_elapsed_at_least() {
+  local out=$1 expected_timeout=$2 label=$3 elapsed
+  elapsed=$(printf '%s\n' "$out" | sed -n \
+    "s/^FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=${expected_timeout}s elapsed=\([0-9][0-9]*\)s)$/\1/p" \
+    | tail -1)
+  [ -n "$elapsed" ] || fail "$label: missing numeric elapsed time for timeout=${expected_timeout}s"
+  [ "$elapsed" -ge "$expected_timeout" ] \
+    || fail "$label: elapsed=${elapsed}s is earlier than timeout=${expected_timeout}s"
+}
+
 # Each row (fields are '^'-separated; the install URL contains a literal '|'):
 #   <label>^<lease 1/0>^<tasks-axi version or ->^<quota 1/0>^<backend or ->^<mode>^<expect>^<notcontains>
 #   mode=empty -> output must be empty (expect/notcontains ignored)
@@ -369,8 +379,9 @@ test_fleet_sync_timeout_scales_with_origin_backed_project_count() {
 
   out=$(run_bootstrap_timeout_case "$home" "$fake_root" "$fakebin")
 
-  expected=$'FLEET_SYNC: alpha: synced\nFLEET_SYNC: beta: skipped: no origin remote\nFLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=59s elapsed=59s)'
+  expected=$'FLEET_SYNC: alpha: synced\nFLEET_SYNC: beta: skipped: no origin remote\nFLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=59s elapsed='
   assert_contains "$out" "$expected" "bootstrap timeout should scale to 59s for 18 origin-backed projects and relay partial output first"
+  assert_timeout_elapsed_at_least "$out" 59 "fleet-size-aware timeout"
   pass "bootstrap computes a fleet-size-aware default timeout and preserves partial fleet-sync output"
 }
 
@@ -386,7 +397,8 @@ test_fleet_sync_timeout_floor_preserves_small_fleets() {
 
   out=$(run_bootstrap_timeout_case "$home" "$fake_root" "$fakebin")
 
-  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=20s elapsed=20s)" "small fleets should keep the 20s timeout floor"
+  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=20s elapsed=" "small fleets should keep the 20s timeout floor"
+  assert_timeout_elapsed_at_least "$out" 20 "small-fleet timeout floor"
   pass "bootstrap keeps the quick 20s default for small fleets"
 }
 
@@ -402,7 +414,8 @@ test_fleet_sync_timeout_explicit_override_wins() {
 
   out=$(run_bootstrap_timeout_case "$home" "$fake_root" "$fakebin" 7)
 
-  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=7s elapsed=7s)" "explicit timeout override should still win over computed default"
+  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=7s elapsed=" "explicit timeout override should still win over computed default"
+  assert_timeout_elapsed_at_least "$out" 7 "explicit timeout override"
   assert_not_contains "$out" "timeout=59s" "explicit override should not be replaced by the computed timeout"
   pass "bootstrap preserves FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT as an explicit override"
 }
@@ -419,7 +432,8 @@ test_fleet_sync_timeout_empty_override_uses_default() {
 
   out=$(run_bootstrap_timeout_case "$home" "$fake_root" "$fakebin" "")
 
-  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=59s elapsed=59s)" "blank timeout env should behave like an unset override"
+  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=59s elapsed=" "blank timeout env should behave like an unset override"
+  assert_timeout_elapsed_at_least "$out" 59 "blank timeout override"
   assert_not_contains "$out" "timeout=20s" "blank timeout env should not force the legacy floor on a large fleet"
   pass "bootstrap treats a blank timeout override as unset"
 }
@@ -439,7 +453,8 @@ test_fleet_sync_timeout_is_computed_before_launch() {
   out=$(run_bootstrap_timeout_case "$home" "$fake_root" "$fakebin" __unset__ "$started_marker" "$git_record" 1)
 
   [ ! -s "$git_record" ] || fail "fleet sync launched before timeout scan finished: $(tr '\n' ';' < "$git_record")"
-  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=20s elapsed=20s)" "launch-order case should still enforce the computed timeout"
+  assert_contains "$out" "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=20s elapsed=" "launch-order case should still enforce the computed timeout"
+  assert_timeout_elapsed_at_least "$out" 20 "pre-launch computed timeout"
   pass "bootstrap computes the timeout before launching fleet sync"
 }
 
@@ -498,6 +513,152 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_standalone_mutators_validate_state_before_writes() {
+  local case_dir home outside out status script
+  case_dir="$TMP_ROOT/state-scope-mutators"
+  home="$case_dir/home"
+  outside="$case_dir/outside"
+  mkdir -p "$home" "$outside"
+  ln -s "$outside" "$home/state"
+  for script in fm-lock.sh fm-bootstrap.sh fm-config-push.sh fm-pr-check.sh \
+    fm-merge-local.sh fm-update.sh fm-promote.sh fm-send.sh fm-x-poll.sh \
+    fm-x-reply.sh fm-x-dismiss.sh fm-x-link.sh fm-x-followup.sh; do
+    status=0
+    out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/$script" 2>&1) || status=$?
+    [ "$status" -ne 0 ] || fail "$script accepted a symlinked effective state root"
+    assert_contains "$out" "symlinked effective state path component refused" \
+      "$script did not use centralized state admission"
+    [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+      || fail "$script wrote through a symlinked effective state root"
+  done
+  pass "standalone state mutators validate effective state first"
+}
+
+test_state_creation_rejects_a_raced_symlink() {
+  local home outside out status
+  home="$TMP_ROOT/state-create-race-home"
+  outside="$TMP_ROOT/state-create-race-outside"
+  mkdir -p "$home" "$outside"
+  status=0
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_STATE_INIT=skip \
+    bash -c '. "$1" || exit 1; ln -s "$2" "$STATE"; fm_prepare_effective_state_path' \
+      _ "$ROOT/bin/fm-wake-lib.sh" "$outside" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "state initialization followed a symlink inserted after admission"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "state initialization did not revalidate the created target"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "raced state initialization wrote through the foreign symlink"
+  pass "effective state creation remains no-follow across admission races"
+}
+
+test_bootstrap_rejects_symlinked_task_metadata_before_sync() {
+  local home outside out status
+  home="$TMP_ROOT/bootstrap-symlink-meta"
+  outside="$TMP_ROOT/bootstrap-foreign-meta"
+  mkdir -p "$home/state"
+  printf 'kind=secondmate\nhome=/foreign\n' > "$outside"
+  ln -s "$outside" "$home/state/foreign.meta"
+  status=0
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-bootstrap.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "bootstrap accepted symlinked task metadata"
+  assert_contains "$out" "task metadata is symlinked or non-regular" \
+    "bootstrap did not reject foreign metadata before secondmate sync"
+  pass "bootstrap rejects symlinked task metadata before fleet mutation"
+}
+
+# shellcheck disable=SC2016 # Patterns intentionally match literal shell variables.
+test_session_lock_admission_serializes_before_owner_read() {
+  local source acquire_line inspect_line write_line verify_line
+  source=$(cat "$ROOT/bin/fm-lock.sh")
+  acquire_line=$(printf '%s\n' "$source" | grep -n 'fm_lock_acquire_wait "$ACQUIRE_LOCK"' | cut -d: -f1)
+  inspect_line=$(printf '%s\n' "$source" | grep -n 'if \[ -e "$LOCK" \]' | tail -1 | cut -d: -f1)
+  write_line=$(printf '%s\n' "$source" | grep -n 'fm_write_file_no_follow "$LOCK"' | cut -d: -f1)
+  verify_line=$(printf '%s\n' "$source" | grep -n 'session lock ownership could not be verified' | cut -d: -f1)
+  [ -n "$acquire_line" ] && [ -n "$inspect_line" ] && [ -n "$write_line" ] && [ -n "$verify_line" ] \
+    || fail "session lock admission transaction is incomplete"
+  [ "$acquire_line" -lt "$inspect_line" ] && [ "$inspect_line" -lt "$write_line" ] \
+    && [ "$write_line" -lt "$verify_line" ] \
+    || fail "session lock owner read/write is not serialized and verified"
+  pass "session lock admission serializes owner read, write, and verification"
+}
+
+test_state_entrypoint_inventory_names_active_mutators() {
+  local doc entry
+  doc=$(cat "$ROOT/docs/configuration.md")
+  for entry in fm-config-push.sh fm-pr-check.sh fm-merge-local.sh fm-update.sh \
+    fm-promote.sh fm-send.sh fm-x-poll.sh fm-x-reply.sh fm-x-dismiss.sh \
+    fm-x-link.sh fm-x-followup.sh; do
+    assert_contains "$doc" "bin/$entry" "state entry-point inventory omitted $entry"
+  done
+  pass "state entry-point inventory includes standalone metadata and X mutators"
+}
+
+test_config_push_rejects_redirected_secondmate_registry() {
+  local home outside out status
+  home="$TMP_ROOT/config-push-registry-parent"
+  outside="$TMP_ROOT/config-push-registry-outside"
+  mkdir -p "$home/state" "$outside"
+  printf '%s\n' '- legacy - charter (home: /foreign; scope: all; projects: p; added 2026-01-01)' \
+    > "$outside/secondmates.md"
+  ln -s "$outside" "$home/data"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "config-push followed a symlinked data parent"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "config-push did not validate the registry parent"
+
+  home="$TMP_ROOT/config-push-registry-file"
+  mkdir -p "$home/state" "$home/data"
+  ln -s "$outside/secondmates.md" "$home/data/secondmates.md"
+  status=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "config-push followed a symlinked registry file"
+  assert_contains "$out" "home-scoped file is symlinked or non-regular" \
+    "config-push did not validate the registry file"
+  pass "config-push contains its registry and parent within FM_HOME"
+}
+
+test_state_mutators_reject_symlinked_task_metadata() {
+  local home outside status
+  home="$TMP_ROOT/state-mutator-symlink-meta"
+  outside="$TMP_ROOT/state-mutator-foreign-meta"
+  mkdir -p "$home/state"
+  printf 'kind=secondmate\nwindow=@9\nx_request=req-foreign\n' > "$outside"
+  ln -s "$outside" "$home/state/task-a.meta"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-config-push.sh" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "config-push accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-pr-check.sh" task-a https://example.test/pr/1 \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "pr-check accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "x-link accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-followup.sh" --check task-a >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "x-followup accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-merge-local.sh" task-a \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "merge-local accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-promote.sh" task-a \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "promote accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-send.sh" task-a message \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "send accepted symlinked task metadata"
+  status=0
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-update.sh" \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "update accepted symlinked task metadata"
+  assert_contains "$(cat "$outside")" "x_request=req-foreign" \
+    "state mutator changed foreign task metadata"
+  pass "config, PR, and X mutators reject symlinked task metadata"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -509,3 +670,10 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
+test_standalone_mutators_validate_state_before_writes
+test_state_creation_rejects_a_raced_symlink
+test_bootstrap_rejects_symlinked_task_metadata_before_sync
+test_session_lock_admission_serializes_before_owner_read
+test_state_entrypoint_inventory_names_active_mutators
+test_config_push_rejects_redirected_secondmate_registry
+test_state_mutators_reject_symlinked_task_metadata

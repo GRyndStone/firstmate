@@ -10,30 +10,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-"$FM_ROOT/bin/fm-guard.sh" || true
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
 ID=$1
 URL=$2
-
+case "$ID" in
+  ''|.*|*[!A-Za-z0-9._-]*) echo "error: unsafe task id: $ID" >&2; exit 2 ;;
+esac
 META="$STATE/$ID.meta"
-if [ -f "$META" ]; then
-  WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
-  PR_HEAD=
-  if [ -n "$WT" ] && [ -d "$WT" ]; then
-    if command -v gh >/dev/null 2>&1; then
-      if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
-        PR_HEAD=$REMOTE_HEAD
+if [ -e "$META" ] || [ -L "$META" ]; then
+  fm_validate_task_meta_file "$META" || exit 1
+fi
+"$FM_ROOT/bin/fm-guard.sh" || true
+if [ -e "$META" ] || [ -L "$META" ]; then
+  META_LOCK=$(fm_meta_lock_path "$META") || exit 1
+  fm_lock_acquire_wait "$META_LOCK"
+  META_ADDITIONS=$(mktemp "$STATE/.fm-pr-meta.XXXXXX") || {
+    fm_lock_release "$META_LOCK"
+    exit 1
+  }
+  update_status=0
+  if ! fm_validate_task_meta_file "$META"; then
+    update_status=1
+  else
+    WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+    PR_HEAD=
+    if [ -n "$WT" ] && [ -d "$WT" ]; then
+      if command -v gh >/dev/null 2>&1; then
+        if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null); then
+          PR_HEAD=$REMOTE_HEAD
+        fi
       fi
     fi
+    if ! grep -qxF "pr=$URL" "$META"; then
+      printf 'pr=%s\n' "$URL" >> "$META_ADDITIONS" || update_status=1
+    fi
+    if [ -n "$PR_HEAD" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
+      printf 'pr_head=%s\n' "$PR_HEAD" >> "$META_ADDITIONS" || update_status=1
+    fi
+    if [ "$update_status" -eq 0 ] && [ -s "$META_ADDITIONS" ]; then
+      fm_append_file_no_follow "$META" < "$META_ADDITIONS" || update_status=1
+    fi
   fi
-  if ! grep -qxF "pr=$URL" "$META"; then
-    echo "pr=$URL" >> "$META"
-  fi
-  if [ -n "$PR_HEAD" ] && ! grep -qxF "pr_head=$PR_HEAD" "$META"; then
-    echo "pr_head=$PR_HEAD" >> "$META"
-  fi
+  rm -f "$META_ADDITIONS" 2>/dev/null || true
+  fm_lock_release "$META_LOCK"
+  [ "$update_status" -eq 0 ] || exit 1
 fi
 
-cat > "$STATE/$ID.check.sh" <<EOF
+fm_write_file_no_follow "$STATE/$ID.check.sh" <<EOF
 state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
 [ "\$state" = "MERGED" ] && echo "merged"
 EOF

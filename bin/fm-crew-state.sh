@@ -7,9 +7,9 @@
 # last EVENT, not the current STATE. After firstmate resolves a needs-decision
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
-# current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else the pane
-# busy-signature) and reconciles the possibly-stale log against it.
+# current state from a tail of the log: it reconciles branch-matched
+# no-mistakes run evidence, exact-run recovery context, and live pane evidence
+# before using the status log as a fallback.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -21,13 +21,29 @@
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crew's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
-#      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
-#      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
+#      The current run-step is authoritative: running/fixing -> working, ci ->
+#      working, awaiting_approval/fix_review -> parked (with gate findings),
+#      terminal passed/checks-passed -> done, failed/cancelled -> failed. The
+#      ordinary ship brief's run-step/status invariant forbids working events
+#      while a run is active, reserves a later working event for substantive
+#      same-pane recovery after terminal, and requires recovered validation to
+#      start a new run. A working event plus a readable busy pane can therefore
+#      supersede a recoverable terminal classification when that event names
+#      the exact terminal run as `after-run=<id>`; passed stays final.
+#      While that exact recovery context remains open, a later
+#      needs-decision, blocked, or paused event supersedes the same named
+#      recoverable terminal as status-log evidence; resolved returns it to
+#      working, while done or failed closes the recovery context.
+#      A coarse runs-list entry carries no run id and cannot be superseded.
+#      Before recovered work starts a new run, its brief requires a distinct
+#      `working: validating-after-run=<id>` event. During that handoff the named
+#      old terminal remains recoverable; a full current run with a different id
+#      is the fresh validation and remains authoritative.
+#      While
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
-#      green, so a green PR is never silently read as still-validating.
+#      green, while a monitor with zero reported checks remains non-green.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
@@ -46,6 +62,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
+FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 
 # shellcheck source=bin/fm-tmux-lib.sh
 . "$SCRIPT_DIR/fm-tmux-lib.sh"
@@ -79,7 +102,7 @@ emit() {  # <state> <source> [detail]
 
 # --- meta resolution --------------------------------------------------------
 
-[ -f "$META" ] || emit unknown none "no metadata for $ID"
+[ -f "$META" ] && [ ! -L "$META" ] || emit unknown none "no regular metadata for $ID"
 
 meta_value() {  # <key>
   grep "^$1=" "$META" 2>/dev/null | tail -1 | cut -d= -f2- || true
@@ -98,7 +121,7 @@ fi
 
 # Last non-empty status line, and its leading verb (the word before the colon).
 log_last_line() {
-  [ -f "$LOG" ] || return 1
+  [ -f "$LOG" ] && [ ! -L "$LOG" ] || return 1
   grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -1
 }
 # Map a status-log verb onto a canonical state for the fallback path. `paused` is
@@ -124,10 +147,10 @@ map_log_state() {  # <line>
 LOG_LINE=$(log_last_line || true)
 LOG_VERB=$(status_line_verb "$LOG_LINE")
 
-# pane_readable is consulted ONLY in the no-run fallback below. The run-step path
-# stays authoritative regardless of pane liveness - judge by the run-step, not the
-# shell - so a finished crew whose endpoint has closed still reports its run-step
-# state (e.g. done) instead of being masked as unknown. Backend-aware
+# pane_readable is consulted in the no-run fallback and to corroborate newer
+# same-pane recovery evidence. A current run-step stays authoritative regardless
+# of pane liveness, so a finished crew whose endpoint has closed still reports
+# its run-step state (e.g. done) instead of being masked as unknown. Backend-aware
 # (fm_backend_of_meta defaults absent backend= to tmux, the P1 contract): a
 # herdr task is read through fm_backend_capture instead of a bare tmux probe.
 TASK_BACKEND=$(fm_backend_of_meta "$META")
@@ -316,13 +339,12 @@ nm_effective_ci_step_status() {
 # never distinguishes "still waiting on checks" from "checks green, waiting on
 # merge": both read as plain `ci,running,...`. The only place that transition is
 # recorded is the ci step's own log text, e.g. "all CI checks passed - still
-# monitoring until merged or closed" or "no CI checks reported - still
 # monitoring until merged or closed" (verified against 360+ real run logs under
 # ~/.no-mistakes/logs/*/ci.log on the installed v1.32.2 binary, including the
 # actual PR #252 run). Reads the ci step's log tail via `axi logs` and scans it
 # for the MOST RECENT recognized marker (the log is append-only/chronological,
-# so the last match is current): green with nothing red after it means CI is
-# green right now, still only waiting on merge/close.
+# so the last match is current). A passed marker is green; a zero-check marker
+# remains distinct because no successful check exists.
 nm_ci_checks_state() {
   local run_id log_tail marker
   run_id=$(strip_quotes "$(nm_field id)")
@@ -333,7 +355,8 @@ nm_ci_checks_state() {
     | grep -E 'CI checks passed|no CI checks reported - still monitoring|no CI checks reported yet|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
     | tail -1)
   case "$marker" in
-    *"checks passed"*|*"no CI checks reported - still monitoring"*) printf 'green' ;;
+    *"checks passed"*) printf 'green' ;;
+    *"no CI checks reported - still monitoring"*) printf 'zero-check' ;;
     *"no CI checks reported yet"*|*"checks failed"*|*"issues detected"*|*"CI checks running"*|*"base branch advanced"*"re-arming CI monitor timeout"*) printf 'not-ready' ;;
     *) printf 'unknown' ;;
   esac
@@ -362,29 +385,103 @@ nm_ci_checks_state() {
 # The real run-listing command is the top-level `no-mistakes runs` (verified:
 # `no-mistakes --help` lists it separately from `axi`). It is plain, human-
 # oriented text - no run id, no JSON/TOON, newest-first, columns
-# "<status> <branch> <short-sha> <date> [<pr-url>]" separated by runs of
-# spaces (verified: no quoting, so splitting on the first two whitespace runs
-# is exact) - but branch + coarse status is exactly what this predicate needs:
-# is a run for THIS branch active right now. Echoes the first (most recent)
-# matching row's status word (running/completed/cancelled/failed), or empty
-# when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
-nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br
+# "<status> <branch> <short-sha> <YYYY-MM-DD> <HH:MM> [<pr-url>]" separated
+# by whitespace. The displayed timestamp is the run's `CreatedAt`. The first
+# matching row supplies its coarse status and head as "<status>|<head>", or
+# the function returns empty when the branch has no run within
+# FM_CREW_STATE_RUNS_LIMIT rows.
+
+nm_runs_record_for_branch() {  # <branch>
+  local branch=$1 out row st br head
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
   while IFS= read -r row; do
     row=$(trim "$row")
     [ -n "$row" ] || continue
-    st=${row%% *}
-    rest=${row#* }
-    rest=$(trim "$rest")
-    br=${rest%% *}
+    read -r st br head _ <<< "$row"
+    [ -n "$st" ] && [ -n "$br" ] || continue
     if [ "$br" = "$branch" ]; then
-      printf '%s' "$st"
+      printf '%s|%s' "$st" "$head"
       return 0
     fi
   done <<< "$out"
   return 0
+}
+
+recovery_context() {
+  local line verb note token prefix id="" kind=""
+  [ -f "$LOG" ] && [ ! -L "$LOG" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$(trim "$line")" ] || continue
+    verb=$(status_line_verb "$line")
+    if [ "$verb" = working ]; then
+      note=$(status_line_note "$line")
+      case "$note" in
+        after-run=*) prefix='after-run=' ;;
+        validating-after-run=*) prefix=validating-after-run= ;;
+        *)
+          [ -n "$id" ] && kind=working
+          continue
+          ;;
+      esac
+      token=${note%%[[:space:]]*}
+      id=${token#"$prefix"}
+      case "$id" in
+        ''|*[!A-Za-z0-9]*) id=""; kind="" ;;
+        *) kind=working ;;
+      esac
+    elif [ -n "$id" ]; then
+      if status_is_paused "$line"; then
+        kind=signal
+      else
+        case "$verb" in
+          needs-decision|blocked) kind=signal ;;
+          resolved) kind=working ;;
+          done|failed) id=""; kind="" ;;
+        esac
+      fi
+    fi
+  done < "$LOG"
+  [ -n "$id" ] && [ -n "$kind" ] || return 1
+  printf '%s|%s' "$id" "$kind"
+}
+
+RECOVERY_CONTEXT_KIND=""
+exact_recovery_evidence() {
+  local context recovery_id current_id recovery_out saved_out recovery_branch recovery_outcome recovery_status
+  [ "$RUN_SOURCE" = full ] || return 1
+  context=$(recovery_context) || return 1
+  recovery_id=${context%%|*}
+  RECOVERY_CONTEXT_KIND=${context#*|}
+  current_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$current_id" ] && [ "$current_id" = "$recovery_id" ] || return 1
+
+  recovery_out=$(nm_run axi status --run "$recovery_id")
+  [ -n "$recovery_out" ] || return 1
+  saved_out=$RUN_OUT
+  RUN_OUT=$recovery_out
+  recovery_branch=$(strip_quotes "$(nm_field branch)")
+  recovery_outcome=$(strip_quotes "$(nm_field outcome)")
+  recovery_status=$(strip_quotes "$(nm_field status)")
+  RUN_OUT=$saved_out
+
+  [ "$recovery_branch" = "$CREW_BRANCH" ] || return 1
+  case "$recovery_outcome" in
+    checks-passed|failed|cancelled) ;;
+    passed) return 1 ;;
+    "")
+      case "$recovery_status" in
+        failed|cancelled) ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$RECOVERY_CONTEXT_KIND" = working ]; then
+    [ -n "$BACKEND_TARGET" ] || return 1
+    pane_readable "$BACKEND_TARGET" && crew_pane_is_busy "$BACKEND_TARGET"
+  fi
 }
 
 # CREW_BRANCH is empty at detached HEAD (a just-spawned crew, or a scout's
@@ -413,7 +510,8 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+      COARSE_RECORD=$(nm_runs_record_for_branch "$CREW_BRANCH")
+      COARSE_STATUS=${COARSE_RECORD%%|*}
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
@@ -430,6 +528,7 @@ if [ "$HAVE_RUN" = 1 ]; then
   CI_STEP_STATUS=""
   CI_LOG_STATE=""
   RUN_STATUS=""
+  RUN_RECOVERABLE_TERMINAL=0
   if [ "$RUN_SOURCE" = coarse ]; then
     # No step/gate detail is available from the plain runs list - only ever
     # true/working, done, or failed. A crew genuinely parked at a gate still
@@ -440,9 +539,9 @@ if [ "$HAVE_RUN" = 1 ]; then
     # coarse-vs-full distinction, so a real gate is never silently missed.
     case "$COARSE_STATUS" in
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
-      completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
-      failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+      completed) RUN_STATE="done";  RUN_DETAIL="run completed"; RUN_RECOVERABLE_TERMINAL=1 ;;
+      failed)    RUN_STATE=failed;  RUN_DETAIL="run failed"; RUN_RECOVERABLE_TERMINAL=1 ;;
+      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_RECOVERABLE_TERMINAL=1 ;;
       *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
     esac
   else
@@ -457,9 +556,9 @@ if [ "$HAVE_RUN" = 1 ]; then
     if [ -n "$outcome" ]; then
       case "$outcome" in
         passed)        RUN_STATE="done"; RUN_DETAIL="run passed: PR merged/closed" ;;
-        checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
-        failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
-        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;
+        checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review"; RUN_RECOVERABLE_TERMINAL=1 ;;
+        failed)        RUN_STATE=failed; RUN_DETAIL="run failed"; RUN_RECOVERABLE_TERMINAL=1 ;;
+        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled"; RUN_RECOVERABLE_TERMINAL=1 ;;
         *)             RUN_STATE=unknown; RUN_DETAIL="outcome: $outcome" ;;
       esac
     elif [ -n "$awaiting" ] || [ "$status" = awaiting_approval ] || [ "$status" = fix_review ] || [ -n "$gate_status" ] || [ "$has_gate" = 1 ]; then
@@ -481,9 +580,9 @@ if [ "$HAVE_RUN" = 1 ]; then
       case "$status" in
         ci)             RUN_STATE=working; RUN_DETAIL="ci running" ;;
         running|fixing) RUN_STATE=working; RUN_DETAIL="validating ($status)" ;;
-        completed)      RUN_STATE="done"; RUN_DETAIL="run completed" ;;
-        failed)         RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+        completed)      RUN_STATE="done"; RUN_DETAIL="run completed"; RUN_RECOVERABLE_TERMINAL=1 ;;
+        failed)         RUN_STATE=failed;  RUN_DETAIL="run failed"; RUN_RECOVERABLE_TERMINAL=1 ;;
+        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_RECOVERABLE_TERMINAL=1 ;;
         "")             RUN_STATE=working; RUN_DETAIL="run active" ;;
         *)              RUN_STATE=working; RUN_DETAIL="run active ($status)" ;;
       esac
@@ -492,10 +591,16 @@ if [ "$HAVE_RUN" = 1 ]; then
         case "$CI_STEP_STATUS" in
           running)
             CI_LOG_STATE=$(nm_ci_checks_state)
-            if [ "$CI_LOG_STATE" = green ]; then
-              RUN_STATE="done"
-              RUN_DETAIL="checks green: PR ready for review (still monitoring for merge/close)"
-            fi
+            case "$CI_LOG_STATE" in
+              green)
+                RUN_STATE="done"
+                RUN_DETAIL="checks green: PR ready for review (still monitoring for merge/close)"
+                RUN_RECOVERABLE_TERMINAL=1
+                ;;
+              zero-check)
+                RUN_DETAIL="no CI checks reported: still monitoring until merged or closed"
+                ;;
+            esac
             ;;
           fixing)
             CI_LOG_STATE=not-ready
@@ -507,18 +612,28 @@ if [ "$HAVE_RUN" = 1 ]; then
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+      RUN_DETAIL="$RUN_DETAIL${SEP}older checks-green status is not bound to this current run"
+    else
+      [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
+      if [ "$RUN_STATUS" = fixing ]; then
+        CI_LOG_STATE=not-ready
+      elif [ "$CI_STEP_STATUS" = running ] && [ -z "$CI_LOG_STATE" ]; then
+        CI_LOG_STATE=$(nm_ci_checks_state)
+      elif [ "$CI_STEP_STATUS" = fixing ]; then
+        CI_LOG_STATE=not-ready
+      fi
+      if [ "$CI_LOG_STATE" = green ]; then
+        emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+      fi
     fi
-    [ -n "$CI_STEP_STATUS" ] || CI_STEP_STATUS=$(nm_effective_ci_step_status)
-    if [ "$RUN_STATUS" = fixing ]; then
-      CI_LOG_STATE=not-ready
-    elif [ "$CI_STEP_STATUS" = running ] && [ -z "$CI_LOG_STATE" ]; then
-      CI_LOG_STATE=$(nm_ci_checks_state)
-    elif [ "$CI_STEP_STATUS" = fixing ]; then
-      CI_LOG_STATE=not-ready
-    fi
-    if [ "$CI_LOG_STATE" != not-ready ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
+  fi
+
+  if [ "$RUN_RECOVERABLE_TERMINAL" = 1 ]; then
+    if exact_recovery_evidence; then
+      if [ "$RECOVERY_CONTEXT_KIND" = signal ]; then
+        emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")${SEP}exact-run recovery context supersedes $RUN_DETAIL"
+      fi
+      emit working pane "exact-run recovery status and busy pane supersede $RUN_DETAIL"
     fi
   fi
 

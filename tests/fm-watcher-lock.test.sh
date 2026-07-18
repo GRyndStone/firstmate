@@ -203,6 +203,25 @@ test_lock_steals_dead_pid_lock() {
   pass "dead-pid stale lock is reclaimed by a single acquirer"
 }
 
+test_lock_release_cleans_supervisor_target_metadata() {
+  local dir state lockdir owner
+  dir=$(make_case lock-supervisor-metadata)
+  state="$dir/state"
+  lockdir="$state/.supervise-daemon.lock"
+  owner=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 7
+    owner=$(fm_lock_link_owner "$2") || exit 8
+    printf "%s\n" tmux > "$2/supervisor-backend"
+    printf "%s\n" %99 > "$2/supervisor-target"
+    printf "%s\n" "$owner"
+    fm_lock_release "$2"
+  ' _ "$LIB" "$lockdir") || fail "could not acquire and release supervisor lock"
+  [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] || fail "supervisor lock link survived release"
+  [ ! -d "$owner" ] || fail "supervisor lock owner directory survived release"
+  pass "portable lock release cleans recorded supervisor target metadata"
+}
+
 test_lock_stale_steal_single_winner_under_concurrency() {
   local dir state lockdir dead marker i pids pid wins
   dir=$(make_case lock-stale-concurrency)
@@ -551,6 +570,12 @@ test_arm_starts_and_self_heals() {
     grep -F "watcher: started pid=$lock_pid (beacon fresh)" "$armout" >/dev/null \
       || fail "arm ($row) started line did not name the confirmed live watcher (lock '$lock_pid')"
     kill -0 "$lock_pid" 2>/dev/null || fail "arm ($row) confirmed-started watcher is not actually alive"
+    [ "$(cat "$state/.watch.lock/owner-kind" 2>/dev/null || true)" = arm ] \
+      || fail "arm ($row) watcher omitted durable arm ownership provenance"
+    [ "$(cat "$state/.watch.lock/owner-pid" 2>/dev/null || true)" = "$armpid" ] \
+      || fail "arm ($row) watcher ownership did not name the live arm process"
+    [ -s "$state/.watch.lock/owner-identity" ] \
+      || fail "arm ($row) watcher ownership omitted the arm process identity"
     [ -z "$dead_pid" ] || [ "$lock_pid" != "$dead_pid" ] || fail "arm ($row) did not replace the dead-pid lock with a live watcher"
     kill "$armpid" "$lock_pid" 2>/dev/null || true
     wait "$armpid" 2>/dev/null || true
@@ -703,13 +728,39 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_pid_alive_rejects_zombie_state() {
+  local dir fakebin real_ps live status=0
+  dir=$(make_case pid-zombie-state)
+  fakebin="$dir/zombie-fakebin"
+  mkdir -p "$fakebin"
+  real_ps=$(command -v ps) || fail "test host must provide ps"
+  cat > "$fakebin/ps" <<EOF
+#!/usr/bin/env bash
+if [ "\$*" = "-p \${FM_ZOMBIE_PID:?} -o stat=" ]; then
+  printf 'Z+\n'
+  exit 0
+fi
+exec "$real_ps" "\$@"
+EOF
+  chmod +x "$fakebin/ps"
+  sleep 300 &
+  live=$!
+  PATH="$fakebin:$PATH" FM_ZOMBIE_PID="$live" bash -c '. "$1"; fm_pid_alive "$2"' _ "$LIB" "$live" || status=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "fm_pid_alive accepted a zombie process state"
+  pass "fm_pid_alive rejects zombie watcher and owner processes"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_pid_alive_rejects_zombie_state
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
+test_lock_release_cleans_supervisor_target_metadata
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock

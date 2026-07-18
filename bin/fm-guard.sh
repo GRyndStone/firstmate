@@ -11,8 +11,8 @@
 # banner so the agent cannot skim past it in the tool output of whatever it was
 # doing - the one channel every harness has. Normal wake handling (watcher
 # briefly down between a wake and the next supervision resume) stays inside the
-# grace window and stays silent. Always exits 0: the guard warns, it never
-# blocks.
+# grace window and stays silent. Operational findings exit 0 because this guard
+# warns rather than blocks; unsafe effective-state admission exits non-zero.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +27,7 @@ case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
 CONTINUE_LINE=${FM_GUARD_CONTINUE_LINE:-This is a supervision warning only; the guarded operation WILL still run.}
 
 # shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 # shellcheck source=bin/fm-tangle-lib.sh
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh

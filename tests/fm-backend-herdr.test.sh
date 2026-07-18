@@ -269,13 +269,14 @@ test_workspace_label_secondmate_marker_trims_whitespace() {
   pass "fm_backend_herdr_workspace_label: trims whitespace around the marker's secondmate id"
 }
 
-test_workspace_label_empty_marker_falls_back_to_primary() {
-  local home
+test_workspace_label_empty_marker_fails_closed() {
+  local home out status=0
   home="$TMP_ROOT/secondmate-home-empty"; mkdir -p "$home"
   : > "$home/.fm-secondmate-home"
-  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
-  [ "$out" = "firstmate" ] || fail "an empty/unreadable marker should fall back to 'firstmate', got '$out'"
-  pass "fm_backend_herdr_workspace_label: an empty marker file falls back to the primary label 'firstmate'"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" ) || status=$?
+  [ "$status" -ne 0 ] || fail "an empty secondmate marker must fail closed instead of adopting the primary workspace"
+  [ -z "$out" ] || fail "an empty secondmate marker unexpectedly produced a workspace label: $out"
+  pass "fm_backend_herdr_workspace_label: an empty secondmate marker fails closed"
 }
 
 test_workspace_label_different_secondmates_get_different_labels() {
@@ -1404,7 +1405,7 @@ test_dispatch_composer_state_routes_by_backend() {
   # classifier the away-mode daemon dispatches through - bin/fm-supervise-daemon.sh's
   # pane_input_pending) must route to each backend's OWN named classifier with
   # the target passed through unchanged, fall back to unknown for a backend with
-  # no named classifier (zellij), and unknown for an unrecognized backend name.
+  # a named classifier, and unknown for an unrecognized backend name.
   # Sourced-guards are pre-set so fm_backend_source no-ops and these stubs are
   # never clobbered by the real per-backend files trying (and failing) a live call.
   (
@@ -1416,14 +1417,15 @@ test_dispatch_composer_state_routes_by_backend() {
     _FM_BACKEND_ZELLIJ_SOURCED=1
     fm_tmux_composer_state() { [ "$1" = "sess:win" ] || fail "tmux composer_state got wrong target: $1"; printf 'pending'; }
     fm_backend_herdr_composer_state() { [ "$1" = "default:w1:p2" ] || fail "herdr composer_state got wrong target: $1"; printf 'empty'; }
+    fm_backend_zellij_composer_state() { [ "$1" = "sess:win" ] || fail "zellij composer_state got wrong target: $1"; printf 'empty'; }
     fm_backend_orca_composer_state() { [ "$1" = "term-1" ] || fail "orca composer_state got wrong target: $1"; printf 'empty'; }
     [ "$(fm_backend_composer_state tmux sess:win)" = pending ] || fail "composer_state did not dispatch to the tmux classifier"
     [ "$(fm_backend_composer_state herdr default:w1:p2)" = empty ] || fail "composer_state did not dispatch to the herdr classifier"
     [ "$(fm_backend_composer_state orca term-1)" = empty ] || fail "composer_state did not dispatch to the orca classifier"
-    [ "$(fm_backend_composer_state zellij sess:win)" = unknown ] || fail "composer_state should report unknown for zellij (no named classifier yet)"
+    [ "$(fm_backend_composer_state zellij sess:win)" = empty ] || fail "composer_state did not dispatch to the zellij classifier"
     [ "$(fm_backend_composer_state bogus x)" = unknown ] || fail "composer_state should report unknown for an unrecognized backend"
   ) || fail "composer_state dispatch subshell failed"
-  pass "fm_backend_composer_state dispatches tmux/herdr/orca to their named classifiers, unknown for zellij/unrecognized backends"
+  pass "fm_backend_composer_state dispatches all named classifiers and reports unknown for unrecognized backends"
 }
 
 test_scripts_route_explicit_target_through_meta_backend() {
@@ -1942,6 +1944,50 @@ test_wait_transition_not_capable_returns_2() {
   pass "fm_backend_herdr_wait_transition: below-capability protocol/schema falls back to polling (rc 2)"
 }
 
+test_large_early_marker_schema_and_checkpoint_are_quiet() {
+  local dir fb watcher out err direct_err status
+  dir="$TMP_ROOT/large-schema-capability"; fb="$dir/fakebin"; mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "status --json")
+    printf '%s\n' '{"client":{"protocol":16},"server":{"running":true}}'
+    ;;
+  "api schema")
+    printf '%s' '{"events.subscribe":{},"pane.agent_status_changed":{},"padding":"'
+    awk 'BEGIN { for (i = 0; i < 240000; i++) printf "x" }'
+    printf '%s\n' '"}'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  direct_err="$dir/direct.err"
+  status=0
+  PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENT_READER=fake-reader \
+    /bin/bash -o pipefail -c '. "$1"; fm_backend_herdr_events_capable test' _ "$ROOT/bin/backends/herdr.sh" \
+    >"$dir/direct.out" 2>"$direct_err" || status=$?
+  expect_code 0 "$status" "large-schema capability exit"
+  [ ! -s "$direct_err" ] || fail "large-schema capability wrote stderr: $(cat "$direct_err")"
+
+  watcher="$dir/watcher.sh"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+. "$FM_TEST_ROOT/bin/backends/herdr.sh"
+fm_backend_herdr_events_capable test || exit 2
+printf '%s\n' 'signal: large-schema capability wake'
+SH
+  chmod +x "$watcher"
+  out="$dir/checkpoint.out"; err="$dir/checkpoint.err"; status=0
+  PATH="$fb:$PATH" FM_TEST_ROOT="$ROOT" FM_BACKEND_HERDR_EVENT_READER=fake-reader \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 5 \
+    >"$out" 2>"$err" || status=$?
+  expect_code 0 "$status" "large-schema checkpoint exit"
+  assert_contains "$(cat "$out")" "signal: large-schema capability wake" "checkpoint dropped the successful wake"
+  [ ! -s "$err" ] || fail "successful large-schema checkpoint wrote stderr: $(cat "$err")"
+  pass "Herdr large-schema capability and successful checkpoint complete without stderr"
+}
+
 test_wait_transition_reconcile_blocked_returns_record() {
   local dir state agent temp fb reader lines out rc marker
   dir="$TMP_ROOT/wt-reconcile"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
@@ -2081,7 +2127,7 @@ test_version_check_refuses_missing_herdr
 test_workspace_label_primary_home_no_marker
 test_workspace_label_secondmate_home_uses_marker_id
 test_workspace_label_secondmate_marker_trims_whitespace
-test_workspace_label_empty_marker_falls_back_to_primary
+test_workspace_label_empty_marker_fails_closed
 test_workspace_label_different_secondmates_get_different_labels
 test_cli_helper_sets_env_and_appends_trailing_session_flag
 test_container_ensure_starts_server_and_workspace
@@ -2166,6 +2212,7 @@ test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2
 test_wait_transition_not_capable_returns_2
+test_large_early_marker_schema_and_checkpoint_are_quiet
 test_wait_transition_reconcile_blocked_returns_record
 test_wait_transition_subscribes_before_reconcile
 test_wait_transition_reconcile_dedupes_when_marked

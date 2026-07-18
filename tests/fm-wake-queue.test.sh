@@ -229,6 +229,112 @@ test_drain_asserts_watcher_liveness() {
   pass "drain asserts watcher liveness: warns on a lapse, stays silent right after a fire"
 }
 
+test_no_follow_publish_rejects_darwin_directory_race() {
+  local dir state fakebin source destination status real_perl
+  dir=$(make_case darwin-directory-race)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  source="$state/source"
+  destination="$state/destination"
+  mkdir -p "$fakebin"
+  printf 'payload\n' > "$source"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Darwin\n'
+SH
+  cat > "$fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+/bin/mkdir -p "${FM_RACE_DESTINATION:?}"
+exec "${FM_REAL_PERL:?}" "$@"
+SH
+  chmod +x "$fakebin/uname" "$fakebin/perl"
+  real_perl=$(command -v perl) || fail "Perl is required for the Darwin publication fixture"
+  status=0
+  PATH="$fakebin:$PATH" FM_REAL_PERL="$real_perl" FM_RACE_DESTINATION="$destination" \
+    FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_publish_file_no_follow "$2" "$3" replace' \
+      _ "$ROOT/bin/fm-wake-lib.sh" "$source" "$destination" || status=$?
+  [ "$status" -ne 0 ] || fail "Darwin exact-target publisher accepted a raced directory"
+  assert_present "$source" "failed exact-target publication consumed its source"
+  [ -d "$destination" ] || fail "Darwin publication race fixture did not create its directory target"
+  [ -z "$(find "$destination" -mindepth 1 -print -quit)" ] \
+    || fail "Darwin publication moved its source inside a raced directory"
+  pass "no-follow publication preserves its source across a Darwin directory race"
+}
+
+test_no_follow_append_preserves_content() {
+  local dir state target
+  dir=$(make_case append-preserves-content)
+  state="$dir/state"
+  target="$state/log"
+  printf 'first\n' > "$target"
+  printf 'second\n' | FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_append_file_no_follow "$2"' \
+    _ "$ROOT/bin/fm-wake-lib.sh" "$target" || fail "no-follow append failed"
+  [ "$(cat "$target")" = $'first\nsecond' ] || fail "no-follow append lost existing content"
+  pass "no-follow append preserves existing state content"
+}
+
+test_state_final_symlinks_are_never_written() {
+  local dir state fakebin outside status
+  dir=$(make_case final-symlink-writes)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  outside="$dir/outside"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$state/.wake-queue"
+  status=0
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "wake drain accepted a symlinked queue target"
+  [ "$(cat "$outside")" = sentinel ] || fail "wake drain wrote through a symlinked queue"
+
+  rm -f "$state/.wake-queue"
+  ln -s "$outside" "$state/.last-watcher-beat"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$WATCH" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "watcher accepted a symlinked beacon target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher wrote through a symlinked beacon"
+  pass "watcher and wake drain reject symlinked durable state targets"
+}
+
+test_lock_cleanup_never_follows_foreign_owner_links() {
+  local dir state lock outside
+  dir=$(make_case foreign-lock-owner)
+  state="$dir/state"
+  lock="$state/.foreign.lock"
+  outside="$dir/foreign-owner"
+  mkdir "$outside"
+  printf 'sentinel-pid\n' > "$outside/pid"
+  printf 'sentinel-home\n' > "$outside/fm-home"
+  ln -s "$outside" "$lock"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_lock_remove_path "$2"' \
+    _ "$ROOT/bin/fm-wake-lib.sh" "$lock" || fail "foreign lock link removal failed"
+  assert_absent "$lock" "foreign lock symlink was retained"
+  [ "$(cat "$outside/pid")" = sentinel-pid ] || fail "lock cleanup removed a foreign pid marker"
+  [ "$(cat "$outside/fm-home")" = sentinel-home ] || fail "lock cleanup removed a foreign home marker"
+  pass "lock cleanup rejects owner directories outside its exact sibling namespace"
+}
+
+test_unknown_pid_state_never_steals_lock() {
+  local dir state lock owner status
+  dir=$(make_case unknown-pid-lock)
+  state="$dir/state"
+  lock="$state/.unknown.lock"
+  owner="$lock.owner.test"
+  mkdir "$owner"
+  printf '%s\n' "$$" > "$owner/pid"
+  ln -s "$owner" "$lock"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '
+    ps() { return 1; }
+    . "$1"
+    fm_lock_try_acquire "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$lock" || status=$?
+  [ "$status" -ne 0 ] || fail "lock acquisition stole an owner whose pid state was unknown"
+  assert_present "$lock" "unknown pid state removed the live lock"
+  [ "$(cat "$owner/pid")" = "$$" ] || fail "unknown pid state altered the existing owner"
+  pass "transient pid inspection failure keeps lock ownership fail-closed"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -237,3 +343,8 @@ test_check_output_is_queued
 test_atomic_double_drain
 test_drain_dedupes_obvious_duplicates
 test_drain_asserts_watcher_liveness
+test_no_follow_publish_rejects_darwin_directory_race
+test_no_follow_append_preserves_content
+test_state_final_symlinks_are_never_written
+test_lock_cleanup_never_follows_foreign_owner_links
+test_unknown_pid_state_never_steals_lock

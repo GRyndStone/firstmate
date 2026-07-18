@@ -193,7 +193,7 @@ window_to_task() {
   local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta mw mt t
   if [ -n "$state" ]; then
     for meta in "$state"/*.meta; do
-      [ -e "$meta" ] || continue
+      [ -f "$meta" ] && [ ! -L "$meta" ] || continue
       mw=$(grep '^window=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
       mt=$(grep '^terminal=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
       [ "$mw" = "$w" ] || [ "$mt" = "$w" ] || continue

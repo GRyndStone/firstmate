@@ -80,7 +80,16 @@ test_no_mistakes_dod_wording() {
     "no-mistakes DOD lost its guidance-reference sentence"
   assert_no_grep "no-mistakes' own guidance" "$brief" \
     "no-mistakes DOD regressed to the apostrophe form that breaks bash -n"
-  pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'do not append a `working:` phase line during that run' "$brief" \
+    "no-mistakes DOD does not reserve active-run progress for the run-step"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'Append a fresh `working: after-run=<run-id> <summary>` line only when substantive same-pane recovery begins after the named run is terminal' "$brief" \
+    "no-mistakes DOD does not reserve later working evidence for terminal recovery"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'Immediately before validating recovered work, append `working: validating-after-run=<run-id> starting a fresh no-mistakes run`' "$brief" \
+    "no-mistakes DOD does not require recovered validation to establish a newer run"
+  pass "fm-brief.sh: no-mistakes DOD owns run-step and recovery status evidence"
 }
 
 test_ship_project_memory_wording() {

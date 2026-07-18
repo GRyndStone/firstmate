@@ -22,28 +22,42 @@ SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
-target=""
+target="" format="" task="" owner=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-t" ]; then target=$arg; fi
+  if [ "$prev" = "-F" ]; then format=$arg; fi
   prev=$arg
+done
+for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
+  [ -f "$m" ] && [ ! -L "$m" ] || continue
+  [ "$(sed -n 's/^window=//p' "$m" | tail -1)" = "$target" ] || continue
+  task=$(basename "$m" .meta)
+  owner=$(sed -n 's/^tmux_home_identity=//p' "$m" | tail -1)
+  break
 done
 case "${1:-}" in
   list-windows)
-    # Strict-probe inventory (docs/tmux-backend.md "Strict window-existence
-    # probe"): every recorded window is live in this suite; deadness is
-    # expressed through agent_alive (a zsh pane_current_command), not a gone
-    # endpoint.
     for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
-      [ -e "$m" ] || continue
-      sed -n 's/^window=//p' "$m"
+      [ -f "$m" ] && [ ! -L "$m" ] || continue
+      identity=$(sed -n 's/^tmux_home_identity=//p' "$m" | tail -1)
+      window=$(sed -n 's/^tmux_window_id=//p' "$m" | tail -1)
+      [ -n "$identity" ] && [ -n "$window" ] || continue
+      id=$(basename "$m" .meta)
+      label="fm-$id"
+      case "$*" in *"$label"*|*"$window"*) ;; *) continue ;; esac
+      case "$format" in
+        *$'\t_') printf '%s\t%s\t%s\t_\n' "$window" "$label" "$identity" ;;
+        *) printf '%s\t%s\t%s\n' "$window" "$label" "$identity" ;;
+      esac
     done
     ;;
   display-message)
     case "$*" in
+      *'#{session_name}'*) printf '%s\tfirstmate\tfm-%s\t%s\n' "$target" "$task" "$owner" ;;
       *pane_current_command*)
-        case "$target" in
-          *dead-secondmate*) printf 'zsh\n' ;;
+        case "$task" in
+          dead-secondmate) printf 'zsh\n' ;;
           *) printf 'codex\n' ;;
         esac
         ;;
@@ -51,16 +65,41 @@ case "${1:-}" in
     esac
     ;;
   capture-pane)
-    case "$target" in
-      *ship-task*|*active-secondmate*) printf 'work in progress\nesc to interrupt\n' ;;
+    case "$task:$target" in
+      ship-task:*|stale-decision:*|stale-blocked:*|active-secondmate:*|*:*ship-task*) printf 'work in progress\nesc to interrupt\n' ;;
       *) printf 'all quiet\n> \n' ;;
     esac
     ;;
 esac
 exit 0
 SH
-  chmod +x "$fb/no-mistakes" "$fb/tmux"
+  cat > "$fb/cmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ping) printf '%s\n' PONG ;;
+  list-windows) printf '%s\n' '[{"id":"fixture-window"}]' ;;
+  workspace) printf '%s\n' '{"workspaces":[]}' ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/cmux"
   printf '%s\n' "$fb"
+}
+
+tmux_home_identity() {
+  FM_HOME="$1" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh"
+}
+
+write_scoped_tmux_meta() {
+  local home=$1 meta=$2 window_id=$3 identity
+  shift 3
+  identity=$(tmux_home_identity "$home")
+  fm_write_meta "$meta" \
+    "window=@$window_id" \
+    "tmux_window_id=@$window_id" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
+    "$@"
 }
 
 make_home() {  # <name>
@@ -70,7 +109,8 @@ make_home() {  # <name>
 }
 
 write_fixture() {  # <home>
-  local home=$1
+  local home=$1 identity
+  identity=$(tmux_home_identity "$home")
   mkdir -p "$home/projects/alpha-worktree" "$home/projects/scout-worktree" "$home/secondmate-home"
   cat > "$home/data/backlog.md" <<EOF
 ## In flight
@@ -88,7 +128,10 @@ EOF
   mkdir -p "$home/data/scout-task"
   printf '# Scout\n' > "$home/data/scout-task/report.md"
   fm_write_meta "$home/state/ship-task.meta" \
-    "window=firstmate:fm-ship-task" \
+    "window=@101" \
+    "tmux_window_id=@101" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/projects/alpha-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -98,7 +141,10 @@ EOF
     "pr=https://github.com/kunchenguid/firstmate/pull/9"
   printf 'needs-decision: choose an API shape\n' > "$home/state/ship-task.status"
   fm_write_meta "$home/state/scout-task.meta" \
-    "window=firstmate:fm-scout-task" \
+    "window=@102" \
+    "tmux_window_id=@102" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/projects/scout-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -107,7 +153,10 @@ EOF
     "yolo=off"
   printf 'done: report ready\n' > "$home/state/scout-task.status"
   fm_write_meta "$home/state/secondmate-task.meta" \
-    "window=firstmate:fm-secondmate-task" \
+    "window=@103" \
+    "tmux_window_id=@103" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/secondmate-home" \
     "project=$home/secondmate-home" \
     "harness=codex" \
@@ -135,6 +184,48 @@ test_empty_fleet_json() {
   view=$(FM_HOME="$home" "$VIEW")
   assert_contains "$view" "No live task metadata found." "empty fleet view should say no live metadata"
   pass "empty fleet snapshot and view use explicit absence markers"
+}
+
+test_metadata_audit_precedes_task_projection() {
+  local home fakebin outside log out state_home state_outside status
+  home=$(make_home metadata-audit-order)
+  fakebin=$(make_fakebin "$home")
+  outside="$TMP_ROOT/metadata-audit-order-foreign.meta"
+  log="$TMP_ROOT/metadata-audit-order-backend.log"
+  fm_write_meta "$outside" \
+    "window=foreign:window" \
+    "worktree=$TMP_ROOT/foreign-worktree" \
+    "project=foreign" \
+    "kind=ship"
+  ln -s "$outside" "$home/state/foreign.meta"
+  cat > "$fakebin/tmux" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$log"
+exit 1
+EOF
+  chmod +x "$fakebin/tmux"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.tasks | length) == 0
+      and (.endpoint_anomalies | length) == 1
+      and .endpoint_anomalies[0].kind == "inventory_unavailable"
+      and (.endpoint_anomalies[0].reason | contains("metadata is symlinked or non-regular"))
+  ' >/dev/null || fail "snapshot did not retain the pre-projection metadata audit: $out"
+  assert_absent "$log" "snapshot probed a backend through symlinked task metadata"
+
+  state_home=$(make_home state-audit-order)
+  state_outside="$TMP_ROOT/state-audit-order-outside"
+  rmdir "$state_home/state"
+  mkdir -p "$state_outside"
+  ln -s "$state_outside" "$state_home/state"
+  status=0
+  out=$(FM_HOME="$state_home" "$SNAPSHOT" --json 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "snapshot accepted a symlinked effective state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "snapshot did not surface endpoint-audit state validation failure"
+  [ -z "$(find "$state_outside" -mindepth 1 -print -quit)" ] \
+    || fail "snapshot traversed symlinked effective state before its audit"
+  pass "fleet snapshot audits metadata before task projection or backend probes"
 }
 
 test_fixture_snapshot_json() {
@@ -170,6 +261,8 @@ test_fixture_snapshot_json() {
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "cmux-task")
     | .backend == "cmux"
+      and .endpoint.exists == null
+      and .endpoint.agent_alive == "not_checked"
       and .paths.worktree.present == false
       and .current_state.state == "unknown"
   ' >/dev/null || fail "cmux missing-file row missing"
@@ -191,32 +284,28 @@ test_event_hints_follow_reconciled_current_state() {
     "$home/projects/active-blocked" \
     "$home/projects/stale-decision" \
     "$home/projects/stale-blocked"
-  fm_write_meta "$home/state/active-decision.meta" \
-    "window=firstmate:fm-active-decision" \
+  write_scoped_tmux_meta "$home" "$home/state/active-decision.meta" 201 \
     "worktree=$home/projects/active-decision" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'needs-decision: choose an API shape\n' > "$home/state/active-decision.status"
-  fm_write_meta "$home/state/active-blocked.meta" \
-    "window=firstmate:fm-active-blocked" \
+  write_scoped_tmux_meta "$home" "$home/state/active-blocked.meta" 202 \
     "worktree=$home/projects/active-blocked" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'blocked: waiting on access\n' > "$home/state/active-blocked.status"
-  fm_write_meta "$home/state/stale-decision.meta" \
-    "window=firstmate:fm-stale-decision-ship-task" \
+  write_scoped_tmux_meta "$home" "$home/state/stale-decision.meta" 203 \
     "worktree=$home/projects/stale-decision" \
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
   printf 'needs-decision: already answered\n' > "$home/state/stale-decision.status"
-  fm_write_meta "$home/state/stale-blocked.meta" \
-    "window=firstmate:fm-stale-blocked-ship-task" \
+  write_scoped_tmux_meta "$home" "$home/state/stale-blocked.meta" 204 \
     "worktree=$home/projects/stale-blocked" \
     "project=alpha" \
     "harness=codex" \
@@ -283,8 +372,7 @@ test_backlog_tasks_axi_forms_and_overrides() {
 - [x] done-note - Done Note local main (repo: delta, done 2026-07-11) (kind: ship)
 EOF
   printf '# Bold Scout\n' > "$data/bold-task/report.md"
-  fm_write_meta "$home/state/bold-task.meta" \
-    "window=firstmate:fm-bold-task" \
+  write_scoped_tmux_meta "$home" "$home/state/bold-task.meta" 205 \
     "worktree=$projects/bold-worktree" \
     "project=alpha" \
     "harness=codex" \
@@ -363,11 +451,11 @@ EOF
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$VIEW")
   assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | present | $data/bold-task/report.md" \
     "view should render bold in-flight row from snapshot"
-  assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | queued-comma - waits on queued-comma | - |" \
+  assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | - | queued-comma - waits on queued-comma | - |" \
     "view should render blocked reason without title metadata"
-  assert_contains "$view" "| done-bracket-pr | Done Bracket PR | gamma | ship | - | https://github.com/kunchenguid/firstmate/pull/43 |" \
+  assert_contains "$view" "| done-bracket-pr | Done Bracket PR | gamma | ship | - | - | https://github.com/kunchenguid/firstmate/pull/43 |" \
     "view should render bracketed PR artifact outside the title"
-  assert_contains "$view" "| done-note | Done Note | delta | ship | - | local main |" \
+  assert_contains "$view" "| done-note | Done Note | delta | ship | - | - | local main |" \
     "view should render local-only done artifact outside the title"
   pass "snapshot parses tasks-axi rows and respects operational overrides"
 }
@@ -380,9 +468,9 @@ test_view_renders_snapshot() {
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
   assert_contains "$view" "| ship-task | working / pane | ship | alpha | tmux | present | https://github.com/kunchenguid/firstmate/pull/9" \
     "view should render ship row from snapshot"
-  assert_contains "$view" "| queued-task | Queued Task | alpha | ship | ship-task | -" \
+  assert_contains "$view" "| queued-task | Queued Task | alpha | ship | - | ship-task | -" \
     "view should render queued backlog row"
-  assert_contains "$view" "| done-task | Done Task | alpha | ship | - | https://github.com/kunchenguid/firstmate/pull/7 |" \
+  assert_contains "$view" "| done-task | Done Task | alpha | ship | - | - | https://github.com/kunchenguid/firstmate/pull/7 |" \
     "view should render done backlog row"
   assert_contains "$view" "bin/fm-send.sh fm-secondmate-task" \
     "view should show secondmate send guidance"
@@ -390,14 +478,221 @@ test_view_renders_snapshot() {
     "view should show secondmate endpoint agent liveness"
   assert_not_contains "$view" "fm-peek.sh fm-secondmate-task" \
     "view must not tell firstmate to routinely peek secondmates"
+  assert_contains "$view" "ALERT kind=inventory_unavailable task=cmux-task" \
+    "view should identify the endpoint anomaly kind"
+  assert_contains "$view" "reason=cmux has no exact-home duplicate inventory; app-global sweep refused" \
+    "view should explain why endpoint inventory is unavailable"
   pass "fleet view renders the snapshot without secondmate peek guidance"
 }
 
+test_queue_accounting_surfaces_holds_and_durable_program_boundary() {
+  local home out view
+  home=$(make_home program-boundary)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] dependency - Active Dependency (repo: alpha) (kind: ship)
+
+## Queued
+- [ ] held-task - Held Task (repo: alpha) (kind: ship) (hold: captain decision pending) (hold-kind: captain)
+- [ ] blocked-task - Blocked Task (repo: alpha) (kind: ship) blocked-by: dependency - waiting for dependency
+
+## Done
+EOF
+  printf '# Durable program\n\nThis plan still has undecomposed obligations.\n' > "$home/data/alpha-program.md"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e --arg path "$home/data/alpha-program.md" '
+    .queue_accounting.runnable_candidates == 0
+      and .queue_accounting.empty_runnable_queue == true
+      and .queue_accounting.held == 1
+      and .queue_accounting.blocked == 1
+      and .queue_accounting.durable_program_source_count == 1
+      and .queue_accounting.decomposition_status == "requires_supervisor_judgment"
+      and .program_sources == [{path:$path,relative_path:"alpha-program.md"}]
+      and (.queue_accounting.supervisor_boundary | contains("does not prove the durable program is complete"))
+  ' >/dev/null || fail "queue/program accounting did not distinguish an empty runnable queue from durable obligations: $out"
+  view=$(FM_HOME="$home" "$VIEW")
+  assert_contains "$view" "Runnable candidates: 0" "view omitted the empty runnable queue"
+  assert_contains "$view" "Durable program sources: 1" "view omitted durable program sources"
+  assert_contains "$view" "| held-task | Held Task | alpha | ship | captain - captain decision pending |" \
+    "view omitted structured held work"
+  pass "status reporting distinguishes an empty runnable queue from held work and durable program obligations"
+}
+
+test_queue_accounting_uses_active_hold_and_blocker_semantics() {
+  local home out view
+  home=$(make_home active-queue-gates)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] live-dependency - Live Dependency (repo: alpha) (kind: ship)
+
+## Queued
+- [ ] future-hold - Future Hold (repo: alpha) (kind: ship) (hold: scheduled) (hold-kind: external) (hold-until: 2026-07-18)
+- [ ] expired-hold - Expired Hold (repo: alpha) (kind: ship) (hold: scheduled) (hold-kind: external) (hold-until: 2026-07-16)
+- [ ] active-blocker - Active Blocker (repo: alpha) (kind: ship) blocked-by: live-dependency - waits on live work
+- [ ] resolved-blocker - Resolved Blocker (repo: alpha) (kind: ship) blocked-by: done-dependency - already landed
+- [ ] missing-blocker - Missing Blocker (repo: alpha) (kind: ship) blocked-by: removed-dependency - legacy dangling edge
+- [ ] prose-hold - Explain (hold: scheduled) in title prose (repo: alpha) (kind: ship)
+- [ ] prose-blocker - Explain blocked-by: live-dependency in title prose (repo: alpha) (kind: ship)
+- [ ] mixed-blockers - Mixed Blockers (repo: alpha) (kind: ship) blocked-by: done-dependency - already landed blocked-by: live-dependency - waits on live work
+- [ ] repeated-hold - Repeated Hold (repo: alpha) (kind: ship) (hold: older value) (hold: rightmost value)
+- [ ] embedded-marker - Embedded Marker unblocked-by: live-dependency (repo: alpha) (kind: ship)
+
+## Done
+- [x] done-dependency - Done Dependency (repo: alpha) (kind: ship) (done 2026-07-16)
+EOF
+  out=$(FM_HOME="$home" FM_FLEET_SNAPSHOT_TODAY=2026-07-17 "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .queue_accounting.held == 2
+      and .queue_accounting.blocked == 3
+      and .queue_accounting.runnable_candidates == 5
+      and .queue_accounting.empty_runnable_queue == false
+      and (.backlog.records[] | select(.id == "future-hold")
+           | .hold_until == "2026-07-18" and .active_hold == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "expired-hold")
+           | .hold == "scheduled" and .active_hold == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "active-blocker")
+           | .active_blocked_by_ids == ["live-dependency"] and .active_blocked == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "resolved-blocker")
+           | .blocked_by_ids == ["done-dependency"] and .active_blocked_by_ids == [] and .active_blocked == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "missing-blocker")
+           | .active_blocked_by_ids == [] and .runnable == true)
+      and (.backlog.records[] | select(.id == "prose-hold")
+           | .title == "Explain (hold: scheduled) in title prose" and .hold == null and .active_hold == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "prose-blocker")
+           | .title == "Explain blocked-by: live-dependency in title prose" and .blocked_by_ids == [] and .active_blocked == false and .runnable == true)
+      and (.backlog.records[] | select(.id == "mixed-blockers")
+           | .blocked_by_ids == ["done-dependency","live-dependency"]
+             and .active_blocked_by_ids == ["live-dependency"]
+             and .active_blocked_reason == "waits on live work")
+      and (.backlog.records[] | select(.id == "repeated-hold")
+           | .hold == "rightmost value" and .active_hold == true and .runnable == false)
+      and (.backlog.records[] | select(.id == "embedded-marker")
+           | .title == "Embedded Marker un" and .blocked_by_ids == ["live-dependency"]
+             and .active_blocked_by_ids == ["live-dependency"] and .runnable == false)
+  ' >/dev/null || fail "queue accounting did not resolve expired holds and landed or missing blockers: $out"
+  view=$(FM_HOME="$home" FM_FLEET_SNAPSHOT_TODAY=2026-07-17 "$VIEW")
+  assert_contains "$view" "| future-hold | Future Hold | alpha | ship | external - scheduled | - |" \
+    "view omitted an active hold"
+  assert_contains "$view" "| expired-hold | Expired Hold | alpha | ship | - | - |" \
+    "view rendered an expired hold as active"
+  assert_contains "$view" "| active-blocker | Active Blocker | alpha | ship | - | live-dependency - waits on live work |" \
+    "view omitted an active blocker"
+  assert_contains "$view" "| resolved-blocker | Resolved Blocker | alpha | ship | - | - |" \
+    "view rendered a resolved blocker as active"
+  assert_contains "$view" "| prose-hold | Explain (hold: scheduled) in title prose | alpha | ship | - | - |" \
+    "view treated title prose as a hold tag"
+  pass "queue accounting matches tasks-axi active hold and blocker semantics"
+}
+
+test_backlog_rows_match_tasks_axi_section_grammar() {
+  local home out tab
+  home=$(make_home exact-row-grammar)
+  tab=$(printf '\t')
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] active-checkbox - Active checkbox
+- **active-legacy** - Active legacy
+- [x] active-wrong-check - Not an in-flight task
+
+## Queued
+- [ ] runnable - Runnable task
+  canonical body continuation
+ one-space raw obligation
+${tab}tab-prefixed raw obligation
+- [x] checked-queued - Not queued
+- **bold-queued** - Not queued
+* [ ] star-bullet - Not queued
+- [ ] bad/id - Invalid id
+- [X] uppercase-check - Not queued
+
+## Done archive
+- [x] landed - Landed task
+- [X] uppercase-done - Not done
+EOF
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .queue_accounting.queued_total == 8
+      and .queue_accounting.structured_queued == 1
+      and .queue_accounting.unstructured_queued == 7
+      and .queue_accounting.runnable_candidates == 1
+      and ([.backlog.records[] | select(.structured) | .id]
+           == ["active-checkbox","active-legacy","runnable","landed"])
+      and (.backlog.records[] | select(.id == "runnable") | .body_excerpt == "canonical body continuation")
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true)] | length == 7)
+      and ([.backlog.records[] | select(.raw == " one-space raw obligation")] | length == 1)
+      and ([.backlog.records[] | select(.raw == "\ttab-prefixed raw obligation")] | length == 1)
+      and ([.backlog.records[] | select(.state == "done" and .structured != true)] | length == 1)
+  ' >/dev/null || fail "snapshot accepted rows outside tasks-axi section grammar: $out"
+  pass "snapshot recognizes tasks-axi rows and exact two-space continuations"
+}
+
+test_heading_resets_body_continuation_context() {
+  local home out
+  home=$(make_home heading-body-context)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] active-task - Active task
+
+## Queued
+  raw queued obligation after section change
+- [ ] queued-before-repeat - Queued before repeated heading
+
+## Queued
+  raw queued obligation after repeated heading
+- [ ] runnable - Runnable task
+EOF
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.backlog.records[] | select(.id == "active-task") | .body_excerpt == null)
+      and (.backlog.records[] | select(.id == "queued-before-repeat") | .body_excerpt == null)
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true and .raw == "  raw queued obligation after section change")] | length) == 1
+      and ([.backlog.records[] | select(.state == "queued" and .structured != true and .raw == "  raw queued obligation after repeated heading")] | length) == 1
+      and .queue_accounting.queued_total == 4
+      and .queue_accounting.structured_queued == 2
+      and .queue_accounting.unstructured_queued == 2
+  ' >/dev/null || fail "a heading did not reset body continuation context: $out"
+  pass "snapshot resets body continuation context at every heading"
+}
+
+test_program_sources_stay_inside_selected_home() {
+  local home escaped_home outside out
+  home=$(make_home contained-program-sources)
+  outside=$TMP_ROOT/outside-program-sources
+  mkdir -p "$outside/programs"
+  printf '## Queued\n' > "$home/data/backlog.md"
+  printf '# Safe\n' > "$home/data/safe-program.md"
+  printf '# Escaped file\n' > "$outside/escaped.md"
+  printf '# Escaped directory\n' > "$outside/programs/escaped.md"
+  ln -s "$outside/escaped.md" "$home/data/escaped-program.md"
+  ln -s "$outside/programs" "$home/data/programs"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e --arg path "$home/data/safe-program.md" '
+    .program_sources == [{path:$path,relative_path:"safe-program.md"}]
+      and .queue_accounting.durable_program_source_count == 1
+  ' >/dev/null || fail "snapshot followed a program source outside the selected home: $out"
+  escaped_home=$(make_home escaped-data-program-sources)
+  mkdir -p "$outside/data"
+  printf '## Queued\n' > "$outside/data/backlog.md"
+  printf '# Escaped data\n' > "$outside/data/escaped-program.md"
+  rmdir "$escaped_home/data"
+  ln -s "$outside/data" "$escaped_home/data"
+  out=$(FM_HOME="$escaped_home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.program_sources | length) == 0
+      and .queue_accounting.durable_program_source_count == 0
+  ' >/dev/null || fail "snapshot followed a data directory outside the selected home: $out"
+  pass "snapshot rejects program-source symlinks that escape the selected home"
+}
+
 test_view_renders_dead_secondmate_agent_status() {
-  local home fakebin view
+  local home fakebin view identity
   home=$(make_home dead-secondmate)
+  identity=$(tmux_home_identity "$home")
   fm_write_meta "$home/state/dead-secondmate.meta" \
-    "window=firstmate:fm-dead-secondmate" \
+    "window=@104" \
+    "tmux_window_id=@104" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "project=$home/secondmate-home" \
     "harness=codex" \
     "kind=secondmate" \
@@ -448,11 +743,15 @@ test_open_decision_survives_later_unrelated_event() {
 }
 
 test_secondmate_open_decision_survives_live_endpoint() {
-  local home fakebin out
+  local home fakebin out identity
   home=$(make_home active-secondmate)
+  identity=$(tmux_home_identity "$home")
   mkdir -p "$home/secondmate-home"
   fm_write_meta "$home/state/active-secondmate.meta" \
-    "window=firstmate:fm-active-secondmate" \
+    "window=@105" \
+    "tmux_window_id=@105" \
+    "tmux_session=firstmate" \
+    "tmux_home_identity=$identity" \
     "worktree=$home/secondmate-home" \
     "project=$home/secondmate-home" \
     "harness=codex" \
@@ -512,8 +811,7 @@ test_completed_scout_report_is_pointer_not_pending() {
   local home fakebin out
   home=$(make_home completed-scout)
   mkdir -p "$home/projects/scout-wt" "$home/data/lavish-103"
-  fm_write_meta "$home/state/lavish-103.meta" \
-    "window=firstmate:fm-lavish-103" \
+  write_scoped_tmux_meta "$home" "$home/state/lavish-103.meta" 210 \
     "worktree=$home/projects/scout-wt" \
     "project=firstmate" \
     "harness=codex" \
@@ -562,7 +860,38 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_unknown_endpoint_ownership_still_reads_recorded_target() {
+  local home fakebin log out
+  home=$(make_home unknown-endpoint-probe)
+  fakebin=$(make_fakebin "$home")
+  log="$home/zellij.log"
+  mkdir "$home/worktree"
+  fm_write_meta "$home/state/zellij-task.meta" \
+    'backend=zellij' \
+    'window=fm:42' \
+    'zellij_session=fm' \
+    'zellij_tab_id=7' \
+    "worktree=$home/worktree" \
+    'kind=ship'
+  cat > "$fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_ZELLIJ_LOG:?}"
+exit 99
+SH
+  chmod +x "$fakebin/zellij"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_ZELLIJ_LOG="$log" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "zellij-task")
+    | .endpoint.exists == null
+      and .current_state.state == "unknown"
+      and .current_state.source == "none"
+  ' >/dev/null || fail "unknown endpoint ownership did not produce an unknown current state: $out"
+  assert_present "$log" "snapshot skipped the exact recorded Zellij target read"
+  pass "snapshot reads exact recorded targets without licensing endpoint mutation"
+}
+
 test_empty_fleet_json
+test_metadata_audit_precedes_task_projection
 test_fixture_snapshot_json
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
@@ -570,7 +899,13 @@ test_secondmate_open_decision_survives_live_endpoint
 test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
+test_unknown_endpoint_ownership_still_reads_recorded_target
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
+test_queue_accounting_surfaces_holds_and_durable_program_boundary
+test_queue_accounting_uses_active_hold_and_blocker_semantics
+test_backlog_rows_match_tasks_axi_section_grammar
+test_heading_resets_body_continuation_context
+test_program_sources_stay_inside_selected_home
 test_view_renders_dead_secondmate_agent_status

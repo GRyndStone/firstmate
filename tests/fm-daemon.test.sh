@@ -12,6 +12,7 @@ set -u
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
+WATCH="$ROOT/bin/fm-watch.sh"
 # Source the daemon's pure functions once. Its main loop is skipped under sourcing
 # via a BASH_SOURCE guard, so only classify_*/housekeeping/escalate_*/afk_* and the
 # pane/submit helpers become defined.
@@ -36,6 +37,25 @@ test_afk_start_refuses_when_flag_cannot_be_written() {
   assert_not_contains "$out" "starting supervise daemon" "fm-afk-start.sh continued into daemon startup after .afk write failure"
   assert_absent "$state/.supervise-daemon.log" "fm-afk-start.sh started the daemon after .afk write failure"
   pass "fm-afk-start.sh fails before daemon startup when the afk flag cannot be written"
+}
+
+test_afk_start_never_follows_flag_directory_symlink() {
+  local dir state outside out status
+  dir=$(make_supercase afk-start-flag-symlink)
+  state="$dir/state"
+  outside="$dir/outside"
+  mkdir -p "$outside"
+  ln -s "$outside" "$state/.afk"
+  status=0
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh accepted a symlinked away flag"
+  assert_contains "$out" "unsafe publication target refused" \
+    "fm-afk-start.sh did not surface the unsafe final target"
+  assert_not_contains "$out" "starting supervise daemon" \
+    "fm-afk-start.sh started the daemon after refusing its away flag"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "fm-afk-start.sh published through a directory symlink"
+  pass "fm-afk-start.sh publishes the away flag without following symlinks"
 }
 
 test_afk_start_ignores_stale_pidfile_without_lock() {
@@ -89,6 +109,51 @@ test_daemon_state_root_uses_fm_home() {
   [ "$out" = "$override" ] || fail "daemon state root ignored FM_STATE_OVERRIDE: $out"
 
   pass "supervise daemon state root is scoped by FM_HOME"
+}
+
+test_state_mutating_entrypoints_validate_before_access() {
+  local dir outside state fakebin mkdir_log real_mkdir out status
+  dir="$TMP_ROOT/state-entrypoint-validation"
+  outside="$dir/outside"
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  mkdir_log="$dir/state-mkdir.log"
+  real_mkdir=$(command -v mkdir) || fail "state-entrypoint test requires mkdir"
+  mkdir -p "$outside" "$fakebin"
+  ln -s "$outside" "$state"
+  cat > "$fakebin/mkdir" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = "$state" ]; then
+    printf 'state mkdir\n' >> "$mkdir_log"
+  fi
+done
+exec "$real_mkdir" "\$@"
+EOF
+  chmod +x "$fakebin/mkdir"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-afk-start.sh accessed effective state before shared validation"
+  assert_absent "$outside/.afk" "fm-afk-start.sh wrote the away flag through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-afk-start.sh did not surface state validation failure"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$DAEMON" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-supervise-daemon.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-supervise-daemon.sh accessed effective state before shared validation"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "fm-supervise-daemon.sh wrote through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-supervise-daemon.sh did not surface state validation failure"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-watch.sh accepted a symlinked effective state"
+  assert_absent "$mkdir_log" "fm-watch.sh accessed effective state before shared validation"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "fm-watch.sh wrote through symlinked state"
+  assert_contains "$out" "symlinked effective state path component refused" "fm-watch.sh did not surface state validation failure"
+
+  pass "state-mutating supervision entrypoints validate effective state before first access"
 }
 
 test_classify_routine_signal_self() {
@@ -342,6 +407,7 @@ test_housekeeping_paused_resurfaces_and_resets() {
   dir=$(make_supercase paused-resurface)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w11"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w11.meta"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w11.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
@@ -363,6 +429,7 @@ test_housekeeping_paused_resumed_cleared() {
   dir=$(make_supercase paused-resumed)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w12"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w12.meta"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w12.status"
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
@@ -382,6 +449,7 @@ test_housekeeping_paused_unpaused_cleared() {
   dir=$(make_supercase paused-unpaused)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w13"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w13.meta"
   printf 'paused: holding for the upstream release\nworking: resumed, upstream landed\n' > "$state/held-w13.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w13" | tr ':/.' '___')
@@ -397,6 +465,7 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-to-paused)
   state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w14"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w14.meta"
   printf 'paused: awaiting the upstream tool release\n' > "$state/held-w14.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w14" | tr ':/.' '___')
@@ -413,6 +482,7 @@ test_housekeeping_pause_marker_transitions_to_clear() {
   local dir state fakebin win pane key
   dir=$(make_supercase paused-to-stale)
   state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w15"; pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w15.meta"
   printf 'working: upstream landed, resuming\n' > "$state/held-w15.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w15" | tr ':/.' '___')
@@ -432,6 +502,7 @@ test_housekeeping_persistent_stale_escalates() {
   fakebin="$dir/fakebin"
   win="sess:fm-pers-w5"
   pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/pers-w5.meta"
   printf 'working\n' > "$state/pers-w5.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "pers-w5" | tr ':/.' '___')
@@ -450,6 +521,7 @@ test_housekeeping_resumed_stale_cleared() {
   fakebin="$dir/fakebin"
   win="sess:fm-res-w6"
   pane="$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/res-w6.meta"
   printf 'working\n' > "$state/res-w6.status"
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "res-w6" | tr ':/.' '___')
@@ -595,6 +667,60 @@ test_escalate_batches_into_one_digest() {
   n=$(grep -c '\[ENTER\]' "$sent")
   [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
   pass "multiple escalations flush as a single batched digest"
+}
+
+test_daemon_durable_writers_reject_final_symlinks() {
+  local dir state outside status
+  dir=$(make_supercase daemon-final-symlink)
+  state="$dir/state"
+  outside="$dir/outside"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$state/.subsuper-escalations"
+  status=0
+  escalate_add "$state" "done: must not escape" || status=$?
+  [ "$status" -ne 0 ] || fail "daemon accepted a symlinked escalation buffer"
+  [ "$(cat "$outside")" = sentinel ] || fail "daemon wrote through a symlinked escalation buffer"
+  pass "daemon durable writers reject symlinked final targets"
+}
+
+test_daemon_watcher_stderr_uses_buffered_no_follow_append() {
+  local dir state outside target status source append_count
+  dir=$(make_supercase daemon-watcher-stderr)
+  state="$dir/state"
+  outside="$dir/outside"
+  target="$state/.supervise-daemon.watcher.err"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$target"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    printf escaped | fm_append_file_no_follow "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$target" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "no-follow stderr append accepted a symlinked target"
+  [ "$(cat "$outside")" = sentinel ] || fail "watcher stderr escaped through a final symlink"
+  rm "$target"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    printf watcher-error | fm_append_file_no_follow "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$target" >/dev/null 2>&1 \
+    || fail "no-follow watcher stderr append failed"
+  [ "$(cat "$target")" = watcher-error ] || fail "no-follow watcher stderr append lost output"
+  source=$(cat "$DAEMON")
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
+  assert_contains "$source" '"$WATCH" >"$CUR_TMP" 2>"$CUR_ERR" &' \
+    "daemon watcher stderr is not buffered by its directly supervised child"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
+  assert_contains "$source" 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"' \
+    "daemon watcher stderr buffer is not published through the no-follow helper"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
+  append_count=$(printf '%s\n' "$source" | grep -c 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"')
+  [ "$append_count" -ge 2 ] || fail "daemon shutdown does not flush the active watcher stderr buffer"
+  assert_not_contains "$source" 'fm_exec_stderr_append_no_follow' \
+    "daemon watcher launch still depends on the Perl stderr opener"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
+  assert_not_contains "$source" '2>>"$WATCH_ERR"' \
+    "daemon still opens watcher stderr through a symlink-following redirection"
+  pass "daemon watcher stderr buffers without a Perl launch dependency"
 }
 
 test_escalate_batch_age_uses_first_append() {
@@ -1562,6 +1688,19 @@ test_discover_supervisor_target_herdr() {
   pass "discover_supervisor_target: override > TMUX_PANE > herdr '<session>:<pane-id>' composition > firstmate:0 fallback"
 }
 
+test_canonical_supervisor_target_binds_tmux_pane_id() {
+  local out
+  out=$(
+    tmux() {
+      [ "$*" = "display-message -p -t firstmate:0 #{pane_id}" ] || return 1
+      printf '%%77\n'
+    }
+    canonical_supervisor_target tmux firstmate:0
+  ) || fail "tmux supervisor target could not be bound to a pane id"
+  [ "$out" = '%77' ] || fail "tmux supervisor target was not canonicalized to its exact pane id: $out"
+  pass "canonical_supervisor_target binds tmux injection to one exact pane id"
+}
+
 test_pane_is_busy_herdr_native_busy_state() {
   (
     fm_backend_busy_state() { [ "$1" = herdr ] && [ "$2" = "default:w1:p2" ] || fail "unexpected busy_state args: $1 $2"; printf 'busy'; }
@@ -1686,6 +1825,43 @@ test_inject_msg_herdr_submits_through_backend_dispatch() {
   pass "inject_msg: dispatches busy-guard/composer-guard/submit through the herdr backend and succeeds on a confirmed empty composer"
 }
 
+test_away_injection_supports_every_runtime_backend() {
+  local dir state backend target out
+  dir=$(make_supercase inject-all-backends)
+  state="$dir/state"
+  afk_enter "$state"
+  for backend in zellij orca cmux; do
+    target="exact-$backend-target"
+    out=$(
+      fm_backend_target_exists() { [ "$1" = "$backend" ] && [ "$2" = "$target" ]; }
+      fm_backend_busy_state() { printf 'idle'; }
+      fm_backend_capture() { printf 'idle agent pane\n'; }
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() {
+        [ "$1" = "$backend" ] && [ "$2" = "$target" ] || return 1
+        printf 'empty'
+      }
+      FM_SUPERVISOR_BACKEND="$backend" FM_SUPERVISOR_TARGET="$target" \
+        inject_msg "backend $backend" "$state"
+    ) || fail "away injection failed through $backend"
+    [ -z "$out" ] || fail "away injection through $backend printed unexpected output: $out"
+    [ "$(canonical_supervisor_target "$backend" "$target")" = "$target" ] \
+      || fail "$backend supervisor target was not retained as an exact backend identity"
+  done
+  for backend in tmux herdr zellij orca cmux; do
+    fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$backend" \
+      || fail "away supervisor omitted supported runtime backend $backend"
+  done
+  fm_backend_source zellij || fail "could not load zellij composer classifier"
+  out=$(
+    # shellcheck disable=SC2329 # Overrides a backend function in this subshell.
+    fm_backend_zellij_capture() { printf '│ > │\n'; }
+    fm_backend_zellij_composer_state exact-zellij-target
+  )
+  [ "$out" = empty ] || fail "zellij agent composer was not safely classifiable: $out"
+  pass "away-mode injection covers every supported runtime backend"
+}
+
 # Safety-critical (task fm-composer-shellglyph-safety): the away-mode injector
 # must NEVER type an escalation into a dead-shell pane. A bare shell prompt
 # classifies `unknown` (not `pending`), and inject_msg now defers on anything
@@ -1710,9 +1886,11 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 }
 
 test_afk_start_refuses_when_flag_cannot_be_written
+test_afk_start_never_follows_flag_directory_symlink
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
+test_state_mutating_entrypoints_validate_before_access
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
@@ -1740,6 +1918,8 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale
 test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
+test_daemon_durable_writers_reject_final_symlinks
+test_daemon_watcher_stderr_uses_buffered_no_follow_append
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
@@ -1797,6 +1977,7 @@ test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
+test_canonical_supervisor_target_binds_tmux_pane_id
 test_pane_is_busy_herdr_native_busy_state
 test_pane_is_busy_herdr_falls_back_to_capture_regex
 test_pane_is_busy_herdr_idle_falls_back_to_capture_regex
@@ -1806,4 +1987,5 @@ test_inject_msg_herdr_busy_guard_defers
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
+test_away_injection_supports_every_runtime_backend
 test_inject_msg_defers_on_dead_shell_unknown

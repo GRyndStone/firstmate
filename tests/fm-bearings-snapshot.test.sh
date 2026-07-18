@@ -32,6 +32,9 @@ case "${1:-}" in
   # probe"): recorded windows are live except dead-marked ones, which the
   # inventory omits exactly like a killed real window.
   list-windows)
+    case "$*" in
+      *' -f '*) exit 0 ;;
+    esac
     for m in "${FM_HOME:-/nonexistent}"/state/*.meta; do
       [ -e "$m" ] || continue
       sed -n 's/^window=//p' "$m"
@@ -202,18 +205,187 @@ test_report_pointers_surface() {
   pass "current report pointers surface"
 }
 
-test_superseded_queued_item_dropped_by_default() {
+test_queued_prose_annotations_do_not_hide_tasks() {
   local home fakebin json
   home=$(make_home superseded); write_fixture "$home"
   fakebin=$(make_fakebin "$home")
   json=$(run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
-    (.gates | any(.[]; .id == "live-gate")) and (.gates | any(.[]; .id == "dead-gate") | not)
-  ' >/dev/null || fail "default gates must include live and drop superseded: $json"
-  json=$(run "$home" "$fakebin" --json --all-queued)
-  printf '%s' "$json" | jq -e '.gates | any(.[]; .id == "dead-gate")' >/dev/null \
-    || fail "--all-queued must restore the superseded item"
-  pass "superseded queued items are dropped by default and restored with --all-queued"
+    (.gates | any(.[]; .id == "live-gate" and .annotations == "-"))
+      and (.gates | any(.[]; .id == "dead-gate" and (.annotations | contains("NOT REQUIRED"))))
+  ' >/dev/null || fail "queued prose annotations hid a tasks-axi runnable record: $json"
+  pass "queued prose annotations are visible without changing task state"
+}
+
+test_endpoint_anomaly_kind_and_reason_surface() {
+  local home fakebin json
+  home=$(make_home endpoint-anomaly)
+  printf '## Queued\n' > "$home/data/backlog.md"
+  fm_write_meta "$home/state/cmux-task.meta" \
+    'backend=cmux' \
+    'window=ws-a:sf-a' \
+    'cmux_workspace_id=ws-a' \
+    'cmux_surface_id=sf-a' \
+    'worktree=/owned/worktree' \
+    'project=firstmate' \
+    'kind=ship' \
+    'mode=no-mistakes'
+  fakebin=$(make_fakebin "$home")
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/cmux"
+  chmod +x "$fakebin/cmux"
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .duplicate_endpoints == [{
+      id:"cmux-task",
+      kind:"inventory_unavailable",
+      backend:"cmux",
+      recorded:"ws-a:sf-a",
+      live:"",
+      worktree:"/owned/worktree",
+      reason:"cmux has no exact-home duplicate inventory; app-global sweep refused",
+      action:"inspect; do not auto-close"
+    }]
+  ' >/dev/null || fail "bearings dropped endpoint anomaly kind or reason: $json"
+  pass "bearings preserves endpoint anomaly kind and reason"
+}
+
+test_held_work_and_program_boundary_are_never_omitted() {
+  local home fakebin json
+  home=$(make_home held-program)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] live-dependency - Live dependency (repo: firstmate) (kind: ship)
+
+## Queued
+- [ ] held-gate - Held work (repo: firstmate) (kind: ship) (hold: captain review pending) (hold-kind: captain)
+- [ ] expired-gate - Expired work (repo: firstmate) (kind: ship) (hold: old schedule) (hold-kind: external) (hold-until: 2026-07-16)
+- [ ] active-blocked - Active blocked work (repo: firstmate) (kind: ship) blocked-by: live-dependency - still in flight
+- [ ] resolved-blocked - Resolved blocked work (repo: firstmate) (kind: ship) blocked-by: done-dependency - already landed
+
+## Done
+- [x] done-dependency - Done dependency (repo: firstmate) (kind: ship) (done 2026-07-16)
+EOF
+  printf '# Durable program\n\nMore obligations require decomposition.\n' > "$home/data/firstmate-program.md"
+  fakebin=$(make_fakebin "$home")
+  json=$(FM_FLEET_SNAPSHOT_TODAY=2026-07-17 run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.gates | any(.[]; .id == "held-gate" and .hold == "captain: captain review pending"))
+      and (.gates | any(.[]; .id == "expired-gate" and .hold == "-" and .blocked_by == "-" and .reason == "-"))
+      and (.gates | any(.[]; .id == "active-blocked" and .hold == "-" and .blocked_by == "live-dependency" and .reason == "still in flight"))
+      and (.gates | any(.[]; .id == "resolved-blocked" and .hold == "-" and .blocked_by == "-" and .reason == "-"))
+      and .program[0].runnable_candidates == 2
+      and .program[0].held == 1
+      and .program[0].blocked == 1
+      and .program[0].durable_sources == 1
+      and .program[0].decomposition == "requires_supervisor_judgment"
+      and (.program[0].boundary | contains("does not prove the durable program is complete"))
+      and ([.omitted[].surface] | index("superseded/held queued items") == null)
+  ' >/dev/null || fail "bearings omitted held work or the durable-program boundary: $json"
+  pass "bearings includes held work and warns when an empty runnable queue still has durable program sources"
+}
+
+test_program_source_paths_are_bounded_and_disclosed() {
+  local home fakebin json
+  home=$(make_home program-source-cap)
+  printf '## Queued\n' > "$home/data/backlog.md"
+  mkdir -p "$home/data/programs"
+  printf '# A\n' > "$home/data/a-program.md"
+  printf '# B\n' > "$home/data/b-program.md"
+  printf '# C\n' > "$home/data/programs/c.md"
+  fakebin=$(make_fakebin "$home")
+  json=$(FM_BEARINGS_PROGRAM_SOURCES=2 run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .program[0].durable_sources == 3
+      and .program[0].sources_shown == 2
+      and .program[0].source_paths == "a-program.md|b-program.md"
+      and .program[0].sources_truncated == true
+      and ([.omitted[] | select(.surface == "program sources showing 2 of 3" and .reveal == "raise FM_BEARINGS_PROGRAM_SOURCES")] | length) == 1
+  ' >/dev/null || fail "bearings did not retain bounded source paths with truncation disclosure: $json"
+  pass "bearings retains bounded program source paths and discloses truncation"
+}
+
+test_durable_obligations_are_bounded_and_disclosed() {
+  local home fakebin json expanded tab
+  home=$(make_home durable-obligations)
+  tab=$(printf '\t')
+  cat > "$home/data/backlog.md" <<EOF
+## In flight
+- [ ] live-dependency - Live dependency
+
+## Queued
+- [ ] held-obligation - Held obligation (hold: captain review) (hold-kind: captain)
+  NOT REQUIRED until the captain resolves the retained obligation.
+- [ ] blocked-obligation - Blocked obligation blocked-by: live-dependency - provider recovery
+  DEFERRED while the dependency remains active.
+ one-space raw obligation
+${tab}tab-prefixed raw obligation
+- [x] raw-obligation - Checked rows are durable raw queued prose, not tasks-axi tasks
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$home")
+  json=$(FM_BEARINGS_GATES=2 run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.gates | map(.id)) == ["held-obligation","blocked-obligation"]
+      and (.durable_obligations | length) == 2
+      and (.durable_obligations[0] | .id == "held-obligation" and .type == "held" and .reason == "captain review")
+      and (.durable_obligations[1] | .id == "blocked-obligation" and .type == "blocked" and .reason == "provider recovery")
+      and .program[0].unstructured_queued == 3
+      and .program[0].durable_obligations == 5
+      and ([.omitted[] | select(.surface == "durable obligations showing 2 of 5" and .reveal == "--all-queued")] | length) == 1
+  ' >/dev/null || fail "bearings dropped or failed to disclose durable obligations: $json"
+  expanded=$(FM_BEARINGS_GATES=2 run "$home" "$fakebin" --json --all-queued)
+  printf '%s' "$expanded" | jq -e '
+    (.durable_obligations | length) == 5
+      and (.durable_obligations | any(.[]; (.id | startswith("raw-")) and .type == "unstructured" and (.reason | contains("raw-obligation"))))
+      and (.durable_obligations | any(.[]; .type == "unstructured" and .reason == " one-space raw obligation"))
+      and (.durable_obligations | any(.[]; .type == "unstructured" and .reason == " tab-prefixed raw obligation"))
+      and ([.omitted[].surface | select(startswith("durable obligations showing"))] | length) == 0
+  ' >/dev/null || fail "--all-queued did not reveal the bounded raw obligation: $expanded"
+  pass "bearings surfaces active and raw durable obligations with bounded disclosure"
+}
+
+test_held_blocked_obligation_preserves_both_gates() {
+  local home fakebin json
+  home=$(make_home held-blocked-obligation)
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+- [ ] live-dependency - Live dependency
+
+## Queued
+- [ ] dual-gate - Dual gate (hold: captain review) (hold-kind: captain) blocked-by: live-dependency - provider recovery
+
+## Done
+EOF
+  fakebin=$(make_fakebin "$home")
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    .durable_obligations[] | select(.id == "dual-gate")
+    | .type == "held+blocked"
+      and .hold_reason == "captain review"
+      and .blocked_by == "live-dependency"
+      and .blocked_reason == "provider recovery"
+      and (.reason | contains("hold: captain review"))
+      and (.reason | contains("blocker live-dependency: provider recovery"))
+  ' >/dev/null || fail "held+blocked obligation dropped one of its active gates: $json"
+  pass "bearings preserves both hold and blocker detail for dual-gated obligations"
+}
+
+test_bearings_skill_routes_durable_obligations() {
+  local skill=$ROOT/.agents/skills/bearings/SKILL.md
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
+  grep -Fq 'Read every `durable_obligations` row even when `runnable_candidates` is zero.' "$skill" \
+    || fail "bearings skill does not require durable-obligation consumption"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
+  grep -Fq 'Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued** with both hold and blocker details when present' "$skill" \
+    || fail "bearings skill does not route gated durable obligations"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
+  grep -Fq 'route `unstructured` rows that require supervisor interpretation to **Plans / main pickup points**.' "$skill" \
+    || fail "bearings skill does not route unstructured durable obligations"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
+  grep -Fq 'When an `omitted` row says `durable obligations showing ...`, state that the projection is truncated and include its `reveal` action' "$skill" \
+    || fail "bearings skill does not disclose durable-obligation truncation"
+  pass "bearings skill routes durable obligations and truncation disclosure"
 }
 
 test_include_prs_is_the_only_fetch_path() {
@@ -253,7 +425,7 @@ test_perl_fallback_bounds_github_call() {
   fakebin=$(make_fakebin "$home")
   toolbin="$home/toolbin"
   mkdir -p "$toolbin"
-  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find; do
+  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mktemp rm rmdir awk; do
     ln -s "$(command -v "$cmd")" "$toolbin/$cmd"
   done
   started=$(date +%s)
@@ -298,13 +470,13 @@ test_section_caps_and_expansion_flags() {
     run "$home" "$fakebin" --json)
   printf '%s' "$json" | jq -e '
     (.in_flight|length) == 2 and (.decisions_open|length) == 2 and (.gates|length) == 2
-    and (.reports|length) == 2 and (.recorded_prs|length) == 2 and (.unhealthy_endpoints|length) == 2
+    and (.reports|length) == 2 and (.recorded_prs|length) == 2 and (.duplicate_endpoints|length) == 2
     and ([.omitted[].surface] | index("in_flight showing 2 of 5") != null)
     and ([.omitted[].surface] | index("decisions_open showing 2 of 5") != null)
     and ([.omitted[].surface] | index("gates showing 2 of 5") != null)
     and ([.omitted[].surface] | index("reports showing 2 of 5") != null)
     and ([.omitted[].surface] | index("recorded_prs showing 2 of 5") != null)
-    and ([.omitted[].surface] | index("unhealthy_endpoints showing 2 of 5") != null)
+    and ([.omitted[].surface] | index("duplicate_endpoints showing 2 of 5") != null)
   ' >/dev/null || fail "section caps or counted omissions are wrong: $json"
   expanded=$(FM_BEARINGS_IN_FLIGHT=2 FM_BEARINGS_DECISIONS=2 FM_BEARINGS_GATES=2 \
     FM_BEARINGS_REPORTS=2 FM_BEARINGS_RECORDED_PRS=2 FM_BEARINGS_UNHEALTHY=2 \
@@ -312,7 +484,7 @@ test_section_caps_and_expansion_flags() {
       --all-reports --all-recorded-prs --all-unhealthy)
   printf '%s' "$expanded" | jq -e '
     (.in_flight|length) == 5 and (.decisions_open|length) == 5 and (.gates|length) == 5
-    and (.reports|length) == 5 and (.recorded_prs|length) == 5 and (.unhealthy_endpoints|length) == 5
+    and (.reports|length) == 5 and (.recorded_prs|length) == 5 and (.duplicate_endpoints|length) == 5
   ' >/dev/null || fail "section expansion flags did not reveal full sets: $expanded"
   pass "all fleet-sized sections are capped with counted opt-in expansion"
 }
@@ -414,7 +586,13 @@ test_toon_json_parity
 test_completed_scout_report_not_pending
 test_open_decision_surfaces_end_to_end
 test_report_pointers_surface
-test_superseded_queued_item_dropped_by_default
+test_queued_prose_annotations_do_not_hide_tasks
+test_endpoint_anomaly_kind_and_reason_surface
+test_held_work_and_program_boundary_are_never_omitted
+test_program_source_paths_are_bounded_and_disclosed
+test_durable_obligations_are_bounded_and_disclosed
+test_held_blocked_obligation_preserves_both_gates
+test_bearings_skill_routes_durable_obligations
 test_include_prs_is_the_only_fetch_path
 test_partial_github_failure_degrades
 test_perl_fallback_bounds_github_call

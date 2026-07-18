@@ -79,7 +79,440 @@ test_existing_singleton_watcher_is_not_success() {
   pass "checkpoint rejects an existing watcher singleton as unowned"
 }
 
+test_interrupted_checkpoint_reaps_only_its_watcher() {
+  local home out err checkpoint_pid watcher_pid unrelated i status
+  home=$(make_home interrupted)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  sleep 30 &
+  unrelated=$!
+  FM_HOME="$home" FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" &
+  checkpoint_pid=$!
+  watcher_pid=
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$home/state/.watch.lock/pid" 2>/dev/null || true)
+    [ -n "$watcher_pid" ] && [ -s "$home/state/.watch.lock/owner-identity" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -n "$watcher_pid" ] || fail "interrupted checkpoint never recorded its watcher child"
+  [ "$(ps -p "$watcher_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')" = "$checkpoint_pid" ] \
+    || fail "watcher $watcher_pid was not the checkpoint's direct child"
+  [ "$(cat "$home/state/.watch.lock/owner-kind" 2>/dev/null || true)" = checkpoint ] \
+    || fail "checkpoint watcher did not record foreground ownership provenance"
+  [ "$(cat "$home/state/.watch.lock/owner-pid" 2>/dev/null || true)" = "$checkpoint_pid" ] \
+    || fail "checkpoint watcher ownership did not name the checkpoint process"
+  [ -s "$home/state/.watch.lock/owner-identity" ] \
+    || fail "checkpoint watcher ownership omitted the checkpoint process identity"
+
+  kill -TERM "$checkpoint_pid"
+  status=0
+  wait "$checkpoint_pid" || status=$?
+  expect_code 143 "$status" "interrupted checkpoint exit"
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    fail "watcher child $watcher_pid survived its interrupted checkpoint"
+  fi
+  assert_absent "$home/state/.watch.lock/pid" "interrupted checkpoint left a watcher lock"
+  kill -0 "$unrelated" 2>/dev/null || fail "checkpoint cleanup killed an unrelated process"
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+  pass "interrupted checkpoint reaps only its exact watcher child instead of orphaning it"
+}
+
+test_timeout_marks_then_kills_only_term_resistant_watcher() {
+  local home out err watcher pid_file order_file unrelated status started elapsed watcher_pid
+  home=$(make_home resistant-timeout)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/term-resistant-watch.sh"
+  pid_file="$home/watcher.pid"
+  order_file="$home/term-order"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap 'if [ -e "${FM_WATCH_CHECKPOINT_TIMEOUT_MARKER:-}" ]; then printf "marker-before-term\n" > "$WATCH_ORDER_FILE"; else printf "term-before-marker\n" > "$WATCH_ORDER_FILE"; fi' TERM
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+while :; do sleep 0.1; done
+SH
+  chmod +x "$watcher"
+  sleep 30 &
+  unrelated=$!
+  started=$SECONDS
+  status=0
+  WATCH_PID_FILE="$pid_file" WATCH_ORDER_FILE="$order_file" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 124 "$status" "TERM-resistant timeout exit"
+  [ "$(cat "$order_file" 2>/dev/null || true)" = marker-before-term ] \
+    || fail "timeout signaled the watcher before publishing its timeout marker"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  [ -n "$watcher_pid" ] || fail "TERM-resistant watcher did not record its pid"
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    fail "TERM-resistant watcher $watcher_pid survived bounded KILL escalation"
+  fi
+  [ "$elapsed" -lt 10 ] || fail "TERM-resistant timeout was not bounded (${elapsed}s)"
+  kill -0 "$unrelated" 2>/dev/null || fail "timeout escalation killed an unrelated process"
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+  pass "timeout marks before TERM, escalates exact watcher to KILL, and reaps it"
+}
+
+test_timeout_revalidates_watcher_birth_identity_before_escalation() {
+  local home out err watcher fakebin flip identity_log status
+  home=$(make_home identity-recheck)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/identity-changing-watch.sh"
+  fakebin="$home/fakebin"
+  flip="$home/identity-flipped"
+  identity_log="$home/identity.log"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap ': > "$WATCH_IDENTITY_FLIP"' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_IDENTITY_FLIP" ]; then
+  printf 'birth-identity-probed\n' >> "$WATCH_IDENTITY_LOG"
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" WATCH_IDENTITY_FLIP="$flip" WATCH_IDENTITY_LOG="$identity_log" \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "identity-changing timeout exit"
+  assert_contains "$(cat "$identity_log" 2>/dev/null || true)" "birth-identity-probed" \
+    "timeout escalation did not revalidate watcher birth identity after TERM"
+  pass "timeout escalation revalidates stable watcher birth identity before every later signal"
+}
+
+test_identity_capture_failure_never_signals_pid_fallback() {
+  local home out err watcher fakebin signaled launched status started elapsed
+  home=$(make_home identity-unavailable)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/short-watch.sh"
+  fakebin="$home/fakebin"
+  signaled="$home/watcher-signaled"
+  launched="$home/watcher-launched"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+trap ': > "$WATCH_SIGNAL_MARKER"' TERM INT HUP
+: > "$WATCH_LAUNCH_MARKER"
+sleep 2
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]]; then
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  started=$SECONDS
+  status=0
+  PATH="$fakebin:$PATH" WATCH_SIGNAL_MARKER="$signaled" WATCH_LAUNCH_MARKER="$launched" \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$CHECKPOINT" --seconds 30 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 1 "$status" "identity-unavailable checkpoint exit"
+  assert_absent "$signaled" "checkpoint signaled its watcher after birth identity capture failed"
+  assert_absent "$launched" "checkpoint launched the real watcher without exact child identity"
+  [ "$elapsed" -lt 5 ] || fail "identity capture failure waited indefinitely (${elapsed}s)"
+  assert_contains "$(cat "$err")" "exact checkpoint process identity could not be captured" \
+    "identity failure was not explained"
+  pass "birth-identity capture failure aborts before watcher launch without fallback signaling"
+}
+
+test_checkpoint_polls_process_identity_coarsely() {
+  local home out err fakebin probe_log status probe_count
+  home=$(make_home coarse-identity-poll)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  fakebin="$home/fakebin"
+  probe_log="$home/identity-probes.log"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]]; then
+  printf 'probe\n' >> "$WATCH_IDENTITY_PROBE_LOG"
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" WATCH_IDENTITY_PROBE_LOG="$probe_log" FM_HOME="$home" \
+    FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 2 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "coarse identity polling checkpoint"
+  probe_count=$(wc -l < "$probe_log" | tr -d '[:space:]')
+  [ "$probe_count" -le 12 ] \
+    || fail "checkpoint hot-polled process identity $probe_count times during two seconds"
+  pass "checkpoint polls process identity coarsely outside signal-time revalidation"
+}
+
+test_transient_identity_probe_failure_remains_bounded() {
+  local home out err watcher fakebin launched failed pid_file status started elapsed watcher_pid
+  home=$(make_home transient-identity)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/transient-watch.sh"
+  fakebin="$home/fakebin"
+  launched="$home/launched"
+  failed="$home/failed-once"
+  pid_file="$home/watcher.pid"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+: > "$WATCH_LAUNCHED"
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_LAUNCHED" ] && [ ! -e "$WATCH_FAILED_ONCE" ]; then
+  : > "$WATCH_FAILED_ONCE"
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  started=$SECONDS
+  PATH="$fakebin:$PATH" WATCH_LAUNCHED="$launched" WATCH_FAILED_ONCE="$failed" \
+    WATCH_PID_FILE="$pid_file" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 124 "$status" "transient identity-probe timeout"
+  assert_present "$failed" "fixture did not inject a transient identity failure"
+  [ "$elapsed" -lt 8 ] || fail "transient identity failure made checkpoint unbounded (${elapsed}s)"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  [ -z "$watcher_pid" ] || ! kill -0 "$watcher_pid" 2>/dev/null \
+    || fail "transient identity failure left the exact watcher child alive"
+  pass "transient watcher identity failures retry without fallback signaling or unbounded wait"
+}
+
+test_transient_liveness_probe_failure_is_not_treated_as_exit() {
+  local home out err watcher fakebin launched failed pid_file status started elapsed watcher_pid
+  home=$(make_home transient-liveness)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/liveness-watch.sh"
+  fakebin="$home/fakebin"
+  launched="$home/launched"
+  failed="$home/stat-failed-once"
+  pid_file="$home/watcher.pid"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+: > "$WATCH_LAUNCHED"
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o stat= "* ]] && [ -e "$WATCH_LAUNCHED" ] && [ ! -e "$WATCH_FAILED_ONCE" ]; then
+  : > "$WATCH_FAILED_ONCE"
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  started=$SECONDS
+  PATH="$fakebin:$PATH" FM_HOME="$home" WATCH_LAUNCHED="$launched" WATCH_FAILED_ONCE="$failed" \
+    WATCH_PID_FILE="$pid_file" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 124 "$status" "transient liveness-probe timeout"
+  assert_present "$failed" "fixture did not inject a transient liveness failure"
+  [ "$elapsed" -lt 8 ] || fail "transient liveness failure made checkpoint unbounded (${elapsed}s)"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  [ -z "$watcher_pid" ] || ! kill -0 "$watcher_pid" 2>/dev/null \
+    || fail "transient liveness failure left the exact watcher child alive"
+  pass "transient liveness probe failures remain unknown until bounded exact-child cleanup"
+}
+
+test_persistent_identity_uncertainty_is_durable_and_reconciled_by_arm() {
+  local home out err watcher fakebin launched pid_file status watcher_pid arm_out
+  home=$(make_home durable-orphan)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/uncertain-watch.sh"
+  fakebin="$home/fakebin"
+  launched="$home/launched"
+  pid_file="$home/watcher.pid"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+: > "$WATCH_LAUNCHED"
+printf '%s\n' "$$" > "$WATCH_PID_FILE"
+trap 'exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_LAUNCHED" ]; then
+  exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$home" WATCH_LAUNCHED="$launched" WATCH_PID_FILE="$pid_file" \
+    FM_WATCH_CHECKPOINT_WATCHER="$watcher" "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "persistent identity uncertainty timeout"
+  assert_contains "$(cat "$err")" "ORPHANED exact watcher" "persistent uncertainty was not surfaced loudly"
+  assert_present "$home/state/.watch-checkpoint-orphan" "checkpoint did not persist exact orphan ownership"
+  watcher_pid=$(cat "$pid_file" 2>/dev/null || true)
+  kill -0 "$watcher_pid" 2>/dev/null || fail "durably owned orphan watcher was not alive for reconciliation"
+  printf 'done: reconcile checkpoint orphan\n' > "$home/state/reconcile.status"
+  arm_out=$(FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$ROOT/bin/fm-watch-arm.sh" 2>&1) || fail "watcher arm did not reconcile durable checkpoint ownership: $arm_out"
+  assert_absent "$home/state/.watch-checkpoint-orphan" "watcher arm retained a reconciled orphan record"
+  kill -0 "$watcher_pid" 2>/dev/null && fail "watcher arm did not terminate the exact orphan identity"
+  assert_contains "$arm_out" "signal:" "watcher arm did not continue after orphan reconciliation"
+  pass "persistent checkpoint uncertainty transfers durable exact ownership to the next watcher arm"
+}
+
+test_checkpoint_admission_reconciles_retained_orphan_before_reserving() {
+  local home orphan_pid orphan_identity out err status
+  home=$(make_home admission-reconcile)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(FM_HOME="$home" bash -c '. "$1"; fm_pid_birth_identity "$2"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "$orphan_pid") || fail "could not capture retained orphan identity"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$home/state/.watch-checkpoint-orphan"
+  printf 'done: admission reconciliation\n' > "$home/state/admission.status"
+  status=0
+  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 5 > "$out" 2> "$err" || status=$?
+  expect_code 0 "$status" "checkpoint admission after retained orphan"
+  kill -0 "$orphan_pid" 2>/dev/null && fail "checkpoint admission left the retained exact orphan alive"
+  wait "$orphan_pid" 2>/dev/null || true
+  assert_absent "$home/state/.watch-checkpoint-orphan" \
+    "checkpoint admission did not release its reconciled reservation"
+  assert_contains "$(cat "$out")" "signal:" \
+    "checkpoint did not start after admission-time orphan reconciliation"
+  pass "checkpoint admission reconciles retained exact ownership before reserving a new watcher"
+}
+
+test_concurrent_checkpoint_cannot_share_orphan_authority() {
+  local home first_out first_err second_out first_pid status i record_kind
+  home=$(make_home concurrent-reservation)
+  first_out="$home/first-out.txt"
+  first_err="$home/first-err.txt"
+  FM_HOME="$home" FM_POLL=10 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 30 > "$first_out" 2> "$first_err" &
+  first_pid=$!
+  i=0
+  record_kind=
+  while [ "$i" -lt 100 ]; do
+    record_kind=$(sed -n '1p' "$home/state/.watch-checkpoint-orphan" 2>/dev/null || true)
+    [ "$record_kind" = active ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ "$record_kind" = active ] || fail "first checkpoint never activated its orphan reservation"
+  status=0
+  second_out=$(FM_HOME="$home" "$CHECKPOINT" --seconds 1 2>&1) || status=$?
+  expect_code 1 "$status" "concurrent checkpoint reservation"
+  assert_contains "$second_out" "another foreground checkpoint owns orphan authority" \
+    "concurrent checkpoint did not fail closed on the live reservation"
+  kill -TERM "$first_pid"
+  status=0
+  wait "$first_pid" || status=$?
+  expect_code 143 "$status" "reserved checkpoint interruption"
+  assert_absent "$home/state/.watch-checkpoint-orphan" \
+    "interrupted checkpoint retained its reservation after exact reap"
+  pass "one checkpoint atomically owns orphan authority from admission through exact reap"
+}
+
+test_checkpoint_refuses_symlinked_state_before_orphan_reconciliation() {
+  local home outside orphan_pid orphan_identity out status
+  home=$(make_home symlinked-orphan-state)
+  outside="$TMP_ROOT/symlinked-orphan-state-outside"
+  mkdir -p "$outside"
+  sleep 30 &
+  orphan_pid=$!
+  orphan_identity=$(LC_ALL=C ps -p "$orphan_pid" -o lstart= 2>/dev/null \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$orphan_identity" ] || fail "could not capture foreign orphan identity"
+  printf '%s\n%s\n' "$orphan_pid" "$orphan_identity" > "$outside/.watch-checkpoint-orphan"
+  rm -rf "$home/state"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(FM_HOME="$home" "$CHECKPOINT" --seconds 1 2>&1) || status=$?
+  expect_code 1 "$status" "checkpoint with symlinked orphan state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "checkpoint did not reject foreign orphan authority before reconciliation"
+  kill -0 "$orphan_pid" 2>/dev/null \
+    || fail "checkpoint signaled another home's orphan through symlinked state"
+  assert_present "$outside/.watch-checkpoint-orphan" \
+    "checkpoint cleared another home's orphan authority"
+  kill -TERM "$orphan_pid" 2>/dev/null || true
+  wait "$orphan_pid" 2>/dev/null || true
+  pass "checkpoint orphan authority rejects symlinked cross-home state"
+}
+
+test_term_delivery_is_recorded_only_after_exact_signal_succeeds() {
+  local home out err watcher fakebin launched count term_seen status
+  home=$(make_home term-retry)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  watcher="$home/term-retry-watch.sh"
+  fakebin="$home/fakebin"
+  launched="$home/launched"
+  count="$home/lstart-count"
+  term_seen="$home/term-seen"
+  mkdir -p "$fakebin"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+: > "$WATCH_LAUNCHED"
+trap ': > "$WATCH_TERM_SEEN"; exit 0' TERM
+while :; do sleep 0.1; done
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *" -o lstart= "* ]] && [ -e "$WATCH_LAUNCHED" ]; then
+  current=$(cat "$WATCH_LSTART_COUNT" 2>/dev/null || printf 0)
+  current=$((current + 1))
+  printf '%s\n' "$current" > "$WATCH_LSTART_COUNT"
+  [ "$current" -ne 2 ] || exit 1
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$watcher" "$fakebin/ps"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$home" WATCH_LAUNCHED="$launched" WATCH_LSTART_COUNT="$count" \
+    WATCH_TERM_SEEN="$term_seen" FM_WATCH_CHECKPOINT_WATCHER="$watcher" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "TERM identity retry timeout"
+  assert_present "$term_seen" "failed first TERM identity check suppressed the later exact TERM retry"
+  pass "checkpoint records TERM delivery only after the exact identity signal succeeds"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success
+test_interrupted_checkpoint_reaps_only_its_watcher
+test_timeout_marks_then_kills_only_term_resistant_watcher
+test_timeout_revalidates_watcher_birth_identity_before_escalation
+test_identity_capture_failure_never_signals_pid_fallback
+test_checkpoint_polls_process_identity_coarsely
+test_transient_identity_probe_failure_remains_bounded
+test_transient_liveness_probe_failure_is_not_treated_as_exit
+test_persistent_identity_uncertainty_is_durable_and_reconciled_by_arm
+test_checkpoint_admission_reconciles_retained_orphan_before_reserving
+test_concurrent_checkpoint_cannot_share_orphan_authority
+test_checkpoint_refuses_symlinked_state_before_orphan_reconciliation
+test_term_delivery_is_recorded_only_after_exact_signal_succeeds

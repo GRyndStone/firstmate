@@ -9,17 +9,46 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
-When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses its verbs for routine backlog mutations.
+When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses `bin/fm-backlog.sh` for routine backlog operations.
+That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
+The wrapper refuses `done` while owned task meta or unresolved teardown state exists, except for a complete current-version `backlog-done-started` stage whose exact endpoint is absent, whose parent worktree is absent or proved returned as the exact available Treehouse path for its project, whose auxiliary cleanup targets are absent, and whose ownership, force, outcome, record, and completion bindings are internally consistent.
+It refuses a scout report completion unless the exact owned report is a regular non-symlink file canonically contained beneath the selected home.
+`fm-teardown.sh` owns the supported completion order by validating the deliverable, closing the endpoint, tearing down the worktree, verifying each cleanup target absent or the exact Treehouse worktree returned available for its project, and only then entering the durable backlog mutation subphases.
+Before destructive cleanup it persists a staged completion binding and exact-backlog-record phase in canonically external state; the binding proves nothing by itself and is accepted only with the retained finalization stage plus independently confirmed cleanup.
+Cleanup ownership combines canonical path identity with a random task-owned marker outside worktree contents, so filesystem identity reuse cannot authorize removal of a replacement target.
+An interrupted retry refuses a changed backlog record and cannot inspect or remove a path after either ownership binding no longer matches.
+After independently confirmed cleanup, lifecycle state remains through serialized backlog finalization and is removed only after that mutation succeeds.
+Only `delivered-report`, `delivered-local`, `delivered-pr`, and `delivered-default` outcomes may enter Done; `discarded` and `unlanded` outcomes remain outside Done through a structured hold or reopen transition.
+Before automatic endpoint closure, teardown invokes the read-only duplicate owner described under [Runtime backend](#runtime-backend-configbackend--fm_backend) and refuses every reported anomaly, leaving exact reconciliation to the supervisor.
+Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
+If the Done mutation fails after teardown, the lifecycle is safely closed, finalization remains retryable, and the command fails loudly with the backlog outside Done.
+Manual backend mode suppresses the `TASKS_AXI: available` capability notice, while the wrapper remains the normal path for home-scoped reads, serialized mutations, and receipt-gated completion.
+Direct hand-editing is sanctioned only in manual mode when one operator has exclusive single-owner authority over the home, no executable backend wrapper or lock-backed mutation path is available, no other agent or session can mutate its backlog, and no completion binding, outstanding claim, or teardown stage exists for an affected task.
+Whenever the serialized wrapper or a lock-backed mutation path is available, every edit must route through it.
+Any concurrent-agent or multi-session mutation waits unless it can use that serialized path.
+Manual edits must never add, move, alter, or remove a Done record, because all completion and scout-report recording remains mechanically owned by `fm-teardown.sh` and receipt-gated `bin/fm-backlog.sh done`.
+Inspect the current record immediately before an allowed manual edit and preserve the existing backlog grammar exactly.
 Secondmate handoffs are separate and unconditional: `fm-backlog-handoff.sh` keeps only its own fleet-level validation and always delegates the item move to `tasks-axi mv`, the single owner of the backlog format.
+It acquires both homes' backlog locks in sorted absolute-path order before classification and holds them through the atomic move, preventing races on either file without deadlocking opposite handoffs.
 It moves in-scope `## Queued` items only and refuses `## In flight` and historical `## Done` records, which stay with their home for pruning or archiving.
 Handoff item bodies must use at least two leading spaces, and the helper refuses a selected item with a single-space or tab-indented continuation rather than risk orphaning it.
-Because bootstrap requires `tasks-axi` on `PATH` on every profile, that delegation works fleet-wide, and the `config/backlog-backend=manual` knob governs firstmate's own hand-editing of its backlog, not this validated helper.
+Bootstrap reports missing or incompatible `tasks-axi` on every profile, while `config/backlog-backend=manual` controls capability reporting and permits only the exclusive single-owner fallback above.
 Compatible means the shared bootstrap probe accepts `tasks-axi --version` as 0.1.1 or newer, `tasks-axi update --help` exposes `--archive-body`, and `tasks-axi mv --help` exposes `[<id>...]` for the atomic multi-ID move introduced in 0.2.2 and required by handoff delegation.
 That sentence is the single owner of the tasks-axi compatibility definition; every other document points here instead of restating the version gates.
 Bootstrap requires compatible `tasks-axi` on every profile; see "Toolchain" below for missing-tool reporting and `TASKS_AXI: available` behavior.
-Set the local, gitignored `config/backlog-backend` file to `manual` to force manual backlog editing and suppress `TASKS_AXI: available`, not missing-tool reporting.
+Set the local, gitignored `config/backlog-backend` file to `manual` to suppress `TASKS_AXI: available`, not missing-tool reporting or the requirement to serialize concurrent writers.
 Absent or `tasks-axi` selects the default tasks-axi backend.
 The file format is unchanged in both modes; tasks-axi and manual edits produce the same `## In flight`, `## Queued`, and `## Done` sections.
+`bin/fm-program-lib.sh` owns the convention that `data/program.md`, `data/*-program.md`, and `data/programs/*.md` are durable program-source pointers.
+Session-start recovery and the canonical fleet snapshot report them beside the backlog or structured runnable, held, and blocked queue counts.
+It deliberately does not interpret prose plans into obligations: when any source exists, decomposition status remains `requires_supervisor_judgment`, and an empty runnable queue is never reported as proof that the program is complete.
+
+## Effective state home scoping
+
+`bin/fm-wake-lib.sh` owns effective-state path validation and portable final-component no-follow publication for shell entry points.
+The audited state entry-point inventory is `bin/fm-afk-start.sh`, `bin/fm-lock.sh`, `bin/fm-bootstrap.sh`, `bin/fm-config-push.sh`, `bin/fm-pr-check.sh`, `bin/fm-merge-local.sh`, `bin/fm-update.sh`, `bin/fm-promote.sh`, `bin/fm-send.sh`, `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-watch-checkpoint.sh`, `bin/fm-supervise-daemon.sh`, `bin/fm-guard.sh`, `bin/fm-wake-drain.sh`, `bin/fm-turnend-guard.sh`, `bin/fm-turnend-guard-grok.sh`, `bin/fm-turnend-guard-grok-deliver.sh`, `bin/fm-crew-state.sh`, `bin/fm-backlog.sh`, `bin/fm-backlog-handoff.sh`, `bin/fm-spawn.sh`, `bin/fm-teardown.sh`, `bin/fm-endpoint-audit.sh`, `bin/fm-fleet-snapshot.sh`, `bin/fm-session-start.sh`, `bin/fm-x-poll.sh`, `bin/fm-x-reply.sh`, `bin/fm-x-dismiss.sh`, `bin/fm-x-link.sh`, `bin/fm-x-followup.sh`, `.opencode/plugins/fm-primary-watch-arm.js`, `.opencode/plugins/fm-primary-turnend-guard.js`, `.pi/extensions/fm-primary-pi-watch.ts`, and `.pi/extensions/fm-primary-turnend-guard.ts`.
+Every listed entry point must normalize only a verified operating-system `/var` or `/tmp` alias to its physical path, reject every other symlinked effective-state path component before its first state read or mutation, reject symlinked or non-regular task metadata before parsing or backend lookup, and use no-follow publication for durable final targets it owns.
+The daemon buffers watcher stderr in an owned temporary file and appends it to `state/.supervise-daemon.watcher.err` through the shared no-follow publication helper after the watcher exits, so the watcher remains the directly supervised child without making Perl a launch-time dependency.
 
 ## Runtime backend (config/backend / FM_BACKEND)
 
@@ -41,6 +70,8 @@ A zellij spawn additionally version-gates against the installed `zellij` binary'
 A cmux spawn additionally version-gates against the installed `cmux` binary's version, requires `jq`, and requires the control socket to be reachable and accessible (see [`docs/cmux-backend.md`](cmux-backend.md) "Setup" for the one-time socket-access configuration this needs; Automation mode is the recommended socket control mode, with Password mode supported via `config/cmux-socket-password`), refusing loudly and non-retryably on a `cmuxOnly`/unauthenticated socket.
 A backend spawn refusal from a missing dependency, version gate, or unauthenticated socket is terminal for that selected backend; firstmate surfaces it as a blocker instead of silently retrying another backend.
 Task meta records `backend=` only for a non-default backend; an absent `backend=` means `tmux`, preserving existing default-path meta files.
+A tmux task records its stable `window=@<window-id>` lifecycle target together with `tmux_window_id=`, `tmux_session=`, and `tmux_home_identity=`, the canonical-home digest also stored on its window for exact-home inventory filtering.
+A locked session start adopts a fully legacy `session:fm-<id>` tmux record only when exactly one matching window in that session is untagged or already belongs to the active home; it then tags the window and atomically records the stable id, while partial or ambiguous legacy state remains unknown.
 A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
 A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
 An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
@@ -54,6 +85,16 @@ These five sentences are the single owner of the task-selector vocabulary; backe
 `fm-teardown.sh <id>` takes a task id directly and uses the same recorded backend target fields after loading `state/<id>.meta`.
 Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
+`bin/fm-endpoint-audit.sh` is the read-only recovery owner for duplicate endpoints on backends with an exact-home inventory boundary.
+For Herdr it queries only sessions and exact workspace ids named by the active home's own meta.
+For tmux it queries only windows matching both the recorded task label and the active home's recorded identity inside the exact named session, while lifecycle operations target the recorded stable window id.
+It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
+For Zellij, Orca, and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global endpoint namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
+The separate teardown-grade endpoint probe is tri-state: tmux and Herdr classify only the exact meta-bound home target, Orca classifies its exact recorded terminal from validated success or typed not-found responses, and every unreadable or malformed result is `unknown` rather than absent.
+Zellij and cmux return `unknown` from that lifecycle probe because their available inventories cannot prove exact-home absence without reading a shared or app-global namespace.
+Orca's exact-terminal tri-state does not prove that no replacement or duplicate terminal exists, so its duplicate audit remains `inventory_unavailable` and current teardown fails closed before closure.
+Zellij lifecycle finalization follows the fail-closed exact-home boundary in [`docs/zellij-backend.md`](zellij-backend.md#teardown-absence-boundary).
+Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.
 For normal zellij operations, `FM_ZELLIJ_SESSION` selects the named session and defaults to `firstmate`.
@@ -67,12 +108,12 @@ The `config/backend` file is not inherited by secondmate homes.
 ## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
 
 The `/afk` sub-supervisor injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
-It currently supports only `tmux` and `herdr` supervisor panes.
-Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
+It supports `tmux`, `herdr`, `zellij`, `orca`, and `cmux` supervisor endpoints through the shared backend existence, capture, composer, and verified-submit operations.
+Set `FM_SUPERVISOR_BACKEND=<backend>` and `FM_SUPERVISOR_TARGET=<exact-target>` to override both axes explicitly.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
 That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
 Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the legacy `firstmate:0` tmux fallback with a warning.
-Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
+Zellij, Orca, and cmux have no ambient supervisor-target discovery, so they require both explicit values; an unknown backend or an unresolved target refuses at daemon startup.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
@@ -213,7 +254,7 @@ When bootstrap resolves `backend=orca` from `FM_BACKEND` or `config/backend`, it
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.
-An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available` and firstmate uses its verbs for routine backlog mutations, otherwise it hand-edits `data/backlog.md` until installation is approved and completed.
+An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available`, while any manual fallback remains governed by the backlog-backend contract above.
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still degrades to the first profile at runtime when quota data is unavailable.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
@@ -372,8 +413,8 @@ FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line onc
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
-FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
-FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
+FM_SUPERVISOR_BACKEND=             # optional supervisor backend override: tmux|herdr|zellij|orca|cmux; ambient detection covers tmux/herdr only, and other backends require this plus FM_SUPERVISOR_TARGET
+FM_SUPERVISOR_TARGET=              # optional exact supervisor endpoint override; otherwise auto-detected only from tmux/herdr markers before the legacy tmux fallback
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
 FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
 FM_MAX_DEFER_SECS=300              # max buffered escalation age before retry plus wedge alarm; 0 disables

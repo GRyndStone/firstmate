@@ -13,7 +13,8 @@
 #   backlog: {path,present,records[]} where records are ordered as written in
 #     data/backlog.md and cover In flight, Queued, and Done.
 #     Canonical tasks-axi rows are structured; free-form non-empty lines in
-#     those sections are preserved as unstructured records.
+#     those sections are preserved as unstructured records; structured rows
+#     expose raw tags plus active_hold, active_blocked_by_ids, and runnable.
 #   tasks[]: one row per state/<id>.meta, sorted by id.
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately.
@@ -27,6 +28,11 @@
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
 #   scout_reports[]: present data/<id>/report.md pointers.
+#   endpoint_anomalies[]: deterministic same-home duplicate endpoint findings.
+#   program_sources[]: durable data/program.md, data/*-program.md, and
+#     data/programs/*.md pointers.
+#   queue_accounting: runnable candidates, held/blocked queued work, and the
+#     explicit supervisor-judgment boundary for program decomposition.
 #   secondmate_guidance: return-channel action note for renderers and bearings.
 #
 # Compatibility: JSON is the primary machine-readable surface.
@@ -41,6 +47,14 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 BACKLOG="$DATA/backlog.md"
+TODAY=${FM_FLEET_SNAPSHOT_TODAY:-$(date +%Y-%m-%d)}
+
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
+FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
@@ -48,6 +62,9 @@ BACKLOG="$DATA/backlog.md"
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-program-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-program-lib.sh"
 
 usage() {
   cat <<'EOF'
@@ -65,6 +82,13 @@ case "${1:---json}" in
 esac
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
+
+ENDPOINT_ANOMALIES_JSON=$(
+  FM_ROOT_OVERRIDE="$FM_ROOT" \
+    FM_HOME="$FM_HOME" \
+    FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
+) || exit 1
 
 bool_json() {
   if [ "$1" = 1 ]; then printf 'true'; else printf 'false'; fi
@@ -149,9 +173,10 @@ backlog_json() {
   jq -Rn --arg path "$BACKLOG" '
     def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
     def section_state:
-      if . == "In flight" then "in_flight"
-      elif . == "Queued" then "queued"
-      elif . == "Done" then "done"
+      ascii_downcase
+      | if . == "in flight" then "in_flight"
+      elif . == "queued" then "queued"
+      elif startswith("done") then "done"
       else null end;
     def cap($rest; $re):
       (((($rest | capture($re)?) // {}) | .v) // null) as $v
@@ -160,6 +185,75 @@ backlog_json() {
       cap($rest; ".*(?:\\(|,[[:space:]]*)" + $key + ":[[:space:]]*(?<v>[^,)]*)");
     def metadata_word($rest; $key):
       cap($rest; ".*(?:\\(|,[[:space:]]*)" + $key + "[[:space:]]+(?<v>[^,)]*)");
+    def dep_re:
+      "[[:space:]]*(?<type>blocked-by|parent|discovered-from):[[:space:]]*(?<id>[A-Za-z0-9][A-Za-z0-9._-]*)(?:[[:space:]]+-[[:space:]]+(?<reason>(?:(?![[:space:]]+(?:blocked-by|parent|discovered-from):[[:space:]]).)+?))?[[:space:]]*$";
+    def repo_re: "[[:space:]]*\\((?:[^()]*\\+[[:space:]]*)?repo:[[:space:]]*(?<value>[^)]+)\\)[[:space:]]*$";
+    def kind_re: "[[:space:]]*\\(kind:[[:space:]]*(?<value>[^)]+)\\)[[:space:]]*$";
+    def priority_re: "[[:space:]]*\\(priority:[[:space:]]*(?<value>[0-4])\\)[[:space:]]*$";
+    def since_re: "[[:space:]]*\\(since[[:space:]]+(?<value>[0-9]{4}-[0-9]{2}-[0-9]{2})\\)[[:space:]]*$";
+    def closed_re: "[[:space:]]*\\((?<verb>merged|reported|done|closed)[[:space:]]+(?<value>[0-9]{4}-[0-9]{2}-[0-9]{2})\\)[[:space:]]*$";
+    def hold_until_re: "[[:space:]]*\\(hold-until:[[:space:]]*(?<value>[0-9]{4}-[0-9]{2}-[0-9]{2})\\)[[:space:]]*$";
+    def hold_kind_re: "[[:space:]]*\\(hold-kind:[[:space:]]*(?<value>captain|external|load|parked|future)\\)[[:space:]]*$";
+    def hold_re: "[[:space:]]*\\(hold:[[:space:]]*(?<value>[^()]+)\\)[[:space:]]*$";
+    def peel_tags:
+      ((.title | capture(dep_re)?) // null) as $dep
+      | if $dep != null then
+          .title |= sub(dep_re; "")
+          | .deps = ([{type:$dep.type,id:$dep.id} + (if $dep.reason == null then {} else {reason:($dep.reason | trim)} end)] + .deps)
+          | peel_tags
+        else ((.title | capture(repo_re)?) // null) as $repo
+        | if $repo != null then
+            .title |= sub(repo_re; "")
+            | .repo = (.repo // ($repo.value | trim))
+            | peel_tags
+          else ((.title | capture(kind_re)?) // null) as $kind
+          | if $kind != null then
+              .title |= sub(kind_re; "")
+              | .kind = (.kind // ($kind.value | trim))
+              | peel_tags
+            else ((.title | capture(priority_re)?) // null) as $priority
+            | if $priority != null then
+                .title |= sub(priority_re; "")
+                | .priority = (.priority // ($priority.value | tonumber))
+                | peel_tags
+              else ((.title | capture(since_re)?) // null) as $since
+              | if $since != null then
+                  .title |= sub(since_re; "")
+                  | .since = (.since // $since.value)
+                  | peel_tags
+                else ((.title | capture(closed_re)?) // null) as $closed
+                | if $closed != null then
+                    .title |= sub(closed_re; "")
+                    | .closed = (.closed // {verb:$closed.verb,date:$closed.value})
+                    | peel_tags
+                  else ((.title | capture(hold_until_re)?) // null) as $hold_until
+                  | if $hold_until != null then
+                      .title |= sub(hold_until_re; "")
+                      | .hold_until = (.hold_until // $hold_until.value)
+                      | peel_tags
+                    else ((.title | capture(hold_kind_re)?) // null) as $hold_kind
+                    | if $hold_kind != null then
+                        .title |= sub(hold_kind_re; "")
+                        | .hold_kind = (.hold_kind // $hold_kind.value)
+                        | peel_tags
+                      else ((.title | capture(hold_re)?) // null) as $hold
+                      | if $hold != null then
+                          .title |= sub(hold_re; "")
+                          | .hold = (.hold // ($hold.value | trim))
+                          | peel_tags
+                        else . end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end;
+    def tags($rest):
+      {title:$rest,repo:null,kind:null,priority:null,since:null,closed:null,hold:null,hold_kind:null,hold_until:null,deps:[]}
+      | peel_tags
+      | .title |= trim;
     def url_pattern: "https?://[^[:space:])\"<>]+";
     def wrapped_url_pattern: "<?" + url_pattern + ">?";
     def links($rest): [$rest | scan(url_pattern)];
@@ -177,97 +271,110 @@ backlog_json() {
       | strip_title_artifacts
       | gsub("[[:space:]]+"; " ")
       | trim;
-    def title_of($rest):
-      $rest
+    def title_of($title):
+      $title
       | gsub(wrapped_url_pattern; "")
-      | sub("[[:space:]]*blocked-by:[[:space:]]+[^[:space:])]+[[:space:]]+-[[:space:]]+.*$"; "")
-      | gsub("[[:space:]]*blocked-by:[[:space:]]+[^[:space:]]+"; "")
       | clean_title;
-    def blocked_reason($rest):
-      cap($rest; ".*blocked-by:[[:space:]]*[^[:space:])]+[[:space:]]+-[[:space:]]*(?<v>.*)$") as $reason
-      | if $reason == null then null
-        else ($reason | clean_title | if . == "" then null else . end)
-        end;
-    def local_note($rest):
-      cap(($rest | strip_trailing_metadata); ".*(?:^|[[:space:]]+-[[:space:]]+|[[:space:]])(?<v>local main)$");
-    def completion($rest):
+    def blocked_deps($tags): [$tags.deps[] | select(.type == "blocked-by")];
+    def local_note($title):
+      cap(($title | strip_trailing_metadata); ".*(?:^|[[:space:]]+-[[:space:]]+|[[:space:]])(?<v>local main)$");
+    def completion($rest; $tags):
       (metadata_word($rest; "merged")) as $merged
       | (metadata_word($rest; "reported")) as $reported
       | (metadata_word($rest; "done")) as $done
-      | if $merged != null then {verb:"merged",date:$merged}
+      | if $tags.closed != null then $tags.closed
+        elif $merged != null then {verb:"merged",date:$merged}
         elif $reported != null then {verb:"reported",date:$reported}
         elif $done != null then {verb:"done",date:$done}
         else {verb:null,date:null} end;
-    def row_match($line):
-      (($line | capture("^[-*][[:space:]]+\\[(?<check>[ xX])\\][[:space:]]+(?<id>[^[:space:]]+)[[:space:]]+-[[:space:]]+(?<rest>.*)$")?) //
-       (($line | capture("^[-*][[:space:]]+\\*\\*(?<id>[^*]+)\\*\\*[[:space:]]+-[[:space:]]+(?<rest>.*)$")?)
-        | if . == null then null else . + {check:" "} end));
-    def structured_row($line):
-      ($line | test("^[-*][[:space:]]+\\[[ xX]\\][[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+"))
-      or ($line | test("^[-*][[:space:]]+\\*\\*[^*]+\\*\\*[[:space:]]+-[[:space:]]+"));
+    def unchecked_row($line):
+      (($line | capture("^- \\[ \\] (?<id>[A-Za-z0-9][A-Za-z0-9._-]*) - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:" "} end;
+    def legacy_in_flight_row($line):
+      (($line | capture("^- \\*\\*(?<id>[A-Za-z0-9][A-Za-z0-9._-]*)\\*\\* - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:" "} end;
+    def done_row($line):
+      (($line | capture("^- \\[x\\] (?<id>[A-Za-z0-9][A-Za-z0-9._-]*) - (?<rest>.*)$")?) // null) as $match
+      | if $match == null then null else $match + {check:"x"} end;
+    def row_match($line; $section):
+      if $section == "queued" then unchecked_row($line)
+      elif $section == "in_flight" then (unchecked_row($line) // legacy_in_flight_row($line))
+      elif $section == "done" then done_row($line)
+      else null end;
+    def structured_row($line; $section): row_match($line; $section) != null;
     def parse_row($line; $section; $order):
-      row_match($line) as $m
+      row_match($line; $section) as $m
       | if $m == null then
           {order:$order,state:$section,structured:false,id:null,raw:$line,body_lines:[],body_excerpt:null}
         else
           ($m.rest) as $rest
+          | tags($rest) as $tags
+          | blocked_deps($tags) as $blockers
           | {order:$order,
              state:$section,
              structured:true,
              id:($m.id | trim),
              checked:($m.check | test("[xX]")),
-             title:title_of($rest),
+             title:title_of($tags.title),
              repo:metadata($rest; "repo"),
-             kind:metadata($rest; "kind"),
-             priority:metadata($rest; "priority"),
-             blocked_by:cap($rest; ".*blocked-by:[[:space:]]*(?<v>[^[:space:])]+).*"),
-             blocked_reason:blocked_reason($rest),
-             since:metadata_word($rest; "since"),
-             merged:metadata_word($rest; "merged"),
-             reported:metadata_word($rest; "reported"),
-             done:metadata_word($rest; "done"),
-             completion:completion($rest),
+             kind:(metadata($rest; "kind") // $tags.kind),
+             priority:(metadata($rest; "priority") // (if $tags.priority == null then null else ($tags.priority | tostring) end)),
+             hold:$tags.hold,
+             hold_kind:$tags.hold_kind,
+             hold_until:$tags.hold_until,
+             deps:$tags.deps,
+             blocked_by:($blockers[0].id // null),
+             blocked_by_ids:[$blockers[].id],
+             blocked_reason:($blockers[0].reason // null),
+             since:(metadata_word($rest; "since") // $tags.since),
+             merged:(metadata_word($rest; "merged") // (if $tags.closed.verb == "merged" then $tags.closed.date else null end)),
+             reported:(metadata_word($rest; "reported") // (if $tags.closed.verb == "reported" then $tags.closed.date else null end)),
+             done:(metadata_word($rest; "done") // (if $tags.closed.verb == "done" then $tags.closed.date else null end)),
+             completion:completion($rest; $tags),
              links:links($rest),
              pr_url:((links($rest) | map(select(test("/pull/[0-9]+"))) | .[0]) // null),
              report_path:cap($rest; ".*(?<v>data/[^[:space:])]+/report\\.md).*"),
-             local_note:local_note($rest),
+             local_note:local_note($tags.title),
              raw:$line,
              body_lines:[],
              body_excerpt:null}
         end;
     reduce inputs as $line
-      ({path:$path,present:true,records:[],section:null,order:0};
+      ({path:$path,present:true,records:[],section:null,order:0,body_open:false};
        if ($line | test("^##[[:space:]]+")) then
          .section = (($line | sub("^##[[:space:]]+";"") | trim) | section_state)
+         | .body_open = false
        elif .section == null or ($line | trim) == "" then
          .
-       elif structured_row($line) then
+       elif structured_row($line; .section) then
          .order += 1
          | .records += [parse_row($line; .section; .order)]
-       elif ((.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^[[:space:]]+"))) then
-         ($line | trim) as $body
+         | .body_open = true
+       elif (.body_open == true and (.records | length) > 0 and (.records[-1].structured == true) and ($line | test("^  "))) then
+         ($line | sub("^  ";"")) as $body
          | if $body == "" then .
            else .records[-1].body_lines += [$body] end
        else
          .order += 1
          | .records += [{order:.order,state:.section,structured:false,id:null,raw:$line,body_lines:[],body_excerpt:null}]
+         | .body_open = false
        end)
     | .records |= map(
         if (.body_lines | length) > 0 then
           .body_excerpt = ((.body_lines | join(" "))[:240])
         else . end)
-    | del(.section,.order)
+    | del(.section,.order,.body_open)
   ' < "$BACKLOG"
 }
 
 task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
-  local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
+  local pr pr_source event_json current_json endpoint_exists endpoint_state agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
   for meta in "$STATE"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     id=$(basename "$meta" .meta)
     kind=$(meta_value "$meta" kind)
     [ -n "$kind" ] || kind=ship
@@ -293,7 +400,22 @@ task_json_lines() {
       pr_source=absent
     fi
 
-    current_json=$(crew_state_json "$id")
+    endpoint_exists=null
+    endpoint_state=unknown
+    if [ -n "$target" ]; then
+      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+      case "$endpoint_state" in
+        present) endpoint_exists=true ;;
+        absent) endpoint_exists=false ;;
+        *) endpoint_exists=null ;;
+      esac
+    fi
+    if [ -n "$target" ]; then
+      current_json=$(crew_state_json "$id")
+    else
+      current_json=$(jq -n --arg detail "task has no recorded endpoint target" \
+        '{state:"unknown",source:"endpoint",detail:$detail,raw:""}')
+    fi
     event_json=$(status_event_json "$status_log")
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
     current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
@@ -330,16 +452,8 @@ task_json_lines() {
     pending_decision=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "needs-decision") then 1 else 0 end')
     blocked_event=$(printf '%s' "$open_decisions_json" | jq 'if any(.[]; .verb == "blocked") then 1 else 0 end')
 
-    endpoint_exists=null
-    if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
-        endpoint_exists=true
-      else
-        endpoint_exists=false
-      fi
-    fi
     agent_alive=not_checked
-    if [ "$kind" = secondmate ] && [ -n "$target" ]; then
+    if [ "$kind" = secondmate ] && [ "${endpoint_state:-unknown}" = present ]; then
       agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)
     fi
 
@@ -432,9 +546,18 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
+program_source_lines() {
+  local relative source
+  while IFS=$'\t' read -r relative source; do
+    [ -n "$source" ] || continue
+    jq -n --arg path "$source" --arg relative "$relative" '{path:$path,relative_path:$relative}'
+  done < <(fm_program_source_lines "$DATA" "$FM_HOME") | jq -s 'sort_by(.relative_path)'
+}
+
 BACKLOG_JSON=$(backlog_json)
 TASKS_JSON=$(task_json_lines)
 SCOUT_REPORTS_JSON=$(scout_report_lines)
+PROGRAM_SOURCES_JSON=$(program_source_lines)
 
 jq -n \
   --arg fm_home "$FM_HOME" \
@@ -443,19 +566,66 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
+  --arg today "$TODAY" \
   --argjson backlog "$BACKLOG_JSON" \
   --argjson tasks "$TASKS_JSON" \
   --argjson scout_reports "$SCOUT_REPORTS_JSON" \
-  'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+  --argjson program_sources "$PROGRAM_SOURCES_JSON" \
+  --argjson endpoint_anomalies "$ENDPOINT_ANOMALIES_JSON" \
+  'def raw_blocker_ids($record):
+     ($record.blocked_by_ids // (if ($record.blocked_by // "") == "" then [] else [$record.blocked_by] end));
+   def active_blocker_ids($record; $records):
+     if $record.state == "done" then []
+     else raw_blocker_ids($record) as $ids
+     | [$ids[] as $id
+        | select(any($records[]?;
+                     .structured == true
+                     and .state != "done"
+                     and .id == $id))
+        | $id]
+     end;
+   def annotate_record($record; $records):
+     if $record.structured != true then $record
+     else active_blocker_ids($record; $records) as $active_ids
+     | (((($record.hold // "") != "")
+         and $record.state != "done"
+         and ((($record.hold_until // "") == "") or (($record.hold_until // "") > $today)))) as $active_hold
+     | $record + {
+         active_hold:$active_hold,
+         active_blocked_by_ids:$active_ids,
+         active_blocked_by:($active_ids[0] // null),
+         active_blocked_reason:([$record.deps[]?
+                                 | select(.type == "blocked-by" and .id == ($active_ids[0] // null))
+                                 | .reason][0] // null),
+         active_blocked:($active_ids | length > 0),
+         runnable:($record.state == "queued" and ($active_hold | not) and (($active_ids | length) == 0))
+       }
+     end;
+   ($backlog | .records as $records | .records |= map(annotate_record(.; $records))) as $derived_backlog
+   | def backlog_by_id($id): ($derived_backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
    {
      schema:"fm-fleet-snapshot.v1",
      fm_home:$fm_home,
      roots:{fm_root:$fm_root,state:$state,data:$data,config:$config,projects:$projects},
-     backlog:$backlog,
+     backlog:$derived_backlog,
      tasks:($tasks | map(. + {backlog:backlog_by_id(.id)})),
      scout_reports:($scout_reports | map(. + {kind:report_kind(.id)})),
+     endpoint_anomalies:$endpoint_anomalies,
+     program_sources:$program_sources,
+     queue_accounting:{
+       queued_total:([$derived_backlog.records[]? | select(.state == "queued")] | length),
+       structured_queued:([$derived_backlog.records[]? | select(.state == "queued" and .structured == true)] | length),
+       unstructured_queued:([$derived_backlog.records[]? | select(.state == "queued" and .structured != true)] | length),
+       held:([$derived_backlog.records[]? | select(.state == "queued" and .structured == true and .active_hold)] | length),
+       blocked:([$derived_backlog.records[]? | select(.state == "queued" and .structured == true and .active_blocked)] | length),
+       runnable_candidates:([$derived_backlog.records[]? | select(.state == "queued" and .structured == true and .runnable)] | length),
+       empty_runnable_queue:(([$derived_backlog.records[]? | select(.state == "queued" and .structured == true and .runnable)] | length) == 0),
+       durable_program_source_count:($program_sources | length),
+       decomposition_status:(if ($program_sources | length) > 0 then "requires_supervisor_judgment" else "no_declared_program_sources" end),
+       supervisor_boundary:(if ($program_sources | length) > 0 then "An empty runnable queue does not prove the durable program is complete; audit each program source for obligations that were never materialized as backlog tasks." else "No convention-named durable program source was found; absence does not prove that no plan exists elsewhere." end)
+     },
      secondmate_guidance:{
        note:"For kind=secondmate, send marked supervisor requests with fm-send and read the status/doc return channel; do not routinely fm-peek the secondmate chat for answers."
      }

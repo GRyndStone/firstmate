@@ -17,6 +17,7 @@
 # suite sets its own (e.g. the watcher-lock guard-banner cases).
 if [ -z "${FM_ROOT_OVERRIDE:-}" ]; then
   FM_ROOT_OVERRIDE="$(fm_test_tmproot fm-wake-tangle-root)"
+  mkdir -p "$FM_ROOT_OVERRIDE"
   export FM_ROOT_OVERRIDE
 fi
 
@@ -102,7 +103,7 @@ exit 1
 SH
   chmod +x "$fakebin/tmux"
   make_fake_crew_state "$fakebin" >/dev/null
-  printf '%s\n' "$dir"
+  (cd "$dir" && pwd -P)
 }
 
 # Install a hermetic fake fm-crew-state.sh into <fakebin> and echo its path. The
@@ -213,7 +214,7 @@ esac
 exit 1
 SH
   chmod +x "$fakebin/tmux"
-  printf '%s\n' "$dir"
+  (cd "$dir" && pwd -P)
 }
 
 make_bordered_case() {
@@ -265,7 +266,7 @@ esac
 exit 1
 SH
   chmod +x "$fakebin/tmux"
-  printf '%s\n' "$dir"
+  (cd "$dir" && pwd -P)
 }
 
 wait_for_exit() {

@@ -28,12 +28,13 @@ You do not need to open the app for routine supervision: from an active firstmat
 
 Verify it works by spawning a trivial task with `--backend orca` and confirming the task's meta records `backend=orca`, `terminal=`, `orca_worktree_id=`, and `worktree=`; the Orca app should show a new terminal for the task.
 
-Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semantics need a separate design), Escape is unsupported, Orca is macOS-only and explicit-only, and it exposes no stable CLI version marker, so spawn gates on runtime reachability instead of a version floor - see "Limitations" below for the complete list.
+Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semantics need a separate design), Escape is unsupported, Orca is macOS-only and explicit-only, it exposes no stable CLI version marker, and current teardown refuses at the unavailable exact-home duplicate-inventory boundary - see "Limitations" below for the complete list.
 
 ## Status
 
 PR #210 landed the primitive Orca terminal adapter: bounded capture, text send, Enter, Ctrl-C interrupt, and close for already-created Orca terminals.
-This follow-up adds full ship/scout task lifecycle support for `backend=orca`: spawn, metadata, send/peek/watch/crew-state routing from metadata, and guarded teardown through Orca.
+This follow-up originally added ship/scout spawn, metadata, send/peek/watch/crew-state routing, and guarded teardown primitives for `backend=orca`.
+Current lifecycle finalization is narrower because the fleet-wide exact-home audit now fails closed before an Orca close; the boundary below supersedes that original full-lifecycle claim.
 
 Orca remains explicit-only.
 Select it by putting `orca` in a local `config/backend` file, by exporting `FM_BACKEND=orca`, or by telling the first mate in chat to use Orca.
@@ -89,7 +90,9 @@ Teardown:
 - Scout teardown still requires `data/<id>/report.md` unless `--force` is explicitly used.
 - Ship teardown still refuses dirty or unlanded work before any terminal/worktree cleanup.
 - Ship teardown resolves `orca_worktree_id` back through Orca and verifies it matches the inspected `worktree=` path before removing anything; mismatches or uninspectable paths preserve metadata and fail closed.
-- After the existing firstmate safety checks pass, teardown closes the recorded Orca terminal and releases the recorded worktree through `orca worktree rm --worktree id:<orca_worktree_id> --force`.
+- Before closure, `bin/fm-endpoint-audit.sh` reports `inventory_unavailable` because Orca exposes no verified exact-worktree terminal inventory that can find replacements or duplicates without an app-global sweep.
+- Current `fm-teardown.sh` therefore refuses before closing the terminal or removing the worktree; a typed not-found response can prove the recorded terminal absent, but cannot prove no duplicate endpoint exists.
+- The recorded close and `orca worktree rm --worktree id:<orca_worktree_id> --force` paths remain guarded primitives for a future exact-home audit; current staged retries run the same audit and refuse while inventory is unavailable.
 - Teardown does not raw-delete Orca worktrees.
 
 ## Limitations
@@ -98,6 +101,7 @@ Teardown:
 - Escape is unsupported because the current Orca terminal send primitive exposes Enter and interrupt-style input but no verified Escape operation.
 - Orca is explicit-only and is not selected by runtime auto-detection.
 - Orca currently exposes no stable CLI version or protocol marker. Unlike the herdr/zellij/cmux docs, this backend intentionally gates spawn support on runtime reachability from `orca status --json` rather than a version floor.
+- Orca exposes no verified exact-worktree duplicate-terminal inventory, so new teardown attempts fail closed before closure rather than sweeping the app-global terminal namespace.
 
 ## Verification
 
@@ -113,7 +117,7 @@ Fake-Orca tests cover:
 - `fm-spawn.sh --backend orca` metadata creation and harness launch;
 - `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` routing through recorded Orca metadata;
 - slash-command popup placeholder handling that requires a second Enter before `fm-send.sh` reports submission;
-- scout teardown releasing an Orca worktree through `orca worktree rm`;
+- guarded Orca close/worktree-removal primitives plus current teardown refusal when exact duplicate inventory is unavailable;
 - ship teardown failing closed when the recorded Orca worktree id is missing, cannot resolve to a path, or resolves to a different path than `worktree=`.
 
 Run the focused suite with:

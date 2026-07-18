@@ -246,13 +246,8 @@ test_poll_preserves_conversation_context() {
 
 test_poll_inbox_commit_failure_reports_error() {
   local home fakebin out rc body
-  home="$TMP_ROOT/poll-mv-fail"; mkdir -p "$home"
+  home="$TMP_ROOT/poll-publish-fail"; mkdir -p "$home/state/x-inbox/req-rename.json"
   fakebin=$(make_fake_curl "$home")
-  cat > "$fakebin/mv" <<'SH'
-#!/usr/bin/env bash
-exit 1
-SH
-  chmod +x "$fakebin/mv"
   printf 'FMX_PAIRING_TOKEN=tok-q\n' > "$home/.env"
   body='{"request_id":"req-rename","tweet_id":"555","author_id":"42","text":"what are you building?"}'
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
@@ -261,15 +256,16 @@ SH
   expect_code 0 "$rc" "poll inbox commit failure exit"
   [ "$out" = "x-mode-error cannot write inbox" ] \
     || fail "poll inbox commit failure must emit an error, not a wake marker (got: $out)"
-  assert_absent "$home/state/x-inbox/req-rename.json" "poll must not report a committed inbox file that was not created"
-  assert_absent "$home/state/x-inbox/req-rename.json.tmp" "poll must clean up the failed inbox temp file"
+  [ -d "$home/state/x-inbox/req-rename.json" ] || fail "poll replaced an unsafe inbox target"
+  [ -z "$(find "$home/state/x-inbox" -name '.fm-x-poll.*' -print -quit)" ] \
+    || fail "poll did not clean up the failed inbox temp file"
   assert_present "$home/state/x-poll.error" "poll inbox commit failure must write a dedupe marker"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
     "$ROOT/bin/fm-x-poll.sh"); rc=$?
   expect_code 0 "$rc" "poll repeated inbox commit failure exit"
   [ -z "$out" ] || fail "repeated poll inbox commit failure must be quiet after the first diagnostic (got: $out)"
-  rm -f "$fakebin/mv"
+  rmdir "$home/state/x-inbox/req-rename.json"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FAKE_POLL_CODE=200 FAKE_POLL_BODY="$body" \
     "$ROOT/bin/fm-x-poll.sh"); rc=$?
@@ -443,7 +439,7 @@ test_bootstrap_reports_missing_x_dependency() {
   home="$TMP_ROOT/boot-missing-x"; mkdir -p "$home"
   fakebin=$(fm_fakebin "$home")
   fm_fake_exit0 "$fakebin" tmux node no-mistakes gh-axi chrome-devtools-axi lavish-axi curl
-  for tool in dirname grep tail; do
+  for tool in dirname grep tail uname; do
     tool_path=$(command -v "$tool") || fail "test host must provide $tool"
     ln -s "$tool_path" "$fakebin/$tool"
   done
@@ -606,6 +602,89 @@ SH
   assert_present "$home/state/x-watch.check.sh" "failed opt-out cleanup must leave the stale shim visible"
   assert_present "$home/config/x-mode.env" "failed opt-out cleanup must leave the stale cadence visible"
   pass "bootstrap reports failed X artifact cleanup on opt-out"
+}
+
+test_bootstrap_opt_out_removes_cadence_without_state_directory() {
+  local home out
+  home="$TMP_ROOT/boot-optout-no-state"
+  mkdir -p "$home/config"
+  printf 'stale\n' > "$home/config/x-mode.env"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
+    "missing volatile state prevented independent cadence cleanup"
+  assert_absent "$home/config/x-mode.env" "opt-out left the cadence file when state was absent"
+  pass "bootstrap removes X cadence independently when volatile state is absent"
+}
+
+test_bootstrap_x_artifacts_reject_final_symlinks() {
+  local home outside out
+  home="$TMP_ROOT/boot-final-symlinks"
+  outside="$TMP_ROOT/boot-final-symlink-outside"
+  mkdir -p "$home/state" "$home/config"
+  printf 'sentinel\n' > "$outside"
+  ln -s "$outside" "$home/state/x-watch.check.sh"
+  ln -s "$outside" "$home/config/x-mode.env"
+  printf 'FMX_PAIRING_TOKEN=tok-scope\n' > "$home/.env"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim or 30s cadence" \
+    "bootstrap did not refuse unsafe X-mode publication targets"
+  [ "$(cat "$outside")" = sentinel ] || fail "bootstrap wrote through an X-mode artifact symlink"
+  assert_absent "$home/state/x-watch.check.sh" "failed X-mode activation did not safely remove the shim symlink"
+  assert_absent "$home/config/x-mode.env" "failed X-mode activation did not safely remove the cadence symlink"
+  pass "bootstrap X-mode publication and cleanup reject final symlinks"
+}
+
+test_x_state_publications_reject_final_symlinks() {
+  local home fakebin outside out status
+  home="$TMP_ROOT/x-state-final-symlinks"
+  fakebin=$(make_fake_curl "$home")
+  outside="$home/outside"
+  mkdir -p "$home/state/x-outbox" "$home/state/x-inbox"
+  printf 'sentinel\n' > "$outside"
+
+  ln -s "$outside" "$home/state/x-outbox/req-reply.json"
+  status=0
+  FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-reply.sh" req-reply preview \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "reply dry-run followed an outbox symlink"
+  [ "$(cat "$outside")" = sentinel ] || fail "reply dry-run escaped the state home"
+
+  ln -s "$outside" "$home/state/x-outbox/req-dismiss.json"
+  status=0
+  FM_HOME="$home" FMX_DRY_RUN=1 "$ROOT/bin/fm-x-dismiss.sh" req-dismiss \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "dismiss dry-run followed an outbox symlink"
+  [ "$(cat "$outside")" = sentinel ] || fail "dismiss dry-run escaped the state home"
+
+  ln -s "$outside" "$home/state/x-inbox/req-poll.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_PAIRING_TOKEN=token \
+    FAKE_POLL_CODE=200 FAKE_POLL_BODY='{"request_id":"req-poll","text":"hello"}' \
+    "$ROOT/bin/fm-x-poll.sh")
+  assert_contains "$out" "x-mode-error cannot write inbox" \
+    "poll did not surface refused inbox publication"
+  [ "$(cat "$outside")" = sentinel ] || fail "poll escaped through an inbox symlink"
+  pass "X state publications reject symlinked final targets"
+}
+
+test_x_inbox_context_rejects_symlinked_parent() {
+  local home outside meta err status
+  home="$TMP_ROOT/x-inbox-parent-symlink"
+  outside="$TMP_ROOT/x-inbox-parent-outside"
+  mkdir -p "$home/state" "$outside"
+  meta="$home/state/task-a.meta"
+  printf 'window=w\nkind=ship\n' > "$meta"
+  jq -cn '{request_id:"req-a",platform:"discord",text:"foreign"}' > "$outside/req-a.json"
+  ln -s "$outside" "$home/state/x-inbox"
+  err="$home/link.err"
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a \
+    --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
+    >/dev/null 2>"$err" || status=$?
+  [ "$status" -ne 0 ] || fail "x-link followed a symlinked inbox parent"
+  assert_grep "failed to inspect request platform context" "$err" \
+    "x-link did not fail closed on the redirected inbox parent"
+  assert_no_grep "x_request=" "$meta" "redirected inbox context changed local task metadata"
+  pass "X inbox context validates its nested parent before reading"
 }
 
 test_reply_dry_run_records_not_posts() {
@@ -1326,6 +1405,65 @@ TXT
   pass "fm-x-link records Discord platform context so follow-ups keep the Discord budget"
 }
 
+test_pr_and_x_metadata_updates_share_one_lock() {
+  local home fakebin meta ready release pr_pid x_pid waited pr_rc x_rc
+  home="$TMP_ROOT/pr-x-meta-lock"
+  fakebin="$home/fakebin"
+  ready="$home/pr-ready"
+  release="$home/pr-release"
+  mkdir -p "$home/state" "$home/wt" "$fakebin"
+  touch "$home/state/.last-watcher-beat"
+  meta="$home/state/task-a.meta"
+  printf 'window=w\nworktree=%s\nkind=ship\n' "$home/wt" > "$meta"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+: > "${FM_PR_READY:?}"
+while [ ! -e "${FM_PR_RELEASE:?}" ]; do sleep 0.02; done
+printf '%s\n' deadbeefcafefeed0000000000000000deadbeef
+SH
+  chmod +x "$fakebin/gh"
+
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_PR_READY="$ready" FM_PR_RELEASE="$release" \
+    "$ROOT/bin/fm-pr-check.sh" task-a https://example.test/pr/1 >/dev/null 2>"$home/pr.err" &
+  pr_pid=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || {
+    : > "$release"
+    wait "$pr_pid" 2>/dev/null || true
+    fail "PR metadata writer did not enter its serialized update"
+  }
+
+  FM_HOME="$home" "$ROOT/bin/fm-x-link.sh" task-a req-a \
+    --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
+    >/dev/null 2>"$home/x.err" &
+  x_pid=$!
+  sleep 0.2
+  if ! kill -0 "$x_pid" 2>/dev/null; then
+    : > "$release"
+    wait "$pr_pid" 2>/dev/null || true
+    x_rc=0
+    wait "$x_pid" || x_rc=$?
+    fail "X metadata writer bypassed the PR writer lock (exit $x_rc)"
+  fi
+  assert_no_grep "x_request=" "$meta" "X metadata update committed before the PR lock released"
+  : > "$release"
+  pr_rc=0
+  wait "$pr_pid" || pr_rc=$?
+  x_rc=0
+  wait "$x_pid" || x_rc=$?
+  expect_code 0 "$pr_rc" "serialized PR metadata update"
+  expect_code 0 "$x_rc" "serialized X metadata update"
+  assert_grep "pr=https://example.test/pr/1" "$meta" "serialized metadata lost the PR URL"
+  assert_grep "pr_head=deadbeefcafefeed0000000000000000deadbeef" "$meta" \
+    "serialized metadata lost the PR head"
+  assert_grep "x_request=req-a" "$meta" "serialized metadata lost the X request link"
+  pass "PR and X metadata rewrites serialize on the task lock"
+}
+
 # Regression (2026-07-10 incident): a ~470-char Discord follow-up posted as a
 # (1/2)(2/2) thread because the link was recorded AFTER the ack reply drained the
 # inbox file, so the platform was lost and the splitter defaulted to X's 280-char
@@ -1710,7 +1848,7 @@ test_followup_post_failure_keeps_link() {
 }
 
 test_followup_post_record_failure_clears_link() {
-  local home fakebin out rc meta err flag mvflag
+  local home fakebin out rc meta err flag mvflag real_perl
   home="$TMP_ROOT/fu-post-record-fail"; mkdir -p "$home/state"
   fakebin=$(make_fake_curl "$home")
   flag="$home/fail-followups-write"
@@ -1728,6 +1866,19 @@ fi
 exec /bin/mv "$@"
 SH
   chmod +x "$fakebin/mv"
+  real_perl=$(command -v perl)
+  cat > "$fakebin/perl" <<SH
+#!/usr/bin/env bash
+if [ -n "\${FAKE_MV_FAIL_AFTER_FLAG:-}" ] \
+  && [ -f "\$FAKE_MV_FAIL_AFTER_FLAG" ] \
+  && [ -n "\${FAKE_MV_FAILED_ONCE:-}" ] \
+  && [ ! -f "\$FAKE_MV_FAILED_ONCE" ]; then
+  : > "\$FAKE_MV_FAILED_ONCE"
+  exit 2
+fi
+exec "$real_perl" "\$@"
+SH
+  chmod +x "$fakebin/perl"
   printf 'FMX_PAIRING_TOKEN=tok-fu\n' > "$home/.env"
   mk_linked_task "$home" task-rf req-rf 1700000000
   meta="$home/state/task-rf.meta"
@@ -1904,6 +2055,7 @@ test_dismiss_unsafe_request_id_rejected
 test_dismiss_usage_error
 test_link_records_request_and_timestamp
 test_link_records_discord_platform_for_followups
+test_pr_and_x_metadata_updates_share_one_lock
 test_link_resolves_platform_by_request_id_after_inbox_cleanup
 test_link_warns_loudly_when_platform_unresolvable
 test_link_carry_count_and_ts_preserve_followup_binding
@@ -1932,3 +2084,7 @@ test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_inert_without_token
 test_bootstrap_opt_out_cleanup
 test_bootstrap_opt_out_reports_cleanup_failure
+test_bootstrap_opt_out_removes_cadence_without_state_directory
+test_bootstrap_x_artifacts_reject_final_symlinks
+test_x_state_publications_reject_final_symlinks
+test_x_inbox_context_rejects_symlinked_parent

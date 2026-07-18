@@ -6,12 +6,16 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-pi-watch-extension)
+if [ "$(uname)" = Darwin ]; then
+  case "$TMP_ROOT" in /var/*|/tmp/*) TMP_ROOT="/private$TMP_ROOT" ;; esac
+fi
 EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 
 install_pi_watch_extension_fixture() {
   local repo=$1
-  mkdir -p "$repo/.pi/extensions" "$repo/node_modules/typebox"
+  mkdir -p "$repo/.pi/extensions" "$repo/node_modules/typebox" "$repo/bin"
   cp "$EXT" "$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cp "$ROOT/bin/fm-wake-lib.sh" "$repo/bin/fm-wake-lib.sh"
   cat > "$repo/node_modules/typebox/package.json" <<'JSON'
 {"name":"typebox","type":"module","exports":"./index.js"}
 JSON
@@ -43,7 +47,7 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
   assert_contains "$text" "if (!sessionOwnsLock()) return { ok: false" "tracked extension arms without the session lock"
-  assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
+  assert_contains "$text" "fm_write_file_no_follow" "tracked extension does not publish its loaded marker through the shared no-follow writer"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
   assert_contains "$text" "FM_WATCH_ARM_SCRIPT: armScript" "tracked extension does not pass the effective watcher arm script"
@@ -578,13 +582,16 @@ printf 'watcher: started pid=1 (beacon fresh)\n'
 SH
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
+if [ ! -s "${FM_ARM_LOG:?}" ]; then
+  printf 'guard-before-arm\n' >> "${FM_GUARD_LOG:?}"
+  exit 2
+fi
 printf 'guard\n' >> "${FM_GUARD_LOG:?}"
-printf 'guard should not run\n' >&2
-exit 2
+exit 0
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh" "$repo/bin/fm-turnend-guard.sh"
   out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" node 2>&1 <<'EOF'
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const armMod = await import(pathToFileURL(process.env.ARM_PLUGIN).href);
@@ -616,8 +623,12 @@ if (!existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm did not run");
   process.exit(1);
 }
-if (existsSync(process.env.FM_GUARD_LOG)) {
-  console.error("turn-end guard ran before the watch arm could establish supervision");
+if (!existsSync(process.env.FM_GUARD_LOG)) {
+  console.error("turn-end guard did not verify supervision after the watch arm ran");
+  process.exit(1);
+}
+if (readFileSync(process.env.FM_GUARD_LOG, "utf8").includes("guard-before-arm")) {
+  console.error("turn-end guard ran before the watch arm established supervision");
   process.exit(1);
 }
 if (promptBody) {
@@ -627,9 +638,9 @@ if (promptBody) {
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode turn-end guard must let the auto-arm plugin establish supervision first"
+  expect_code 0 "$status" "OpenCode turn-end guard must verify supervision after the auto-arm plugin: $out"
   [ -z "$out" ] || fail "OpenCode coordination test printed output: $out"
-  pass "OpenCode watcher plugin coordinates with the turn-end guard"
+  pass "OpenCode watcher plugin arms before the turn-end guard verifies supervision"
 }
 
 test_opencode_healthy_arm_output_does_not_suppress_guard() {
@@ -704,9 +715,61 @@ if (!promptBody.includes("TURN WOULD END BLIND")) {
 EOF
 )
   status=$?
-  expect_code 0 "$status" "OpenCode watch plugin must not treat external healthy output as an owned arm"
+  expect_code 0 "$status" "OpenCode watch plugin must not treat external healthy output as an owned arm: $out"
   [ -z "$out" ] || fail "OpenCode external-healthy test printed output: $out"
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
+}
+
+test_watch_adapters_reject_symlinked_effective_state() {
+  local opencode repo home outside out status pi_repo pi_home pi_outside pi_plugin
+  opencode="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/watch-state-symlink-opencode-root"
+  home="$TMP_ROOT/watch-state-symlink-opencode-home"
+  outside="$TMP_ROOT/watch-state-symlink-opencode-outside"
+  mkdir -p "$repo/bin" "$home" "$outside"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  ln -s "$outside" "$home/state"
+  out=$(PLUGIN="$opencode" WORKTREE="$repo" FM_HOME="$home" node 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let rejected = false;
+try {
+  await mod.FmPrimaryWatchArm({ client: {}, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+} catch (error) {
+  rejected = String(error).includes("state validation failed");
+}
+if (!rejected) throw new Error("OpenCode watcher accepted symlinked effective state");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode watcher state-root admission"
+  [ -z "$out" ] || fail "OpenCode state validation test printed output: $out"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] || fail "OpenCode watcher touched symlinked state"
+
+  pi_repo="$TMP_ROOT/watch-state-symlink-pi-root"
+  pi_home="$TMP_ROOT/watch-state-symlink-pi-home"
+  pi_outside="$TMP_ROOT/watch-state-symlink-pi-outside"
+  mkdir -p "$pi_home" "$pi_outside"
+  install_pi_watch_extension_fixture "$pi_repo"
+  pi_plugin="$pi_repo/.pi/extensions/fm-primary-pi-watch.ts"
+  ln -s "$pi_outside" "$pi_home/state"
+  out=$(PLUGIN="$pi_plugin" FM_HOME="$pi_home" FM_ROOT_OVERRIDE="$pi_repo" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+let rejected = false;
+try {
+  await import(pathToFileURL(process.env.PLUGIN).href);
+} catch (error) {
+  rejected = String(error).includes("state validation failed");
+}
+if (!rejected) throw new Error("Pi watcher accepted symlinked effective state");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi watcher state-root admission"
+  [ -z "$out" ] || fail "Pi state validation test printed output: $out"
+  [ -z "$(find "$pi_outside" -mindepth 1 -print -quit)" ] || fail "Pi watcher touched symlinked state"
+  pass "OpenCode and Pi watch adapters reject symlinked effective state"
 }
 
 test_tracked_extension_present_and_self_hashing
@@ -723,3 +786,4 @@ test_opencode_watch_arm_coordinator_respects_primary_scope
 test_opencode_primary_watch_plugin_rearms_after_wake
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard
+test_watch_adapters_reject_symlinked_effective_state

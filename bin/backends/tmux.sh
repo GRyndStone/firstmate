@@ -4,8 +4,8 @@
 # Reference backend (AGENTS.md section 8; data/fm-backend-design-d7). P1 moves
 # the tmux command sequences that fm-send.sh, fm-peek.sh, fm-watch.sh,
 # fm-spawn.sh, and fm-teardown.sh already ran inline into named functions
-# here, running the EXACT same commands in the EXACT same order, so the
-# default (tmux, `backend=` absent) path stays byte-identical. Sourced only
+# here. That extraction preserved the original command order; later lifecycle
+# hardening added stable window ids and exact-home ownership tags. Sourced only
 # through bin/fm-backend.sh's fm_backend_source, never directly.
 #
 # Worktree acquisition (running `treehouse get` inside the pane, and polling
@@ -82,13 +82,34 @@ fm_backend_tmux_container_ensure() {
 #     treehouse cd's into the worktree, which would break name-based targeting.
 # The returned window id lets callers target the window even if its name is ever
 # lost, so worktree discovery cannot fall back to the active client's window.
-fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints window id
-  local ses=$1 wname=$2 proj_abs=$3 wid
-  if tmux list-windows -t "$ses" -F '#{window_name}' | grep -qx "$wname"; then
+fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> [home-identity] -> prints window id
+  local ses=$1 wname=$2 proj_abs=$3 home_identity=${4:-} wid filter inventory
+  if [ -z "$home_identity" ]; then
+    home_identity=$(fm_backend_home_identity) || return 1
+  fi
+  filter="#{==:#{window_name},$wname}"
+  inventory=$(tmux list-windows -t "=$ses" -f "$filter" \
+    -F $'#{window_id}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  if [ -n "$inventory" ] && ! printf '%s\n' "$inventory" | awk -F '\t' -v label="$wname" '
+    NF != 4 || $1 !~ /^@[0-9]+$/ || $2 != label || $4 != "_" { bad=1 }
+    END { exit bad ? 1 : 0 }
+  '; then
+    echo "error: invalid tmux window inventory for $ses:$wname" >&2
+    return 1
+  fi
+  if printf '%s\n' "$inventory" | awk -F '\t' -v owner="$home_identity" 'NF == 4 && $3 == owner { found=1 } END { exit found ? 0 : 1 }'; then
     echo "error: window $ses:$wname already exists" >&2
     return 1
   fi
+  if printf '%s\n' "$inventory" | awk -F '\t' 'NF == 4 && $3 == "" { found=1 } END { exit found ? 0 : 1 }'; then
+    echo "error: untagged legacy window $ses:$wname has ambiguous Firstmate-home ownership" >&2
+    return 1
+  fi
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1
+  if ! tmux set-window-option -t "$wid" @firstmate_home "$home_identity" 2>/dev/null; then
+    tmux kill-window -t "$wid" 2>/dev/null || true
+    return 1
+  fi
   tmux set-window-option -t "$wid" automatic-rename off 2>/dev/null || true
   tmux set-window-option -t "$wid" allow-rename off 2>/dev/null || true
   printf '%s\n' "$wid"
@@ -132,8 +153,8 @@ fm_backend_tmux_strict_miss() {  # <target> <expected-label>
 # fm_backend_tmux_create_task's duplicate check - never a target-resolution
 # probe. Recognized shapes, matched strictly: a pane id (%N - the away-mode
 # daemon's TMUX_PANE supervisor target), a window id (@N - fm-spawn's stable
-# window handle), session:name or session:index (fm-spawn's recorded window=
-# meta, the daemon's firstmate:0 default), a bare window name, a
+# window handle), session:name or session:index (supported explicit or legacy
+# targets, including the daemon's firstmate:0 default), a bare window name, a
 # session-qualified pane id (session:%N), and a pane-qualified window
 # (session:window.pane, the window by exact name or index and the pane by
 # index or %id, matched as one composite line against the pane inventory so a
@@ -270,7 +291,19 @@ fm_backend_tmux_send_literal() {  # <target> <text>
 # fm_backend_tmux_kill: remove the task's window, best-effort. Mirrors
 # fm-teardown.sh's `tmux kill-window -t "$T" 2>/dev/null || true`.
 fm_backend_tmux_kill() {  # <target>
-  tmux kill-window -t "$1" 2>/dev/null || true
+  if [ "${FM_BACKEND_STRICT_CLOSE:-0}" = 1 ]; then
+    tmux kill-window -t "$1" 2>/dev/null
+  else
+    tmux kill-window -t "$1" 2>/dev/null || true
+  fi
+}
+
+fm_backend_tmux_kill_owned() {  # <target> <session> <expected-label> <home-identity>
+  local target=$1 session=$2 expected_label=$3 home_identity=$4 condition out
+  condition="#{&&:#{==:#{window_id},$target},#{&&:#{==:#{session_name},$session},#{&&:#{==:#{window_name},$expected_label},#{==:#{@firstmate_home},$home_identity}}}}"
+  out=$(tmux if-shell -F -t "$target" "$condition" \
+    "kill-window -t $target" "display-message -p ownership-mismatch" 2>&1) || return 1
+  [ -z "$out" ]
 }
 
 # fm_backend_tmux_current_command: <target>'s live foreground process name -

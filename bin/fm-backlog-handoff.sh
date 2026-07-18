@@ -39,8 +39,12 @@
 # The move needs compatible `tasks-axi` on PATH, including atomic multi-ID `mv`
 # (introduced in 0.2.2). Bootstrap requires it fleet-wide, so this works
 # everywhere; the `config/backlog-backend=manual` knob only governs firstmate's
-# own hand-editing of its own backlog, not this validated helper. Idempotent:
-# re-running converges. Atomic: on any move failure nothing moves.
+# own hand-editing of its own backlog, not this validated helper.
+# The helper acquires both homes' state/.backlog.lock files in sorted path order
+# before classification and holds them through the atomic move, so routine
+# mutations cannot race either side of the handoff and two opposite handoffs
+# cannot deadlock.
+# Idempotent: re-running converges. Atomic: on any move failure nothing moves.
 # See AGENTS.md project management and task lifecycle.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 set -eu
@@ -49,14 +53,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
-REG="$DATA/secondmates.md"
-MAIN_BACKLOG="$DATA/backlog.md"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+REG=
+MAIN_BACKLOG=
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+[ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$STATE
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 
 [ $# -ge 2 ] || { echo "usage: fm-backlog-handoff.sh <secondmate-id> <item-key>..." >&2; exit 1; }
 ID=$1
 shift
+for key in "$@"; do
+  fm_tasks_axi_valid_task_id "$key" || {
+    echo "error: invalid backlog item id: $key" >&2
+    exit 2
+  }
+done
 
 secondmate_home() {
   local id=$1 line
@@ -80,6 +96,12 @@ path_is_ancestor_of() {
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
+  cd "$path" && pwd -P
+}
+
+resolved_existing_data_dir() {
+  local path=$1
+  [ -d "$path" ] || { echo "error: active firstmate data directory does not exist or is not a directory: $path" >&2; return 1; }
   cd "$path" && pwd -P
 }
 
@@ -180,6 +202,36 @@ validate_backlog_file() {
   fi
 }
 
+validate_home_tasks_config() {
+  local home=$1 config archive_rel archive_path archive_parent archive_resolved
+  config="$home/.tasks.toml"
+  if [ -L "$config" ] || [ ! -f "$config" ]; then
+    echo "error: firstmate home must contain a regular .tasks.toml: $config" >&2
+    return 1
+  fi
+  archive_rel=$(fm_tasks_axi_markdown_archive "$config") || return 1
+  case "$archive_rel" in
+    /*) archive_path=$archive_rel ;;
+    *) archive_path="$home/$archive_rel" ;;
+  esac
+  archive_parent=$(dirname "$archive_path")
+  archive_resolved=$(cd "$archive_parent" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$archive_path")") || {
+    echo "error: cannot resolve markdown.archive parent inside firstmate home: $archive_path" >&2
+    return 1
+  }
+  case "$archive_resolved" in
+    "$home"/*) ;;
+    *)
+      echo "error: markdown.archive must remain inside firstmate home: $archive_path" >&2
+      return 1
+      ;;
+  esac
+  if [ -L "$archive_resolved" ]; then
+    echo "error: markdown.archive must not be a symlink: $archive_resolved" >&2
+    return 1
+  fi
+}
+
 # Classify a single key by the section it lives under (## In flight /
 # ## Queued / ## Done), or return non-zero if no `- [ ] <key>` / `- [x] <key>`
 # header exists in the file. This reads only section headings and item header
@@ -225,12 +277,78 @@ backlog_key_noncanonical_body_lines() {
   ' "$file"
 }
 
+ACTIVE_HOME=$(resolved_existing_dir "$FM_HOME") || exit 1
+ACTIVE_DATA=$(resolved_existing_data_dir "$DATA") || exit 1
+if [ -z "${FM_DATA_OVERRIDE:-}" ]; then
+  case "$ACTIVE_DATA" in
+    "$ACTIVE_HOME"/*) ;;
+    *)
+      echo "error: active firstmate data directory must resolve inside the active home: $DATA" >&2
+      exit 1
+      ;;
+  esac
+fi
+DATA=$ACTIVE_DATA
+REG="$DATA/secondmates.md"
+MAIN_BACKLOG="$DATA/backlog.md"
+
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
 SUB_HOME=$(validate_secondmate_home "$ID" "$RAW_HOME") || exit 1
 SUB_BACKLOG="$SUB_HOME/data/backlog.md"
+fm_validate_effective_state_path "$SUB_HOME/state" allow-missing-final || exit 1
+SUB_STATE=$FM_VALIDATED_STATE_PATH
 validate_backlog_file "main backlog" "$MAIN_BACKLOG" || exit 1
 validate_backlog_file "secondmate backlog" "$SUB_BACKLOG" || exit 1
+
+MAIN_LOCK="$STATE/.backlog.lock"
+SUB_LOCK="$SUB_STATE/.backlog.lock"
+[ -d "$SUB_STATE" ] || mkdir "$SUB_STATE"
+if [ "$MAIN_LOCK" = "$SUB_LOCK" ]; then
+  FIRST_LOCK=$MAIN_LOCK
+  SECOND_LOCK=
+elif [ "$(printf '%s\n' "$MAIN_LOCK" "$SUB_LOCK" | LC_ALL=C sort | head -n 1)" = "$MAIN_LOCK" ]; then
+  FIRST_LOCK=$MAIN_LOCK
+  SECOND_LOCK=$SUB_LOCK
+else
+  FIRST_LOCK=$SUB_LOCK
+  SECOND_LOCK=$MAIN_LOCK
+fi
+LOCKS_HELD=0
+MOVE_RESULT=
+release_backlog_locks() {
+  [ -z "$MOVE_RESULT" ] || rm -f "$MOVE_RESULT" 2>/dev/null || true
+  if [ "$LOCKS_HELD" -eq 1 ]; then
+    [ -z "$SECOND_LOCK" ] || fm_lock_release "$SECOND_LOCK"
+    fm_lock_release "$FIRST_LOCK"
+    LOCKS_HELD=0
+  fi
+}
+trap release_backlog_locks EXIT
+fm_lock_acquire_wait "$FIRST_LOCK"
+[ -z "$SECOND_LOCK" ] || fm_lock_acquire_wait "$SECOND_LOCK"
+LOCKS_HELD=1
+if ! fm_tasks_axi_reconcile_mutation_owner "$STATE"; then
+  echo "error: the active home still has live or unreadable durable backlog mutation ownership" >&2
+  exit 1
+fi
+if [ "$SUB_STATE" != "$STATE" ] \
+   && ! fm_tasks_axi_reconcile_mutation_owner "$SUB_STATE"; then
+  echo "error: secondmate $ID still has live or unreadable durable backlog mutation ownership" >&2
+  exit 1
+fi
+refuse_receipt_transactions() {
+  local label=$1 state_dir=$2 claim
+  for claim in "$state_dir"/.backlog-receipts.claimed.*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    echo "error: $label has an interrupted backlog receipt transaction; reconcile it with fm-backlog.sh before handoff" >&2
+    return 1
+  done
+}
+refuse_receipt_transactions "the active home" "$STATE" || exit 1
+if [ "$SUB_STATE" != "$STATE" ]; then
+  refuse_receipt_transactions "secondmate $ID" "$SUB_STATE" || exit 1
+fi
 
 # Classify every key before changing anything: move-from-main, already-in-sub, or
 # missing. Abort with no changes if any key matches neither backlog.
@@ -277,7 +395,43 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+refuse_current_lifecycle() {
+  local label=$1 state_dir=$2 key marker
+  shift 2
+  for key in "$@"; do
+    for marker in \
+      "$state_dir/$key.meta" \
+      "$state_dir/$key.spawning" \
+      "$state_dir/$key.tearing-down" \
+      "$state_dir/$key.teardown-stage" \
+      "$state_dir/$key.teardown-final-cleanup"; do
+      if [ -e "$marker" ] || [ -L "$marker" ]; then
+        echo "error: refusing backlog handoff while $label has current lifecycle state for $key: $marker" >&2
+        return 1
+      fi
+    done
+  done
+}
+
+refuse_current_lifecycle "the active home" "$STATE" "$@" || exit 1
+if [ "$SUB_STATE" != "$STATE" ]; then
+  refuse_current_lifecycle "secondmate $ID" "$SUB_STATE" "$@" || exit 1
+fi
+
+invalidate_requested_receipts() {
+  local key failed=0
+  for key in "$@"; do
+    fm_tasks_axi_invalidate_completion_receipt "$STATE" "$key" || failed=1
+    fm_tasks_axi_invalidate_completion_receipt "$SUB_STATE" "$key" || failed=1
+  done
+  [ "$failed" -eq 0 ]
+}
+
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
+  if ! invalidate_requested_receipts "$@"; then
+    echo "error: idempotent handoff could not reconcile one or more completion receipts" >&2
+    exit 1
+  fi
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
   exit 0
 fi
@@ -295,7 +449,10 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-if ! fm_tasks_axi_compatible; then
+validate_home_tasks_config "$ACTIVE_HOME" || exit 1
+validate_home_tasks_config "$SUB_HOME" || exit 1
+
+if ! (cd "$ACTIVE_HOME" && HOME="$ACTIVE_HOME" fm_tasks_axi_compatible); then
   echo "error: tasks-axi with atomic multi-ID mv support (0.2.2+) is required to move backlog items" >&2
   exit 1
 fi
@@ -310,20 +467,121 @@ if [ ! -f "$SUB_BACKLOG" ]; then
   printf '## In flight\n\n## Queued\n\n## Done\n' > "$SUB_BACKLOG"
   SUB_CREATED=1
 fi
+MOVE_RESULT=$(mktemp "$STATE/.backlog-handoff-result.XXXXXX") || exit 1
+printf '%s\n' ambiguous > "$MOVE_RESULT" || exit 1
+
+run_owned_handoff_mutation() {
+  local parent_pid worker_pid worker_identity current_identity previous_identity=
+  local mutation_token start_path i=0 status=0 published_main=0 published_sub=0
+  parent_pid=${BASHPID:-$$}
+  mutation_token=$(fm_tasks_axi_mutation_owner_token) || return 1
+  start_path=$(fm_tasks_axi_mutation_owner_start_path "$STATE") || return 1
+  (
+    local wait_count=0
+    while [ ! -e "$start_path" ]; do
+      fm_pid_alive "$parent_pid" || exit 125
+      [ "$wait_count" -lt 200 ] || exit 125
+      sleep 0.05
+      wait_count=$((wait_count + 1))
+    done
+    cd "$ACTIVE_HOME" || exit 1
+    HOME="$ACTIVE_HOME" exec tasks-axi mv "${TO_MOVE[@]}" --backend markdown \
+      --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG"
+  ) &
+  worker_pid=$!
+  while [ "$i" -lt 40 ]; do
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    if [ -n "$current_identity" ] && [ -n "$previous_identity" ] \
+       && [ "$current_identity" = "$previous_identity" ]; then
+      worker_identity=$current_identity
+      break
+    fi
+    previous_identity=$current_identity
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if [ -z "${worker_identity:-}" ]; then
+    wait "$worker_pid" 2>/dev/null || true
+    return 1
+  fi
+  if ! fm_tasks_axi_publish_mutation_owner "$STATE" "$worker_pid" "$worker_identity" "$mutation_token"; then
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    return 1
+  fi
+  published_main=1
+  if [ "$SUB_STATE" != "$STATE" ]; then
+    if ! fm_tasks_axi_publish_mutation_owner "$SUB_STATE" "$worker_pid" "$worker_identity" "$mutation_token"; then
+      current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+      [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+      wait "$worker_pid" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+      return 1
+    fi
+    published_sub=1
+    if ! fm_tasks_axi_start_mutation_owner "$SUB_STATE" "$mutation_token"; then
+      current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+      [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+      wait "$worker_pid" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" 2>/dev/null || true
+      fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if ! fm_tasks_axi_start_mutation_owner "$STATE" "$mutation_token"; then
+    current_identity=$(fm_tasks_axi_mutation_pid_identity "$worker_pid" 2>/dev/null || true)
+    [ "$current_identity" != "$worker_identity" ] || kill -TERM "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+    [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" 2>/dev/null || true
+    [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" 2>/dev/null || true
+    return 1
+  fi
+  wait "$worker_pid" || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' committed > "$MOVE_RESULT" || return 1
+  else
+    printf '%s\n' failed > "$MOVE_RESULT" || return 1
+  fi
+  [ "$published_sub" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$SUB_STATE" "$mutation_token" || status=70
+  [ "$published_main" -eq 0 ] || fm_tasks_axi_clear_mutation_owner "$STATE" "$mutation_token" || status=70
+  return "$status"
+}
 
 # Delegate the move to tasks-axi. Passing the whole in-scope set to one call is a
 # single atomic transaction, so a connected set (blocker + dependents) moves
 # together and, on any failure, neither backlog's content changes - the only
 # cleanup is a scaffold we just created. tasks-axi writes both its success and
 # error output to stdout, so capture it and surface it only on failure.
-if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BACKLOG" 2>&1); then
-  if [ "$SUB_CREATED" -eq 1 ]; then
+MV_STATUS=0
+MV_OUT=$(run_owned_handoff_mutation 2>&1) || MV_STATUS=$?
+MOVE_OUTCOME=$(cat "$MOVE_RESULT" 2>/dev/null || printf '%s\n' ambiguous)
+rm -f "$MOVE_RESULT"
+MOVE_RESULT=
+RECEIPT_INVALIDATION_FAILED=0
+if [ "$MOVE_OUTCOME" = committed ]; then
+  invalidate_requested_receipts "$@" || RECEIPT_INVALIDATION_FAILED=1
+fi
+if [ "$MV_STATUS" -ne 0 ]; then
+  if [ "$SUB_CREATED" -eq 1 ] && [ "$MOVE_OUTCOME" = failed ]; then
     rm -f "$SUB_BACKLOG"
   fi
   if [ -n "$MV_OUT" ]; then
     printf '%s\n' "$MV_OUT" >&2
   fi
-  echo "error: tasks-axi mv failed; nothing was moved." >&2
+  if [ "$MOVE_OUTCOME" = committed ]; then
+    echo "error: backlog handoff committed, but durable mutation-owner cleanup failed; destination was preserved" >&2
+    [ "$RECEIPT_INVALIDATION_FAILED" -eq 0 ] \
+      || echo "error: one or more completion receipts also could not be invalidated safely" >&2
+  elif [ "$MOVE_OUTCOME" = failed ]; then
+    echo "error: tasks-axi mv failed; nothing was moved." >&2
+  else
+    echo "error: backlog handoff outcome is ambiguous; destination was preserved for reconciliation" >&2
+  fi
+  exit 1
+fi
+if [ "$RECEIPT_INVALIDATION_FAILED" -ne 0 ]; then
+  echo "error: handoff succeeded but one or more completion receipts could not be invalidated safely" >&2
   exit 1
 fi
 

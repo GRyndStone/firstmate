@@ -24,8 +24,23 @@ case "$*" in
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window) exit 0 ;;
+  list-windows)
+    [ -z "${FM_FAKE_INVENTORY_UNKNOWN:-}" ] || { echo 'inventory failed' >&2; exit 2; }
+    exit 0
+    ;;
+  has-session|new-session|kill-window|set-window-option) exit 0 ;;
+  new-window)
+    if [ -n "${FM_FAKE_ENDPOINT_LOG:-}" ]; then
+      printf '%s\n' "$*" >> "$FM_FAKE_ENDPOINT_LOG"
+    fi
+    [ -z "${FM_FAKE_ENDPOINT_READY:-}" ] || : > "$FM_FAKE_ENDPOINT_READY"
+    while [ -n "${FM_FAKE_ENDPOINT_RELEASE:-}" ] && [ ! -e "$FM_FAKE_ENDPOINT_RELEASE" ]; do
+      sleep 0.05
+    done
+    [ -z "${FM_FAKE_ENDPOINT_FAIL:-}" ] || exit 1
+    printf '@1\n'
+    exit 0
+    ;;
   send-keys)
     if [ -n "${FM_FAKE_SHELL_LOG:-}" ] && [ "${4:-}" != "-l" ]; then
       printf '%s\n' "${4:-}" >> "$FM_FAKE_SHELL_LOG"
@@ -60,12 +75,15 @@ make_spawn_case() {
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
+  printf '## In flight\n\n' > "$home/data/backlog.md"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    printf -- '- [ ] %s - test task\n' "$id" >> "$home/data/backlog.md"
   done
+  printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$launchlog"
 }
 
@@ -94,6 +112,11 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_SHELL_LOG="$shelllog" \
+    FM_FAKE_ENDPOINT_LOG="${FM_FAKE_ENDPOINT_LOG:-}" \
+    FM_FAKE_ENDPOINT_READY="${FM_FAKE_ENDPOINT_READY:-}" \
+    FM_FAKE_ENDPOINT_RELEASE="${FM_FAKE_ENDPOINT_RELEASE:-}" \
+    FM_FAKE_ENDPOINT_FAIL="${FM_FAKE_ENDPOINT_FAIL:-}" \
+    FM_FAKE_INVENTORY_UNKNOWN="${FM_FAKE_INVENTORY_UNKNOWN:-}" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -428,6 +451,236 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_secondmate_recovery_refuses_symlinked_metadata() {
+  local rec id sm outside out status
+  id=profile-secondmate-meta-symlink-z17
+  rec=$(make_spawn_case profile-secondmate-meta-symlink codex "$id")
+  read_case_record "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  outside="$CASE_DIR/foreign.meta"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'home=%s\n' "$sm" > "$outside"
+  ln -s "$outside" "$HOME_DIR/state/$id.meta"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" --secondmate) || status=$?
+  expect_code 1 "$status" "secondmate recovery from symlinked metadata"
+  assert_contains "$out" "task metadata is symlinked or non-regular" \
+    "secondmate recovery parsed a symlinked metadata home"
+  assert_present "$outside" "secondmate recovery removed foreign metadata"
+  assert_absent "$CASE_DIR/endpoint.log" "secondmate recovery created an endpoint from foreign metadata"
+  pass "secondmate recovery rejects symlinked metadata before reading home ownership"
+}
+
+test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint() {
+  local rec id out status claim endpoint_log
+  id=profile-receipt-z19
+  rec=$(make_spawn_case profile-receipt claude "$id")
+  read_case_record "$rec"
+  claim="$HOME_DIR/state/.$id.teardown-complete.claimed.stale"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  printf 'canonical\n' > "$HOME_DIR/state/$id.teardown-complete"
+  mkdir "$claim"
+  printf 'claimed\n' > "$claim/proof"
+
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "spawn with stale completion receipts should succeed after invalidation"
+  assert_absent "$HOME_DIR/state/$id.teardown-complete" \
+    "spawn left a reusable canonical completion proof"
+  assert_absent "$claim" "spawn left a reusable interrupted completion claim"
+  assert_absent "$HOME_DIR/state/$id.spawning" "successful spawn retained lifecycle ownership"
+  assert_present "$endpoint_log" "spawn did not create its endpoint after safe receipt invalidation"
+
+  id=profile-receipt-failure-z20
+  rec=$(make_spawn_case profile-receipt-failure claude "$id")
+  read_case_record "$rec"
+  claim="$HOME_DIR/state/.$id.teardown-complete.claimed.unsafe"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  mkdir "$claim"
+  printf 'claimed\n' > "$claim/proof"
+  printf 'unexpected\n' > "$claim/extra"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with an unsafe completion claim"
+  assert_contains "$out" "could not invalidate completion receipts safely before spawning $id" \
+    "spawn did not report unsafe receipt invalidation"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "receipt invalidation refusal retained ownership despite no endpoint attempt"
+  assert_absent "$endpoint_log" "spawn created an endpoint after receipt invalidation failed"
+  assert_absent "$HOME_DIR/state/$id.meta" "spawn wrote lifecycle meta after receipt invalidation failed"
+  pass "spawn invalidates canonical and claimed receipts before endpoint creation"
+}
+
+test_spawn_lifecycle_claim_covers_endpoint_creation() {
+  local rec id ready release endpoint_log out_file pid status out
+  id=profile-spawn-claim-z21
+  rec=$(make_spawn_case profile-spawn-claim claude "$id")
+  read_case_record "$rec"
+  ready="$CASE_DIR/endpoint-ready"
+  release="$CASE_DIR/endpoint-release"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  out_file="$CASE_DIR/spawn.out"
+  FM_FAKE_ENDPOINT_LOG="$endpoint_log" FM_FAKE_ENDPOINT_READY="$ready" \
+    FM_FAKE_ENDPOINT_RELEASE="$release" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    > "$out_file" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [ ! -e "$ready" ] || break
+    sleep 0.05
+  done
+  assert_present "$ready" "spawn did not reach the blocked endpoint creation"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "spawn did not retain durable ownership during endpoint creation"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "spawn published metadata before endpoint creation completed"
+  : > "$release"
+  status=0
+  wait "$pid" || status=$?
+  expect_code 0 "$status" "spawn lifecycle claim release"
+  assert_present "$HOME_DIR/state/$id.meta" "spawn did not atomically publish lifecycle metadata"
+  assert_absent "$HOME_DIR/state/$id.spawning" "spawn did not release ownership after metadata publication"
+
+  id=profile-done-first-z22
+  rec=$(make_spawn_case profile-done-first claude "$id")
+  read_case_record "$rec"
+  printf '## In flight\n\n## Queued\n\n## Done\n\n- [x] %s - completed task\n' "$id" \
+    > "$HOME_DIR/data/backlog.md"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn after backlog completion"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn did not reject a task completed before lifecycle ownership"
+  assert_absent "$endpoint_log" "spawn created an endpoint after backlog completion won the lock"
+  assert_absent "$HOME_DIR/state/$id.spawning" "Done-first refusal retained spawn ownership"
+
+  id=profile-missing-backlog-z22a
+  rec=$(make_spawn_case profile-missing-backlog claude "$id")
+  read_case_record "$rec"
+  rm -f "$HOME_DIR/data/backlog.md"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn without durable backlog accounting"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn accepted a missing durable backlog program"
+  assert_absent "$HOME_DIR/state/$id.spawning" "missing backlog refusal retained spawn ownership"
+
+  id=profile-duplicate-backlog-z22aa
+  rec=$(make_spawn_case profile-duplicate-backlog claude "$id")
+  read_case_record "$rec"
+  printf -- '- [ ] %s - duplicate task\n' "$id" >> "$HOME_DIR/data/backlog.md"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with duplicate backlog accounting"
+  assert_contains "$out" "not a canonical In flight backlog record" \
+    "spawn accepted duplicate durable backlog records"
+  assert_absent "$HOME_DIR/state/$id.spawning" "duplicate backlog refusal retained spawn ownership"
+
+  id=profile-final-cleanup-z22b
+  rec=$(make_spawn_case profile-final-cleanup claude "$id")
+  read_case_record "$rec"
+  : > "$HOME_DIR/state/$id.teardown-final-cleanup"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn during partial final lifecycle cleanup"
+  assert_contains "$out" "unresolved owned lifecycle state" \
+    "spawn did not reject existing final cleanup authority"
+  assert_absent "$endpoint_log" "spawn created an endpoint during partial final lifecycle cleanup"
+
+  id=profile-endpoint-fail-z23
+  rec=$(make_spawn_case profile-endpoint-fail claude "$id")
+  read_case_record "$rec"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_FAIL=1 \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "endpoint creation failure"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "clean endpoint creation failure retained unrecoverable lifecycle ownership"
+  assert_absent "$HOME_DIR/state/$id.meta" "failed endpoint creation published lifecycle metadata"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  assert_contains "$out" "spawned $id" "clean endpoint failure could not be retried"
+
+  id=profile-endpoint-unknown-z24
+  rec=$(make_spawn_case profile-endpoint-unknown claude "$id")
+  read_case_record "$rec"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_FAIL=1 FM_FAKE_INVENTORY_UNKNOWN=1 \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "endpoint creation failure with unknown rollback state"
+  assert_absent "$HOME_DIR/state/$id.spawning" \
+    "failed endpoint command retained lifecycle ownership without an endpoint identity"
+  assert_absent "$HOME_DIR/state/$id.meta" "unknown endpoint rollback published lifecycle metadata"
+
+  id=profile-worktree-recovery-z25
+  rec=$(make_spawn_case profile-worktree-recovery pi "$id")
+  read_case_record "$rec"
+  mkdir "$HOME_DIR/state/$id.pi-ext.ts"
+  status=0
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn failure after entering a worktree"
+  assert_present "$HOME_DIR/state/$id.spawning" \
+    "failed worktree spawn lost its durable lifecycle claim"
+  assert_present "$HOME_DIR/state/$id.meta" \
+    "failed worktree spawn did not publish teardown-recoverable metadata"
+  assert_grep "window=@1" "$HOME_DIR/state/$id.meta" \
+    "recovery metadata did not retain the exact tmux window id"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
+    "recovery metadata did not retain the observed worktree"
+  pass "spawn lifecycle ownership covers endpoint creation and Done-first ordering"
+}
+
+test_spawn_waits_for_durable_backlog_mutation_owner() {
+  local rec id endpoint_log out status worker identity owner claim
+  id=profile-mutation-owner-z26
+  rec=$(make_spawn_case profile-mutation-owner claude "$id")
+  read_case_record "$rec"
+  endpoint_log="$CASE_DIR/endpoint.log"
+  sleep 30 &
+  worker=$!
+  identity=$(LC_ALL=C ps -p "$worker" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  owner="$HOME_DIR/state/.backlog-mutation-owner"
+  mkdir "$owner"
+  {
+    printf 'version=1\n'
+    printf 'pid=%s\n' "$worker"
+    printf 'identity=%s\n' "$identity"
+    printf 'token=0123456789abcdef0123456789abcdef\n'
+  } > "$owner/record"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn during orphaned backlog mutation"
+  assert_contains "$out" "durable backlog mutation ownership is live or unreadable" \
+    "spawn did not fail closed behind the orphaned backend child"
+  assert_absent "$endpoint_log" "spawn created an endpoint while backlog mutation ownership was live"
+  assert_absent "$HOME_DIR/state/$id.spawning" "blocked spawn created lifecycle authority"
+  kill -TERM "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+  claim="$HOME_DIR/state/.backlog-receipts.claimed.interrupted"
+  mkdir "$claim"
+  printf 'synthetic snapshot\n' > "$claim/snapshot-before"
+  status=0
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR") || status=$?
+  expect_code 1 "$status" "spawn with interrupted backlog receipt claim"
+  assert_contains "$out" "interrupted backlog receipt claims" \
+    "spawn did not fail closed behind the unreconciled receipt claim"
+  assert_absent "$endpoint_log" "spawn created an endpoint while a receipt claim was unresolved"
+  rm -f "$claim/snapshot-before"
+  rmdir "$claim"
+  out=$(FM_FAKE_ENDPOINT_LOG="$endpoint_log" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  assert_contains "$out" "spawned $id" "spawn did not reconcile the dead durable mutation owner"
+  assert_absent "$owner" "dead durable mutation owner was not reconciled"
+  pass "spawn admission shares durable backlog mutation ownership recovery"
+}
+
 test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
@@ -444,5 +697,9 @@ test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_secondmate_recovery_refuses_symlinked_metadata
+test_spawn_invalidates_all_same_id_completion_receipts_before_endpoint
+test_spawn_lifecycle_claim_covers_endpoint_creation
+test_spawn_waits_for_durable_backlog_mutation_owner
 
 echo "# all fm-spawn-dispatch-profile tests passed"

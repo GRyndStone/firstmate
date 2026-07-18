@@ -6,8 +6,8 @@
 # data/fm-backend-design-d7/herdr-addendum.md ("Events as the core
 # abstraction"). P1 extracted the tmux command sequences that fm-send.sh,
 # fm-peek.sh, fm-watch.sh, fm-spawn.sh, and fm-teardown.sh already ran inline
-# into bin/backends/tmux.sh, with those SAME command sequences, so the default
-# (tmux) path stays byte-identical. P2 adds bin/backends/herdr.sh, an
+# into bin/backends/tmux.sh with those same command sequences. Later lifecycle
+# hardening added stable tmux identity and exact-home ownership metadata. P2 adds bin/backends/herdr.sh, an
 # EXPERIMENTAL spawn-capable backend behind `--backend herdr`/`FM_BACKEND=herdr`/
 # `config/backend`, and behind runtime auto-detection when firstmate itself is
 # running inside herdr with no explicit backend setting; see herdr-addendum.md and
@@ -31,8 +31,8 @@
 #
 # Compatibility contract: a task's meta may omit `backend=`; every reader here
 # treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
-# `backend=tmux` for a default-backend task, so existing and newly spawned
-# default-path metas stay byte-identical. Only a task spawned on a non-tmux
+# `backend=tmux` for a default-backend task. New tmux metas may still carry
+# stable-id and exact-home ownership fields. Only a task spawned on a non-tmux
 # spawn-capable backend, currently experimental herdr, zellij, orca, or cmux,
 # carries an explicit `backend=` line.
 #
@@ -68,6 +68,16 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # codex-app remains deliberately absent; see docs/codex-app-backend.md.
 FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
 FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
+
+fm_backend_home_identity() {
+  local home digest
+  home=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+  digest=$(printf '%s\0' "$home" | git hash-object --stdin 2>/dev/null) || return 1
+  case "$digest" in
+    [0-9a-f][0-9a-f]*) printf 'fmh-%s' "$digest" ;;
+    *) return 1 ;;
+  esac
+}
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -311,6 +321,30 @@ fm_backend_of_meta() {  # <meta-file>
   printf '%s' "${v:-tmux}"
 }
 
+fm_backend_target_identity_of_meta() {  # <meta-file>
+  local meta=$1 backend
+  backend=$(fm_backend_of_meta "$meta")
+  case "$backend" in
+    tmux) fm_meta_get "$meta" tmux_home_identity ;;
+    herdr) fm_meta_get "$meta" herdr_workspace_id ;;
+    zellij) fm_meta_get "$meta" zellij_tab_id ;;
+    orca) fm_meta_get "$meta" orca_worktree_id ;;
+    cmux) fm_meta_get "$meta" cmux_workspace_id ;;
+  esac
+}
+
+fm_backend_target_container_of_meta() {  # <meta-file>
+  local meta=$1 backend
+  backend=$(fm_backend_of_meta "$meta")
+  case "$backend" in
+    tmux) fm_meta_get "$meta" tmux_session ;;
+    herdr) fm_meta_get "$meta" herdr_session ;;
+    zellij) fm_meta_get "$meta" zellij_session ;;
+    orca) fm_meta_get "$meta" orca_worktree_id ;;
+    cmux) fm_meta_get "$meta" cmux_workspace_id ;;
+  esac
+}
+
 fm_backend_target_of_meta() {  # <meta-file>
   local meta=$1 backend terminal window
   backend=$(fm_backend_of_meta "$meta")
@@ -322,10 +356,80 @@ fm_backend_target_of_meta() {  # <meta-file>
   [ -n "$window" ] && printf '%s' "$window"
 }
 
+fm_backend_adopt_legacy_tmux_meta() {  # <meta-file> <expected-label>
+  local meta=$1 expected_label=$2 window session identity inventory wid owner confirmed before after parent tmp
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  [ "$(fm_backend_of_meta "$meta")" = tmux ] || return 0
+  if [ -n "$(fm_meta_get "$meta" tmux_home_identity)" ] \
+     && [ -n "$(fm_meta_get "$meta" tmux_session)" ] \
+     && [ -n "$(fm_meta_get "$meta" tmux_window_id)" ]; then
+    return 0
+  fi
+  [ -z "$(fm_meta_get "$meta" tmux_home_identity)" ] \
+    && [ -z "$(fm_meta_get "$meta" tmux_session)" ] \
+    && [ -z "$(fm_meta_get "$meta" tmux_window_id)" ] || return 1
+  window=$(fm_meta_get "$meta" window)
+  case "$window" in
+    *:*) session=${window%%:*} ;;
+    *) return 1 ;;
+  esac
+  [ -n "$session" ] && [ "$window" = "$session:$expected_label" ] || return 1
+  identity=$(fm_backend_home_identity) || return 1
+  fm_backend_source tmux >/dev/null 2>&1 || return 1
+  before=$(cksum "$meta" 2>/dev/null) || return 1
+  inventory=$(tmux list-windows -t "=$session" -f "#{==:#{window_name},$expected_label}" \
+    -F $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  printf '%s\n' "$inventory" | awk -F '\t' -v session="$session" -v label="$expected_label" -v identity="$identity" '
+    NF != 5 || $1 !~ /^@[0-9]+$/ || $2 != session || $3 != label || ($4 != "" && $4 != identity) || $5 != "_" { bad=1 }
+    { rows++ }
+    END { exit (bad || rows != 1) ? 1 : 0 }
+  ' || return 1
+  wid=$(printf '%s\n' "$inventory" | awk -F '\t' 'NR == 1 { print $1 }')
+  owner=$(printf '%s\n' "$inventory" | awk -F '\t' 'NR == 1 { print $4 }')
+  if [ -z "$owner" ]; then
+    tmux set-window-option -t "$wid" @firstmate_home "$identity" >/dev/null 2>&1 || return 1
+  fi
+  confirmed=$(tmux display-message -p -t "$wid" \
+    $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}\t_' 2>/dev/null) || return 1
+  printf '%s\n' "$confirmed" | awk -F '\t' -v wid="$wid" -v session="$session" -v label="$expected_label" -v identity="$identity" '
+    NR != 1 || NF != 5 || $1 != wid || $2 != session || $3 != label || $4 != identity || $5 != "_" { bad=1 }
+    END { exit bad ? 1 : 0 }
+  ' || return 1
+  after=$(cksum "$meta" 2>/dev/null) || return 1
+  [ "$before" = "$after" ] || return 1
+  declare -F fm_publish_file_no_follow >/dev/null 2>&1 || return 1
+  parent=${meta%/*}
+  tmp=$(mktemp "$parent/.legacy-tmux-meta.tmp.XXXXXXXX") || return 1
+  if ! awk -F= '$1 != "window" && $1 != "tmux_home_identity" && $1 != "tmux_session" && $1 != "tmux_window_id" { print }' "$meta" > "$tmp" \
+     || ! {
+       printf 'window=%s\n' "$wid"
+       printf 'tmux_home_identity=%s\n' "$identity"
+       printf 'tmux_session=%s\n' "$session"
+       printf 'tmux_window_id=%s\n' "$wid"
+     } >> "$tmp" \
+     || ! fm_publish_file_no_follow "$tmp" "$meta" replace; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+fm_backend_adopt_legacy_tmux_state() {  # <state-dir>
+  local state=$1 meta id status=0
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  for meta in "$state"/*.meta; do
+    [ -e "$meta" ] || [ -L "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    [ "$(fm_backend_of_meta "$meta")" = tmux ] || continue
+    id=$(basename "$meta" .meta)
+    fm_backend_adopt_legacy_tmux_meta "$meta" "fm-$id" || status=1
+  done
+  return "$status"
+}
+
 fm_backend_meta_for_window() {  # <target> <state-dir>
   local target=$1 state=$2 meta window terminal
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     window=$(fm_meta_get "$meta" window)
     terminal=$(fm_meta_get "$meta" terminal)
     { [ -n "$window" ] && [ "$window" = "$target" ]; } || { [ -n "$terminal" ] && [ "$terminal" = "$target" ]; } || continue
@@ -586,12 +690,7 @@ fm_backend_busy_state() {  # <backend> <target>
 # caller other than the send path (the away-mode daemon's supervisor-pane
 # pending-input guard, bin/fm-supervise-daemon.sh) can ask the same question
 # without duplicating per-backend composer-reading logic. tmux and herdr both
-# expose a named classifier already (fm_tmux_composer_state,
-# fm_backend_herdr_composer_state), as do orca and cmux
-# (fm_backend_orca_composer_state, fm_backend_cmux_composer_state); zellij's
-# submit path uses an internal content-diff approach with no separately named
-# classifier, so it reports unknown here - callers fall back to their own
-# policy, exactly as an unknown fm_backend_busy_state already does.
+# expose a named classifier already.
 fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   local backend=$1
   shift
@@ -599,6 +698,7 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   case "$backend" in
     tmux) fm_tmux_composer_state "$@" ;;
     herdr) fm_backend_herdr_composer_state "$@" ;;
+    zellij) fm_backend_zellij_composer_state "$@" ;;
     orca) fm_backend_orca_composer_state "$@" ;;
     cmux) fm_backend_cmux_composer_state "$@" ;;
     *) printf 'unknown' ;;
@@ -612,16 +712,17 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # server as a side effect via fm_backend_herdr_server_ensure - fine for an
 # operation that is about to use the pane, wrong for a passive liveness
 # probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose. The tmux arm matches the target
+# closed), missing zellij pane, or unreadable Orca terminal makes this Boolean
+# presence probe fail. The tmux arm matches the target
 # against the server's own window/pane inventory instead of probing tmux's
 # lenient target resolution, which reads a killed window as alive while its
 # session survives (fm_backend_tmux_target_exists, bin/backends/tmux.sh).
 # Same role as fm-crew-state.sh's pane_readable check (whose tmux arm keeps
 # the lenient read - its authoritative run-step path does not ride on it);
-# exists here as one shared primitive so callers that only need a fast
-# alive/dead read (recovery digests, the session-start fleet digest) do not
-# re-derive it inline.
+# exists here as one shared primitive for watcher endpoint-gone detection,
+# send paths, and away-mode supervisor-target validation.
+# Recovery and session-start fleet accounting instead use
+# fm_backend_target_state_of_meta so uncertainty remains an explicit `unknown`.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
@@ -659,6 +760,269 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
     *)
       return 1
       ;;
+  esac
+}
+
+# fm_backend_target_state: teardown-grade endpoint existence probe.
+# Prints present, absent, or unknown; backend inventory/read failures are
+# unknown so destructive lifecycle cleanup cannot treat unreadability as gone.
+fm_backend_target_state() {  # <backend> <target> [expected-label] [backend-identity] [expected-worktree] [backend-container] [expected-workspace-label]
+  local backend=$1 target=$2 expected_label=${3:-} backend_identity=${4:-} expected_worktree=${5:-}
+  local backend_container=${6:-} expected_workspace_label=${7:-} out code session pane state workspace workspace_label tabs panes verdict home_identity count
+  : "$expected_worktree"
+  if [ "$backend" = herdr ]; then
+    fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+    session=${target%%:*}
+    pane=${target#*:}
+    workspace=$backend_identity
+    if [ -z "$session" ] || [ -z "$pane" ] || [ "$pane" = "$target" ] \
+       || [ -z "$workspace" ] || [ -z "$expected_label" ]; then
+      printf 'unknown'
+      return 0
+    fi
+    if ! out=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1); then
+      code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+      case "$code" in
+        workspace_not_found) printf 'unknown' ;;
+        *) printf 'unknown' ;;
+      esac
+      return 0
+    fi
+    workspace_label=$expected_workspace_label
+    if [ -z "$workspace_label" ]; then
+      workspace_label=$(fm_backend_herdr_workspace_label 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+    fi
+    printf '%s' "$out" | jq -e --arg workspace "$workspace" --arg want_label "$workspace_label" \
+      '.result.workspace.workspace_id == $workspace and .result.workspace.label == $want_label' >/dev/null 2>&1 \
+      || { printf 'unknown'; return 0; }
+    tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>&1) \
+      || { printf 'unknown'; return 0; }
+    panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$workspace" 2>&1) \
+      || { printf 'unknown'; return 0; }
+    verdict=$(jq -ren \
+      --arg pane "$pane" \
+      --arg want_label "$expected_label" \
+      --argjson tabs "$tabs" \
+      --argjson panes "$panes" '
+        if (($tabs.result.tabs | type) != "array")
+           or (($panes.result.panes | type) != "array")
+           or (all($tabs.result.tabs[]?;
+                 ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+                 and ((.label | type) == "string")) | not)
+           or (all($panes.result.panes[]?;
+                 ((.pane_id | type) == "string") and ((.pane_id | length) > 0)
+                 and ((.tab_id | type) == "string") and ((.tab_id | length) > 0)) | not)
+        then "unknown"
+        else
+          [$panes.result.panes[]? | select(.pane_id == $pane)] as $owned
+          | if ($owned | length) == 0 then "absent"
+            elif ($owned | length) != 1 then "unknown"
+            else $owned[0].tab_id as $tab_id
+              | [$tabs.result.tabs[]? | select(.tab_id == $tab_id)] as $owners
+              | if (($owners | length) == 1 and $owners[0].label == $want_label)
+                then "present" else "unknown" end
+            end
+        end
+      ' 2>/dev/null) || verdict=unknown
+    case "$verdict" in
+      present|absent) printf '%s' "$verdict" ;;
+      *) printf 'unknown' ;;
+    esac
+    return 0
+  fi
+  case "$backend" in
+    tmux)
+      fm_backend_source tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      command -v tmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      home_identity=$(fm_backend_home_identity 2>/dev/null) || { printf 'unknown'; return 0; }
+      [ -n "$backend_identity" ] && [ "$backend_identity" = "$home_identity" ] \
+        || { printf 'unknown'; return 0; }
+      case "$target" in
+        @*)
+          case "${target#@}" in
+            ''|*[!0-9]*) printf 'unknown'; return 0 ;;
+          esac
+          ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      session=$backend_container
+      [ -n "$session" ] && [ -n "$expected_label" ] || { printf 'unknown'; return 0; }
+      if out=$(tmux display-message -p -t "$target" $'#{window_id}\t#{session_name}\t#{window_name}\t#{@firstmate_home}' 2>&1); then
+        state=0
+      else
+        state=$?
+      fi
+      if [ "$state" -ne 0 ]; then
+        if printf '%s\n' "$out" | grep -Eqi "can't find (window|session)|no server running|failed to connect.*(no such file|connection refused)|no sessions"; then
+          printf 'absent'
+        else
+          printf 'unknown'
+        fi
+        return 0
+      fi
+      [ -n "$out" ] || { printf 'unknown'; return 0; }
+      if ! printf '%s\n' "$out" | awk -F '\t' -v target="$target" -v session="$session" -v label="$expected_label" -v owner="$home_identity" '
+        NF != 4 || $1 != target || $2 != session || $3 != label || $4 != owner { bad=1 }
+        END { exit bad ? 1 : 0 }
+      '; then
+        printf 'unknown'
+        return 0
+      fi
+      count=$(printf '%s\n' "$out" | awk 'NF { count++ } END { print count+0 }')
+      case "$count" in
+        0) printf 'absent' ;;
+        1) printf 'present' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+    herdr) printf 'unknown' ;;
+    zellij)
+      printf 'unknown'
+      ;;
+    orca)
+      fm_backend_source orca >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      if out=$(orca terminal read --terminal "$target" --limit 1 --json 2>&1); then
+        state=0
+      else
+        state=$?
+      fi
+      if [ "$state" -eq 0 ] && printf '%s' "$out" | jq -e 'type == "object" and (.ok != false) and (.result | type == "object")' >/dev/null 2>&1; then
+        printf 'present'
+        return 0
+      fi
+      code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+      case "$code" in
+        terminal_handle_stale|terminal_not_found|not_found) printf 'absent' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+    cmux)
+      fm_backend_source cmux >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+      fm_backend_cmux_parse_target "$target" || { printf 'unknown'; return 0; }
+      state=$(fm_backend_cmux_ping_state)
+      case "$state" in
+        ok) ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      printf 'unknown'
+      ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+fm_backend_target_state_of_meta() {  # <meta-file> [expected-label]
+  local meta=$1 expected_label=${2:-} backend target backend_identity backend_container worktree window pane
+  local kind meta_home task_id workspace_label
+  [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  worktree=$(fm_meta_get "$meta" worktree)
+  case "$backend" in
+    tmux)
+      backend_identity=$(fm_meta_get "$meta" tmux_home_identity)
+      backend_container=$(fm_meta_get "$meta" tmux_session)
+      ;;
+    herdr)
+      fm_backend_source herdr >/dev/null 2>&1 \
+        || { printf 'unknown'; return 0; }
+      backend_identity=$(fm_meta_get "$meta" herdr_workspace_id)
+      backend_container=$(fm_meta_get "$meta" herdr_session)
+      pane=$(fm_meta_get "$meta" herdr_pane_id)
+      window=$(fm_meta_get "$meta" window)
+      [ -n "$backend_identity" ] && [ -n "$backend_container" ] && [ -n "$pane" ] \
+        && [ "$window" = "$backend_container:$pane" ] \
+        && [ "$target" = "$window" ] \
+        || { printf 'unknown'; return 0; }
+      kind=$(fm_meta_get "$meta" kind)
+      task_id=$(basename "$meta" .meta)
+      if [ "$kind" = secondmate ]; then
+        meta_home=$(fm_meta_get "$meta" home)
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$meta_home" "$task_id" 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+      else
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$FM_HOME" 2>/dev/null) \
+          || { printf 'unknown'; return 0; }
+      fi
+      ;;
+    orca)
+      ;;
+    *)
+      printf 'unknown'
+      return 0
+      ;;
+  esac
+  [ -n "$target" ] || { printf 'unknown'; return 0; }
+  fm_backend_target_state "$backend" "$target" "$expected_label" "$backend_identity" "$worktree" "$backend_container" "${workspace_label:-}"
+}
+
+fm_backend_closed_target_state_of_meta() {  # <meta-file> [expected-label]
+  local meta=$1 expected_label=${2:-} backend target session pane out code
+  [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'unknown'; return 0; }
+  backend=$(fm_backend_of_meta "$meta")
+  [ "$backend" = herdr ] || {
+    fm_backend_target_state_of_meta "$meta" "$expected_label"
+    return
+  }
+  target=$(fm_backend_target_of_meta "$meta")
+  session=$(fm_meta_get "$meta" herdr_session)
+  pane=$(fm_meta_get "$meta" herdr_pane_id)
+  [ -n "$session" ] && [ -n "$pane" ] && [ "$target" = "$session:$pane" ] \
+    || { printf 'unknown'; return 0; }
+  fm_backend_source herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  if out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>&1); then
+    if printf '%s' "$out" | jq -e --arg pane "$pane" \
+      '.result.pane.pane_id == $pane' >/dev/null 2>&1; then
+      printf 'present'
+    else
+      printf 'unknown'
+    fi
+    return 0
+  fi
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  case "$code" in
+    pane_not_found) printf 'absent' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+fm_backend_kill_owned_meta() {  # <meta-file> <expected-label>
+  local meta=$1 expected_label=$2 before after backend target state tab_id session identity workspace workspace_label kind meta_home task_id
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  before=$(cksum "$meta" 2>/dev/null) || return 1
+  state=$(fm_backend_target_state_of_meta "$meta" "$expected_label")
+  [ "$state" = present ] || return 1
+  after=$(cksum "$meta" 2>/dev/null) || return 1
+  [ "$before" = "$after" ] || return 1
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux)
+      session=$(fm_meta_get "$meta" tmux_session)
+      identity=$(fm_meta_get "$meta" tmux_home_identity)
+      fm_backend_tmux_kill_owned "$target" "$session" "$expected_label" "$identity"
+      ;;
+    herdr)
+      workspace=$(fm_meta_get "$meta" herdr_workspace_id)
+      kind=$(fm_meta_get "$meta" kind)
+      task_id=$(basename "$meta" .meta)
+      if [ "$kind" = secondmate ]; then
+        meta_home=$(fm_meta_get "$meta" home)
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$meta_home" "$task_id" 2>/dev/null) || return 1
+      else
+        workspace_label=$(fm_backend_herdr_workspace_label_for_home "$FM_HOME" 2>/dev/null) || return 1
+      fi
+      fm_backend_herdr_kill_owned "$target" "$workspace" "$workspace_label" "$expected_label"
+      ;;
+    zellij)
+      tab_id=$(fm_meta_get "$meta" zellij_tab_id)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_zellij_kill "$target" "$tab_id" "$expected_label"
+      ;;
+    orca)
+      FM_BACKEND_STRICT_CLOSE=1 fm_backend_orca_kill "$target"
+      ;;
+    *) return 1 ;;
   esac
 }
 

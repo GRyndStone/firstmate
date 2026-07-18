@@ -51,7 +51,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -62,6 +62,11 @@ GRACE=${FM_GUARD_GRACE:-300}
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
+
+if ! fm_reconcile_checkpoint_orphan "$STATE"; then
+  echo "watcher: FAILED - unresolved foreground checkpoint ownership"
+  exit 1
+fi
 
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
@@ -185,7 +190,8 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+arm_owner_pid=${BASHPID:-$$}
+FM_WATCH_OWNER_KIND=arm FM_WATCH_OWNER_PID="$arm_owner_pid" "$WATCH" >"$child_out" &
 child=$!
 child_done=0
 

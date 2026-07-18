@@ -21,6 +21,8 @@
 #
 # This wrapper consumes the canonical snapshot's hints.open_decisions field.
 # fm-classify-lib.sh owns the durable keyed-decision contract.
+# durable_obligations keeps every active queued hold or blocker and every
+# unstructured queued record, with the same bound and expansion flag as gates.
 #
 # Flags:
 #   (default)        compact projection, TOON, local-only
@@ -30,7 +32,7 @@
 #   --all-in-flight  include every in-flight task
 #   --all-decisions  include every open decision
 #   --all-reports    include the full scout-report inventory (default: relevant only)
-#   --all-queued     include superseded/held queued items (default: dropped)
+#   --all-queued     expand queued projections and durable obligations
 #   --all-recorded-prs include every locally recorded PR
 #   --all-unhealthy  include every unhealthy endpoint
 #   --all-pr-repos   query every discovered repository under --include-prs
@@ -50,6 +52,7 @@ FM_BEARINGS_GATES=${FM_BEARINGS_GATES:-20}
 FM_BEARINGS_REPORTS=${FM_BEARINGS_REPORTS:-20}
 FM_BEARINGS_RECORDED_PRS=${FM_BEARINGS_RECORDED_PRS:-20}
 FM_BEARINGS_UNHEALTHY=${FM_BEARINGS_UNHEALTHY:-20}
+FM_BEARINGS_PROGRAM_SOURCES=${FM_BEARINGS_PROGRAM_SOURCES:-10}
 FM_BEARINGS_PR_REPOS=${FM_BEARINGS_PR_REPOS:-10}
 FM_BEARINGS_PR_LIMIT=${FM_BEARINGS_PR_LIMIT:-20}
 FM_BEARINGS_PR_TIMEOUT=${FM_BEARINGS_PR_TIMEOUT:-20}
@@ -64,6 +67,7 @@ validate_bound FM_BEARINGS_GATES "$FM_BEARINGS_GATES"
 validate_bound FM_BEARINGS_REPORTS "$FM_BEARINGS_REPORTS"
 validate_bound FM_BEARINGS_RECORDED_PRS "$FM_BEARINGS_RECORDED_PRS"
 validate_bound FM_BEARINGS_UNHEALTHY "$FM_BEARINGS_UNHEALTHY"
+validate_bound FM_BEARINGS_PROGRAM_SOURCES "$FM_BEARINGS_PROGRAM_SOURCES"
 validate_bound FM_BEARINGS_PR_REPOS "$FM_BEARINGS_PR_REPOS"
 validate_bound FM_BEARINGS_PR_LIMIT "$FM_BEARINGS_PR_LIMIT"
 
@@ -80,12 +84,17 @@ Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
-  gates{id,title,blocked_by,reason}, reports{id,path}, recorded_prs{id,url},
+  gates{id,title,hold,blocked_by,reason,annotations},
+  durable_obligations{id,type,reason,hold_reason,blocked_by,blocked_reason},
+  program{source_paths,...}, reports{id,path},
+  recorded_prs{id,url},
+  duplicate_endpoints{id,kind,backend,recorded,live,worktree,reason,action},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Opt-in surfaces: --fields bodies|paths|actions|endpoints, --all-in-flight,
   --all-decisions, --all-reports, --all-queued, --all-recorded-prs,
   --all-unhealthy, --all-pr-repos, --include-prs (adds candidate_prs).
 Raise FM_BEARINGS_PR_LIMIT to expand per-repository open-PR results.
+Raise FM_BEARINGS_PROGRAM_SOURCES to expand durable program source paths.
 EOF
 }
 
@@ -235,6 +244,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   --argjson reports_n "$FM_BEARINGS_REPORTS" \
   --argjson recorded_prs_n "$FM_BEARINGS_RECORDED_PRS" \
   --argjson unhealthy_n "$FM_BEARINGS_UNHEALTHY" \
+  --argjson program_sources_n "$FM_BEARINGS_PROGRAM_SOURCES" \
   --argjson include_prs "$INCLUDE_PRS" \
   --argjson all_in_flight "$ALL_IN_FLIGHT" \
   --argjson all_decisions "$ALL_DECISIONS" \
@@ -271,15 +281,42 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | {id:$t.id, key, verb, summary:(.summary | trunc(90))} ]) as $decisions_all
   | ([ .backlog.records[]
        | select(.state == "queued" and .structured)
-       | select(($all_queued == 1)
-                or (((.body_excerpt // "") | test("SUPERSEDED|NOT REQUIRED|NOT-REQUIRED|DEFERRED"; "i")) | not))
-       | {id, title:(.title | trunc(60)), blocked_by:(.blocked_by // "-"),
-          reason:((.blocked_reason // "-") | trunc(40))} ]) as $gates_all
+       | . as $record
+       | {id, title:(.title | trunc(60)),
+          hold:(if .active_hold != true then "-" elif (.hold_kind // "") == "" then .hold else "\(.hold_kind): \(.hold)" end),
+          blocked_by:(.active_blocked_by // "-"),
+          reason:((if .active_hold == true then .hold else (.active_blocked_reason // "-") end) | trunc(60)),
+          annotations:(["SUPERSEDED","NOT REQUIRED","NOT-REQUIRED","DEFERRED"]
+                       | map(. as $term
+                             | select((($record.title + " " + ($record.body_excerpt // "")) | test($term; "i"))))
+                       | unique
+                       | join("|")
+                       | if . == "" then "-" else . end)} ]) as $gates_all
+  | ([ .backlog.records[]
+       | select(.state == "queued")
+       | if .structured == true then
+           select(.active_hold == true or .active_blocked == true)
+           | {id,
+              type:(if .active_hold == true and .active_blocked == true then "held+blocked" elif .active_hold == true then "held" else "blocked" end),
+              reason:((if .active_hold == true and .active_blocked == true then
+                         "hold: \(.hold // "active hold"); blocker \(.active_blocked_by // "active dependency"): \(.active_blocked_reason // "active dependency")"
+                       elif .active_hold == true then .hold
+                       else (.active_blocked_reason // .active_blocked_by // "active dependency") end) | trunc(180)),
+              hold_reason:(if .active_hold == true then (.hold | trunc(90)) else "-" end),
+              blocked_by:(if .active_blocked == true then (.active_blocked_by // "active dependency") else "-" end),
+              blocked_reason:(if .active_blocked == true then ((.active_blocked_reason // "active dependency") | trunc(90)) else "-" end)}
+         else
+           {id:("raw-" + (.order | tostring)),type:"unstructured",reason:(.raw | trunc(90)),hold_reason:"-",blocked_by:"-",blocked_reason:"-"}
+         end ]) as $obligations_all
   | ([ .scout_reports[]
        | . as $r
        | select(($all_reports == 1) or (($rel_ids | index($r.id)) != null))
        | {id, path} ]) as $reports_all
   | ([ .tasks[] | select(.pr.url != null and .pr.source == "meta") | {id, url:.pr.url} ]) as $recorded_prs_all
+  | ([ .endpoint_anomalies[]
+       | {id:.task,kind,backend,recorded:.recorded_endpoint,
+          live:(.live_endpoints | join("|")),worktree,
+          reason:(.reason // "-"),action} ]) as $duplicate_endpoints_all
   | . as $snap
   | {
       schema: "fm-bearings.v1",
@@ -291,8 +328,23 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       landed: ($done | map({id, what:(.title | trunc(70)),
                             artifact:(.pr_url // .report_path // .local_note // "-")})),
       gates: (if $all_queued == 1 then $gates_all else $gates_all[:$gates_n] end),
+      durable_obligations: (if $all_queued == 1 then $obligations_all else $obligations_all[:$gates_n] end),
+      program:[{
+        runnable_candidates:$snap.queue_accounting.runnable_candidates,
+        held:$snap.queue_accounting.held,
+        blocked:$snap.queue_accounting.blocked,
+        unstructured_queued:$snap.queue_accounting.unstructured_queued,
+        durable_obligations:($obligations_all | length),
+        durable_sources:$snap.queue_accounting.durable_program_source_count,
+        sources_shown:([$snap.program_sources[:$program_sources_n][]] | length),
+        source_paths:([$snap.program_sources[:$program_sources_n][] | .relative_path] | join("|")),
+        sources_truncated:(($snap.program_sources | length) > $program_sources_n),
+        decomposition:$snap.queue_accounting.decomposition_status,
+        boundary:$snap.queue_accounting.supervisor_boundary
+      }],
       reports: (if $all_reports == 1 then $reports_all else $reports_all[:$reports_n] end),
-      recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end)
+      recorded_prs: (if $all_recorded_prs == 1 then $recorded_prs_all else $recorded_prs_all[:$recorded_prs_n] end),
+      duplicate_endpoints:(if $all_unhealthy == 1 then $duplicate_endpoints_all else $duplicate_endpoints_all[:$unhealthy_n] end)
     }
   | . + (if ($unhealthy_all | length) > 0 then
            {unhealthy_endpoints:(if $all_unhealthy == 1 then $unhealthy_all else $unhealthy_all[:$unhealthy_n] end)}
@@ -308,13 +360,15 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         (if $f_actions then empty else {surface:"watch/steer actions", reveal:"--fields actions"} end),
         (if $f_endpoints then empty else {surface:"healthy endpoint detail", reveal:"--fields endpoints"} end),
         (if $all_reports == 1 then empty else {surface:"full scout-report inventory", reveal:"--all-reports"} end),
-        (if $all_queued == 1 then empty else {surface:"superseded/held queued items", reveal:"--all-queued"} end),
         (if $all_in_flight == 0 and ($in_flight_all | length) > $in_flight_n then {surface:("in_flight showing \($in_flight_n) of \($in_flight_all | length)"), reveal:"--all-in-flight"} else empty end),
         (if $all_decisions == 0 and ($decisions_all | length) > $decisions_n then {surface:("decisions_open showing \($decisions_n) of \($decisions_all | length)"), reveal:"--all-decisions"} else empty end),
         (if $all_queued == 0 and ($gates_all | length) > $gates_n then {surface:("gates showing \($gates_n) of \($gates_all | length)"), reveal:"--all-queued"} else empty end),
+        (if $all_queued == 0 and ($obligations_all | length) > $gates_n then {surface:("durable obligations showing \($gates_n) of \($obligations_all | length)"), reveal:"--all-queued"} else empty end),
         (if $all_reports == 0 and ($reports_all | length) > $reports_n then {surface:("reports showing \($reports_n) of \($reports_all | length)"), reveal:"--all-reports"} else empty end),
         (if $all_recorded_prs == 0 and ($recorded_prs_all | length) > $recorded_prs_n then {surface:("recorded_prs showing \($recorded_prs_n) of \($recorded_prs_all | length)"), reveal:"--all-recorded-prs"} else empty end),
         (if $all_unhealthy == 0 and ($unhealthy_all | length) > $unhealthy_n then {surface:("unhealthy_endpoints showing \($unhealthy_n) of \($unhealthy_all | length)"), reveal:"--all-unhealthy"} else empty end),
+        (if $all_unhealthy == 0 and ($duplicate_endpoints_all | length) > $unhealthy_n then {surface:("duplicate_endpoints showing \($unhealthy_n) of \($duplicate_endpoints_all | length)"), reveal:"--all-unhealthy"} else empty end),
+        (if ($snap.program_sources | length) > $program_sources_n then {surface:("program sources showing \($program_sources_n) of \($snap.program_sources | length)"), reveal:"raise FM_BEARINGS_PROGRAM_SOURCES"} else empty end),
         (if $include_prs == 1 and $pr_repos_total > $pr_repos_shown then {surface:("PR repositories showing \($pr_repos_shown) of \($pr_repos_total)"), reveal:"--all-pr-repos"} else empty end),
         (if $include_prs == 1 and $pr_rows_capped > 0 then {surface:("candidate_prs showing \($candidate_prs | length) of at least \($pr_rows_min_total); capped in \($pr_rows_capped) repo(s)"), reveal:"raise FM_BEARINGS_PR_LIMIT"} else empty end),
         (if $include_prs == 1 then empty else {surface:"live PR discovery + checks", reveal:"--include-prs"} end) ]) }

@@ -15,6 +15,7 @@
 #   - orphan status logs whose task meta has already disappeared
 #   - per-task endpoint-liveness lines for a live and a dead recorded target,
 #     tmux and herdr both
+#   - durable program sources remain visible beside an empty runnable queue
 #   - composition: the script invokes the real fm-lock.sh/fm-bootstrap.sh/
 #     fm-wake-drain.sh (their real, distinctive output appears verbatim), it
 #     does not reimplement their logic
@@ -141,25 +142,37 @@ SH
   chmod +x "$fakebin/ps"
 }
 
-# make_fake_tmux <fakebin> <live-target>: list-windows lists only the given
-# "session:window" target - the exact inventory read
-# fm_backend_target_exists's strict tmux probe uses for an endpoint liveness
-# read (docs/tmux-backend.md "Strict window-existence probe"). display-message
-# stays lenient for any target, mirroring real tmux's target resolution, so
-# these cases also regress a liveness read ever falling back to it.
+# make_fake_tmux <fakebin> <home-identity>: list-windows exposes only the
+# exact, tagged task-live window in the requested session.
 make_fake_tmux() {
-  local fakebin=$1 live=$2
+  local fakebin=$1 identity=$2
   cat > "$fakebin/tmux" <<SH
 #!/usr/bin/env bash
 set -u
 case "\${1:-}" in
   list-windows)
-    printf '%s\n' "$live"
+    case "\$*" in
+      *fm-task-live*|*'#{window_id},@41}'*)
+        case "\$*" in
+          *'#{@firstmate_home}'*'_') printf '@41\tfm-task-live\t%s\t_\n' "$identity" ;;
+          *) printf '@41\tfm-task-live\t%s\n' "$identity" ;;
+        esac
+        ;;
+    esac
     exit 0
     ;;
   display-message)
-    printf '%%1\n'
-    exit 0
+    case "\$*" in
+      *'@41'*'#{pane_current_command}'*) printf 'codex\n'; exit 0 ;;
+      *'#{session_name}'*)
+        case "\$*" in
+          *'@41'*) printf '@41\tfm-sess\tfm-task-live\t%s\n' "$identity"; exit 0 ;;
+          *) printf "can't find window\n" >&2; exit 1 ;;
+        esac
+        ;;
+      *'@41'*) printf '%%1\n'; exit 0 ;;
+      *) exit 1 ;;
+    esac
     ;;
 esac
 exit 1
@@ -445,21 +458,22 @@ EOF
 # --- endpoint liveness: tmux and herdr, live and dead ------------------------
 
 test_endpoint_liveness_tmux() {
-  local rec root home fakebin out
+  local rec root home fakebin out identity
   rec=$(new_world liveness-tmux)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  make_fake_tmux "$fakebin" "fm-sess:live-window"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  make_fake_tmux "$fakebin" "$identity"
 
-  printf 'window=fm-sess:live-window\nkind=ship\n' > "$home/state/task-live.meta"
-  printf 'window=fm-sess:dead-window\nkind=ship\n' > "$home/state/task-dead.meta"
+  printf 'window=@41\ntmux_window_id=@41\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=ship\n' "$identity" > "$home/state/task-live.meta"
+  printf 'window=@42\ntmux_window_id=@42\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=ship\n' "$identity" > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:live-window)" "live tmux endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:dead-window)" "dead tmux endpoint not reported dead"
+  assert_contains "$out" "endpoint: alive (backend=tmux window=@41)" "live tmux endpoint not reported alive"
+  assert_contains "$out" "endpoint: dead (backend=tmux window=@42)" "dead tmux endpoint not reported dead"
 
   pass "tmux endpoint liveness is reported per task: alive for a live window, dead for a gone one"
 }
@@ -476,12 +490,197 @@ EOF
 
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-live.meta"
   printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
+  printf 'stale\n' > "$home/state/x-watch.check.sh"
+  printf 'stale\n' > "$home/config/x-mode.env"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" "live herdr endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" "dead herdr endpoint not reported dead"
+  assert_contains "$out" "endpoint: unknown (backend=herdr window=sess:p-live; exact-home probe unavailable)" \
+    "session start did not preserve a regular anomalous Herdr meta as unknown"
+  assert_not_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" \
+    "session start probed a live Herdr endpoint after its ownership audit failed"
+  assert_not_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" \
+    "session start probed a dead Herdr endpoint after its ownership audit failed"
+  assert_contains "$out" "Herdr meta lacks a consistent exact window/session/workspace/pane identity" \
+    "session start silently treated inconsistent Herdr ownership metadata as probe-safe"
+  assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
+    "Herdr ownership inconsistency disabled unrelated bootstrap mutation"
+  assert_absent "$home/state/x-watch.check.sh" "Herdr endpoint anomaly suppressed X-mode cleanup"
+  assert_absent "$home/config/x-mode.env" "Herdr endpoint anomaly suppressed cadence cleanup"
 
-  pass "herdr endpoint liveness is reported per task: alive for a live pane, dead for a gone one"
+  pass "inconsistent Herdr ownership blocks endpoint action without disabling bootstrap"
+}
+
+test_metadata_audit_precedes_fleet_projection() {
+  local rec root home fakebin outside out count
+  rec=$(new_world metadata-audit-order)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  outside="$TMP_ROOT/session-start-foreign.meta"
+  printf '%s\n' \
+    'window=foreign:window' \
+    'kind=ship' \
+    'sentinel=FOREIGN_META_CONTENT' > "$outside"
+  ln -s "$outside" "$home/state/foreign.meta"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "task metadata is symlinked or non-regular; cross-home read refused" \
+    "session start did not surface its pre-projection metadata audit"
+  assert_not_contains "$out" "FOREIGN_META_CONTENT" \
+    "session start projected foreign metadata before rejecting its symlink"
+  assert_not_contains "$out" "--- foreign ---" \
+    "session start rendered a task row for symlinked metadata"
+  count=$(printf '%s\n' "$out" | grep -c 'task metadata is symlinked or non-regular; cross-home read refused')
+  [ "$count" -eq 1 ] || fail "session start reran or duplicated the captured endpoint audit: $out"
+  pass "session start reuses its metadata audit before fleet projection"
+}
+
+test_state_validation_precedes_session_mutation() {
+  local rec root home fakebin outside out status
+  rec=$(new_world state-validation-order)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  outside="$TMP_ROOT/session-start-state-outside"
+  rmdir "$home/state"
+  mkdir -p "$outside"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH" 2>&1) || status=$?
+  expect_code 1 "$status" "session start invalid effective state report"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "session start did not surface shared state validation failure"
+  assert_contains "$out" "lock, bootstrap, recovery, and fleet probes were skipped" \
+    "session start did not fail closed before its state-mutating composition"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "session start wrote through symlinked effective state before validation"
+  pass "session start validates effective state before lock or fleet access"
+}
+
+test_endpoint_anomaly_suppresses_only_endpoint_mutation() {
+  local rec root home fakebin out identity
+  rec=$(new_world endpoint-anomaly-detect-only)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  make_fake_tmux "$fakebin" "$identity"
+  printf 'backend=zellij\nwindow=fm-anomalous\nkind=secondmate\nharness=codex\n' > "$home/state/anomalous.meta"
+  printf 'window=@41\ntmux_window_id=@41\ntmux_session=fm-sess\ntmux_home_identity=%s\nkind=secondmate\nharness=codex\n' \
+    "$identity" > "$home/state/task-live.meta"
+  printf 'stale\n' > "$home/state/x-watch.check.sh"
+  printf 'stale\n' > "$home/config/x-mode.env"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "ALERT endpoint-ownership: kind=inventory_unavailable task=anomalous" \
+    "session start did not surface the endpoint ownership anomaly"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate anomalous: skipped: exact endpoint ownership is unavailable or anomalous" \
+    "session start did not isolate the anomalous secondmate"
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate task-live: already-live" \
+    "one endpoint anomaly suppressed a safe secondmate liveness probe"
+  assert_contains "$out" "FMX: X mode off - removed relay poll shim and 30s cadence" \
+    "session start suppressed unrelated bootstrap mutation after an endpoint anomaly"
+  assert_absent "$home/state/x-watch.check.sh" "endpoint anomaly suppressed X-mode cleanup"
+  assert_absent "$home/config/x-mode.env" "endpoint anomaly suppressed cadence cleanup"
+  pass "endpoint anomalies suppress only their own liveness mutation"
+}
+
+test_recorded_target_owner_mismatch_blocks_liveness_cleanup() {
+  local rec root home fakebin out identity log
+  rec=$(new_world recorded-owner-mismatch)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  log="$home/tmux.log"
+  fm_write_meta "$home/state/recycled.meta" \
+    'window=@41' \
+    'tmux_window_id=@41' \
+    'tmux_session=fm-sess' \
+    "tmux_home_identity=$identity" \
+    'kind=secondmate' \
+    'harness=codex'
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  display-message)
+    printf '@41\tfm-sess\tfm-other-task\t%s\n' "${FM_TMUX_OWNER:?}"
+    ;;
+  list-windows) ;;
+  kill-window) exit 92 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
+  out=$(FM_TMUX_LOG="$log" FM_TMUX_OWNER="$identity" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "recorded tmux window ownership could not be confirmed" \
+    "session start did not surface the recorded-target ownership mismatch"
+  assert_not_contains "$(cat "$log")" "kill-window" \
+    "session start automatically closed a recorded target with mismatched ownership"
+  assert_contains "$out" \
+    "SECONDMATE_LIVENESS: secondmate recycled: skipped: exact endpoint ownership is unavailable or anomalous" \
+    "session start did not isolate the unverified secondmate endpoint"
+  pass "recorded endpoint ownership mismatches block automatic liveness cleanup"
+}
+
+test_bootstrap_reaudits_immediately_before_liveness_mutation() {
+  local rec root home fakebin out identity log counter
+  rec=$(new_world action-time-owner-audit)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  identity=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" bash -c '. "$1"; fm_backend_home_identity' _ "$ROOT/bin/fm-backend.sh")
+  log="$home/tmux.log"
+  counter="$home/inventory-count"
+  printf '0\n' > "$counter"
+  fm_write_meta "$home/state/recovering.meta" \
+    'window=@41' \
+    'tmux_window_id=@41' \
+    'tmux_session=fm-sess' \
+    "tmux_home_identity=$identity" \
+    'kind=secondmate' \
+    'harness=codex'
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  display-message)
+    printf '@41\tfm-sess\tfm-recovering\t%s\n' "${FM_TMUX_OWNER:?}"
+    ;;
+  list-windows)
+    count=$(cat "${FM_TMUX_COUNTER:?}")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FM_TMUX_COUNTER"
+    if [ "$count" -eq 1 ]; then
+      printf '@41\tfm-recovering\t%s\t_\n' "$FM_TMUX_OWNER"
+    else
+      printf '@41\tfm-recovering\t%s\t_\n@42\tfm-recovering\t%s\t_\n' "$FM_TMUX_OWNER" "$FM_TMUX_OWNER"
+    fi
+    ;;
+  kill-window) exit 92 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux"
+  out=$(FM_TMUX_LOG="$log" FM_TMUX_COUNTER="$counter" FM_TMUX_OWNER="$identity" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" \
+    "SECONDMATE_LIVENESS: secondmate recovering: skipped: exact endpoint ownership is unavailable or anomalous" \
+    "bootstrap did not honor its action-adjacent endpoint re-audit"
+  assert_not_contains "$(cat "$log")" "kill-window" \
+    "bootstrap killed an endpoint after ownership changed post-lock"
+  pass "bootstrap re-audits ownership immediately before liveness mutation"
 }
 
 # --- composition: real scripts run, not reimplemented ------------------------
@@ -528,6 +727,27 @@ EOF
   pass "an empty fleet reports (none) for in-flight tasks and an absent AFK flag"
 }
 
+test_durable_program_source_warns_beside_empty_queue() {
+  local rec root home fakebin out
+  rec=$(new_world durable-program)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$home/data/backlog.md"
+  printf '# Durable program\n\nUnmaterialized obligations remain.\n' > "$home/data/alpha-program.md"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Durable program sources" "session start omitted the durable-program section"
+  assert_contains "$out" "alpha-program.md: $home/data/alpha-program.md" "session start omitted the durable program pointer"
+  assert_contains "$out" "runnable queue is dispatch state, not proof of durable-program completion" \
+    "session start treated the empty queue as complete program accounting"
+  assert_contains "$out" "decomposition completeness requires supervisor judgment" \
+    "session start omitted the supervisor-judgment boundary"
+  pass "session-start recovery distinguishes an empty queue from durable program obligations"
+}
+
 test_next_step_sources_x_mode_cadence() {
   local rec root home fakebin out
   rec=$(new_world next-step-x)
@@ -536,7 +756,7 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  fm_fake_exit0 "$fakebin" curl jq
+  fm_fake_exit0 "$fakebin" curl
   printf 'FMX_PAIRING_TOKEN=tok-next-step\n' > "$home/.env"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
@@ -708,8 +928,14 @@ test_status_tail_bounding
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
+test_metadata_audit_precedes_fleet_projection
+test_state_validation_precedes_session_mutation
+test_endpoint_anomaly_suppresses_only_endpoint_mutation
+test_recorded_target_owner_mismatch_blocks_liveness_cleanup
+test_bootstrap_reaudits_immediately_before_liveness_mutation
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
+test_durable_program_source_warns_beside_empty_queue
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic

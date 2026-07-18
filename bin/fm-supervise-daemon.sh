@@ -66,20 +66,17 @@
 #                                   auto-discovered per backend - $TMUX_PANE
 #                                   under tmux, "<session>:<pane-id>" from
 #                                   $HERDR_PANE_ID under herdr - then
-#                                   firstmate:0 fallback). Accepts either a
-#                                   tmux target or a herdr "<session>:<pane-id>"
-#                                   target; which one it's read as is decided by
-#                                   FM_SUPERVISOR_BACKEND (below), independently.
-#          FM_SUPERVISOR_BACKEND    supervisor pane BACKEND (tmux|herdr;
+#                                   firstmate:0 fallback). The exact target
+#                                   shape is decided by FM_SUPERVISOR_BACKEND.
+#          FM_SUPERVISOR_BACKEND    supervisor pane BACKEND
+#                                   (tmux|herdr|zellij|orca|cmux;
 #                                   override; otherwise auto-discovered the same
 #                                   way bin/fm-backend.sh's fm_backend_detect
 #                                   resolves the runtime firstmate itself is
 #                                   executing inside - $TMUX_PANE selects tmux,
 #                                   $HERDR_ENV=1 selects herdr - falling back to
-#                                   tmux). zellij, orca, and cmux are not yet
-#                                   supported as supervisor backends; the daemon
-#                                   refuses loudly at startup rather than trying
-#                                   tmux primitives against a non-tmux pane.
+#                                   tmux). Backends without ambient discovery
+#                                   require an explicit backend and exact target.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -144,6 +141,14 @@ set -u
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_DAEMON_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
+FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091,SC2317
+. "$FM_DAEMON_DIR/fm-wake-lib.sh" || { return 1 2>/dev/null || exit 1; }
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 
 # Shared tmux pane primitives for supervisor injection (busy/composer detection
 # + verify-retry submit). Sourced at top level so BOTH the executed daemon and
@@ -169,14 +174,7 @@ FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
 # detected) assumes tmux - matching this daemon's pre-herdr-support behavior
 # byte-for-byte when run outside both tmux and herdr.
 FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
-# Supervisor backends this daemon knows how to inject into today. zellij, orca,
-# and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# daemon has no verified composer/busy primitives wired up for them yet - see
-# docs/herdr-backend.md and AGENTS.md section 4's
-# harness-verification discipline. Selecting one refuses loudly at startup
-# instead of silently running tmux primitives against a pane that is not a tmux
-# pane.
-FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr"
+FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr zellij orca cmux"
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
 ESCALATE_BATCH_SECS_DEFAULT=90
@@ -248,8 +246,11 @@ afk_active() {  # <state>
 # skill (enter) and by firstmate on user return (exit). Durable: a plain file,
 # so recovery (§5) re-enters afk if it is present after a restart.
 afk_enter() {  # <state>
-  mkdir -p "$1"
-  date '+%s' > "$1/$AFK_FLAG_NAME"
+  local state=$1
+  fm_validate_effective_state_path "$state" allow-missing-final || return 1
+  state=$FM_VALIDATED_STATE_PATH
+  [ -d "$state" ] || mkdir "$state" || return 1
+  date '+%s' | fm_write_file_no_follow "$state/$AFK_FLAG_NAME"
 }
 
 afk_exit() {  # <state>
@@ -338,10 +339,26 @@ discover_supervisor_target() {
   return 1
 }
 
-# Auto-discover the supervisor's BACKEND at startup - independent of the
-# target string above, so an explicit FM_SUPERVISOR_TARGET override still
-# needs to know which primitives (tmux vs herdr) to dispatch through. Priority
-# mirrors discover_supervisor_target and bin/fm-backend.sh's fm_backend_detect:
+canonical_supervisor_target() {  # <backend> <target>
+  local backend=$1 target=$2 exact
+  case "$backend" in
+    tmux)
+      exact=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || return 1
+      case "$exact" in
+        %*[!0-9]*|%|'') return 1 ;;
+        %*) printf '%s' "$exact" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    herdr|zellij|orca|cmux) printf '%s' "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolve the supervisor's BACKEND at startup independently of the target.
+# An explicit FM_SUPERVISOR_TARGET still needs an exact backend so shared
+# operations dispatch correctly; ambient discovery exists for tmux/herdr only.
+# Priority mirrors discover_supervisor_target and bin/fm-backend.sh's fm_backend_detect:
 #   1. FM_SUPERVISOR_BACKEND env (explicit override).
 #   2. $TMUX_PANE set — tmux.
 #   3. $HERDR_ENV=1 (with $HERDR_PANE_ID present) — herdr.
@@ -464,7 +481,11 @@ stale_marker_record() {  # <window> <state>  — create if absent
   local win=$1 state=$2 key marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-stale-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ]
+    return
+  fi
+  _now | fm_write_file_no_follow "$marker"
 }
 
 stale_marker_remove() {  # <window> <state>
@@ -482,7 +503,11 @@ pause_marker_record() {  # <window> <state> - create if absent
   local win=$1 state=$2 key marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-paused-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ]
+    return
+  fi
+  _now | fm_write_file_no_follow "$marker"
 }
 
 pause_marker_remove() {  # <window> <state>
@@ -518,7 +543,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
 migrate_watcher_pause_markers() {  # <state>
   local state=$1 meta win task key last watcher_key
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
     [ -n "$win" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
@@ -552,7 +577,7 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
 # escalate path and the catch-all scan.
 mark_status_seen() {  # <state> <task> <last-line>
   local state=$1 task=$2 line=$3
-  printf '%s' "$line" > "$state/.subsuper-seen-status-$(_stale_key "$task")"
+  printf '%s' "$line" | fm_write_file_no_follow "$state/.subsuper-seen-status-$(_stale_key "$task")"
 }
 
 # Mark every captain-relevant status line a per-wake classification escalated as
@@ -648,8 +673,8 @@ stale_window_is_busy() {  # <window> <state>
 escalate_add() {  # <state> <distilled-item>
   local state=$1 item=$2 buf
   buf="$state/.subsuper-escalations"
-  [ -s "$buf" ] || _now > "${buf}.since"
-  printf '%s\n' "$item" >> "$buf"
+  [ -s "$buf" ] || _now | fm_write_file_no_follow "${buf}.since" || return 1
+  printf '%s\n' "$item" | fm_append_file_no_follow "$buf"
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
@@ -665,7 +690,7 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  if inject_msg "$msg" "$state"; then fm_touch_file_no_follow "$buf" || return 1; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
 
@@ -926,7 +951,7 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
     cat "$state/.subsuper-escalations" 2>/dev/null
-  } 2>/dev/null > "$marker" || true
+  } 2>/dev/null | fm_write_file_no_follow "$marker" || true
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   # Best-effort status-line flash. tmux's display-message is a client-side OSD
@@ -1064,7 +1089,7 @@ housekeeping() {  # <state>
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
-          _now > "$marker"
+          _now | fm_write_file_no_follow "$marker" || return 1
         else
           rm -f "$marker"
         fi
@@ -1077,7 +1102,7 @@ housekeeping() {  # <state>
   #     captain-relevant filtering is the shared classifier's
   #     scan_captain_relevant_statuses; the daemon layers its digest dedup on top.
   if [ "$(_file_age "$state/.subsuper-last-scan")" -ge "${FM_HEARTBEAT_SCAN_SECS:-$HEARTBEAT_SCAN_SECS_DEFAULT}" ]; then
-    _now > "$state/.subsuper-last-scan"
+    _now | fm_write_file_no_follow "$state/.subsuper-last-scan" || return 1
     local seen
     while IFS="$(printf '\t')" read -r f task last; do
       [ -n "$f" ] || continue
@@ -1091,17 +1116,13 @@ housekeeping() {  # <state>
 
 # Find a recorded or live window target whose task id matches the marker key.
 window_for_task() {  # <task-key> [state]
-  local key=$1 state=${2:-$(_state_root)} meta task w t
+  local key=$1 state=${2:-$(_state_root)} meta task w
   for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
     [ "$(_stale_key "$task")" = "$key" ] || continue
     w=$(fm_backend_target_of_meta "$meta")
     [ -n "$w" ] && { printf '%s' "$w"; return 0; }
-  done
-  for w in $(tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep ':fm-' || true); do
-    t=$(window_to_task "$w" "$state")
-    [ "$(_stale_key "$t")" = "$key" ] && { printf '%s' "$w"; return 0; }
   done
   return 1
 }
@@ -1292,15 +1313,15 @@ handle_wake() {  # <reason> <state>
 # --- log --------------------------------------------------------------------
 # Uses LOG set by fm_super_main; harmless no-op-ish if unset (tests source fns
 # directly and pass state explicitly, so they do not call log).
-log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG"; }
+log() { [ -n "${LOG:-}" ] && printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | fm_append_file_no_follow "$LOG"; }
 
 trim_log() {
-  local sz tmp
+  local sz
   [ -n "${LOG:-}" ] || return 0
   sz=$(wc -c < "$LOG" 2>/dev/null) || return 0
   [ "$sz" -ge "${FM_LOG_MAX_BYTES:-$LOG_MAX_BYTES_DEFAULT}" ] || return 0
-  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-daemon-log.XXXXXX") || return 0
-  tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
+  tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" \
+    | fm_write_file_no_follow "$LOG" 2>/dev/null
 }
 
 # ============================================================================
@@ -1311,12 +1332,10 @@ trim_log() {
 fm_super_main() {
   local STATE
   STATE="$(_state_root)"
-  mkdir -p "$STATE"
 
-  # Source the portable lock helpers (works on macOS where flock is absent).
-  # Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
-  # shellcheck source=bin/fm-wake-lib.sh
-  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
+  fm_validate_effective_state_path "$STATE" allow-missing-final || return 1
+  STATE=$FM_VALIDATED_STATE_PATH
+  [ -d "$STATE" ] || mkdir "$STATE" || return 1
 
   local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
   local LOG="$STATE/.supervise-daemon.log"
@@ -1340,12 +1359,13 @@ fm_super_main() {
     fi
     exit 1
   fi
-  echo "$$" > "$PIDFILE"
+  printf '%s\n' "$$" | fm_write_file_no_follow "$PIDFILE" || exit 1
   fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
 
-  # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
-  # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1
-  # (herdr) > tmux fallback. Resolved before the target below, since target
+  # --- resolve the supervisor BACKEND before its target ---------------------
+  # Explicit FM_SUPERVISOR_BACKEND accepts every verified backend; ambient
+  # discovery is $TMUX_PANE (tmux) > $HERDR_ENV=1 (herdr) > tmux fallback.
+  # Resolved before the target below, since target
   # discovery composes a herdr "<session>:<pane-id>" string using the same
   # $HERDR_PANE_ID/$HERDR_SESSION markers this checks. Exporting the result
   # into FM_SUPERVISOR_BACKEND makes inject_msg/pane_is_busy/pane_input_pending
@@ -1366,13 +1386,9 @@ fm_super_main() {
   FM_SUPERVISOR_BACKEND="$discovered_backend"
   local BACKEND="$FM_SUPERVISOR_BACKEND"
 
-  # --- refuse an unsupported supervisor backend loudly, before ever trying a
-  # tmux/herdr-specific call against it (zellij, orca, and cmux have no verified
-  # composer/busy primitives wired up for this daemon yet - AGENTS.md section 4
-  # harness-verification discipline). This is the clear refusal the task calls
-  # for, instead of a confusing "does not resolve to a tmux pane" error.
+  # --- refuse an unsupported supervisor backend loudly before target probing.
   if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND and FM_SUPERVISOR_TARGET to an exact supported endpoint" >&2
     log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
@@ -1404,6 +1420,15 @@ fm_super_main() {
   FM_SUPERVISOR_TARGET="$discovered"
   local TARGET="$FM_SUPERVISOR_TARGET"
 
+  TARGET=$(canonical_supervisor_target "$BACKEND" "$TARGET") || {
+    echo "error: supervisor target '$FM_SUPERVISOR_TARGET' cannot be bound to an exact $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+    log "startup failed: target '$FM_SUPERVISOR_TARGET' has no exact pane identity (backend=$BACKEND)"
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    exit 1
+  }
+  FM_SUPERVISOR_TARGET="$TARGET"
+
   # --- validate supervisor target at startup (a missing target is a typo) ---
   # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
   # probe, so a herdr supervisor pane is checked via the herdr adapter; for
@@ -1419,6 +1444,14 @@ fm_super_main() {
     rm -f "$PIDFILE" 2>/dev/null || true
     exit 1
   fi
+  if ! printf '%s\n' "$BACKEND" > "$LOCK/supervisor-backend" \
+    || ! printf '%s\n' "$TARGET" > "$LOCK/supervisor-target"; then
+    echo "error: could not persist supervisor injection target ownership" >&2
+    log "startup failed: could not persist supervisor injection target ownership"
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    exit 1
+  fi
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
@@ -1426,7 +1459,7 @@ fm_super_main() {
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
-  local WATCHER_PID="" CUR_TMP=""
+  local WATCHER_PID="" CUR_TMP="" CUR_ERR=""
   cleanup() {
     trap - TERM INT
     wedge_alarm_stop_active_notifier
@@ -1435,8 +1468,15 @@ fm_super_main() {
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
     fi
+    if [ -n "${CUR_ERR:-}" ] && [ -s "${CUR_ERR:-}" ]; then
+      fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR" \
+        || log "warn: watcher stderr could not be appended safely during shutdown"
+    fi
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
+    fi
+    if [ -n "${CUR_ERR:-}" ]; then
+      rm -f "$CUR_ERR" 2>/dev/null || true
     fi
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
@@ -1467,7 +1507,18 @@ fm_super_main() {
 
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
+    CUR_ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-err.XXXXXX") || {
+      rm -f "$CUR_TMP" 2>/dev/null || true
+      CUR_TMP=""
+      log "error: stderr mktemp failed; retrying in 5s"
+      sleep 5
+      return 1
+    }
+    env \
+      FM_WATCH_OWNER_KIND=daemon \
+      FM_WATCH_OWNER_MODE=away-inject \
+      FM_WATCH_OWNER_PID="${BASHPID:-$$}" \
+      "$WATCH" >"$CUR_TMP" 2>"$CUR_ERR" &
     WATCHER_PID=$!
   }
 
@@ -1492,6 +1543,14 @@ fm_super_main() {
       if [ -n "${WATCHER_PID:-}" ]; then
         # child exited: reap + classify its wake reason
         if wait "${WATCHER_PID}"; then rc=0; else rc=$?; fi
+        if [ -n "${CUR_ERR:-}" ] && [ -s "${CUR_ERR:-}" ]; then
+          fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR" \
+            || log "warn: watcher stderr could not be appended safely"
+        fi
+        if [ -n "${CUR_ERR:-}" ]; then
+          rm -f "$CUR_ERR" 2>/dev/null || true
+        fi
+        CUR_ERR=""
         reason=""
         if [ -n "${CUR_TMP:-}" ] && [ -e "${CUR_TMP:-}" ]; then
           reason=$(<"${CUR_TMP}")
@@ -1531,7 +1590,7 @@ fm_super_main() {
     # cadence. Gating keeps a large fleet cheap between ticks.
     sleep 1
     if [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
-      _now > "$STATE/.subsuper-last-housekeep"
+      _now | fm_write_file_no_follow "$STATE/.subsuper-last-housekeep" || exit 1
       housekeeping "$STATE"
     fi
   done

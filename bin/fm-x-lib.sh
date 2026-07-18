@@ -113,9 +113,32 @@ fmx_load_config() {
 # tweet_id shape is used: "discord:<channel>:<message>" means Discord, while a
 # numeric id means X. Empty fields mean unknown, and callers must default safely.
 fmx_request_inbox_context() {
-  local state=$1 rid=$2 inbox
-  inbox="$state/x-inbox/$rid.json"
-  if [ ! -f "$inbox" ]; then
+  local state=$1 rid=$2 inbox inbox_dir saved_state validated_state
+  saved_state=${FM_VALIDATED_STATE_PATH:-}
+  fm_validate_effective_state_path "$state" allow-missing-final || return 1
+  validated_state=$FM_VALIDATED_STATE_PATH
+  FM_VALIDATED_STATE_PATH=$saved_state
+  if [ ! -e "$validated_state" ] && [ ! -L "$validated_state" ]; then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  inbox_dir="$validated_state/x-inbox"
+  if [ ! -e "$inbox_dir" ] && [ ! -L "$inbox_dir" ]; then
+    printf '{"platform":"","reply_max_chars":""}\n'
+    return 0
+  fi
+  fm_validate_effective_state_path "$inbox_dir" require-existing || {
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  }
+  [ "$FM_VALIDATED_STATE_PATH" = "$inbox_dir" ] || {
+    FM_VALIDATED_STATE_PATH=$saved_state
+    return 1
+  }
+  FM_VALIDATED_STATE_PATH=$saved_state
+  [ -d "$inbox_dir" ] && [ ! -L "$inbox_dir" ] || return 1
+  inbox="$inbox_dir/$rid.json"
+  if [ ! -f "$inbox" ] || [ -L "$inbox" ]; then
     printf '{"platform":"","reply_max_chars":""}\n'
     return 0
   fi
@@ -492,7 +515,7 @@ fmx_post_json() (
 # empty output as "unset".
 fmx_meta_get() {
   local meta=$1 key=$2 line
-  [ -f "$meta" ] || return 0
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
   line=$(grep -E "^${key}=" "$meta" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   printf '%s' "${line#*=}"
@@ -515,37 +538,69 @@ fmx_meta_tmp() {
 # budget against a binding the relay already knows about. Returns non-zero if
 # <meta> is missing or the rewrite fails.
 fmx_meta_link_set() {
-  local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp
-  [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
+  local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp lock status=0
+  lock=$(fm_meta_lock_path "$meta") || return 1
+  fm_lock_acquire_wait "$lock"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
+  if [ "$status" -eq 0 ]; then
+    tmp=$(fmx_meta_tmp "$meta") || status=1
+  fi
+  if [ "$status" -ne 0 ]; then
+    fm_lock_release "$lock"
+    return 1
+  fi
   if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+    status=1
   fi
-  printf 'x_request=%s\n' "$rid" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_request_ts=%s\n' "$ts" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_followups=%s\n' "$followups" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  if [ -n "$platform" ]; then
-    printf 'x_platform=%s\n' "$platform" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ]; then
+    printf 'x_request=%s\n' "$rid" >> "$tmp" || status=1
+    printf 'x_request_ts=%s\n' "$ts" >> "$tmp" || status=1
+    printf 'x_followups=%s\n' "$followups" >> "$tmp" || status=1
   fi
-  case "$reply_max" in
-    ''|*[!0-9]*) ;;
-    *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
-  esac
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ] && [ -n "$platform" ]; then
+    printf 'x_platform=%s\n' "$platform" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    case "$reply_max" in
+      ''|*[!0-9]*) ;;
+      *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || status=1 ;;
+    esac
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_publish_file_no_follow "$tmp" "$meta" replace || status=1
+  fi
+  [ "$status" -eq 0 ] || rm -f "$tmp" 2>/dev/null || true
+  fm_lock_release "$lock"
+  [ "$status" -eq 0 ]
 }
 
 # fmx_meta_followups_set <meta> <n>: atomically rewrite just the x_followups
 # line, preserving every other meta line including link and reply context.
 # Returns non-zero if <meta> is missing or the rewrite fails.
 fmx_meta_followups_set() {
-  local meta=$1 n=$2 tmp
-  [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+  local meta=$1 n=$2 tmp lock status=0
+  lock=$(fm_meta_lock_path "$meta") || return 1
+  fm_lock_acquire_wait "$lock"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
+  if [ "$status" -eq 0 ]; then
+    tmp=$(fmx_meta_tmp "$meta") || status=1
   fi
-  printf 'x_followups=%s\n' "$n" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -ne 0 ]; then
+    fm_lock_release "$lock"
+    return 1
+  fi
+  if ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    printf 'x_followups=%s\n' "$n" >> "$tmp" || status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_publish_file_no_follow "$tmp" "$meta" replace || status=1
+  fi
+  [ "$status" -eq 0 ] || rm -f "$tmp" 2>/dev/null || true
+  fm_lock_release "$lock"
+  [ "$status" -eq 0 ]
 }
 
 # fmx_meta_link_clear <meta>: atomically remove the x_request/x_request_ts/
@@ -553,11 +608,27 @@ fmx_meta_followups_set() {
 # succeeds whether or not a link is present, and is a no-op when <meta> is
 # missing.
 fmx_meta_link_clear() {
-  local meta=$1 tmp
-  [ -f "$meta" ] || return 0
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
+  local meta=$1 tmp lock status=0
+  lock=$(fm_meta_lock_path "$meta") || return 1
+  fm_lock_acquire_wait "$lock"
+  if [ -e "$meta" ] || [ -L "$meta" ]; then
+    [ -f "$meta" ] && [ ! -L "$meta" ] || status=1
+  else
+    fm_lock_release "$lock"
+    return 0
   fi
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  if [ "$status" -eq 0 ]; then
+    tmp=$(fmx_meta_tmp "$meta") || status=1
+  fi
+  if [ "$status" -eq 0 ] && ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    fm_publish_file_no_follow "$tmp" "$meta" replace || status=1
+  fi
+  if [ "$status" -ne 0 ] && [ -n "${tmp:-}" ]; then
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  fm_lock_release "$lock"
+  [ "$status" -eq 0 ]
 }

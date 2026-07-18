@@ -5,6 +5,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
+WATCHER=${FM_WATCH_CHECKPOINT_WATCHER:-$SCRIPT_DIR/fm-watch.sh}
 
 usage() {
   cat <<'EOF'
@@ -44,47 +45,293 @@ case "$SECONDS_ARG" in
   0) echo "error: --seconds must be greater than zero" >&2; exit 2 ;;
 esac
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_validate_effective_state_path "$STATE" existing || exit 1
+STATE=$FM_VALIDATED_STATE_PATH
+
+CHECKPOINT_PID=${BASHPID:-$$}
+CHECKPOINT_IDENTITY=$(fm_pid_birth_identity "$CHECKPOINT_PID") || {
+  echo "checkpoint: exact checkpoint process identity could not be captured" >&2
+  exit 1
+}
+fm_reserve_checkpoint_orphan "$STATE" "$CHECKPOINT_PID" "$CHECKPOINT_IDENTITY" || exit 1
+CHECKPOINT_RECORD=$FM_CHECKPOINT_ORPHAN_RECORD
+
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
   exit 1
 }
-trap 'rm -f "$OUT" "$ERR"' EXIT
+TIMEOUT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.timeout.XXXXXX") || {
+  rm -f "$OUT" "$ERR"
+  exit 1
+}
+rm -f "$TIMEOUT_MARKER"
+START_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.start.XXXXXX") || {
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER"
+  exit 1
+}
+ABORT_MARKER=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.abort.XXXXXX") || {
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER"
+  exit 1
+}
+rm -f "$START_MARKER" "$ABORT_MARKER"
+WATCH_PID=
+WATCH_IDENTITY=
+TIMER_PID=
+CLEANED=0
+OWNERSHIP_FAILURE=0
 
-run_with_perl_timeout() {
-  perl -e '
-    my $seconds = shift;
-    my $pid = fork;
-    die "fork failed\n" unless defined $pid;
-    if (!$pid) {
-      setpgrp(0, 0);
-      exec @ARGV;
-      die "exec failed: $!\n";
-    }
-    local $SIG{ALRM} = sub {
-      kill "TERM", -$pid;
-      select undef, undef, undef, 0.2;
-      kill "KILL", -$pid;
-      exit 124;
-    };
-    alarm $seconds;
-    waitpid $pid, 0;
-    exit($? >> 8);
-  ' "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh"
+watch_birth_identity() {
+  fm_pid_birth_identity "$1"
 }
 
+capture_watch_identity() {
+  local current_identity current_parent previous_identity='' i=0
+  while [ "$i" -lt 40 ]; do
+    current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)
+    current_identity=$(watch_birth_identity "$WATCH_PID" 2>/dev/null || true)
+    if [ "$current_parent" = "$CHECKPOINT_PID" ] && [ -n "$current_identity" ] \
+       && [ -n "$previous_identity" ] && [ "$current_identity" = "$previous_identity" ]; then
+      WATCH_IDENTITY=$current_identity
+      return 0
+    fi
+    previous_identity=$current_identity
+    sleep 0.01
+    i=$((i + 1))
+  done
+  WATCH_IDENTITY=
+  return 1
+}
+
+watch_child_state() {
+  local current_identity current_parent pid_state
+  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || { printf '%s\n' unknown; return; }
+  pid_state=$(fm_pid_state "$WATCH_PID")
+  [ "$pid_state" = alive ] || { printf '%s\n' "$pid_state"; return; }
+  current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]') || {
+    printf '%s\n' unknown
+    return
+  }
+  [ "$current_parent" = "$CHECKPOINT_PID" ] || { printf '%s\n' mismatch; return; }
+  current_identity=$(watch_birth_identity "$WATCH_PID") || { printf '%s\n' unknown; return; }
+  [ "$current_identity" = "$WATCH_IDENTITY" ] || { printf '%s\n' mismatch; return; }
+  printf '%s\n' alive
+}
+
+release_checkpoint_authority() {
+  [ -n "$CHECKPOINT_RECORD" ] || return 0
+  fm_clear_checkpoint_orphan "$STATE" "$CHECKPOINT_RECORD" || return 1
+  CHECKPOINT_RECORD=
+}
+
+reap_watch_child_bounded() {
+  local limit=$1 i=0 child_state
+  [ -n "$WATCH_PID" ] || return 0
+  while [ "$i" -lt "$limit" ]; do
+    child_state=$(watch_child_state)
+    case "$child_state" in
+      dead)
+        wait "$WATCH_PID" 2>/dev/null || true
+        WATCH_PID=
+        release_checkpoint_authority
+        return
+        ;;
+      mismatch) return 1 ;;
+    esac
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+signal_watch_child() {
+  local signal=$1
+  [ "$(watch_child_state)" = alive ] || return 1
+  kill "-$signal" "$WATCH_PID" 2>/dev/null
+}
+
+retain_watch_child() {
+  [ -n "$WATCH_PID" ] && [ -n "$WATCH_IDENTITY" ] || return 1
+  fm_record_checkpoint_orphan "$STATE" "$CHECKPOINT_RECORD" "$WATCH_PID" "$WATCH_IDENTITY" || {
+    echo "checkpoint: FAILED - exact watcher pid=$WATCH_PID remains live but durable orphan ownership could not be recorded" >&2
+    return 1
+  }
+  CHECKPOINT_RECORD=
+  echo "checkpoint: ORPHANED exact watcher pid=$WATCH_PID; durable ownership retained at $(fm_checkpoint_orphan_path "$STATE")" >&2
+  WATCH_PID=
+  return 0
+}
+
+stop_watch_child() {
+  local limit=$1 i=0 term_sent=0 child_state
+  [ -n "$WATCH_PID" ] || return 0
+  while [ "$i" -lt "$limit" ]; do
+    child_state=$(watch_child_state)
+    case "$child_state" in
+      dead)
+        reap_watch_child_bounded 1 && return 0
+        retain_watch_child
+        return
+        ;;
+      mismatch)
+        retain_watch_child
+        return
+        ;;
+    esac
+    if [ "$child_state" = alive ] && [ "$term_sent" -eq 0 ] && signal_watch_child TERM; then
+      term_sent=1
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  child_state=$(watch_child_state)
+  case "$child_state" in
+    dead)
+      reap_watch_child_bounded 1 && return 0
+      retain_watch_child
+      return
+      ;;
+    mismatch)
+      retain_watch_child
+      return
+      ;;
+  esac
+  if [ "$child_state" = alive ]; then
+    signal_watch_child KILL || true
+  fi
+  reap_watch_child_bounded 20 && return 0
+  retain_watch_child
+}
+
+# shellcheck disable=SC2329 # Invoked by EXIT and signal traps below.
+cleanup_owned_children() {
+  [ "$CLEANED" -eq 0 ] || return 0
+  CLEANED=1
+  if [ -n "$TIMER_PID" ] && kill -0 "$TIMER_PID" 2>/dev/null; then
+    kill -TERM "$TIMER_PID" 2>/dev/null || true
+  fi
+  [ -z "$TIMER_PID" ] || wait "$TIMER_PID" 2>/dev/null || true
+  TIMER_PID=
+  if ! stop_watch_child 20; then
+    OWNERSHIP_FAILURE=1
+  fi
+  if [ -z "$WATCH_PID" ] && [ -n "$CHECKPOINT_RECORD" ] \
+    && ! release_checkpoint_authority; then
+    echo "checkpoint: FAILED - reserved checkpoint orphan authority could not be released" >&2
+    OWNERSHIP_FAILURE=1
+  fi
+  rm -f "$OUT" "$ERR" "$TIMEOUT_MARKER" "$START_MARKER" "$ABORT_MARKER"
+}
+
+# shellcheck disable=SC2329 # Invoked by HUP, INT, and TERM traps below.
+checkpoint_interrupted() {
+  local code=$1
+  trap - HUP INT TERM
+  cleanup_owned_children
+  if [ "$OWNERSHIP_FAILURE" -ne 0 ]; then
+    exit 1
+  fi
+  exit "$code"
+}
+
+trap 'checkpoint_interrupted 129' HUP
+trap 'checkpoint_interrupted 130' INT
+trap 'checkpoint_interrupted 143' TERM
+trap cleanup_owned_children EXIT
+
+# The checkpoint owns one exact watcher child and one exact timer child.
+# Signal traps terminate and reap only those captured PIDs, so an interrupted
+# foreground tool call cannot reparent fm-watch.sh to PID 1 or touch a watcher
+# belonging to another checkpoint or Firstmate home.
+(
+  wait_count=0
+  while [ ! -e "$START_MARKER" ]; do
+    [ ! -e "$ABORT_MARKER" ] || exit 125
+    fm_pid_alive "$CHECKPOINT_PID" || exit 125
+    [ "$wait_count" -lt 200 ] || exit 125
+    sleep 0.01
+    wait_count=$((wait_count + 1))
+  done
+  exec env FM_WATCH_OWNER_KIND=checkpoint FM_WATCH_OWNER_PID="$CHECKPOINT_PID" \
+    FM_WATCH_CHECKPOINT_TIMEOUT_MARKER="$TIMEOUT_MARKER" "$WATCHER"
+) >"$OUT" 2>"$ERR" &
+WATCH_PID=$!
+if ! capture_watch_identity; then
+  : > "$ABORT_MARKER"
+  i=0
+  CHILD_STATE=$(fm_pid_state "$WATCH_PID")
+  while [ "$CHILD_STATE" != dead ] && [ "$i" -lt 200 ]; do
+    sleep 0.01
+    i=$((i + 1))
+    CHILD_STATE=$(fm_pid_state "$WATCH_PID")
+  done
+  if [ "$CHILD_STATE" = dead ]; then
+    wait "$WATCH_PID" 2>/dev/null || true
+  else
+    echo "checkpoint: exact wrapper exit could not be confirmed after its abort gate closed" >&2
+  fi
+  WATCH_PID=
+  release_checkpoint_authority || {
+    echo "checkpoint: reserved orphan authority could not be released after startup abort" >&2
+    exit 1
+  }
+  echo "checkpoint: exact watcher child identity could not be captured; watcher was not started" >&2
+  exit 1
+fi
+if ! fm_activate_checkpoint_orphan_reservation "$STATE" "$CHECKPOINT_RECORD" \
+  "$CHECKPOINT_PID" "$CHECKPOINT_IDENTITY" "$WATCH_PID" "$WATCH_IDENTITY"; then
+  : > "$ABORT_MARKER"
+  stop_watch_child 40 || OWNERSHIP_FAILURE=1
+  echo "checkpoint: exact watcher ownership could not be bound before startup" >&2
+  exit 1
+fi
+CHECKPOINT_RECORD=$FM_CHECKPOINT_ORPHAN_RECORD
+: > "$START_MARKER"
+(
+  sleep "$SECONDS_ARG"
+  : > "$TIMEOUT_MARKER"
+) &
+TIMER_PID=$!
+
+WATCH_FINISHED=0
+while [ ! -e "$TIMEOUT_MARKER" ]; do
+  CHILD_STATE=$(watch_child_state)
+  case "$CHILD_STATE" in dead|mismatch) WATCH_FINISHED=1; break ;; esac
+  sleep 1
+done
+if [ -e "$TIMEOUT_MARKER" ]; then
+  stop_watch_child 20 || OWNERSHIP_FAILURE=1
+fi
 set +e
-if command -v timeout >/dev/null 2>&1; then
-  timeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
+RC=1
+if [ -z "$WATCH_PID" ]; then
+  RC=0
+elif [ "$WATCH_FINISHED" -eq 1 ] && [ "$(watch_child_state)" = dead ]; then
+  wait "$WATCH_PID"
   RC=$?
-elif command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
-  RC=$?
+  WATCH_PID=
+elif reap_watch_child_bounded 40; then
+  RC=0
 else
-  run_with_perl_timeout >"$OUT" 2>"$ERR"
-  RC=$?
+  retain_watch_child || OWNERSHIP_FAILURE=1
 fi
 set -e
+if kill -0 "$TIMER_PID" 2>/dev/null; then
+  kill -TERM "$TIMER_PID" 2>/dev/null || true
+fi
+wait "$TIMER_PID" 2>/dev/null || true
+TIMER_PID=
+
+if [ "$OWNERSHIP_FAILURE" -ne 0 ]; then
+  echo "checkpoint: FAILED - exact watcher ownership could not be finalized" >&2
+  exit 1
+fi
+
+if [ -e "$TIMEOUT_MARKER" ]; then
+  RC=124
+fi
 
 if grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" >/dev/null 2>&1; then
   cat "$OUT"

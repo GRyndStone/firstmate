@@ -1,7 +1,7 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,6 +20,21 @@ const root = resolve(extensionDir, "../..");
 const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
 const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
+
+function validateEffectiveState(): void {
+  const result = spawnSync("bash", ["-c", 'FM_WAKE_STATE_INIT=skip; . "$1"', "_", `${fmRoot}/bin/fm-wake-lib.sh`], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FM_ROOT_OVERRIDE: fmRoot,
+      FM_HOME: fmHome,
+      FM_STATE_OVERRIDE: state,
+    },
+  });
+  if (result.status !== 0) throw new Error(`Firstmate Pi watcher state validation failed: ${(result.stderr || "unknown error").trim()}`);
+}
+
+validateEffectiveState();
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
@@ -66,8 +81,16 @@ function sessionOwnsLock(): boolean {
 
 function markLoaded(): void {
   if (lockOwnership() === "other") return;
-  mkdirSync(state, { recursive: true });
-  writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
+  const result = spawnSync("bash", ["-c", '. "$1"; printf "%s\\n%s\\n" "$2" "$3" | fm_write_file_no_follow "$4"', "_", `${fmRoot}/bin/fm-wake-lib.sh`, extensionVersion, String(process.pid), marker], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      FM_ROOT_OVERRIDE: fmRoot,
+      FM_HOME: fmHome,
+      FM_STATE_OVERRIDE: state,
+    },
+  });
+  if (result.status !== 0) throw new Error(`Firstmate Pi watcher marker write failed: ${(result.stderr || "unknown error").trim()}`);
 }
 
 function actionableLine(output: string): string {

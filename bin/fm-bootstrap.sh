@@ -73,6 +73,10 @@
 #          secondmate homes, X-mode artifacts, project clones, or repair
 #          instructions. Unset/0 (the default) runs every sweep exactly as
 #          before - this flag is purely additive.
+#          Set FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 to skip only the
+#          secondmate liveness sweep while retaining secondmate sync, X-mode
+#          setup, and fleet sync. Session start uses it when exact endpoint
+#          ownership is anomalous or unavailable.
 #        fm-bootstrap.sh install <tool>...
 #          Install the named tools (only ones the captain approved).
 set -u
@@ -83,6 +87,13 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
+FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
+fm_validate_task_meta_files "$STATE" || exit 1
 # shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh disable=SC1091
@@ -273,9 +284,9 @@ secondmate_liveness_sweep() {
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
   [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out
+  local meta id window harness backend target verdict out ownership audit
   for meta in "$STATE"/*.meta; do
-    [ -f "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
     id=$(basename "$meta" .meta)
     window=$(fm_meta_get "$meta" window)
@@ -284,7 +295,18 @@ secondmate_liveness_sweep() {
     backend=$(fm_backend_of_meta "$meta")
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
-    verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown"
+    audit=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$id" 2>&1) || audit=unavailable
+    if [ "$audit" != '[]' ]; then
+      echo "SECONDMATE_LIVENESS: secondmate $id: skipped: exact endpoint ownership is unavailable or anomalous"
+      continue
+    fi
+    ownership=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+    case "$ownership" in
+      present) verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown" ;;
+      absent) verdict=dead ;;
+      *) verdict=unknown ;;
+    esac
     case "$harness" in
       claude|codex|opencode|pi|grok) ;;
       *) [ "$verdict" = dead ] && verdict=unknown ;;
@@ -294,7 +316,20 @@ secondmate_liveness_sweep() {
         echo "SECONDMATE_LIVENESS: secondmate $id: already-live"
         ;;
       dead)
-        fm_backend_kill "$backend" "$target" 2>/dev/null || true
+        audit=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+          "$SCRIPT_DIR/fm-endpoint-audit.sh" --json --task "$id" 2>&1) || audit=unavailable
+        ownership=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+        if [ "$audit" != '[]' ] || [ "$ownership" = unknown ]; then
+          echo "SECONDMATE_LIVENESS: secondmate $id: skipped: exact endpoint ownership changed before cleanup"
+          continue
+        fi
+        if [ "$ownership" = present ]; then
+          if ! fm_backend_kill_owned_meta "$meta" "fm-$id" 2>/dev/null \
+             || [ "$(fm_backend_target_state_of_meta "$meta" "fm-$id")" != absent ]; then
+            echo "SECONDMATE_LIVENESS: secondmate $id: skipped: endpoint closure was not confirmed"
+            continue
+          fi
+        fi
         if out=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1); then
           echo "SECONDMATE_LIVENESS: secondmate $id: respawned"
         else
@@ -355,9 +390,29 @@ no_mistakes_compatible() {
 # Write CONTENT to DEST only when it differs, so re-running bootstrap does not
 # churn mtimes or duplicate generated files (idempotence).
 write_if_changed() {
-  local dest=$1 content=$2
-  [ -f "$dest" ] && [ "$(cat "$dest" 2>/dev/null)" = "$content" ] && return 0
-  printf '%s\n' "$content" > "$dest"
+  local dest=$1 content=$2 executable=${3:-no} parent tmp
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    [ -f "$dest" ] && [ ! -L "$dest" ] || return 1
+    if [ "$(cat "$dest" 2>/dev/null)" = "$content" ] \
+       && { [ "$executable" != yes ] || [ -x "$dest" ]; }; then
+      return 0
+    fi
+  fi
+  parent=${dest%/*}
+  [ -n "$parent" ] || parent=.
+  tmp=$(mktemp "$parent/.fm-bootstrap-write.XXXXXX") || return 1
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [ "$executable" = yes ] && ! chmod +x "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! fm_publish_file_no_follow "$tmp" "$dest" replace; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
 }
 
 # X mode (opt-in): when this home's .env carries a non-empty FMX_PAIRING_TOKEN,
@@ -378,14 +433,25 @@ x_mode_setup() {
   local env_file token shim cadence shim_body cadence_body tool missing
   env_file="$FM_HOME/.env"
   shim="$STATE/x-watch.check.sh"
+  if ! fm_validate_effective_state_path "$CONFIG" allow-missing-final; then
+    echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence"
+    return 0
+  fi
+  CONFIG=$FM_VALIDATED_STATE_PATH
   cadence="$CONFIG/x-mode.env"
 
   token=
   [ -f "$env_file" ] && token=$(fmx_env_get FMX_PAIRING_TOKEN "$env_file")
 
   x_mode_remove_artifacts() {
-    rm -f "$shim" "$cadence" 2>/dev/null || true
-    [ ! -e "$shim" ] && [ ! -e "$cadence" ]
+    local rc=0
+    if [ -e "$shim" ] || [ -L "$shim" ]; then
+      fm_remove_file_no_follow "$shim" || rc=1
+    fi
+    if [ -e "$cadence" ] || [ -L "$cadence" ]; then
+      fm_remove_file_no_follow "$cadence" || rc=1
+    fi
+    return "$rc"
   }
 
   x_mode_supervision_repair() {
@@ -398,7 +464,7 @@ x_mode_setup() {
   if [ -z "$token" ]; then
     # Opt-out (or never opted in): drop any X artifacts; stay silent unless we
     # actually removed something.
-    if [ -e "$shim" ] || [ -e "$cadence" ]; then
+    if [ -e "$shim" ] || [ -L "$shim" ] || [ -e "$cadence" ] || [ -L "$cadence" ]; then
       if x_mode_remove_artifacts; then
         echo "FMX: X mode off - removed relay poll shim and 30s cadence; default cadence applies on the next supervision cycle; $(x_mode_supervision_repair)"
       else
@@ -416,7 +482,7 @@ x_mode_setup() {
     fi
   done
   if [ "$missing" -ne 0 ]; then
-    if [ -e "$shim" ] || [ -e "$cadence" ]; then
+    if [ -e "$shim" ] || [ -L "$shim" ] || [ -e "$cadence" ] || [ -L "$cadence" ]; then
       if x_mode_remove_artifacts; then
         echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
       else
@@ -434,7 +500,12 @@ x_mode_setup() {
     fi
   }
 
-  mkdir -p "$STATE" "$CONFIG" 2>/dev/null || { fmx_arm_failed; return 0; }
+  { [ -d "$STATE" ] || mkdir "$STATE"; } 2>/dev/null || { fmx_arm_failed; return 0; }
+  { [ -d "$CONFIG" ] || mkdir "$CONFIG"; } 2>/dev/null || { fmx_arm_failed; return 0; }
+  fm_validate_effective_state_path "$STATE" require-existing || { fmx_arm_failed; return 0; }
+  STATE=$FM_VALIDATED_STATE_PATH
+  fm_validate_effective_state_path "$CONFIG" require-existing || { fmx_arm_failed; return 0; }
+  CONFIG=$FM_VALIDATED_STATE_PATH
 
   shim_body=$(cat <<EOF
 #!/usr/bin/env bash
@@ -444,8 +515,7 @@ export FM_HOME=$(printf '%q' "$FM_HOME")
 exec $(printf '%q' "$FM_ROOT/bin/fm-x-poll.sh")
 EOF
 )
-  write_if_changed "$shim" "$shim_body" || { fmx_arm_failed; return 0; }
-  chmod +x "$shim" 2>/dev/null || { fmx_arm_failed; return 0; }
+  write_if_changed "$shim" "$shim_body" yes || { fmx_arm_failed; return 0; }
 
   cadence_body=$(cat <<'EOF'
 # Auto-generated by fm-bootstrap.sh - X mode watcher cadence.
@@ -589,7 +659,9 @@ if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
-  secondmate_liveness_sweep
+  if [ "${FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION:-0}" != 1 ]; then
+    secondmate_liveness_sweep
+  fi
   x_mode_setup
   fleet_sync
 fi

@@ -16,9 +16,10 @@
 # stays local to this file. Those three scripts remain fully working
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
 # install <tools> after consent, /updatefirstmate, the afk daemon, existing
-# tests) still call them directly. The one seam this script needed -
-# bootstrap running its detect-only diagnostics without its four mutating
-# sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
+# tests) still call them directly. The bootstrap composition seams are the
+# opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag for a read-only session and the
+# narrower FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 flag when endpoint ownership
+# cannot license automatic liveness cleanup. Both live in fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
 #
 # ORDERING, and why LOCK now runs before BOOTSTRAP (the old AGENTS.md order
@@ -34,9 +35,11 @@
 #                       when locked.
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
-#   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
-#                       state/*.status tail, state/.afk, and a cheap
-#                       per-task endpoint-liveness read: read-only, always runs.
+#   5. fleet digest   - data/backlog.md, durable program-source pointers,
+#                       every state/*.meta, a bounded state/*.status tail,
+#                       same-home endpoint ownership anomalies, state/.afk,
+#                       and a cheap per-task endpoint-liveness read: read-only,
+#                       always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
@@ -65,10 +68,10 @@
 # below are always read-only, so they run unconditionally in both modes.
 #
 # Usage: fm-session-start.sh
-#   Prints the full ordered digest to stdout and always exits 0: this is a
-#   reporting command, not a gate. A lock refusal is reported as a loud
-#   banner inline, never a silent failure or a non-zero exit that would make
-#   an agent skip the rest of the digest.
+#   Prints the full ordered digest to stdout. Ordinary reporting and lock
+#   refusal exit 0; unsafe effective-state admission exits non-zero before any
+#   lock, bootstrap, recovery, or fleet access. A lock refusal is reported as
+#   a loud banner inline so the read-only digest still completes.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,10 +80,24 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
+FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
+if ! . "$SCRIPT_DIR/fm-wake-lib.sh"; then
+  unset FM_WAKE_STATE_INIT
+  printf 'SESSION START - %s\n' "$FM_HOME"
+  printf 'ALERT: effective state failed strict home-scoping validation; lock, bootstrap, recovery, and fleet probes were skipped.\n'
+  exit 1
+fi
+unset FM_WAKE_STATE_INIT
+STATE=$FM_VALIDATED_STATE_PATH
 PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-program-lib.sh
+. "$SCRIPT_DIR/fm-program-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -163,10 +180,43 @@ if [ "$LOCK_RC" -ne 0 ]; then
   }
 fi
 
+if [ "$READ_ONLY" -eq 0 ]; then
+  fm_backend_adopt_legacy_tmux_state "$STATE" >/dev/null 2>&1 || true
+fi
+
+ENDPOINT_AUDIT_OK=1
+STATE_PROJECTION_SAFE=1
+STATE_METADATA_SAFE=1
+ENDPOINT_MUTATION_SAFE=1
+ENDPOINT_AUDIT_JSON=$(FM_ROOT_OVERRIDE="$FM_ROOT" \
+  FM_HOME="$FM_HOME" \
+  FM_STATE_OVERRIDE="$STATE" \
+  "$SCRIPT_DIR/fm-endpoint-audit.sh" --json 2>&1) || ENDPOINT_AUDIT_OK=0
+if [ "$ENDPOINT_AUDIT_OK" -eq 1 ]; then
+  if [ "$ENDPOINT_AUDIT_JSON" = '[]' ]; then
+    ENDPOINT_AUDIT_OUT='endpoint-audit: no same-home endpoint ownership anomalies found'
+  else
+    ENDPOINT_AUDIT_OUT=$(printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -r \
+      '.[] | "ALERT endpoint-ownership: kind=\(.kind) task=\(.task) worktree=\(.worktree) backend=\(.backend) recorded=\(.recorded_endpoint) live=\(.live_endpoints | join(",")) reason=\(.reason // "-") action=inspect-only"')
+  fi
+  if printf '%s' "$ENDPOINT_AUDIT_JSON" | jq -e \
+    'any(.[]; .backend == "unknown" and ((.reason // "") | contains("metadata is symlinked or non-regular")))' \
+    >/dev/null; then
+    STATE_PROJECTION_SAFE=0
+    STATE_METADATA_SAFE=0
+  fi
+else
+  ENDPOINT_AUDIT_OUT=$ENDPOINT_AUDIT_JSON
+  STATE_PROJECTION_SAFE=0
+  ENDPOINT_MUTATION_SAFE=0
+fi
+
 # --- 2. bootstrap --------------------------------------------------------
 subsection "BOOTSTRAP"
-if [ "$READ_ONLY" -eq 1 ]; then
+if [ "$READ_ONLY" -eq 1 ] || [ "$STATE_METADATA_SAFE" -eq 0 ]; then
   BOOT_OUT=$(FM_BOOTSTRAP_DETECT_ONLY=1 "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
+elif [ "$ENDPOINT_MUTATION_SAFE" -eq 0 ]; then
+  BOOT_OUT=$(FM_BOOTSTRAP_SKIP_ENDPOINT_MUTATION=1 "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
 else
   BOOT_OUT=$("$SCRIPT_DIR/fm-bootstrap.sh" 2>&1)
 fi
@@ -191,6 +241,8 @@ if [ "$READ_ONLY" -eq 1 ]; then
   printf 'skipped (read-only session) - %s record(s) remain queued for the session holding the lock.\n' "$QLEN"
   GUARD_OUT=$(FM_GUARD_READ_ONLY=1 "$SCRIPT_DIR/fm-guard.sh" 2>&1)
   [ -n "$GUARD_OUT" ] && printf '%s\n' "$GUARD_OUT"
+elif [ "$STATE_PROJECTION_SAFE" -eq 0 ]; then
+  printf 'skipped - state metadata or endpoint inventory failed the pre-projection audit.\n'
 else
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
@@ -202,7 +254,7 @@ fi
 
 # --- 4. supervision operating instructions ----------------------------------
 AFK_PRESENT=0
-[ -e "$STATE/.afk" ] && AFK_PRESENT=1
+[ "$STATE_PROJECTION_SAFE" -eq 0 ] || { [ -e "$STATE/.afk" ] && AFK_PRESENT=1; }
 X_MODE_PRESENT=0
 [ -f "$CONFIG/x-mode.env" ] && X_MODE_PRESENT=1
 
@@ -214,7 +266,8 @@ if [ "$PRIMARY_HARNESS" = pi ]; then
   PI_LOCK="$STATE/.lock"
   PI_WATCH_VERSION=$(hash_file "$PI_EXT" || printf '')
   PI_TURNEND_VERSION=$(hash_file "$PI_TURNEND_EXT" || printf '')
-  if ! pi_extension_loaded "$PI_WATCH_MARKER" "$PI_WATCH_VERSION" "$PI_LOCK" \
+  if [ "$STATE_PROJECTION_SAFE" -eq 0 ] \
+    || ! pi_extension_loaded "$PI_WATCH_MARKER" "$PI_WATCH_VERSION" "$PI_LOCK" \
     || ! pi_extension_loaded "$PI_TURNEND_MARKER" "$PI_TURNEND_VERSION" "$PI_LOCK"; then
     printf 'PI_WATCH_EXTENSION: not loaded - approve Pi project trust once per clone, then restart plain pi so %s and %s auto-load for turn-end guard and background wake coverage; use -e %s -e %s only if project hooks are not trusted\n' "$PI_TURNEND_EXT" "$PI_EXT" "$PI_TURNEND_EXT" "$PI_EXT"
   fi
@@ -236,51 +289,85 @@ print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 section "FLEET STATE"
 print_file_or_absent "$DATA/backlog.md" "data/backlog.md"
 
+subsection "Durable program sources"
+PROGRAM_FOUND=0
+while IFS=$'\t' read -r relative source; do
+  [ -n "$source" ] || continue
+  PROGRAM_FOUND=1
+  printf '%s: %s\n' "$relative" "$source"
+done < <(fm_program_source_lines "$DATA")
+if [ "$PROGRAM_FOUND" -eq 1 ]; then
+  printf 'WARNING: the runnable queue is dispatch state, not proof of durable-program completion; audit each source for obligations that were never materialized as tasks.\n'
+  printf 'Boundary: decomposition completeness requires supervisor judgment; use bin/fm-fleet-view.sh for structured runnable, held, and blocked counts.\n'
+else
+  printf '(none found by the documented naming convention; absence does not prove no plan exists elsewhere)\n'
+fi
+
 subsection "In-flight tasks (state/*.meta)"
 META_FOUND=0
-for meta in "$STATE"/*.meta; do
-  [ -f "$meta" ] || continue
-  META_FOUND=1
-  id=$(basename "$meta" .meta)
-  printf '\n--- %s ---\n' "$id"
-  cat "$meta"
+if [ "$STATE_PROJECTION_SAFE" -eq 1 ]; then
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    META_FOUND=1
+    id=$(basename "$meta" .meta)
+    printf '\n--- %s ---\n' "$id"
+    cat "$meta"
 
-  window=$(fm_meta_get "$meta" window)
-  target=$(fm_backend_target_of_meta "$meta")
-  if [ -n "$window" ]; then
-    backend=$(fm_backend_of_meta "$meta")
-    if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+    window=$(fm_meta_get "$meta" window)
+    target=$(fm_backend_target_of_meta "$meta")
+    if [ -n "$window" ]; then
+      backend=$(fm_backend_of_meta "$meta")
+      endpoint_state=$(fm_backend_target_state_of_meta "$meta" "fm-$id")
+      case "$endpoint_state" in
+        present) printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window" ;;
+        absent) printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window" ;;
+        *) printf 'endpoint: unknown (backend=%s window=%s; exact-home probe unavailable)\n' "$backend" "$window" ;;
+      esac
     else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+      printf 'endpoint: unknown (no window recorded)\n'
     fi
-  else
-    printf 'endpoint: unknown (no window recorded)\n'
-  fi
 
-  status="$STATE/$id.status"
-  if [ -f "$status" ]; then
-    print_status_tail "$status"
-  else
-    printf 'status tail: (no status file yet: %s)\n' "$status"
-  fi
-done
+    status="$STATE/$id.status"
+    if [ -f "$status" ]; then
+      print_status_tail "$status"
+    else
+      printf 'status tail: (no status file yet: %s)\n' "$status"
+    fi
+  done
+else
+  printf '(skipped - endpoint ownership audit failed before metadata projection)\n'
+fi
 [ "$META_FOUND" -eq 1 ] || printf '(none)\n'
+
+subsection "Endpoint ownership anomalies"
+[ -n "$ENDPOINT_AUDIT_OUT" ] && printf '%s\n' "$ENDPOINT_AUDIT_OUT"
+if [ "$ENDPOINT_AUDIT_OK" -eq 0 ]; then
+  printf 'ALERT: same-home endpoint inventory could not be audited; duplicate recovery endpoints cannot be ruled out.\n'
+fi
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
 ORPHAN_STATUS_FOUND=0
-for status in "$STATE"/*.status; do
-  [ -f "$status" ] || continue
-  id=$(basename "$status" .status)
-  [ -f "$STATE/$id.meta" ] && continue
-  ORPHAN_STATUS_FOUND=1
-  printf '\n--- %s ---\n' "$id"
-  print_status_tail "$status"
-done
+if [ "$STATE_PROJECTION_SAFE" -eq 1 ]; then
+  for status in "$STATE"/*.status; do
+    [ -f "$status" ] && [ ! -L "$status" ] || continue
+    id=$(basename "$status" .status)
+    if [ -e "$STATE/$id.meta" ] || [ -L "$STATE/$id.meta" ]; then
+      [ -f "$STATE/$id.meta" ] && [ ! -L "$STATE/$id.meta" ] || continue
+      continue
+    fi
+    ORPHAN_STATUS_FOUND=1
+    printf '\n--- %s ---\n' "$id"
+    print_status_tail "$status"
+  done
+else
+  printf '(skipped - endpoint ownership audit failed before state projection)\n'
+fi
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "AFK"
-if [ -e "$STATE/.afk" ]; then
+if [ "$STATE_PROJECTION_SAFE" -eq 0 ]; then
+  printf 'unknown - effective state could not be audited safely\n'
+elif [ -e "$STATE/.afk" ]; then
   printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
 else
   printf 'absent\n'

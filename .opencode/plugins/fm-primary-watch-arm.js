@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { effectivePrimaryPaths, sessionOwnsLock, validateEffectiveState } from "../lib/fm-primary-session-lock.js";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
 const ARM_READY_TIMEOUT_MS = Number(process.env.FM_OPENCODE_ARM_READY_TIMEOUT_MS || 12000);
@@ -73,14 +74,6 @@ function resolvePath(anchor) {
   }
 }
 
-function effectivePaths(root) {
-  const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
-  const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || fmRoot;
-  const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
-  const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
-  return { root: fmRoot, home: fmHome, state, config };
-}
-
 async function isPrimaryRoot(root, home) {
   if (!root) return false;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
@@ -100,25 +93,6 @@ function shouldArm(paths) {
   } catch {
     return false;
   }
-}
-
-async function sessionOwnsLock(paths) {
-  let lockPid = "";
-  try {
-    lockPid = readFileSync(`${paths.state}/.lock`, "utf8").trim();
-  } catch {
-    return false;
-  }
-  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return false;
-  let pid = String(process.pid);
-  for (let i = 0; i < 8; i += 1) {
-    if (pid === lockPid) return true;
-    const result = await runProcess("ps", ["-o", "ppid=", "-p", pid]);
-    if (result.code !== 0) return false;
-    pid = result.stdout.trim();
-    if (!pid || pid === "1") return false;
-  }
-  return false;
 }
 
 function firstWakeOrFailure(stdout, stderr, code) {
@@ -224,7 +198,9 @@ async function ensureArm(paths, sessionID, client) {
 
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {
   const root = worktree ? resolvePath(worktree) : await resolveRoot(directory);
-  const paths = effectivePaths(root);
+  const paths = effectivePrimaryPaths(root);
+  const validation = await validateEffectiveState(paths);
+  if (!validation.ok) throw new Error(`Firstmate watcher state validation failed: ${validation.error || "unknown error"}`);
   globalThis[COORDINATOR_KEY] = {
     ensureArmed: (sessionID, activeClient) => ensureArm(paths, sessionID, activeClient ?? client),
   };

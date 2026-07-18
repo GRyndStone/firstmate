@@ -96,16 +96,60 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # that home. fm-spawn.sh briefly shadows FM_HOME to a secondmate's own home
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
-fm_backend_herdr_workspace_label() {
-  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
-  if [ -f "$marker" ]; then
-    id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
-    if [ -n "$id" ]; then
-      printf '2ndmate-%s' "$id"
-      return 0
-    fi
+fm_backend_herdr_validate_home_path() {
+  local home=$1 suffix component cursor=/ alias_root
+  FM_BACKEND_HERDR_VALIDATED_HOME=
+  case "$home" in /*) ;; *) return 1 ;; esac
+  case "$home" in
+    /var/*)
+      alias_root=$(cd /var 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/var ] || home="/private$home"
+      ;;
+    /tmp/*)
+      alias_root=$(cd /tmp 2>/dev/null && pwd -P) || return 1
+      [ "$alias_root" != /private/tmp ] || home="/private$home"
+      ;;
+  esac
+  suffix=${home#/}
+  while [ -n "$suffix" ]; do
+    component=${suffix%%/*}
+    if [ "$suffix" = "$component" ]; then suffix=; else suffix=${suffix#*/}; fi
+    [ -n "$component" ] || continue
+    case "$component" in .|..) return 1 ;; esac
+    cursor=${cursor%/}/$component
+    [ ! -L "$cursor" ] || return 1
+    [ -d "$cursor" ] || return 1
+  done
+  FM_BACKEND_HERDR_VALIDATED_HOME=$home
+}
+
+fm_backend_herdr_workspace_label_for_home() {
+  local home=$1 expected_id=${2:-} marker id
+  fm_backend_herdr_validate_home_path "$home" || return 1
+  home=$FM_BACKEND_HERDR_VALIDATED_HOME
+  marker="$home/$FM_BACKEND_HERDR_SECONDMATE_MARKER"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    id=$(cat "$marker" 2>/dev/null) || return 1
+    while [ -n "$id" ]; do
+      case "$id" in [[:space:]]*) id=${id#?} ;; *) break ;; esac
+    done
+    while [ -n "$id" ]; do
+      case "$id" in *[[:space:]]) id=${id%?} ;; *) break ;; esac
+    done
+    case "$id" in
+      ''|.*|*[!A-Za-z0-9._-]*|*$'\n'*) return 1 ;;
+    esac
+    [ -z "$expected_id" ] || [ "$id" = "$expected_id" ] || return 1
+    printf '2ndmate-%s' "$id"
+    return 0
   fi
+  [ -z "$expected_id" ] || return 1
   printf 'firstmate'
+}
+
+fm_backend_herdr_workspace_label() {
+  fm_backend_herdr_workspace_label_for_home "$FM_HOME"
 }
 
 # fm_backend_herdr_cli: run `herdr <args...>` scoped to <session>, setting
@@ -517,7 +561,7 @@ fm_backend_herdr_agent_alive() {  # <target>
 # 4th arg, so this function never even queries for a prune candidate in that
 # case. Echoes "<tab_id> <pane_id>" on success.
 fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_tab_id>
-  local container=$1 label=$2 cwd=$3 seeded_tab_id=${4:-} session wsid list dup_tabs dup dup_pane dup_tab_ids out tab_id pane_id remaining_dup_tabs
+  local container=$1 label=$2 cwd=$3 seeded_tab_id=${4:-} session wsid list dup_tabs dup dup_pane dup_tab_ids out tab_id pane_id remaining_dup_tabs replacement_tabs
   session=${container%%:*}
   wsid=${container#*:}
   list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 1
@@ -543,6 +587,18 @@ EOF
   tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
+    if [ -n "$tab_id" ]; then
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
+    else
+      list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null || true)
+      replacement_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg old "$dup_tab_ids" '
+        ($old | split("\n") | map(select(length > 0))) as $old_ids
+        | .result.tabs[]? | select(.label == $want and (.tab_id as $id | $old_ids | index($id) | not)) | .tab_id
+      ' 2>/dev/null)
+      if [ "$(printf '%s\n' "$replacement_tabs" | awk 'NF { n++ } END { print n+0 }')" = 1 ]; then
+        fm_backend_herdr_cli "$session" tab close "$replacement_tabs" >/dev/null 2>&1 || true
+      fi
+    fi
     echo "error: could not parse tab/pane id from herdr tab create output" >&2
     return 1
   fi
@@ -555,10 +611,12 @@ EOF
 $dup_tab_ids
 EOF
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
       return 1
     }
     if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
       return 1
     fi
@@ -566,6 +624,7 @@ EOF
       '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null)
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
+      fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || true
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
       return 1
     fi
@@ -903,7 +962,46 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
 # closes the tab too, so a separate tab close is unnecessary.
 fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
+  if [ "${FM_BACKEND_STRICT_CLOSE:-0}" = 1 ]; then
+    fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1
+  else
+    fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane close "$FM_BACKEND_HERDR_PANE" >/dev/null 2>&1 || true
+  fi
+}
+
+fm_backend_herdr_kill_owned() {  # <target> <workspace> <workspace-label> <tab-label>
+  local target=$1 workspace=$2 workspace_label=$3 tab_label=$4 session pane workspace_info tabs panes
+  session=${target%%:*}
+  pane=${target#*:}
+  [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
+  workspace_info=$(fm_backend_herdr_cli "$session" workspace get "$workspace" 2>&1) || return 1
+  printf '%s' "$workspace_info" | jq -e --arg workspace "$workspace" --arg want_label "$workspace_label" \
+    '.result.workspace.workspace_id == $workspace and .result.workspace.label == $want_label' >/dev/null 2>&1 || return 1
+  tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$workspace" 2>/dev/null) || return 1
+  panes=$(fm_backend_herdr_cli "$session" pane list --workspace "$workspace" 2>/dev/null) || return 1
+  jq -en --arg pane "$pane" --arg want_label "$tab_label" --argjson tabs "$tabs" --argjson panes "$panes" '
+    (($tabs.result.tabs | type) == "array")
+    and (($panes.result.panes | type) == "array")
+    and all($tabs.result.tabs[]?;
+      ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+      and ((.label | type) == "string")
+    )
+    and all($panes.result.panes[]?;
+      ((.pane_id | type) == "string") and ((.pane_id | length) > 0)
+      and ((.tab_id | type) == "string") and ((.tab_id | length) > 0)
+    )
+    and (($tabs.result.tabs | map(.tab_id)) as $tab_ids
+      | all($panes.result.panes[]?; .tab_id as $tab_id | ($tab_ids | index($tab_id)) != null))
+    and ([$panes.result.panes[]? | select(.pane_id == $pane)] as $owned
+      | ($owned | length) == 1
+      and ($owned[0].tab_id as $tab_id
+        | [$tabs.result.tabs[]? | select(.tab_id == $tab_id and .label == $want_label)] | length) == 1)
+    and ([$panes.result.panes[]? as $candidate
+      | $tabs.result.tabs[]?
+      | select(.tab_id == $candidate.tab_id and .label == $want_label)
+      | $candidate.pane_id] == [$pane])
+  ' >/dev/null 2>&1 || return 1
+  fm_backend_herdr_cli "$session" pane close "$pane" >/dev/null 2>&1
 }
 
 # fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status
@@ -1143,8 +1241,8 @@ fm_backend_herdr_events_capable() {  # <session>
   case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
   [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
   schema=$(herdr api schema --json 2>/dev/null) || return 1
-  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  case "$schema" in *events.subscribe*) : ;; *) return 1 ;; esac
+  case "$schema" in *pane.agent_status_changed*) : ;; *) return 1 ;; esac
   return 0
 }
 

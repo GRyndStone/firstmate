@@ -50,7 +50,8 @@ Do not manually patch metadata to make an externally-created Orca terminal look 
 
 ## Supervision
 
-Use `bin/fm-peek.sh`, `bin/fm-send.sh`, `bin/fm-crew-state.sh`, and `bin/fm-teardown.sh` for routine operation.
+Use `bin/fm-peek.sh`, `bin/fm-send.sh`, and `bin/fm-crew-state.sh` for routine operation.
+Treat `bin/fm-teardown.sh` as a fail-closed inspection until `docs/orca-backend.md`'s exact-home duplicate-inventory boundary is resolved; current teardown refuses without closing the terminal or worktree.
 For steer messages, send short lines through `bin/fm-send.sh <id> '...'`; the stable `fm-<id>` alias also works.
 Put long instructions in the task brief or a temporary file and point the crewmate at that file.
 
@@ -69,13 +70,11 @@ For a messy Orca-backed task:
 1. Read `state/<id>.meta` and the relevant status tail first.
 2. Confirm the task is actually Orca-backed before using Orca-specific assumptions.
 3. Use the recorded `terminal=`, `orca_worktree_id=`, and `worktree=` as the task identity.
-4. Prefer firstmate helpers for peek, send, state, and teardown.
+4. Prefer firstmate helpers for peek, send, and state, and use teardown only to surface its current exact-inventory refusal.
 5. Avoid raw deletion of Orca worktrees or manual branch cleanup.
 6. Stop and inspect if the recorded worktree path, Orca worktree id, or project checkout no longer matches expectations.
 
-Teardown remains governed by the normal firstmate landing rules.
-Scout work can be torn down after the report exists.
-Ship work can be torn down only after the work is landed by its project mode.
+Landing and scout-report rules still gate teardown, but satisfying them does not bypass the current exact-home inventory refusal.
 
 ## Smoke Test
 
@@ -85,7 +84,7 @@ Keep Orca smoke tests focused on lifecycle plumbing:
 2. Spawn through `bin/fm-spawn.sh`.
 3. Confirm metadata records the Orca backend, terminal, Orca worktree id, and isolated worktree path.
 4. Verify `bin/fm-peek.sh`, a short `bin/fm-send.sh` steer, watcher wake behavior, and `bin/fm-crew-state.sh`.
-5. Tear down through `bin/fm-teardown.sh` after the task is safely disposable or landed.
+5. Run `bin/fm-teardown.sh` only to verify the documented exact-inventory refusal preserves metadata, the terminal, and the worktree.
 6. Restore the previous backend selection if Orca was selected only for the smoke test.
 
 Do not mix a backend smoke test with unrelated feature work.
