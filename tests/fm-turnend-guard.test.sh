@@ -443,6 +443,22 @@ test_hook_uses_state_override() {
   pass "fm-turnend-guard: uses FM_STATE_OVERRIDE ahead of FM_HOME/state"
 }
 
+test_hook_fails_closed_on_invalid_effective_state() {
+  local dir outside redirected out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-invalid-state")
+  outside="$TMP_ROOT/hook-invalid-state-outside"
+  redirected="$TMP_ROOT/hook-invalid-state-redirect"
+  mkdir -p "$outside"
+  ln -s "$outside" "$redirected"
+  status=0
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$dir" FM_STATE_OVERRIDE="$redirected" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1) || status=$?
+  expect_code 1 "$status" "hook invalid effective state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "turn-end guard did not surface shared state validation failure"
+  pass "fm-turnend-guard: invalid effective state fails before task scanning"
+}
+
 test_hook_retry_requires_durable_ownership() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-loopguard")
@@ -1158,6 +1174,83 @@ EOF
   [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] || fail "Grok readiness-temp worker did not deliver exactly once"
   assert_absent "$pending" "Grok readiness-temp worker retained its acknowledged handoff"
   pass "fm-turnend-guard-grok: readiness publication uses an exclusive in-directory temp"
+}
+
+test_grok_final_publications_never_follow_directory_symlinks() {
+  local dir handoff outside pending key out status fakebin calls worker i
+  dir=$(make_primary_dir "$TMP_ROOT/grok-final-symlink")
+  : > "$dir/state/task1.meta"
+  handoff="$dir/state/.turnend-handoffs"
+  outside="$TMP_ROOT/grok-final-symlink-outside"
+  mkdir -p "$handoff" "$outside"
+  if command -v shasum >/dev/null 2>&1; then
+    key=$(printf '%s' 'final-symlink-session' | shasum -a 256 | awk '{print substr($1,1,24)}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    key=$(printf '%s' 'final-symlink-session' | sha256sum | awk '{print substr($1,1,24)}')
+  else
+    key=$(printf '%s' 'final-symlink-session' | cksum | awk '{print $1 "-" $2}')
+  fi
+  pending="$handoff/grok-$key.pending"
+  ln -s "$outside" "$pending"
+  status=0
+  out=$(printf '{"sessionId":"final-symlink-session"}' \
+    | GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1) || status=$?
+  expect_code 1 "$status" "Grok pending directory-symlink target"
+  assert_contains "$out" "unsafe publication target refused" \
+    "Grok pending publication did not reject its symlinked final target"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "Grok pending publication moved its record through a directory symlink"
+
+  rm -f "$pending"
+  pending="$handoff/grok-ready-final.pending"
+  printf '%s\n' ready-final-token 999999 ready-final-identity ready-final-session 'ready final reason' > "$pending"
+  ln -s "$outside" "$pending.ready"
+  fakebin=$(fm_fakebin "$TMP_ROOT/grok-ready-final-fakebin")
+  calls="$TMP_ROOT/grok-ready-final-calls"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$fakebin/grok"
+  status=0
+  out=$(PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" \
+      "$pending" "$dir" ready-final-token "$dir/state" 2>&1) || status=$?
+  expect_code 1 "$status" "Grok ready directory-symlink target"
+  assert_contains "$out" "unsafe publication target refused" \
+    "Grok ready publication did not reject its symlinked final target"
+  assert_absent "$calls" "Grok delivered before publishing a safe readiness record"
+  assert_present "$pending" "Grok ready publication failure discarded its pending handoff"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "Grok ready publication moved its record through a directory symlink"
+
+  rm -f "$pending.ready" "$pending"
+  pending="$handoff/grok-ack-final.pending"
+  printf '%s\n' ack-final-token 999999 ack-final-identity ack-final-session 'ack final reason' > "$pending"
+  calls="$TMP_ROOT/grok-ack-final-calls"
+  cat > "$fakebin/grok" <<EOF
+#!/usr/bin/env bash
+ln -s "$outside" "$pending.acknowledged"
+printf 'called\n' >> "$calls"
+EOF
+  chmod +x "$fakebin/grok"
+  PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 \
+    bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" \
+      "$pending" "$dir" ack-final-token "$dir/state" > "$TMP_ROOT/grok-ack-final.out" 2>&1 &
+  worker=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "$calls" ] && [ -L "$pending.acknowledged" ] && break
+    sleep 0.05
+  done
+  [ -s "$calls" ] || fail "Grok acknowledged-publication test never delivered"
+  kill -TERM "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+  [ "$(wc -l < "$calls" | tr -d ' ')" -eq 1 ] \
+    || fail "Grok redelivered after acknowledged publication was refused"
+  assert_present "$pending" "Grok acknowledged publication failure discarded its pending handoff"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "Grok acknowledged publication moved its record through a directory symlink"
+  pass "fm-turnend-guard-grok: final publications reject directory symlinks"
 }
 
 test_grok_hook_and_worker_share_root_override_state_fallback() {
@@ -3005,6 +3098,7 @@ test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
+test_hook_fails_closed_on_invalid_effective_state
 test_hook_retry_requires_durable_ownership
 test_hook_surfaces_bounded_parked_and_idle_tasks
 test_hook_silent_in_secondmate_home
@@ -3030,6 +3124,7 @@ test_grok_acknowledged_cleanup_never_redelivers
 test_grok_worker_binds_pending_to_exact_external_state
 test_grok_worker_normalizes_mac_state_aliases
 test_grok_worker_readiness_temp_never_follows_symlink
+test_grok_final_publications_never_follow_directory_symlinks
 test_grok_hook_and_worker_share_root_override_state_fallback
 test_grok_delivery_log_never_follows_symlink
 test_settings_hook_uses_claude_project_dir

@@ -182,7 +182,7 @@ TOKEN=$(basename "$TMP")
   printf '%s\n' "$REASON"
 } > "$TMP" || { rm -f "$TMP"; exit 1; }
 chmod 600 "$TMP" 2>/dev/null || true
-mv -f "$TMP" "$PENDING" || { rm -f "$TMP"; exit 1; }
+fm_publish_file_no_follow "$TMP" "$PENDING" replace || { rm -f "$TMP"; exit 1; }
 
 DELIVER="$ROOT/bin/fm-turnend-guard-grok-deliver.sh"
 [ -x "$DELIVER" ] || exit 1

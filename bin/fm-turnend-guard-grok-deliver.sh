@@ -149,7 +149,7 @@ trap handle_signal TERM INT
 READY_TMP=$(mktemp "$HANDOFF_DIR/.grok-ready.XXXXXX") || exit 1
 printf '%s\n' "$READY_RECORD" > "$READY_TMP" || exit 1
 chmod 600 "$READY_TMP" 2>/dev/null || true
-mv -f "$READY_TMP" "$READY" || { rm -f "$READY_TMP"; exit 1; }
+fm_publish_file_no_follow "$READY_TMP" "$READY" replace || { rm -f "$READY_TMP"; exit 1; }
 READY_TMP=
 
 run_delivery() {
@@ -207,7 +207,7 @@ cleanup_acknowledged() {
   if [ -f "$PENDING" ] && [ ! -L "$PENDING" ]; then
     [ "$(cat "$PENDING" 2>/dev/null || true)" = "$record" ] || return 1
     if ! acknowledged_matches "$record"; then
-      mv "$PENDING" "$ACKNOWLEDGED" || return 1
+      fm_publish_file_no_follow "$PENDING" "$ACKNOWLEDGED" replace || return 1
     else
       rm -f "$PENDING" || return 1
     fi

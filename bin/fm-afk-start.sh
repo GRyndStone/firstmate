@@ -34,7 +34,12 @@ esac
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 
 LOCK="$STATE/.supervise-daemon.lock"
-date '+%s' > "$STATE/.afk"
+AFK_TMP=$(mktemp "$STATE/.afk.tmp.XXXXXX") || exit 1
+if ! date '+%s' > "$AFK_TMP" \
+  || ! fm_publish_file_no_follow "$AFK_TMP" "$STATE/.afk" replace; then
+  rm -f "$AFK_TMP" 2>/dev/null || true
+  exit 1
+fi
 
 daemon_lock_owner() {
   local owner

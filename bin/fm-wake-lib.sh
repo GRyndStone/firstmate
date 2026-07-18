@@ -58,6 +58,46 @@ fm_validate_effective_state_path() {
   FM_VALIDATED_STATE_PATH=$path
 }
 
+fm_publish_file_no_follow() {
+  local source=$1 destination=$2 mode=${3:-replace} parent source_parent platform
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  parent=${destination%/*}
+  source_parent=${source%/*}
+  [ -n "$parent" ] || parent=.
+  [ -n "$source_parent" ] || source_parent=.
+  [ "$source_parent" = "$parent" ] || return 1
+  [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    echo "error: unsafe publication target refused: $destination" >&2
+    return 1
+  fi
+  platform=$(uname)
+  case "$mode:$platform" in
+    exclusive:Darwin)
+      [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+      ln -h "$source" "$destination" || return 1
+      ;;
+    exclusive:Linux)
+      [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+      ln -T "$source" "$destination" || return 1
+      ;;
+    replace:Darwin)
+      mv -fh "$source" "$destination" || return 1
+      ;;
+    replace:Linux)
+      mv -fT "$source" "$destination" || return 1
+      ;;
+    *)
+      echo "error: unsupported no-follow publication platform: $platform" >&2
+      return 1
+      ;;
+  esac
+  if [ "$mode" = exclusive ]; then
+    rm -f "$source" 2>/dev/null || true
+  fi
+  [ -f "$destination" ] && [ ! -L "$destination" ]
+}
+
 if ! fm_validate_effective_state_path "$STATE" allow-missing-final; then
   return 1 2>/dev/null || exit 1
 fi

@@ -42,6 +42,12 @@ The file format is unchanged in both modes; tasks-axi and manual edits produce t
 Session-start recovery and the canonical fleet snapshot report them beside the backlog or structured runnable, held, and blocked queue counts.
 It deliberately does not interpret prose plans into obligations: when any source exists, decomposition status remains `requires_supervisor_judgment`, and an empty runnable queue is never reported as proof that the program is complete.
 
+## Effective state home scoping
+
+`bin/fm-wake-lib.sh` owns effective-state path validation and portable final-component no-follow publication for shell entry points.
+The audited state entry-point inventory is `bin/fm-afk-start.sh`, `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-watch-checkpoint.sh`, `bin/fm-supervise-daemon.sh`, `bin/fm-guard.sh`, `bin/fm-wake-drain.sh`, `bin/fm-turnend-guard.sh`, `bin/fm-turnend-guard-grok.sh`, `bin/fm-turnend-guard-grok-deliver.sh`, `bin/fm-backlog.sh`, `bin/fm-backlog-handoff.sh`, `bin/fm-spawn.sh`, `bin/fm-teardown.sh`, `bin/fm-endpoint-audit.sh`, `bin/fm-fleet-snapshot.sh`, `bin/fm-session-start.sh`, `.opencode/plugins/fm-primary-turnend-guard.js`, and `.pi/extensions/fm-primary-turnend-guard.ts`.
+Every listed entry point must reject symlinked effective-state path components before its first state read or mutation, reject symlinked or non-regular task metadata before parsing or backend lookup, and use no-follow publication for durable final targets it owns.
+
 ## Runtime backend (config/backend / FM_BACKEND)
 
 For spawn-capable adapters, the runtime session-provider backend controls where task windows/endpoints are created, captured, sent to, watched, and killed.

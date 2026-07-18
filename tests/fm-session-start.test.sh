@@ -479,12 +479,67 @@ EOF
   printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" "live herdr endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" "dead herdr endpoint not reported dead"
+  assert_contains "$out" "skipped - endpoint ownership audit failed before metadata projection" \
+    "session start continued task probes after its Herdr ownership audit failed"
+  assert_not_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" \
+    "session start probed a live Herdr endpoint after its ownership audit failed"
+  assert_not_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" \
+    "session start probed a dead Herdr endpoint after its ownership audit failed"
   assert_contains "$out" "ALERT: same-home endpoint inventory could not be audited" \
     "session start silently treated an unreadable Herdr inventory as duplicate-free"
 
-  pass "herdr endpoint liveness is reported and an unreadable duplicate inventory stays loud"
+  pass "an unreadable Herdr ownership audit blocks later endpoint probes"
+}
+
+test_metadata_audit_precedes_fleet_projection() {
+  local rec root home fakebin outside out count
+  rec=$(new_world metadata-audit-order)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  outside="$TMP_ROOT/session-start-foreign.meta"
+  printf '%s\n' \
+    'window=foreign:window' \
+    'kind=ship' \
+    'sentinel=FOREIGN_META_CONTENT' > "$outside"
+  ln -s "$outside" "$home/state/foreign.meta"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "task metadata is symlinked or non-regular; cross-home read refused" \
+    "session start did not surface its pre-projection metadata audit"
+  assert_not_contains "$out" "FOREIGN_META_CONTENT" \
+    "session start projected foreign metadata before rejecting its symlink"
+  assert_not_contains "$out" "--- foreign ---" \
+    "session start rendered a task row for symlinked metadata"
+  count=$(printf '%s\n' "$out" | grep -c 'task metadata is symlinked or non-regular; cross-home read refused')
+  [ "$count" -eq 1 ] || fail "session start reran or duplicated the captured endpoint audit: $out"
+  pass "session start reuses its metadata audit before fleet projection"
+}
+
+test_state_validation_precedes_session_mutation() {
+  local rec root home fakebin outside out status
+  rec=$(new_world state-validation-order)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  outside="$TMP_ROOT/session-start-state-outside"
+  rmdir "$home/state"
+  mkdir -p "$outside"
+  ln -s "$outside" "$home/state"
+  status=0
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH" 2>&1) || status=$?
+  expect_code 0 "$status" "session start invalid effective state report"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "session start did not surface shared state validation failure"
+  assert_contains "$out" "lock, bootstrap, recovery, and fleet probes were skipped" \
+    "session start did not fail closed before its state-mutating composition"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "session start wrote through symlinked effective state before validation"
+  pass "session start validates effective state before lock or fleet access"
 }
 
 # --- composition: real scripts run, not reimplemented ------------------------
@@ -560,7 +615,7 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  fm_fake_exit0 "$fakebin" curl jq
+  fm_fake_exit0 "$fakebin" curl
   printf 'FMX_PAIRING_TOKEN=tok-next-step\n' > "$home/.env"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
@@ -732,6 +787,8 @@ test_status_tail_bounding
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
+test_metadata_audit_precedes_fleet_projection
+test_state_validation_precedes_session_mutation
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_durable_program_source_warns_beside_empty_queue

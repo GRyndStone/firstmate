@@ -149,6 +149,48 @@ test_empty_fleet_json() {
   pass "empty fleet snapshot and view use explicit absence markers"
 }
 
+test_metadata_audit_precedes_task_projection() {
+  local home fakebin outside log out state_home state_outside status
+  home=$(make_home metadata-audit-order)
+  fakebin=$(make_fakebin "$home")
+  outside="$TMP_ROOT/metadata-audit-order-foreign.meta"
+  log="$TMP_ROOT/metadata-audit-order-backend.log"
+  fm_write_meta "$outside" \
+    "window=foreign:window" \
+    "worktree=$TMP_ROOT/foreign-worktree" \
+    "project=foreign" \
+    "kind=ship"
+  ln -s "$outside" "$home/state/foreign.meta"
+  cat > "$fakebin/tmux" <<EOF
+#!/usr/bin/env bash
+printf 'called\n' >> "$log"
+exit 1
+EOF
+  chmod +x "$fakebin/tmux"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    (.tasks | length) == 0
+      and (.endpoint_anomalies | length) == 1
+      and .endpoint_anomalies[0].kind == "inventory_unavailable"
+      and (.endpoint_anomalies[0].reason | contains("metadata is symlinked or non-regular"))
+  ' >/dev/null || fail "snapshot did not retain the pre-projection metadata audit: $out"
+  assert_absent "$log" "snapshot probed a backend through symlinked task metadata"
+
+  state_home=$(make_home state-audit-order)
+  state_outside="$TMP_ROOT/state-audit-order-outside"
+  rmdir "$state_home/state"
+  mkdir -p "$state_outside"
+  ln -s "$state_outside" "$state_home/state"
+  status=0
+  out=$(FM_HOME="$state_home" "$SNAPSHOT" --json 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "snapshot accepted a symlinked effective state"
+  assert_contains "$out" "symlinked effective state path component refused" \
+    "snapshot did not surface endpoint-audit state validation failure"
+  [ -z "$(find "$state_outside" -mindepth 1 -print -quit)" ] \
+    || fail "snapshot traversed symlinked effective state before its audit"
+  pass "fleet snapshot audits metadata before task projection or backend probes"
+}
+
 test_fixture_snapshot_json() {
   local home fakebin out ids
   home=$(make_home fixture)
@@ -778,6 +820,7 @@ test_parked_scout_decision_stays_pending() {
 }
 
 test_empty_fleet_json
+test_metadata_audit_precedes_task_projection
 test_fixture_snapshot_json
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event

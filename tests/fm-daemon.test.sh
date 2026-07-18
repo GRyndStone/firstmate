@@ -39,6 +39,25 @@ test_afk_start_refuses_when_flag_cannot_be_written() {
   pass "fm-afk-start.sh fails before daemon startup when the afk flag cannot be written"
 }
 
+test_afk_start_never_follows_flag_directory_symlink() {
+  local dir state outside out status
+  dir=$(make_supercase afk-start-flag-symlink)
+  state="$dir/state"
+  outside="$dir/outside"
+  mkdir -p "$outside"
+  ln -s "$outside" "$state/.afk"
+  status=0
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh accepted a symlinked away flag"
+  assert_contains "$out" "unsafe publication target refused" \
+    "fm-afk-start.sh did not surface the unsafe final target"
+  assert_not_contains "$out" "starting supervise daemon" \
+    "fm-afk-start.sh started the daemon after refusing its away flag"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "fm-afk-start.sh published through a directory symlink"
+  pass "fm-afk-start.sh publishes the away flag without following symlinks"
+}
+
 test_afk_start_ignores_stale_pidfile_without_lock() {
   local dir state out status
   dir=$(make_supercase afk-start-stale-pidfile)
@@ -1769,6 +1788,7 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 }
 
 test_afk_start_refuses_when_flag_cannot_be_written
+test_afk_start_never_follows_flag_directory_symlink
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home

@@ -76,6 +76,13 @@ esac
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 
+ENDPOINT_ANOMALIES_JSON=$(
+  FM_ROOT_OVERRIDE="$FM_ROOT" \
+    FM_HOME="$FM_HOME" \
+    FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
+) || exit 1
+
 bool_json() {
   if [ "$1" = 1 ]; then printf 'true'; else printf 'false'; fi
 }
@@ -360,7 +367,7 @@ task_json_lines() {
   local open_decisions_tsv open_decisions_json
 
   for meta in "$STATE"/*.meta; do
-    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     id=$(basename "$meta" .meta)
     kind=$(meta_value "$meta" kind)
     [ -n "$kind" ] || kind=ship
@@ -537,12 +544,6 @@ BACKLOG_JSON=$(backlog_json)
 TASKS_JSON=$(task_json_lines)
 SCOUT_REPORTS_JSON=$(scout_report_lines)
 PROGRAM_SOURCES_JSON=$(program_source_lines)
-ENDPOINT_ANOMALIES_JSON=$(
-  FM_ROOT_OVERRIDE="$FM_ROOT" \
-    FM_HOME="$FM_HOME" \
-    FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-endpoint-audit.sh" --json
-) || exit 1
 
 jq -n \
   --arg fm_home "$FM_HOME" \

@@ -64,11 +64,13 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
 [ -f "$FM_ROOT/AGENTS.md" ] || exit 0
 [ -d "$FM_ROOT/bin" ] || exit 0
-[ -d "$STATE" ] || exit 0
 
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
+FM_WAKE_STATE_INIT=skip
+. "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
+unset FM_WAKE_STATE_INIT
+[ -d "$STATE" ] || exit 0
 
 CHECKPOINT_ORPHAN_UNRESOLVED=0
 fm_reconcile_checkpoint_orphan "$STATE" || CHECKPOINT_ORPHAN_UNRESOLVED=1
