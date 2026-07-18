@@ -81,8 +81,9 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 if ! . "$SCRIPT_DIR/fm-wake-lib.sh"; then
   unset FM_WAKE_STATE_INIT
   printf 'SESSION START - %s\n' "$FM_HOME"

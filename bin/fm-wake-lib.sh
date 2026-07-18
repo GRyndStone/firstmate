@@ -105,6 +105,7 @@ fm_validate_home_file_path() {
     FM_VALIDATED_STATE_PATH=$saved_state
     return 1
   fi
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_VALIDATED_HOME_FILE_PATH=$path
   FM_VALIDATED_STATE_PATH=$saved_state
 }
@@ -235,6 +236,7 @@ fm_remove_file_no_follow() {
 }
 
 if ! fm_validate_effective_state_path "$STATE" allow-missing-final; then
+  # shellcheck disable=SC2317 # This library supports both sourcing and execution.
   return 1 2>/dev/null || exit 1
 fi
 STATE=$FM_VALIDATED_STATE_PATH
@@ -250,6 +252,7 @@ fm_prepare_effective_state_path() {
 }
 
 if [ "${FM_WAKE_STATE_INIT:-create}" != skip ]; then
+  # shellcheck disable=SC2317 # This library supports both sourcing and execution.
   fm_prepare_effective_state_path || { return 1 2>/dev/null || exit 1; }
 fi
 
@@ -372,6 +375,7 @@ fm_reserve_checkpoint_orphan() {
     echo "watcher: FAILED - checkpoint orphan authority could not be reserved at $(fm_checkpoint_orphan_path "$state")" >&2
     return 1
   }
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_CHECKPOINT_ORPHAN_RECORD=$record
 }
 
@@ -383,6 +387,7 @@ fm_activate_checkpoint_orphan_reservation() {
   record=$(printf 'active\n%s\n%s\n%s\n%s' \
     "$checkpoint_pid" "$checkpoint_identity" "$watch_pid" "$watch_identity")
   fm_replace_checkpoint_orphan_record "$state" "$expected" "$record" || return 1
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_CHECKPOINT_ORPHAN_RECORD=$record
 }
 
@@ -393,6 +398,7 @@ fm_record_checkpoint_orphan() {
   state=$FM_VALIDATED_STATE_PATH
   record=$(printf 'orphan\n%s\n%s' "$pid" "$identity")
   fm_replace_checkpoint_orphan_record "$state" "$expected" "$record" || return 1
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_CHECKPOINT_ORPHAN_RECORD=$record
 }
 
@@ -608,8 +614,11 @@ fm_watcher_live_owner() {
   [ -n "$recorded_identity" ] || return 1
   current_identity=$(fm_pid_identity "$pid") || return 1
   [ "$current_identity" = "$recorded_identity" ] || return 1
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_WATCHER_OWNER_KIND=$kind
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_WATCHER_OWNER_PID=$pid
+  # shellcheck disable=SC2034 # Output is read by sourcing callers.
   FM_WATCHER_OWNER_MODE=$mode
   return 0
 }

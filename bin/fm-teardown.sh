@@ -266,12 +266,12 @@ if [ -e "$FINAL_CLEANUP" ] || [ -L "$FINAL_CLEANUP" ]; then
     }
   fi
   if [ -e "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ]; then
-    [ -f "$TEARDOWN_STAGE" ] && [ ! -L "$TEARDOWN_STAGE" ] \
-      && [ "$(cksum < "$TEARDOWN_STAGE" | awk '{print $1 ":" $2}')" = "$(final_cleanup_value stage-cksum)" ] \
-      && grep -q '^phase=backlog-recorded$' "$TEARDOWN_STAGE" || {
+    if ! [ -f "$TEARDOWN_STAGE" ] || [ -L "$TEARDOWN_STAGE" ] \
+      || [ "$(cksum < "$TEARDOWN_STAGE" | awk '{print $1 ":" $2}')" != "$(final_cleanup_value stage-cksum)" ] \
+      || ! grep -q '^phase=backlog-recorded$' "$TEARDOWN_STAGE"; then
       echo "REFUSED: final lifecycle cleanup authority no longer matches the completed teardown stage for $ID." >&2
       exit 1
-    }
+    fi
   fi
   finish_final_state_cleanup || exit 1
   echo "teardown $ID final lifecycle cleanup resumed and completed"
@@ -2108,7 +2108,7 @@ validate_firstmate_home_lifecycle_accounting() {
     return 0
   fi
   for suffix in spawning tearing-down teardown-stage teardown-final-cleanup backlog-mutation-intent teardown-owners; do
-    for artifact in "$sub_state"/*.$suffix; do
+    for artifact in "$sub_state"/*."$suffix"; do
       [ -e "$artifact" ] || [ -L "$artifact" ] || continue
       child_id=$(basename "$artifact" ".$suffix")
       child_meta="$sub_state/$child_id.meta"
@@ -2211,7 +2211,9 @@ child_endpoint_state() {
   : "$child_backend" "$child_target"
   (
     unset FM_ROOT_OVERRIDE
+    # shellcheck disable=SC2030 # These overrides are intentionally subshell-local.
     FM_HOME=$home
+    # shellcheck disable=SC2030 # These overrides are intentionally subshell-local.
     FM_ROOT=$home
     fm_backend_target_state_of_meta "$child_meta" "fm-$child_id"
   )
@@ -2226,7 +2228,9 @@ close_child_endpoint() {
     present)
       (
         unset FM_ROOT_OVERRIDE
+        # shellcheck disable=SC2030 # These overrides are intentionally subshell-local.
         FM_HOME=$home
+        # shellcheck disable=SC2030 # These overrides are intentionally subshell-local.
         FM_ROOT=$home
         fm_backend_kill_owned_meta "$child_meta" "fm-$child_id"
       ) || {
@@ -2409,7 +2413,9 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
 fi
 
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
-  if ! REPORT=$(fm_firstmate_scout_report_path "$FM_HOME" "$ID"); then
+  # shellcheck disable=SC2031 # FM_HOME is intentionally unchanged by child-endpoint subshells.
+  if ! fm_firstmate_scout_report_path "$FM_HOME" "$ID" >/dev/null; then
+    # shellcheck disable=SC2031 # FM_HOME is intentionally unchanged by child-endpoint subshells.
     echo "REFUSED: scout task $ID has no owned regular report at $FM_HOME/data/$ID/report.md." >&2
     echo "The report must be a non-symlink file contained in this Firstmate home, or use --force after explicit discard approval." >&2
     exit 1
@@ -2602,6 +2608,7 @@ cleanup_backend_release_confirmed() {
     probe=$(orca_worktree_probe "$ORCA_WORKTREE_ID") || return 1
     [ "$probe" = absent ]
   elif [ "$KIND" = secondmate ]; then
+    # shellcheck disable=SC2031 # FM_ROOT is intentionally unchanged by child-endpoint subshells.
     worktree_released_from_project "$FM_ROOT" "$HOME_PATH"
   else
     worktree_released_from_project "$PROJ" "$WT"
@@ -2788,6 +2795,7 @@ prepare_final_state_cleanup || {
 }
 finish_final_state_cleanup || exit 1
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
+  # shellcheck disable=SC2031 # FM_ROOT is intentionally unchanged by child-endpoint subshells.
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"

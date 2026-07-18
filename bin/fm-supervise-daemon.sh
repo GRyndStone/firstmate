@@ -143,8 +143,9 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_DAEMON_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091,SC2317
 . "$FM_DAEMON_DIR/fm-wake-lib.sh" || { return 1 2>/dev/null || exit 1; }
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH

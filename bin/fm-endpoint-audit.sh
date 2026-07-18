@@ -20,8 +20,9 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 fm_validate_effective_state_path "$STATE" allow-missing-final || exit 1

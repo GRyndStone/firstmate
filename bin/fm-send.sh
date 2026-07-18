@@ -47,6 +47,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-wake-lib.sh
 # shellcheck disable=SC2034 # Read while sourcing the state library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck disable=SC1091 # Runtime path resolves to the canonical wake library.
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH

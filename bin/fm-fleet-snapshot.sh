@@ -49,8 +49,9 @@ PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 BACKLOG="$DATA/backlog.md"
 TODAY=${FM_FLEET_SNAPSHOT_TODAY:-$(date +%Y-%m-%d)}
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH

@@ -36,8 +36,9 @@ WATCH="$SCRIPT_DIR/fm-watch.sh"
 TARGET_PROBE_TIMEOUT=${FM_TURNEND_TARGET_PROBE_TIMEOUT:-2}
 case "$TARGET_PROBE_TIMEOUT" in ''|*[!0-9]*|0) TARGET_PROBE_TIMEOUT=2 ;; esac
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
@@ -96,8 +97,10 @@ supervisor_target_injectable() {
     esac
   fi
   if command -v timeout >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # Positional parameters expand in the child shell.
     timeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ] || case "$(fm_backend_composer_state "$2" "$3")" in empty|pending) exit 0 ;; *) exit 1 ;; esac' _ "$probe" "$backend" "$target"
   elif command -v gtimeout >/dev/null 2>&1; then
+    # shellcheck disable=SC2016 # Positional parameters expand in the child shell.
     gtimeout "$TARGET_PROBE_TIMEOUT" bash -c '. "$1"; fm_backend_target_exists "$2" "$3" || exit 1; [ "$(fm_backend_agent_alive "$2" "$3")" = alive ] || case "$(fm_backend_composer_state "$2" "$3")" in empty|pending) exit 0 ;; *) exit 1 ;; esac' _ "$probe" "$backend" "$target"
   elif command -v perl >/dev/null 2>&1; then
     perl -e '$seconds=shift; alarm $seconds; exec @ARGV' "$TARGET_PROBE_TIMEOUT" \

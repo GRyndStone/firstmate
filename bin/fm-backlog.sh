@@ -287,7 +287,7 @@ completion_claim_settle() {
   if [ "$show_status" -ne 0 ]; then
     if printf '%s\n' "$task_info" | grep -Fx 'code: NOT_FOUND' >/dev/null \
       && archive_has_done_ack "$ID" "$claim_ack"; then
-      task_state=done
+      task_state='done'
       completion_acked=1
     else
       echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
@@ -295,7 +295,7 @@ completion_claim_settle() {
     fi
   else
     task_state=$(printf '%s\n' "$task_info" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -n 1)
-    if [ "$task_state" = done ] && output_has_done_ack "$task_info" "$claim_ack"; then
+    if [ "$task_state" = 'done' ] && output_has_done_ack "$task_info" "$claim_ack"; then
       completion_acked=1
     fi
   fi
@@ -303,14 +303,14 @@ completion_claim_settle() {
     echo "error: could not determine backlog state while recovering the teardown proof claim for $ID" >&2
     return 1
   fi
-  if [ "$task_state" = done ] && [ "$completion_acked" -eq 1 ]; then
+  if [ "$task_state" = 'done' ] && [ "$completion_acked" -eq 1 ]; then
     rm -f "$CLAIMED_PROOF" || return 1
     rm -f "$CLAIM_ACK" || return 1
     rmdir "$CLAIM_DIR" || return 1
     CLAIMED_PROOF=
     CLAIM_ACK=
     CLAIM_DIR=
-    CLAIM_SETTLED_STATE=done
+    CLAIM_SETTLED_STATE='done'
     return 0
   fi
   case "$task_state" in
@@ -612,18 +612,18 @@ claim_mutation_receipts() {
   if [ "$scope" = all ]; then
     for candidate in "$STATE"/*.teardown-complete "$STATE"/.*.teardown-complete.claimed.*; do
       [ -e "$candidate" ] || [ -L "$candidate" ] || continue
-      candidates[$candidate_count]=$candidate
+      candidates[candidate_count]=$candidate
       candidate_count=$((candidate_count + 1))
     done
   else
     candidate="$STATE/$id.teardown-complete"
     if [ -e "$candidate" ] || [ -L "$candidate" ]; then
-      candidates[$candidate_count]=$candidate
+      candidates[candidate_count]=$candidate
       candidate_count=$((candidate_count + 1))
     fi
     for candidate in "$STATE"/."$id".teardown-complete.claimed.*; do
       [ -e "$candidate" ] || [ -L "$candidate" ] || continue
-      candidates[$candidate_count]=$candidate
+      candidates[candidate_count]=$candidate
       candidate_count=$((candidate_count + 1))
     done
   fi
@@ -786,6 +786,7 @@ run_mutation_tasks_axi() {
   return "$status"
 }
 
+# shellcheck disable=SC2329 # Invoked by the EXIT trap cleanup callback.
 stop_owned_mutation_backend() {
   local owner_status=0 pid i=0
   [ -n "$MUTATION_RECEIPT_DIR" ] || return 0
@@ -824,6 +825,7 @@ release_backlog_lock() {
     LOCKED=0
   fi
 }
+# shellcheck disable=SC2329 # Invoked by name from the EXIT trap.
 cleanup_backlog_wrapper() {
   local status=$?
   trap - EXIT INT TERM
@@ -887,7 +889,7 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     exit 1
   fi
   recover_existing_completion_claim || exit 1
-  if [ "$CLAIM_SETTLED_STATE" = done ]; then
+  if [ "$CLAIM_SETTLED_STATE" = 'done' ]; then
     echo "Done for $ID was already recorded before interrupted proof cleanup completed."
     exit 0
   fi
@@ -895,7 +897,7 @@ if [ "$COMMAND" = "done" ] && [ "$HELP" -eq 0 ]; then
     FINALIZING_INFO_STATUS=0
     FINALIZING_INFO=$(run_tasks_axi show "$ID" --full 2>&1) || FINALIZING_INFO_STATUS=$?
     if [ "$FINALIZING_INFO_STATUS" -eq 0 ] \
-       && [ "$(printf '%s\n' "$FINALIZING_INFO" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)" = done ] \
+       && [ "$(printf '%s\n' "$FINALIZING_INFO" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1)" = 'done' ] \
        && output_has_done_ack "$FINALIZING_INFO" "$FINALIZING_DONE_ACK"; then
       echo "Done for $ID was already recorded before teardown finalization completed."
       exit 0

@@ -85,6 +85,7 @@ if ! acquire_delivery_lock; then
   rm -f "$DELIVERY_LOCK" || exit 0
   acquire_delivery_lock || exit 0
 fi
+# shellcheck disable=SC2329 # Invoked by name from the EXIT trap.
 cleanup() {
   if [ -n "$READY_TMP" ] && [ -f "$READY_TMP" ] && [ ! -L "$READY_TMP" ]; then
     rm -f "$READY_TMP" 2>/dev/null || true
@@ -110,6 +111,7 @@ child_owned_by_worker() {
   fi
   return 1
 }
+# shellcheck disable=SC2329 # Invoked by the signal trap callback.
 stop_active_children() {
   local pid identity attempt
   for pid in "$TIMER_PID" "$DELIVERY_PID"; do
@@ -136,6 +138,7 @@ stop_active_children() {
   DELIVERY_IDENTITY=
   TIMER_IDENTITY=
 }
+# shellcheck disable=SC2329 # Invoked by name from signal traps.
 handle_signal() {
   trap - TERM INT
   stop_active_children

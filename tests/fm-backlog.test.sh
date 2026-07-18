@@ -365,31 +365,31 @@ test_done_requires_matching_single_use_teardown_proof() {
   log="$home/args.log"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "never-dispatched Done"
   assert_contains "$out" "no durable successful-teardown proof" "never-dispatched work was not kept outside Done"
   write_completion_proof "$home" task-a ship delivered-local
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
     FM_FAKE_BLOCKED=yes FM_FAKE_BLOCKED_BY=dep-a FM_FAKE_HELD=yes FM_FAKE_HELP='changed suggestion' \
-    "$BACKLOG" done task-a --note 'local main' 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a --note 'local main' 2>&1) || status=$?
   expect_code 1 "$status" "gate-mutated teardown proof"
   assert_contains "$out" "does not match the current backlog record" "gate mutation did not invalidate staged proof"
   assert_present "$home/state/task-a.teardown-complete" "gate mutation consumed the stale proof"
   status=0
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" FM_FAKE_FAIL_MUTATION=1 \
-    "$BACKLOG" done task-a --note 'local main' >/dev/null 2>&1 || status=$?
+    "$BACKLOG" 'done' task-a --note 'local main' >/dev/null 2>&1 || status=$?
   expect_code 9 "$status" "backend Done failure"
   assert_present "$home/state/task-a.teardown-complete" "backend failure consumed the retry proof"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
-    "$BACKLOG" done task-a --note 'local main'
+    "$BACKLOG" 'done' task-a --note 'local main'
   assert_absent "$home/state/task-a.teardown-complete" "successful Done did not consume its proof"
   write_completion_proof "$home" task-a ship delivered-local
   sed 's/^record-cksum=.*/record-cksum=1:1/' "$home/state/task-a.teardown-complete" \
     > "$home/state/task-a.teardown-complete.tmp"
   mv "$home/state/task-a.teardown-complete.tmp" "$home/state/task-a.teardown-complete"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "stale proof checksum"
   assert_contains "$out" "does not match the current backlog record" "stale proof was accepted for a replacement record"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" rm task-a
@@ -404,9 +404,9 @@ test_empty_completion_claim_reconciles_completed_state() {
   mkdir "$claim"
   printf '%s\n' "$ack" > "$claim/done-ack"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE='done' \
     FM_FAKE_BODY_ACK="fm-done-ack:$ack" \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 0 "$status" "empty completed proof claim recovery"
   assert_contains "$out" "already recorded" "empty completed claim did not reconcile from truthful backlog state"
   assert_absent "$claim" "empty completed proof claim remained stranded"
@@ -419,7 +419,7 @@ test_empty_completion_claim_reconciles_restored_proof() {
   write_completion_proof "$home" task-a ship delivered-local
   claim="$home/state/.task-a.teardown-complete.claimed.empty"
   mkdir "$claim"
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a >/dev/null
   assert_absent "$claim" "empty restored proof claim remained stranded"
   assert_absent "$home/state/task-a.teardown-complete" "restored proof was not consumed after claim recovery"
   pass "empty proof claims reconcile after backend failure restores the proof"
@@ -435,8 +435,8 @@ test_empty_completion_claim_reconciles_exact_finalizing_done() {
   claim="$home/state/.task-a.teardown-complete.claimed.empty"
   mkdir "$claim"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
-    FM_FAKE_BODY_ACK="fm-done-ack:$ack" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE='done' \
+    FM_FAKE_BODY_ACK="fm-done-ack:$ack" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 0 "$status" "empty post-success claim recovery"
   assert_contains "$out" "already recorded" "empty post-success claim did not use exact staged Done acknowledgement"
   assert_absent "$claim" "empty post-success claim remained after exact Done acknowledgement"
@@ -452,7 +452,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
   : > "$home/state/task-a.tearing-down"
   write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" "finalizing Done did not consume its receipt"
   home=$(make_home finalizing-idempotent)
   write_absent_finalizing_meta "$home"
@@ -460,9 +460,9 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   : > "$home/state/task-a.tearing-down"
   write_done_started_stage "$home" task-a "$meta_cksum" staged
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE=done \
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_STATE='done' \
     FM_FAKE_BODY_ACK="fm-done-ack:$ack" \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 0 "$status" "idempotent finalizing Done"
   assert_contains "$out" "already recorded" "finalizing retry did not recognize recorded Done"
   home=$(make_home invalid-finalizing)
@@ -472,7 +472,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   printf 'version=2\ntask=task-a\nmeta-cksum=%s\nrecord-cksum=staged\nphase=finalizing\n' \
     "$meta_cksum" > "$home/state/task-a.teardown-stage"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "invalid finalizing stage"
   assert_contains "$out" "unresolved owned lifecycle" "non-v4 finalizing stage bypassed lifecycle guard"
   home=$(make_home finalizing-live-endpoint)
@@ -483,7 +483,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ENDPOINT_PRESENT=1 \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "finalizing stage with live endpoint"
   assert_contains "$out" "unresolved owned lifecycle" "live endpoint bypassed complete finalization validation"
   home=$(make_home finalizing-inventory-unavailable)
@@ -494,7 +494,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   record_cksum=$(sed -n 's/^record-cksum=//p' "$home/state/task-a.teardown-complete")
   write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "finalizing stage with unavailable exact endpoint inventory"
   assert_contains "$out" "unresolved owned lifecycle" \
     "unavailable endpoint audit bypassed complete finalization validation"
@@ -506,7 +506,7 @@ test_finalizing_stage_allows_guarded_and_idempotent_done() {
   write_done_started_stage "$home" task-a "$meta_cksum" "$record_cksum"
   : > "$home/state/task-a.teardown-final-cleanup"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "finalizing stage during partial final cleanup"
   assert_contains "$out" "unresolved owned lifecycle" \
     "partial final cleanup authority bypassed finalizing lifecycle validation"
@@ -527,14 +527,14 @@ test_completion_recovery_requires_exact_done_ack() {
     "$old_ack" > "$home/data/done-archive.md"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "finalizing retry with reused archived id"
   assert_contains "$out" "no durable successful-teardown proof" \
     "old archived task id bypassed the exact finalization acknowledgement"
   printf '\n- [x] task-a - current task (done 2026-07-17)\n  fm-done-ack:%s\n' \
     "$current_ack" >> "$home/data/done-archive.md"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
-    "$BACKLOG" done task-a >/dev/null
+    "$BACKLOG" 'done' task-a >/dev/null
 
   home=$(make_home claim-archive-reuse)
   write_completion_proof "$home" task-a ship delivered-local ship "$current_ack"
@@ -546,7 +546,7 @@ test_completion_recovery_requires_exact_done_ack() {
     "$old_ack" > "$home/data/done-archive.md"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE=not_found \
-    "$BACKLOG" done task-a 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "claim recovery with reused archived id"
   assert_contains "$out" "could not determine backlog state" \
     "old archived task id consumed a different claimed teardown receipt"
@@ -564,12 +564,12 @@ test_manual_backend_mutations_stay_serialized_and_receipt_gated() {
   assert_contains "$(cat "$log")" "args=update task-a --title changed --backend markdown --file $home/data/backlog.md" \
     "manual routine mutation bypassed the serialized scoped backend"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "manual Done without teardown proof"
   assert_contains "$out" "no durable successful-teardown proof" "manual Done bypassed lifecycle receipt"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
-    "$BACKLOG" done task-a --note 'local main'
+    "$BACKLOG" 'done' task-a --note 'local main'
   assert_contains "$(cat "$log")" "args=done task-a --note local main" \
     "manual completion did not pass through the serialized scoped backend"
   assert_contains "$(cat "$log")" "fm-done-ack:0123456789abcdef0123456789abcdef --backend markdown --file $home/data/backlog.md" \
@@ -646,7 +646,7 @@ test_all_mutation_verbs_and_aliases_invalidate_proofs() {
   assert_absent "$claim" "successful delete left an interrupted completion claim"
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" create task-a replacement >/dev/null
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 1 "$status" "recreated task with stale interrupted claim"
   assert_contains "$out" "no durable successful-teardown proof" \
     "recreated task reused an interrupted claim from the deleted record"
@@ -674,7 +674,7 @@ test_equals_note_completion_is_normalized() {
   log="$home/args.log"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_ARGS_LOG="$log" \
-    "$BACKLOG" done task-a '--note=local main'
+    "$BACKLOG" 'done' task-a '--note=local main'
   assert_contains "$(cat "$log")" "args=done task-a --note local main" \
     "equals-form completion note was not normalized"
   assert_not_contains "$(cat "$log")" "--note=local main" \
@@ -693,7 +693,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
     FM_FAKE_DONE_ACK_FILE="$ack_file" \
-    "$BACKLOG" done task-a >/dev/null 2>&1 &
+    "$BACKLOG" 'done' task-a >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
     [ -f "$marker" ] && break
@@ -703,8 +703,9 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
   [ -n "$transaction" ] || fail "interrupted Done did not retain backend ownership"
   backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
-  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
-    || fail "interrupted Done backend owner was not live"
+  if [ -z "$backend_pid" ] || ! kill -0 "$backend_pid" 2>/dev/null; then
+    fail "interrupted Done backend owner was not live"
+  fi
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -721,7 +722,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   done
   kill -0 "$backend_pid" 2>/dev/null \
     && fail "interrupted Done backend $backend_pid survived the bounded wait"
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a >/dev/null
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" "retry after interrupted proof recovery did not consume proof"
 
   home=$(make_home interrupted-completed)
@@ -733,7 +734,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
     FM_FAKE_TASK_STATE_FILE="$state_file" FM_FAKE_DONE_STATE_FILE="$state_file" \
     FM_FAKE_DONE_ACK_FILE="$ack_file" \
-    "$BACKLOG" done task-a >/dev/null 2>&1 &
+    "$BACKLOG" 'done' task-a >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
     [ -f "$marker" ] && break
@@ -743,8 +744,9 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
   [ -n "$transaction" ] || fail "completed interrupted Done did not retain backend ownership"
   backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
-  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
-    || fail "completed interrupted Done backend owner was not live"
+  if [ -z "$backend_pid" ] || ! kill -0 "$backend_pid" 2>/dev/null; then
+    fail "completed interrupted Done backend owner was not live"
+  fi
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -775,7 +777,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_INTERRUPT_MARKER="$marker" \
     FM_FAKE_SHOW_MODE_FILE="$mode_file" FM_FAKE_DONE_SHOW_MODE=not_found \
     FM_FAKE_ARCHIVE_PATH="$archive_file" FM_FAKE_DONE_ACK_FILE="$ack_file" \
-    "$BACKLOG" done task-a --keep 0 >/dev/null 2>&1 &
+    "$BACKLOG" 'done' task-a --keep 0 >/dev/null 2>&1 &
   pid=$!
   for _ in {1..100}; do
     [ -f "$marker" ] && break
@@ -785,8 +787,9 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   transaction=$(compgen -G "$home/state/.backlog-receipts.claimed.*" | head -1)
   [ -n "$transaction" ] || fail "archived interrupted Done did not retain backend ownership"
   backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
-  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
-    || fail "archived interrupted Done backend owner was not live"
+  if [ -z "$backend_pid" ] || ! kill -0 "$backend_pid" 2>/dev/null; then
+    fail "archived interrupted Done backend owner was not live"
+  fi
   kill -TERM "$pid"
   status=0
   wait "$pid" || status=$?
@@ -820,7 +823,7 @@ test_interrupted_completion_claim_reconciles_from_backlog_state() {
   printf '%s\n' 0123456789abcdef0123456789abcdef > "$claim/done-ack"
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_SHOW_MODE_FILE="$mode_file" \
-    "$BACKLOG" done task-a --keep 0 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a --keep 0 2>&1) || status=$?
   expect_code 1 "$status" "claim recovery after operational show failure"
   assert_contains "$out" "could not determine backlog state" \
     "operational show failure did not fail claim recovery closed"
@@ -833,7 +836,7 @@ test_default_tasks_kind_matches_legacy_ship_lifecycle() {
   home=$(make_home default-kind)
   write_completion_proof "$home" legacy-a ship delivered-local task
   PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_FAKE_TASK_KIND=task \
-    "$BACKLOG" done legacy-a --note 'local main'
+    "$BACKLOG" 'done' legacy-a --note 'local main'
   assert_absent "$home/state/legacy-a.teardown-complete" "default tasks kind did not normalize to ship"
   pass "default tasks kind remains compatible with legacy Firstmate ship tasks"
 }
@@ -844,7 +847,7 @@ test_done_rejects_noncanonical_id_before_proof_access() {
   outside="$home/task-a.teardown-complete"
   printf 'must remain unread\n' > "$outside"
   status=0
-  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done ../task-a 2>&1) || status=$?
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' ../task-a 2>&1) || status=$?
   expect_code 2 "$status" "traversal-shaped completion id"
   assert_contains "$out" "invalid task id" "completion did not reject a noncanonical id"
   assert_present "$outside" "completion accessed a proof path before validating the id"
@@ -913,7 +916,7 @@ test_help_does_not_require_home_configuration() {
   assert_contains "$out" "Usage: fm-backlog.sh" "help output was not available before home validation"
   home=$(make_home done-help)
   status=0
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done --help >/dev/null 2>&1 || status=$?
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' --help >/dev/null 2>&1 || status=$?
   expect_code 0 "$status" "Done help without a task id"
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" update --help >/dev/null
@@ -962,8 +965,9 @@ test_interrupted_mutation_receipt_claims_reconcile_from_files() {
   recorded_identity=$(sed -n '2p' "$claim/backend-owner" 2>/dev/null || true)
   current_identity=$(LC_ALL=C ps -p "$backend_pid" -o lstart= 2>/dev/null \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)
-  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
-    || fail "interrupted mutation did not retain its live backend owner"
+  if [ -z "$backend_pid" ] || ! kill -0 "$backend_pid" 2>/dev/null; then
+    fail "interrupted mutation did not retain its live backend owner"
+  fi
   [ -n "$recorded_identity" ] && [ "$recorded_identity" = "$current_identity" ] \
     || fail "interrupted mutation backend owner identity was not exact and durable"
   status=0
@@ -1022,7 +1026,7 @@ test_interrupted_done_backend_retains_mutation_ownership() {
   write_completion_proof "$home" task-a ship delivered-local
   PATH="$home/fakebin:$PATH" FM_HOME="$home" \
     FM_FAKE_MUTATION_WAIT_MARKER="$marker" FM_FAKE_MUTATION_WAIT_RELEASE="$release" \
-    "$BACKLOG" done task-a --note delivered >/dev/null 2>&1 &
+    "$BACKLOG" 'done' task-a --note delivered >/dev/null 2>&1 &
   wrapper_pid=$!
   wait_for_file "$marker" 5 || fail "Done never reached its backend"
   kill -KILL "$wrapper_pid"
@@ -1034,11 +1038,12 @@ test_interrupted_done_backend_retains_mutation_ownership() {
   [ -n "$transaction" ] || fail "interrupted Done lost durable backend ownership"
   [ -n "$completion_claim" ] || fail "interrupted Done lost its completion proof claim"
   backend_pid=$(sed -n '1p' "$transaction/backend-owner" 2>/dev/null || true)
-  [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null \
-    || fail "interrupted Done backend owner was not live"
+  if [ -z "$backend_pid" ] || ! kill -0 "$backend_pid" 2>/dev/null; then
+    fail "interrupted Done backend owner was not live"
+  fi
   status=0
   out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_LOCK_STALE_AFTER=0 \
-    "$BACKLOG" done task-a --note retry 2>&1) || status=$?
+    "$BACKLOG" 'done' task-a --note retry 2>&1) || status=$?
   expect_code 1 "$status" "Done retry with live orphan backend"
   assert_contains "$out" "durable backlog mutation" \
     "Done retry did not fail closed behind its live orphan backend"
@@ -1052,7 +1057,7 @@ test_interrupted_done_backend_retains_mutation_ownership() {
   done
   kill -0 "$backend_pid" 2>/dev/null \
     && fail "released Done backend $backend_pid did not exit within the bounded wait"
-  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" done task-a --note retry >/dev/null
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" "$BACKLOG" 'done' task-a --note retry >/dev/null
   assert_absent "$home/state/task-a.teardown-complete" \
     "retryable Done left its restored completion proof unconsumed"
   if compgen -G "$home/state/.task-a.teardown-complete.claimed.*" >/dev/null; then
@@ -1149,7 +1154,7 @@ EOF
     printf 'done-ack=%s\n' "$ack"
   } > "$home/state/task-a.teardown-complete"
   note=$'captain note line one\ncaptain note line two'
-  FM_HOME="$home" "$BACKLOG" done task-a --note "$note" --no-prune >/dev/null
+  FM_HOME="$home" "$BACKLOG" 'done' task-a --note "$note" --no-prune >/dev/null
   shown=$(cd "$home" && HOME="$home" tasks-axi show task-a --full \
     --backend markdown --file "$home/data/backlog.md") || fail "real Done record was not retained for full inspection"
   assert_contains "$shown" "captain note line one" "real Done dropped the first user note line"
@@ -1164,7 +1169,7 @@ EOF
   mkdir "$claim"
   printf '%s\n' "$ack" > "$claim/done-ack"
   status=0
-  out=$(FM_HOME="$home" "$BACKLOG" done task-a 2>&1) || status=$?
+  out=$(FM_HOME="$home" "$BACKLOG" 'done' task-a 2>&1) || status=$?
   expect_code 0 "$status" "real archived Done acknowledgement recovery"
   assert_contains "$out" "already recorded" "real archive format did not satisfy exact acknowledgement recovery"
   assert_absent "$claim" "real archive acknowledgement left its recovery claim"

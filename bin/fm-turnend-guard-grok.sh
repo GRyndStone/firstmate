@@ -62,6 +62,7 @@ PREPARE_OWNER="$PREPARE_LOCK/owner"
 PREPARE_RECORD=$(printf '%s\n%s' "$HOOK_PID" "$HOOK_IDENTITY")
 PREPARE_HELD=false
 
+# shellcheck disable=SC2329 # Invoked by name from EXIT and signal traps.
 release_preparation() {
   [ "$PREPARE_HELD" = true ] || return 0
   if [ -d "$PREPARE_LOCK" ] && [ ! -L "$PREPARE_LOCK" ] \

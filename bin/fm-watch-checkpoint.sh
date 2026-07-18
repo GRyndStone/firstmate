@@ -81,7 +81,6 @@ WATCH_PID=
 WATCH_IDENTITY=
 TIMER_PID=
 CLEANED=0
-TIMED_OUT=0
 OWNERSHIP_FAILURE=0
 
 watch_birth_identity() {
@@ -89,7 +88,7 @@ watch_birth_identity() {
 }
 
 capture_watch_identity() {
-  local current_identity current_parent previous_identity= i=0
+  local current_identity current_parent previous_identity='' i=0
   while [ "$i" -lt 40 ]; do
     current_parent=$(ps -p "$WATCH_PID" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)
     current_identity=$(watch_birth_identity "$WATCH_PID" 2>/dev/null || true)
@@ -303,7 +302,6 @@ while [ ! -e "$TIMEOUT_MARKER" ]; do
   sleep 1
 done
 if [ -e "$TIMEOUT_MARKER" ]; then
-  TIMED_OUT=1
   stop_watch_child 20 || OWNERSHIP_FAILURE=1
 fi
 set +e

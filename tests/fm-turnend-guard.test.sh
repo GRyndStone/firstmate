@@ -728,11 +728,14 @@ EOF
   sleep 1 &
   origin_pid=$!
   origin_identity=$(. "$dir/bin/fm-wake-lib.sh"; fm_pid_identity "$origin_pid")
+  # shellcheck disable=SC2031 # The primary-dir path remains valid outside helper subshells.
   mkdir -p "$dir/state/.turnend-handoffs"
+  # shellcheck disable=SC2031 # The primary-dir path remains valid outside helper subshells.
   pending="$dir/state/.turnend-handoffs/grok-origin.pending"
   {
     printf 'origin-token\n%s\n%s\nsession-origin\norigin barrier\n' "$origin_pid" "$origin_identity"
   } > "$pending"
+  # shellcheck disable=SC2031 # The primary-dir path remains valid outside helper subshells.
   PATH="$fakebin:$PATH" FM_GROK_TURNEND_DELAY=0 FM_GROK_TURNEND_RETRY_DELAY=1 bash "$dir/bin/fm-turnend-guard-grok-deliver.sh" "$pending" "$dir" "" "$dir/state" &
   worker_pid=$!
   sleep 0.2
@@ -818,12 +821,14 @@ EOF
   sleep 1 &
   owner_pid=$!
   owner_identity=$(. "$dir/bin/fm-wake-lib.sh"; fm_pid_identity "$owner_pid")
+  # shellcheck disable=SC2031 # The owner PID remains valid outside helper subshells.
   printf 'completed-token\n%s\n%s\n' "$owner_pid" "$owner_identity" > "$pending.delivery"
   (
     sleep 0.2
     rm -f "$pending.delivery"
   ) &
   release_pid=$!
+  # shellcheck disable=SC2031 # The primary-dir path remains valid outside helper subshells.
   out=$(printf '{"sessionId":"session-owner-token","hookEventName":"stop"}' \
     | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_GROK_TURNEND_DELAY=0 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "Grok must replace a live owner that is not bound to a current pending token"
@@ -834,9 +839,12 @@ EOF
     sleep 0.1
   done
   [ -s "$log" ] || fail "Grok accepted a live delivery pid without a matching pending token"
+  # shellcheck disable=SC2031 # The owner PID remains valid outside helper subshells.
   kill "$owner_pid" 2>/dev/null || true
+  # shellcheck disable=SC2031 # The owner PID remains valid outside helper subshells.
   wait "$owner_pid" 2>/dev/null || true
   for i in 1 2 3 4 5 6 7 8 9 10; do
+    # shellcheck disable=SC2031 # The primary-dir path remains valid outside helper subshells.
     delivery=$(find "$dir/state/.turnend-handoffs" -name 'grok-*.delivery' -print -quit 2>/dev/null)
     [ -z "$delivery" ] && break
     sleep 0.1
@@ -939,7 +947,7 @@ test_grok_preparation_owner_never_follows_symlink() {
   local dir handoff key owner outside out status session
   dir=$(make_primary_dir "$TMP_ROOT/grok-prepare-owner-symlink")
   : > "$dir/state/task1.meta"
-  session=session-prepare-owner-symlink
+  session='session-prepare-owner-symlink'
   if command -v shasum >/dev/null 2>&1; then
     key=$(printf '%s' "$session" | shasum -a 256 | awk '{print substr($1,1,24)}')
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -1378,7 +1386,7 @@ EOF
   assert_present "$calls" "Grok worker did not deliver from the shared root-override state"
   [ ! -e "$dir/state/.turnend-handoffs" ] \
     || fail "Grok hook wrote handoff state under its code root instead of FM_ROOT_OVERRIDE"
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     find "$operational/state/.turnend-handoffs" -name 'grok-*.pending' -print -quit 2>/dev/null \
       | grep -q . || break
     sleep 0.1
@@ -3077,6 +3085,7 @@ test_pi_unknown_agent_start_retains_ack_and_cancels_stale_settled_retry() {
   make_adapter_primary_repo "$repo"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state" "$fakebin"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  # shellcheck disable=SC2016 # Dollar expression belongs to the generated script.
   printf '#!/usr/bin/env bash\ncat >/dev/null\nprintf "guard\\n" >> "$PI_GUARD_LOG"\nexit 2\n' > "$repo/bin/fm-turnend-guard.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/bin/fm-arm-pretool-check.sh"
   cp "$repo/bin/fm-arm-pretool-check.sh" "$repo/bin/fm-cd-pretool-check.sh"

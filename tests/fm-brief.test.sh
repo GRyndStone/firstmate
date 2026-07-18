@@ -86,6 +86,7 @@ test_no_mistakes_dod_wording() {
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
   assert_grep 'Append a fresh `working: after-run=<run-id> <summary>` line only when substantive same-pane recovery begins after the named run is terminal' "$brief" \
     "no-mistakes DOD does not reserve later working evidence for terminal recovery"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
   assert_grep 'Immediately before validating recovered work, append `working: validating-after-run=<run-id> starting a fresh no-mistakes run`' "$brief" \
     "no-mistakes DOD does not require recovered validation to establish a newer run"
   pass "fm-brief.sh: no-mistakes DOD owns run-step and recovery status evidence"

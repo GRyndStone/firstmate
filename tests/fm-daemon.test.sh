@@ -706,14 +706,18 @@ test_daemon_watcher_stderr_uses_buffered_no_follow_append() {
     || fail "no-follow watcher stderr append failed"
   [ "$(cat "$target")" = watcher-error ] || fail "no-follow watcher stderr append lost output"
   source=$(cat "$DAEMON")
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   assert_contains "$source" '"$WATCH" >"$CUR_TMP" 2>"$CUR_ERR" &' \
     "daemon watcher stderr is not buffered by its directly supervised child"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   assert_contains "$source" 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"' \
     "daemon watcher stderr buffer is not published through the no-follow helper"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   append_count=$(printf '%s\n' "$source" | grep -c 'fm_append_file_no_follow "$WATCH_ERR" < "$CUR_ERR"')
   [ "$append_count" -ge 2 ] || fail "daemon shutdown does not flush the active watcher stderr buffer"
   assert_not_contains "$source" 'fm_exec_stderr_append_no_follow' \
     "daemon watcher launch still depends on the Perl stderr opener"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   assert_not_contains "$source" '2>>"$WATCH_ERR"' \
     "daemon still opens watcher stderr through a symlink-following redirection"
   pass "daemon watcher stderr buffers without a Perl launch dependency"
@@ -1850,6 +1854,7 @@ test_away_injection_supports_every_runtime_backend() {
   done
   fm_backend_source zellij || fail "could not load zellij composer classifier"
   out=$(
+    # shellcheck disable=SC2329 # Overrides a backend function in this subshell.
     fm_backend_zellij_capture() { printf '│ > │\n'; }
     fm_backend_zellij_composer_state exact-zellij-target
   )

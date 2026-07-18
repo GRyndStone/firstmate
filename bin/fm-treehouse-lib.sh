@@ -20,7 +20,7 @@ fm_treehouse_normalize_system_alias() {  # <absolute-path>
 }
 
 fm_treehouse_worktree_available_for_project() {  # <project> <worktree>
-  local project=$1 target=$2 abs_target status line slot availability path path_abs
+  local project=$1 target=$2 abs_target status line availability path path_abs
   target=$(fm_treehouse_normalize_system_alias "$target") || return 1
   [ ! -L "$target" ] || return 1
   [ -d "$project" ] && [ -d "$target" ] || return 1
@@ -28,13 +28,12 @@ fm_treehouse_worktree_available_for_project() {  # <project> <worktree>
   abs_target=$(cd "$target" 2>/dev/null && pwd -P) || return 1
   status=$( ( cd "$project" && treehouse status ) 2>/dev/null) || return 1
   while IFS= read -r line; do
-    slot= availability= path=
-    read -r slot availability path <<EOF
+    read -r _ availability path <<EOF
 $line
 EOF
     [ "$availability" = available ] && [ -n "$path" ] || continue
     case "$path" in
-      '~/'*) [ -n "${HOME:-}" ] || continue; path="${HOME}/${path#\~/}" ;;
+      \~/*) [ -n "${HOME:-}" ] || continue; path="${HOME}/${path#\~/}" ;;
     esac
     path=$(fm_treehouse_normalize_system_alias "$path") || continue
     [ ! -L "$path" ] || continue

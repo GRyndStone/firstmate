@@ -63,8 +63,9 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
@@ -416,7 +417,7 @@ recovery_context() {
     if [ "$verb" = working ]; then
       note=$(status_line_note "$line")
       case "$note" in
-        after-run=*) prefix=after-run= ;;
+        after-run=*) prefix='after-run=' ;;
         validating-after-run=*) prefix=validating-after-run= ;;
         *)
           [ -n "$id" ] && kind=working
@@ -494,7 +495,6 @@ HAVE_RUN=0
 # run-step block below skips the TOON field parsing entirely for this crew.
 RUN_SOURCE=full
 COARSE_STATUS=""
-COARSE_HEAD=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -512,7 +512,6 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # for no better answer.
       COARSE_RECORD=$(nm_runs_record_for_branch "$CREW_BRANCH")
       COARSE_STATUS=${COARSE_RECORD%%|*}
-      COARSE_HEAD=${COARSE_RECORD#*|}
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse

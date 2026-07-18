@@ -32,8 +32,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
@@ -70,10 +71,10 @@ PAYLOAD=$(jq -cn --arg rid "$REQ" '{request_id:$rid}') || {
 if [ -n "$FMX_DRY" ]; then
   outbox_dir="$STATE/x-outbox"
   outbox_file="$outbox_dir/$REQ.json"
-  fm_ensure_dir_no_follow "$STATE" && fm_ensure_dir_no_follow "$outbox_dir" || {
+  if ! fm_ensure_dir_no_follow "$STATE" || ! fm_ensure_dir_no_follow "$outbox_dir"; then
     echo "fm-x-dismiss: cannot create dry-run outbox: $outbox_dir" >&2
     exit 1
-  }
+  fi
   # The recorded body carries an "endpoint":"dismiss" marker so an outbox record
   # is self-describing (the live POST body stays exactly {request_id}).
   OUTREC=$(printf '%s' "$PAYLOAD" | jq -c '. + {endpoint:"dismiss"}') || {

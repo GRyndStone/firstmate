@@ -71,8 +71,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-# shellcheck source=bin/fm-wake-lib.sh
+# shellcheck disable=SC2034 # Consumed by the sourced wake library.
 FM_WAKE_STATE_INIT=skip
+# shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh" || exit 1
 unset FM_WAKE_STATE_INIT
 STATE=$FM_VALIDATED_STATE_PATH
@@ -248,10 +249,10 @@ fi
 if [ -n "$FMX_DRY" ]; then
   outbox_dir="$STATE/x-outbox"
   outbox_file="$outbox_dir/$REQ.json"
-  fm_ensure_dir_no_follow "$STATE" && fm_ensure_dir_no_follow "$outbox_dir" || {
+  if ! fm_ensure_dir_no_follow "$STATE" || ! fm_ensure_dir_no_follow "$outbox_dir"; then
     echo "fm-x-reply: cannot create dry-run outbox: $outbox_dir" >&2
     exit 1
-  }
+  fi
   # The recorded body is the would-be POST body, except image bytes are replaced
   # by a compact marker. A follow-up preview additionally carries an
   # "endpoint":"followup" marker so an outbox record is self-describing.

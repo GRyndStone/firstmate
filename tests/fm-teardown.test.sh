@@ -1788,8 +1788,10 @@ test_teardown_publications_use_owned_random_temporaries() {
   source=$(cat "$TEARDOWN")
   assert_not_contains "$source" '.tmp.$$' \
     "teardown still publishes through predictable process-id temporaries"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   assert_contains "$source" 'fm_publish_file_no_follow "$tmp" "$TEARDOWN_STAGE" replace' \
     "teardown stage does not use the shared no-follow publisher"
+  # shellcheck disable=SC2016 # Dollar expressions are literal source assertions.
   assert_contains "$source" 'fm_publish_file_no_follow "$tmp" "$COMPLETION_PROOF" exclusive' \
     "completion proof does not use exclusive no-follow publication"
   pass "teardown lifecycle publications use owned random no-follow temporaries"

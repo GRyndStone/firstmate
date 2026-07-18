@@ -373,12 +373,16 @@ EOF
 
 test_bearings_skill_routes_durable_obligations() {
   local skill=$ROOT/.agents/skills/bearings/SKILL.md
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
   grep -Fq 'Read every `durable_obligations` row even when `runnable_candidates` is zero.' "$skill" \
     || fail "bearings skill does not require durable-obligation consumption"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
   grep -Fq 'Route `held`, `blocked`, and `held+blocked` rows to **Date-gated / queued** with both hold and blocker details when present' "$skill" \
     || fail "bearings skill does not route gated durable obligations"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
   grep -Fq 'route `unstructured` rows that require supervisor interpretation to **Plans / main pickup points**.' "$skill" \
     || fail "bearings skill does not route unstructured durable obligations"
+  # shellcheck disable=SC2016 # Backticks are literal skill text.
   grep -Fq 'When an `omitted` row says `durable obligations showing ...`, state that the projection is truncated and include its `reveal` action' "$skill" \
     || fail "bearings skill does not disclose durable-obligation truncation"
   pass "bearings skill routes durable obligations and truncation disclosure"
