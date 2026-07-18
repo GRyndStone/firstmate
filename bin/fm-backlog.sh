@@ -4,8 +4,9 @@
 # home's data/backlog.md, so update/hold and other last-writer races cannot run
 # concurrently against one backend file.
 #
-# `done` additionally requires a single-use state/<id>.teardown-complete proof
-# written by successful lifecycle teardown.
+# `done` additionally requires a single-use state/<id>.teardown-complete binding
+# prepared by teardown before destructive cleanup and validated together with
+# the retained finalizing stage plus independently confirmed cleanup.
 # Interrupted proof claims are reconciled from the task's resulting backlog
 # state, and every other mutation claims affected receipts before backend write.
 # A scout report completion must name the owned data/<id>/report.md, which must

@@ -11,13 +11,14 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 When the default backend is selected and compatible `tasks-axi` is on `PATH`, firstmate uses `bin/fm-backlog.sh` for routine backlog operations.
 That wrapper resolves exactly one home's `data/backlog.md`, refuses caller overrides of the file or backend, and serializes every mutation with that home's `state/.backlog.lock`.
-The wrapper refuses `done` while owned task meta or unresolved teardown state exists, except for a complete current-version `backlog-done-started` stage whose exact endpoint plus parent and auxiliary cleanup targets are verified absent and whose ownership, force, outcome, record, and proof bindings are internally consistent.
+The wrapper refuses `done` while owned task meta or unresolved teardown state exists, except for a complete current-version `backlog-done-started` stage whose exact endpoint is absent, whose parent worktree is absent or proved returned as the exact available Treehouse path for its project, whose auxiliary cleanup targets are absent, and whose ownership, force, outcome, record, and proof bindings are internally consistent.
 It refuses a scout report completion unless the exact owned report is a regular non-symlink file canonically contained beneath the selected home.
-`fm-teardown.sh` owns the supported completion order by validating the deliverable, tearing down the worktree and endpoint, verifying every cleanup target absent, and only then entering the durable backlog mutation subphases.
-It persists the completion proof and exact-backlog-record phase in canonically external state before destructive cleanup.
+`fm-teardown.sh` owns the supported completion order by validating the deliverable, closing the endpoint, tearing down the worktree, verifying each cleanup target absent or the exact Treehouse worktree returned available for its project, and only then entering the durable backlog mutation subphases.
+Before destructive cleanup it persists a staged completion binding and exact-backlog-record phase in canonically external state; the binding proves nothing by itself and is accepted only with the retained finalization stage plus independently confirmed cleanup.
 Cleanup ownership combines canonical path identity with a random task-owned marker outside worktree contents, so filesystem identity reuse cannot authorize removal of a replacement target.
 An interrupted retry refuses a changed backlog record and cannot inspect or remove a path after either ownership binding no longer matches.
 After independently confirmed cleanup, lifecycle state remains through serialized backlog finalization and is removed only after that mutation succeeds.
+Only `delivered-report`, `delivered-local`, `delivered-pr`, and `delivered-default` outcomes may enter Done; `discarded` and `unlanded` outcomes remain outside Done through a structured hold or reopen transition.
 Before automatic endpoint closure, teardown invokes the read-only duplicate owner described under [Runtime backend](#runtime-backend-configbackend--fm_backend) and refuses every reported anomaly, leaving exact reconciliation to the supervisor.
 Forced secondmate retirement applies the same preflight recursively to child-home task metadata before closing a child endpoint.
 If the Done mutation fails after teardown, the lifecycle is safely closed, finalization remains retryable, and the command fails loudly with the backlog outside Done.
@@ -46,7 +47,7 @@ It deliberately does not interpret prose plans into obligations: when any source
 
 `bin/fm-wake-lib.sh` owns effective-state path validation and portable final-component no-follow publication for shell entry points.
 The audited state entry-point inventory is `bin/fm-afk-start.sh`, `bin/fm-lock.sh`, `bin/fm-bootstrap.sh`, `bin/fm-config-push.sh`, `bin/fm-pr-check.sh`, `bin/fm-merge-local.sh`, `bin/fm-update.sh`, `bin/fm-promote.sh`, `bin/fm-send.sh`, `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-watch-checkpoint.sh`, `bin/fm-supervise-daemon.sh`, `bin/fm-guard.sh`, `bin/fm-wake-drain.sh`, `bin/fm-turnend-guard.sh`, `bin/fm-turnend-guard-grok.sh`, `bin/fm-turnend-guard-grok-deliver.sh`, `bin/fm-crew-state.sh`, `bin/fm-backlog.sh`, `bin/fm-backlog-handoff.sh`, `bin/fm-spawn.sh`, `bin/fm-teardown.sh`, `bin/fm-endpoint-audit.sh`, `bin/fm-fleet-snapshot.sh`, `bin/fm-session-start.sh`, `bin/fm-x-poll.sh`, `bin/fm-x-reply.sh`, `bin/fm-x-dismiss.sh`, `bin/fm-x-link.sh`, `bin/fm-x-followup.sh`, `.opencode/plugins/fm-primary-watch-arm.js`, `.opencode/plugins/fm-primary-turnend-guard.js`, `.pi/extensions/fm-primary-pi-watch.ts`, and `.pi/extensions/fm-primary-turnend-guard.ts`.
-Every listed entry point must reject symlinked effective-state path components before its first state read or mutation, reject symlinked or non-regular task metadata before parsing or backend lookup, and use no-follow publication for durable final targets it owns.
+Every listed entry point must normalize only a verified operating-system `/var` or `/tmp` alias to its physical path, reject every other symlinked effective-state path component before its first state read or mutation, reject symlinked or non-regular task metadata before parsing or backend lookup, and use no-follow publication for durable final targets it owns.
 The daemon buffers watcher stderr in an owned temporary file and appends it to `state/.supervise-daemon.watcher.err` through the shared no-follow publication helper after the watcher exits, so the watcher remains the directly supervised child without making Perl a launch-time dependency.
 
 ## Runtime backend (config/backend / FM_BACKEND)
@@ -70,6 +71,7 @@ A cmux spawn additionally version-gates against the installed `cmux` binary's ve
 A backend spawn refusal from a missing dependency, version gate, or unauthenticated socket is terminal for that selected backend; firstmate surfaces it as a blocker instead of silently retrying another backend.
 Task meta records `backend=` only for a non-default backend; an absent `backend=` means `tmux`, preserving existing default-path meta files.
 A tmux task records its stable `window=@<window-id>` lifecycle target together with `tmux_window_id=`, `tmux_session=`, and `tmux_home_identity=`, the canonical-home digest also stored on its window for exact-home inventory filtering.
+A locked session start adopts a fully legacy `session:fm-<id>` tmux record only when exactly one matching window in that session is untagged or already belongs to the active home; it then tags the window and atomically records the stable id, while partial or ambiguous legacy state remains unknown.
 A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
 A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
 An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
@@ -88,6 +90,9 @@ For Herdr it queries only sessions and exact workspace ids named by the active h
 For tmux it queries only windows matching both the recorded task label and the active home's recorded identity inside the exact named session, while lifecycle operations target the recorded stable window id.
 It groups duplicate task labels deterministically and reports the meta-owned worktree plus recorded and live endpoints without closing anything.
 For Zellij, Orca, and cmux it emits a structured `inventory_unavailable` finding without enumerating the shared session or app-global endpoint namespace; read-only fleet accounting can retain the finding, while teardown refuses every audit anomaly.
+The separate teardown-grade endpoint probe is tri-state: tmux and Herdr classify only the exact meta-bound home target, Orca classifies its exact recorded terminal from validated success or typed not-found responses, and every unreadable or malformed result is `unknown` rather than absent.
+Zellij and cmux return `unknown` from that lifecycle probe because their available inventories cannot prove exact-home absence without reading a shared or app-global namespace.
+Orca's exact-terminal tri-state does not prove that no replacement or duplicate terminal exists, so its duplicate audit remains `inventory_unavailable` and current teardown fails closed before closure.
 Zellij lifecycle finalization follows the fail-closed exact-home boundary in [`docs/zellij-backend.md`](zellij-backend.md#teardown-absence-boundary).
 Session-start recovery and the canonical fleet snapshot render those findings, so overwriting one task meta with a newer recovery endpoint cannot make earlier same-home duplicates invisible.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
@@ -103,12 +108,12 @@ The `config/backend` file is not inherited by secondmate homes.
 ## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
 
 The `/afk` sub-supervisor injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
-It currently supports only `tmux` and `herdr` supervisor panes.
-Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
+It supports `tmux`, `herdr`, `zellij`, `orca`, and `cmux` supervisor endpoints through the shared backend existence, capture, composer, and verified-submit operations.
+Set `FM_SUPERVISOR_BACKEND=<backend>` and `FM_SUPERVISOR_TARGET=<exact-target>` to override both axes explicitly.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
 That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
 Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the legacy `firstmate:0` tmux fallback with a warning.
-Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
+Zellij, Orca, and cmux have no ambient supervisor-target discovery, so they require both explicit values; an unknown backend or an unresolved target refuses at daemon startup.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
@@ -408,8 +413,8 @@ FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line onc
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
-FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
-FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
+FM_SUPERVISOR_BACKEND=             # optional supervisor backend override: tmux|herdr|zellij|orca|cmux; ambient detection covers tmux/herdr only, and other backends require this plus FM_SUPERVISOR_TARGET
+FM_SUPERVISOR_TARGET=              # optional exact supervisor endpoint override; otherwise auto-detected only from tmux/herdr markers before the legacy tmux fallback
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
 FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
 FM_MAX_DEFER_SECS=300              # max buffered escalation age before retry plus wedge alarm; 0 disables

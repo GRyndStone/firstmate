@@ -62,7 +62,7 @@ You do not need to bring the window forward for routine supervision: from an act
 Verify it works by spawning a trivial task with `--backend cmux` and confirming the task's meta records `backend=cmux` plus `cmux_workspace_id=` and `cmux_surface_id=`.
 The cmux sidebar should show a new `fm-firstmate-<8hex>-<id>` workspace in the primary home.
 
-Limitations: cmux is experimental, macOS-only, GUI-first (never viable for a headless/CI/SSH-only firstmate instance), has no native busy-state signal, and `--secondmate` spawns are refused until a per-home design exists - see "Known gaps left for a follow-up" at the end of this document.
+Limitations: cmux is experimental, macOS-only, GUI-first (never viable for a headless/CI/SSH-only firstmate instance), has no native busy-state signal, current teardown refuses at the unavailable exact-home inventory boundary, and `--secondmate` spawns are refused until a per-home design exists - see "Known gaps left for a follow-up" at the end of this document.
 
 ## Status: experimental
 
@@ -182,6 +182,12 @@ No session field is needed - unlike herdr/zellij there is no session layer to re
 | Busy state | *(no native primitive)* | cmux has agent-awareness elsewhere (Claude Code hooks integration, session-resume tokens) but exposes nothing over the socket API for generic busy/idle classification; `surface.health`/`surface-health` is render health, not agent status. `fm_backend_busy_state`'s dispatcher (`bin/fm-backend.sh`) falls through to `unknown` for cmux via its wildcard case, exactly like tmux/zellij/Orca - the watcher's existing pane-hash + regex path is the only busy-state source for this backend. |
 | Kill | `cmux close-workspace --workspace <id>`, preceded by a throwaway `new-workspace --window <win> --focus false --id-format uuids` when the target is the only workspace in its window | See "Closing the last workspace in a window" below. The backend owns the whole task workspace; kill closes it best-effort (`\|\| true`), but cmux silently refuses to close the LAST workspace in a window, so kill first detects that case (`fm_backend_cmux_window_of_workspace`) and adds a throwaway sibling before closing, matching every other backend's `kill` contract. |
 | Recovery / list-live | `cmux workspace list --json --id-format uuids`, filter titles starting with this home's `fm-<home-label>-`, then `list-panes` per match for the surface id | Title-based, never trusts a stored workspace uuid blindly - ids do NOT survive an app relaunch (see "Workspace ids do not survive a relaunch" below), so this is the only safe recovery posture. The adapter prints the plain `fm-<id>` label back to callers after stripping the readable home tag and `FM_ROOT` hash. |
+
+## Current teardown absence boundary
+
+cmux exposes app-global window/workspace inventories but no verified exact-home endpoint query that can prove a recorded task absent or find duplicates without sweeping other homes.
+`bin/fm-endpoint-audit.sh` therefore reports `inventory_unavailable`, and current `fm-teardown.sh` refuses before invoking the guarded kill primitive.
+The close mechanics and historical verification below remain valid backend facts, but they do not authorize lifecycle finalization until an exact-home inventory boundary exists.
 
 ## Socket control modes: the full matrix (default `cmuxOnly` rejects external CLIs)
 
@@ -355,8 +361,10 @@ Beyond the fake-CLI unit tests (`tests/fm-backend-cmux.test.sh`) and the real-CL
 7. The crewmate's commit (`add hello.txt`, message `add hello.txt`) was confirmed present on branch `fm/cmux-e2e-t1` in the scratch project's git history, with `hello.txt` containing exactly the expected line, and the status file ending in `done: ready in branch fm/cmux-e2e-t1`.
 8. `bin/fm-teardown.sh cmux-e2e-t1` **REFUSED**, exactly as required: `REFUSED: local-only worktree ... has work not yet merged into main and not on any remote.`
 9. `bin/fm-merge-local.sh cmux-e2e-t1` - fast-forwarded the scratch project's local `main` to the crewmate's commit (`e99f00a -> f064d41`).
-10. `bin/fm-teardown.sh cmux-e2e-t1` now succeeded: terminated the lingering worktree processes, returned the treehouse worktree, closed the cmux workspace (confirmed gone via `workspace list` - only the pre-existing default workspace remained), and removed all of the task's `state/` files.
-11. Two additional trivial crewmate tasks (`cmux-e2e-t2`, `cmux-e2e-t3`) were spawned concurrently into the same scratch project via `fm-spawn.sh`'s batch dispatch form, to exercise multiple simultaneous cmux workspaces; both reached their trust-accepted, standing-by state cleanly, were peeked successfully, and were torn down (clean worktrees, no unlanded work) with the same `fm-teardown.sh` path.
+10. In this historical verification, `bin/fm-teardown.sh cmux-e2e-t1` succeeded: it terminated the lingering worktree processes, returned the treehouse worktree, closed the cmux workspace through the then-current app-global `workspace list` confirmation, and removed the task's state files.
+11. In the same historical run, two additional trivial crewmate tasks (`cmux-e2e-t2`, `cmux-e2e-t3`) were spawned concurrently, reached their trust-accepted standing-by state, were peeked successfully, and were torn down through that then-current path.
+
+Current lifecycle finalization follows [Current teardown absence boundary](#current-teardown-absence-boundary) and does not repeat the app-global absence check used by this historical run.
 
 All three tasks' cmux workspaces and worktrees were confirmed fully cleaned up afterward (`workspace list` showing only the pre-existing default workspace; `treehouse destroy --all --yes` freeing the scratch project's pool); the scratch `FM_HOME` and project were removed entirely.
 
@@ -365,6 +373,7 @@ All three tasks' cmux workspaces and worktrees were confirmed fully cleaned up a
 ## Known gaps left for a follow-up
 
 - **No event push at all**, not even herdr's semantic busy-state: cmux has agent-awareness elsewhere (Claude Code hooks, session-resume) but nothing exposed over the socket API for generic busy/idle classification, so `fm-watch.sh`'s existing pane-hash + `FM_BUSY_REGEX` poll loop is the ONLY event source for this backend, identical to the tmux/zellij/Orca path.
+- **No exact-home duplicate inventory** - the app-global workspace inventory cannot authorize teardown, so lifecycle finalization currently refuses as documented in "Current teardown absence boundary" above.
 - **GUI-first, macOS-only, requires the app running** - identical posture to Orca.
   Never a candidate for a headless/CI firstmate instance, because runtime auto-detection (cmux runtime signals; see "Runtime auto-detection" above) can only fire from inside a live cmux terminal in the first place.
   The one-time socket-access setup remains an unavoidable manual step regardless of how the backend was selected.

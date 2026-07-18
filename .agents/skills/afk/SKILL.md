@@ -74,11 +74,10 @@ opencode, pi, and grok).
 
 ## Busy-guard and composer guard
 
-The daemon never injects into an in-use pane. Two checks run before every
-injection, dispatched through `bin/fm-backend.sh` for the supervisor's own
-backend (tmux or herdr; see "Auto-discovered supervisor pane" below):
+The daemon never injects into an in-use pane.
+Two checks run before every injection, dispatched through `bin/fm-backend.sh` for the supervisor's own tmux, herdr, zellij, Orca, or cmux backend; `docs/configuration.md` "Away-mode supervisor backend" owns discovery and exact-target requirements.
 
-- **`pane_is_busy`** - the harness shows a busy footer (agent mid-turn) on tmux (shared with `fm-send.sh` via `bin/fm-tmux-lib.sh`); on herdr, tries the native `agent.get`-backed busy state first, trusts only `busy` outright, and corroborates every non-`busy` verdict with the same regex-over-capture reader.
+- **`pane_is_busy`** - herdr tries its native `agent.get`-backed busy state first and trusts only `busy` outright; tmux, zellij, Orca, cmux, and every non-`busy` herdr verdict use the same regex-over-capture fallback.
 - **Composer-state guard** - `inject_msg` reads the full `empty`/`pending`/`unknown` verdict from `fm_backend_composer_state` and injects only when it is affirmatively `empty`.
   `pending` means real unsubmitted text, while `unknown` includes an unreadable pane and a bare shell prompt left after the agent exits, so both defer.
   The shared `bin/fm-composer-lib.sh` owns the content decision after each backend captures and structurally identifies its own composer row.
@@ -100,14 +99,13 @@ So a guard false-positive becomes a visible stall, never an unbounded silent no-
 
 ## Submit model
 
-The digest is typed **once** (`send-keys -l` on tmux, `pane send-text` on
-herdr - both literal, non-submitting sends), then submitted with Enter and
-**verified** through the selected backend's submit primitive.
+The digest is typed **once** through the selected backend's literal, non-submitting send, then submitted with Enter and **verified** through that backend's submit primitive.
 Enter is retried (Enter only, never a retype) until the backend confirms the
 submit landed.
 For tmux that confirmation is a cleared composer, using the same corrected,
 border-aware detector as the composer guard.
 For herdr, normal idle-baseline submits are confirmed by native agent-state showing a real turn started; the ANSI-aware composer classifier remains the affirmative-empty pre-injection guard and conservative fallback for non-idle or unreadable baselines.
+Zellij uses its content-delta confirmation, while Orca and cmux use their structural composer readers; each backend adapter header owns its exact mechanism.
 A bordered-empty or ghost-only composer is recognized as empty where that backend uses composer confirmation, rather than mistaken for a swallowed Enter.
 `fm-send.sh` uses the same primitive and exits non-zero
 when a steer's Enter is positively swallowed, so firstmate learns an instruction
@@ -170,13 +168,12 @@ the marker lets firstmate distinguish it from a real captain message.
   applicable, and a backend-independent active alert. A
   composer false-positive surfaces as a visible stall, never an unbounded silent
   no-op.
-- **Verified type-once submit model** - the digest is typed once (`send-keys -l`
-  on tmux, `pane send-text` on herdr), then submitted with Enter and verified.
+- **Verified type-once submit model** - the digest is typed once through the selected backend, then submitted with Enter and verified.
   Enter is retried, Enter only and never a retype, until the backend submit
   primitive reports `empty` as its caller-facing success verdict.
   For tmux that verdict means the shared-ghost-aware and border-aware composer
   cleared.
-  For herdr's normal idle-baseline path it means native agent-state observed a real turn start; herdr uses the ANSI-aware structural classifier for the pre-injection composer guard and fallback paths.
+  For herdr's normal idle-baseline path it means native agent-state observed a real turn start; herdr uses the ANSI-aware structural classifier for the pre-injection composer guard and fallback paths, while the other adapter headers own their exact confirmation mechanisms.
   This lets ghost-only or bordered-empty composers count as empty where a composer read is the active confirmation signal.
 - **Marker strip** - `strip_injection_marker` removes the sentinel prefix before
   classification or relay, so the digest text firstmate sees is clean.
@@ -185,20 +182,9 @@ the marker lets firstmate distinguish it from a real captain message.
 - **Dedupe across signal/stale/scan** - `classify_signal` and `classify_stale`
   both check the seen-status marker before escalating, so a status escalated by
   one path is not re-escalated by another in the same digest.
-- **Auto-discovered supervisor pane** - the daemon resolves its own BACKEND
-  (tmux vs herdr) and TARGET independently, mirroring
-  `bin/fm-backend.sh`'s own runtime auto-detection. Backend: `FM_SUPERVISOR_BACKEND`
-  override, then `$TMUX_PANE` set (tmux), then `$HERDR_ENV=1` with
-  `$HERDR_PANE_ID` present (herdr), then a tmux fallback. Target:
-  `FM_SUPERVISOR_TARGET` override (a tmux target or a herdr
-  `"<session>:<pane-id>"` target), then `$TMUX_PANE`, then
-  `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then a
-  `firstmate:0` fallback with a warning. Both resolution sources are logged at
-  startup so a wrong-but-resolving fallback is detectable. Other runtime
-  backends, including zellij, orca, and cmux, are not yet supported as
-  supervisor backends; the daemon refuses loudly at startup instead of
-  misapplying tmux primitives to a pane that isn't one
-  (docs/herdr-backend.md "Away-mode daemon: herdr supervisor-pane support").
+- **Supervisor endpoint selection** - the daemon supports all five verified backends and resolves its BACKEND and TARGET independently.
+  tmux and herdr have ambient discovery; zellij, Orca, and cmux require an explicit backend plus exact target.
+  Both resolution sources are logged at startup, and `docs/configuration.md` "Away-mode supervisor backend" owns the precedence and target shapes.
 
 ## Reliability properties
 

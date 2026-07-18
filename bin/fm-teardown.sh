@@ -7,9 +7,11 @@
 # Completion happens only from the durable finalizing phase after endpoint and
 # cleanup ownership are closed; meta and phase state remain until the serialized
 # backlog mutation succeeds.
-# Before endpoint or worktree cleanup, teardown persists any required
-# completion proof plus a phase record outside every removal target, bound to a
+# Before endpoint or worktree cleanup, teardown persists a staged completion
+# binding plus a phase record outside every removal target, bound to a
 # non-recyclable task-owned marker and the cleanup target's exact path identity.
+# The binding proves nothing alone; backlog finalization accepts it only with
+# the retained finalizing phase and independently confirmed cleanup.
 # An interrupted retry removes only while both bindings still match, and can
 # independently confirm completed cleanup without touching a replacement path.
 # A secondmate teardown records no backlog completion because secondmates are

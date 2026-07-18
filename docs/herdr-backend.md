@@ -415,9 +415,9 @@ On a herdr-based fleet (firstmate itself running with `HERDR_ENV=1`, no `$TMUX_P
 The fix is transport-layer only - discovery, injection, and the busy/composer guards now dispatch through the SAME `bin/fm-backend.sh` primitives every other backend-aware script already uses (`fm_backend_target_exists`, `fm_backend_busy_state`, `fm_backend_capture`, `fm_backend_send_text_submit`, and the new `fm_backend_composer_state` dispatcher added alongside this work).
 Classification policy, batching, the max-defer escape, the `FM_INJECT_MARK` sentinel contract, locks, and wake-queue handling are all unchanged.
 
-**Discovery.** `FM_SUPERVISOR_TARGET` remains the explicit override, now accepting either a tmux target or a herdr `"<session>:<pane-id>"` target.
-A new `FM_SUPERVISOR_BACKEND` override (`tmux`|`herdr`) resolves independently, mirroring `bin/fm-backend.sh`'s own `fm_backend_detect`: `$TMUX_PANE` set selects tmux (even nested inside herdr, matching the innermost-first rule); `$HERDR_ENV=1` with `$HERDR_PANE_ID` present selects herdr, composing the target as `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"`; absent both, the daemon falls back to tmux/`firstmate:0`, byte-identical to its pre-herdr-support behavior.
-Other runtime backends, including zellij, orca, and cmux, are not yet supported as supervisor backends - the daemon refuses loudly at startup (`FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr"`) rather than misapplying tmux primitives to a pane that isn't a tmux pane.
+**Discovery at the time of this Herdr verification.** `FM_SUPERVISOR_TARGET` became the explicit override for either a tmux target or a herdr `"<session>:<pane-id>"` target.
+`FM_SUPERVISOR_BACKEND` initially accepted tmux or herdr and resolved independently: `$TMUX_PANE` selected tmux, `$HERDR_ENV=1` with `$HERDR_PANE_ID` selected herdr, and absent both the daemon fell back to tmux/`firstmate:0`.
+The later fleet-wide hardening generalized supervisor injection to zellij, Orca, and cmux as well; `docs/configuration.md` "Away-mode supervisor backend" now owns the current supported set, discovery precedence, and explicit-target boundary.
 
 **Injection dispatch.** `inject_msg`'s pane-exists probe, busy-guard (`pane_is_busy`), composer-guard (a direct `fm_backend_composer_state` read; see the composer-safety note below), and verified submit all take an optional `<backend>` argument (defaulting to `tmux` when omitted, so every pre-existing caller/test is unaffected) and route through the generic dispatchers instead of calling `tmux` directly.
 For `backend=tmux` every dispatch resolves to the exact same underlying call as before (`fm_backend_capture`'s tmux arm runs the identical `tmux capture-pane -p -t <target> -S -40`; `fm_backend_tmux_send_text_submit` re-exports `fm_tmux_submit_core` verbatim), so tmux behavior is unchanged byte-for-byte.
@@ -624,14 +624,14 @@ The composer-guard regression for the 2026-07-08 AFK delivery bug lives in `test
 The fix: the fixture now registers itself as a real herdr agent via `herdr pane report-agent <pane> --source <id> --agent <label> --state idle|working|blocked|unknown` (herdr's own documented integration-protocol primitive for a non-built-in-harness process to report its own agent state, verified empirically here) and reports an idle->working->idle cycle around each submission, exactly as a real harness would.
 With that fix, all four scenarios (A: partial-input deferral, B: swallowed-Enter retry, C: normal digest, D: max-defer wedge alarm) pass against the real binary.
 
-## Composer-emptiness safety (2026-07-10, fleet-wide across all four backends)
+## Composer-emptiness safety (2026-07-10, fleet-wide across all five backends)
 
 The structural composer-row read added for the incidents above lived here, in the herdr adapter, while tmux, orca, and cmux each kept their own copy of the "is this composer empty / pending / not an agent composer" decision.
 Those copies drifted, and the dangerous drift was shared by tmux, orca, and cmux: a bare shell prompt glyph (`>`, `$`, `%`, `#`) - what a pane shows once its agent has exited to a plain login shell - was treated as an empty, ready-to-inject agent composer.
 The away-mode escalation injector (`bin/fm-supervise-daemon.sh`) reads composer-emptiness to decide whether a supervisor pane is a safe injection target, so a dead-shell pane misread as "empty" meant an escalation could be typed into (and, worst case, executed by) that shell.
 The herdr adapter was already safe here (its bare shape only matches the agent glyphs `❯`/`›`; a bare shell prompt has no composer row and reads `unknown`), which is why its structural classifier is the prior art for the fix.
 
-**Consolidation.** The one glyph/idle/pending decision now lives in a single shared owner, `bin/fm-composer-lib.sh`'s `fm_composer_classify_content`, which every adapter delegates to: `fm_tmux_composer_state` (via `bin/fm-tmux-lib.sh`), `fm_backend_herdr_composer_state`, `fm_backend_orca_composer_state`, and `fm_backend_cmux_composer_state`.
+**Consolidation.** The one glyph/idle/pending decision now lives in a single shared owner, `bin/fm-composer-lib.sh`'s `fm_composer_classify_content`, which every adapter delegates to: `fm_tmux_composer_state` (via `bin/fm-tmux-lib.sh`), `fm_backend_herdr_composer_state`, `fm_backend_zellij_composer_state`, `fm_backend_orca_composer_state`, and `fm_backend_cmux_composer_state`.
 Each adapter still owns its own capture and structural row-finding (genuinely different primitives), then hands the border-stripped, trimmed candidate content plus a `<bordered>` flag to the shared classifier.
 
 **The safety rule.** A bare shell prompt glyph is a genuine empty agent composer ONLY inside a bordered composer container (where the harness draws its own prompt glyph, e.g. claude's older `| > ... |`).
@@ -640,7 +640,7 @@ The agent prompt glyphs `❯` (claude) and `›` (codex) read `empty` either way
 `inject_msg` was hardened to match: its composer-guard now reads `fm_backend_composer_state` directly and defers on anything that is not affirmatively `empty` (`pending` real text, or `unknown` for a dead shell or an unreadable pane), instead of only deferring on `pending`.
 
 **Regression coverage.** `tests/fm-composer-lib.test.sh` pins the shared owner directly (bare shell glyph -> `unknown`, the same glyph bordered -> `empty`, agent glyphs -> `empty` bordered or bare, idle placeholder, real text -> `pending`).
-Per-backend dead-shell coverage: `tests/fm-daemon.test.sh`'s `test_tmux_composer_state_bare_shell_is_unknown` and `test_inject_msg_defers_on_dead_shell_unknown` (tmux + the injector), `tests/fm-backend-herdr.test.sh`'s `test_composer_state_unknown_when_no_composer_row_found`, `tests/fm-backend-orca.test.sh`'s `test_composer_state_bare_shell_prompt_is_unknown`, and `tests/fm-backend-cmux.test.sh`'s `test_composer_state_unknown_when_no_composer_row_found`.
+Per-backend dead-shell coverage spans the daemon's tmux/injector tests and the composer-state sections in `tests/fm-backend-herdr.test.sh`, `tests/fm-backend-zellij.test.sh`, `tests/fm-backend-orca.test.sh`, and `tests/fm-backend-cmux.test.sh`.
 The herdr incident regressions (`tests/fm-backend-herdr.test.sh`'s composer-state, wait-for-working, and send-text-submit sections) stay green, and `shellcheck bin/*.sh bin/backends/*.sh tests/*.sh` passes clean.
 
 ## Incident (2026-07-10): away-mode injection wedged all night on the primary claude-on-herdr composer's ghost text

@@ -10,9 +10,11 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
 | `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
+| `fm-endpoint-audit.sh`   | Report exact-home duplicate endpoint anomalies without closing anything              |
 | `fm-fleet-view.sh`       | Render the fleet snapshot as a human Markdown view                                   |
 | `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
 | `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
+| `fm-backlog.sh`          | Serialize one home's tasks-axi operations and receipt-gate completion                 |
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
 | `fm-brief.sh`            | Scaffold ship, scout, GSD-manager, secondmate-charter, and Herdr-lab briefs          |
 | `fm-gsd-run.sh`          | Launch a GSD driving run in a visible herdr tab, capturing its exit code and waiting unless `--no-wait` |
@@ -21,6 +23,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-guard.sh`            | Warn on primary-checkout tangles, pending queued wakes, and stale watcher liveness   |
 | `fm-turnend-guard.sh`    | Shared primary turn-end guard predicate so no turn ends blind (docs/turnend-guard.md) |
 | `fm-turnend-guard-grok.sh` | Grok Stop-hook adapter for the primary turn-end guard                              |
+| `fm-turnend-guard-grok-deliver.sh` | Deliver bounded deferred Grok turn-end continuations                     |
 | `fm-arm-pretool-check.sh` | Stable PreToolUse transport for the watcher-arm command policy (docs/arm-pretool-check.md) |
 | `fm-arm-command-policy.mjs` | Semantic owner of the watcher-arm PreToolUse policy (docs/arm-pretool-check.md)   |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
@@ -30,6 +33,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
 | `fm-composer-lib.sh`     | Single fleet-wide owner of composer-content classification for all backends          |
+| `fm-program-lib.sh`      | Discover convention-named durable program pointers without interpreting prose         |
 | `backends/tmux.sh`       | Verified tmux session-provider adapter                                               |
 | `backends/herdr.sh`      | Experimental herdr session-provider adapter                                          |
 | `backends/zellij.sh`     | Experimental zellij session-provider adapter                                         |
@@ -50,6 +54,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
+| `fm-treehouse-lib.sh`    | Prove an exact project worktree path returned to Treehouse's available pool           |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, then assert watcher liveness                  |

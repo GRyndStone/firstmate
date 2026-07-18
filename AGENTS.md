@@ -97,16 +97,17 @@ state/               volatile runtime signals; gitignored
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
+  <id>.spawning      script-owned endpoint-creation admission claim; bin/fm-spawn.sh owns its retry semantics, and fm-backlog treats its presence as unresolved lifecycle state
   <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
   <id>.teardown-stage   script-owned durable cleanup phase and exact worktree ownership record; bin/fm-teardown.sh owns retry semantics and fm-backlog treats its presence as unresolved lifecycle state
-  <id>.teardown-complete   script-owned single-use successful-teardown proof consumed by fm-backlog; bin/fm-teardown.sh and bin/fm-backlog.sh headers own the contract
+  <id>.teardown-complete   script-owned single-use staged completion binding prepared before cleanup; it proves nothing alone, and bin/fm-teardown.sh plus bin/fm-backlog.sh own its post-cleanup validation and consumption
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
-  .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
+  .backlog.lock .watch.lock .wake-queue.lock backlog mutation, watcher singleton, and wake-queue serialization locks
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .endpoint-gone-* .agent-dead-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
@@ -134,7 +135,7 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    When the lock could not be acquired, the queue is left untouched because another session owns it, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
 4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
-5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
+5. **Fleet-state digest** - the full `data/backlog.md`; convention-named durable program-source pointers; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; exact-home endpoint ownership anomalies; and one cheap `alive`/`dead`/`unknown` read of each task's recorded backend endpoint.
    That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
 6. **Supervision operating instructions and next step** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
    The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, and read-once reminders.
@@ -243,7 +244,8 @@ Reconcile reality with your records before doing anything else, working from the
 3. The digest's fleet-state section already printed `data/backlog.md`, `data/secondmates.md` (from the context section), every `state/*.meta`, and a bounded tail of every `state/*.status`.
    Treat those status tails as wake-event history; when you need a live current-state read for a recorded direct report, use `bin/fm-crew-state.sh <id>` instead of inferring from the last status line.
    If older wake-event history matters, read the individual full status log named in the digest instead of bulk-reading every status file.
-4. Use the `window=` values from the digest's `state/*.meta` entries as the live direct-report set, and read the digest's per-task `endpoint: alive|dead` line for each - that cheap check is already done; do not re-probe it yourself.
+4. Use the `window=` values from the digest's `state/*.meta` entries as the recorded direct-report set, and read the digest's per-task `endpoint: alive|dead|unknown` line for each - that cheap check is already done; do not re-probe it yourself.
+   `unknown` is inconclusive, not dead: inspect the recorded metadata and ownership finding, and do not use it to authorize respawn, closure, or another lifecycle mutation.
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
    Treat any `Endpoint ownership anomalies` alert as duplicate same-home accounting to inspect explicitly; the audit is read-only and never licenses automatic closure.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
@@ -505,7 +507,7 @@ The script refuses if the worktree holds uncommitted changes or committed work t
 `bin/fm-teardown.sh`'s header owns the full landed-work definition (remote-reachable, merged-PR-head containment for the squash-merge-then-delete-branch flow, content already in the default branch, local-only merges) and the `pr=` discovery fallback for merges that skipped `bin/fm-pr-check.sh`.
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 A successful PR-based teardown also refreshes that project's clone through `bin/fm-fleet-sync.sh`, best-effort.
-Successful teardown records Done through `bin/fm-backlog.sh` after owned endpoint and cleanup targets are verified absent; the teardown script owns the retained lifecycle-finalization details.
+Successful teardown records Done through `bin/fm-backlog.sh` after owned endpoint absence and cleanup release are verified; `docs/configuration.md` "Backlog backend" owns the retained lifecycle-finalization details.
 If teardown says the task was untracked or lacked a recorded PR, follow its serialized backlog instruction only after teardown has succeeded.
 Never hand-edit a task into Done; `bin/fm-teardown.sh` and the receipt-gated backlog wrapper own completion in every backlog mode.
 Re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
@@ -517,7 +519,7 @@ An empty queue is healthy and does not trigger teardown.
 Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or main firstmate explicitly decides to retire that persistent supervisor.
 Load `secondmate-provisioning` before retiring it.
 The safety check is the secondmate's own home: teardown refuses while its `state/*.meta` contains in-flight work.
-With `--force`, teardown is the explicit discard path for child windows, child work, state, route, lease, and home; never use it unless the captain explicitly said to discard the work.
+With `--force`, teardown is the explicit discard path owned by `secondmate-provisioning`; never use it unless the captain explicitly said to discard the child endpoints, work, state, route, lease, and home.
 
 ### Scout tasks (report instead of PR)
 

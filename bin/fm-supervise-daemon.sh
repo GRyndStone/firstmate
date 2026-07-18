@@ -354,10 +354,10 @@ canonical_supervisor_target() {  # <backend> <target>
   esac
 }
 
-# Auto-discover the supervisor's BACKEND at startup - independent of the
-# target string above, so an explicit FM_SUPERVISOR_TARGET override still
-# needs to know which primitives (tmux vs herdr) to dispatch through. Priority
-# mirrors discover_supervisor_target and bin/fm-backend.sh's fm_backend_detect:
+# Resolve the supervisor's BACKEND at startup independently of the target.
+# An explicit FM_SUPERVISOR_TARGET still needs an exact backend so shared
+# operations dispatch correctly; ambient discovery exists for tmux/herdr only.
+# Priority mirrors discover_supervisor_target and bin/fm-backend.sh's fm_backend_detect:
 #   1. FM_SUPERVISOR_BACKEND env (explicit override).
 #   2. $TMUX_PANE set — tmux.
 #   3. $HERDR_ENV=1 (with $HERDR_PANE_ID present) — herdr.
@@ -1361,9 +1361,10 @@ fm_super_main() {
   printf '%s\n' "$$" | fm_write_file_no_follow "$PIDFILE" || exit 1
   fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
 
-  # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
-  # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1
-  # (herdr) > tmux fallback. Resolved before the target below, since target
+  # --- resolve the supervisor BACKEND before its target ---------------------
+  # Explicit FM_SUPERVISOR_BACKEND accepts every verified backend; ambient
+  # discovery is $TMUX_PANE (tmux) > $HERDR_ENV=1 (herdr) > tmux fallback.
+  # Resolved before the target below, since target
   # discovery composes a herdr "<session>:<pane-id>" string using the same
   # $HERDR_PANE_ID/$HERDR_SESSION markers this checks. Exporting the result
   # into FM_SUPERVISOR_BACKEND makes inject_msg/pane_is_busy/pane_input_pending

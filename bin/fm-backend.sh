@@ -712,16 +712,17 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # server as a side effect via fm_backend_herdr_server_ensure - fine for an
 # operation that is about to use the pane, wrong for a passive liveness
 # probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose. The tmux arm matches the target
+# closed), missing zellij pane, or unreadable Orca terminal makes this Boolean
+# presence probe fail. The tmux arm matches the target
 # against the server's own window/pane inventory instead of probing tmux's
 # lenient target resolution, which reads a killed window as alive while its
 # session survives (fm_backend_tmux_target_exists, bin/backends/tmux.sh).
 # Same role as fm-crew-state.sh's pane_readable check (whose tmux arm keeps
 # the lenient read - its authoritative run-step path does not ride on it);
-# exists here as one shared primitive so callers that only need a fast
-# alive/dead read (recovery digests, the session-start fleet digest) do not
-# re-derive it inline.
+# exists here as one shared primitive for watcher endpoint-gone detection,
+# send paths, and away-mode supervisor-target validation.
+# Recovery and session-start fleet accounting instead use
+# fm_backend_target_state_of_meta so uncertainty remains an explicit `unknown`.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
