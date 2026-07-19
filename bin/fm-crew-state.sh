@@ -8,8 +8,9 @@
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else a hard-bounded
-# backend read) and reconciles the possibly-stale log against it.
+# full no-mistakes run-step attributed to this crew's branch and current HEAD,
+# or the existing coarse cross-branch status, else a hard-bounded backend read)
+# and reconciles the possibly-stale log against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -19,8 +20,12 @@
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crew's branch, active or terminal
-#      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
+#   2. Full `axi status` evidence is attributed only when its branch matches and
+#      its recorded head resolves to this crew's current HEAD. A stale, missing,
+#      malformed, or unresolvable full-run head falls through to the live
+#      backend/status path. If the full answer is for another branch, the
+#      established branch-only `no-mistakes runs` fallback may still attribute
+#      that coarse status to this crew.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -247,6 +252,15 @@ RUN_OUT=""
 nm_field() {  # <key>
   printf '%s\n' "$RUN_OUT" | sed -n "s/^[[:space:]]*$1:[[:space:]]*\(.*\)/\1/p" | head -1
 }
+run_head_is_current() {  # <head>
+  local recorded=$1 resolved current
+  case "$recorded" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  resolved=$(git -C "$WT" rev-parse --verify "$recorded^{commit}" 2>/dev/null) || return 1
+  current=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
+  [ "$resolved" = "$current" ]
+}
 # Finding count from a findings[N]{...} table header; empty when none.
 nm_findings_count() {
   printf '%s\n' "$RUN_OUT" | grep -oE 'findings\[[0-9]+\]' | head -1 | grep -oE '[0-9]+'
@@ -433,8 +447,11 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
+    run_head=$(strip_quotes "$(nm_field head)")
     if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
-      HAVE_RUN=1
+      if run_head_is_current "$run_head"; then
+        HAVE_RUN=1
+      fi
     else
       # The active-or-most-recent run is for another branch (the CLI is alive
       # and answered; only the attribution missed) - try the coarse fallback.
