@@ -363,6 +363,83 @@ test_hook_retry_stays_blocked_without_restored_supervision() {
   pass "fm-turnend-guard: stop_hook_active does not authorize a blind retry"
 }
 
+test_quiet_paused_checkpoint_reproduces_forced_continuation_loop() {
+  local dir watch_pid watch_identity checkpoint_pid checkpoint_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-quiet-paused-checkpoint")
+  printf 'window=fm-task1\nkind=ship\n' > "$dir/state/task1.meta"
+  printf 'paused: deliberately waiting for the scheduled release\n' > "$dir/state/task1.status"
+  sleep 60 & watch_pid=$!
+  sleep 60 & checkpoint_pid=$!
+  watch_identity=$(watcher_identity "$dir" "$watch_pid")
+  checkpoint_identity=$(watcher_identity "$dir" "$checkpoint_pid")
+  record_watcher_lock "$dir" "$watch_pid" "$watch_identity" checkpoint \
+    "$checkpoint_pid" "$checkpoint_identity" checkpoint
+  touch "$dir/state/.last-watcher-beat"
+
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "a live foreground checkpoint must not authorize the first quiet paused turn end"
+  assert_contains "$out" "foreground checkpoint owner cannot survive turn yield" \
+    "checkpoint rejection did not explain its non-durable ownership"
+  out=$(run_hook "$dir" true); status=$?
+  kill "$checkpoint_pid" "$watch_pid" 2>/dev/null || true
+  wait "$checkpoint_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+  expect_code 2 "$status" "the forced continuation must remain blocked with the same foreground checkpoint"
+  assert_contains "$out" "prior forced continuation did not drain wakes" \
+    "checkpoint loop retry did not reproduce the forced-continuation boundary"
+  pass "quiet paused metadata plus a foreground checkpoint reproduces the old forced-continuation loop"
+}
+
+test_normal_daemon_owner_is_durable_and_wake_drain_is_mandatory() {
+  local dir watch_pid watch_identity daemon_pid daemon_identity daemon2_pid daemon2_identity out status drain
+  dir=$(make_primary_dir "$TMP_ROOT/hook-normal-daemon")
+  : > "$dir/state/task1.meta"
+  sleep 60 & watch_pid=$!
+  sleep 60 & daemon_pid=$!
+  watch_identity=$(watcher_identity "$dir" "$watch_pid")
+  daemon_identity=$(watcher_identity "$dir" "$daemon_pid")
+  record_watcher_lock "$dir" "$watch_pid" "$watch_identity" daemon "$daemon_pid" "$daemon_identity" normal-inject
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  printf '%s\n' "$daemon_pid" > "$dir/state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon_pid" > "$dir/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$daemon_identity" > "$dir/state/.supervise-daemon.lock/pid-identity"
+  touch "$dir/state/.last-watcher-beat"
+
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "live identity-bound normal daemon must authorize turn end"
+  [ -z "$out" ] || fail "healthy normal daemon produced guard output: $out"
+
+  FM_HOME="$dir" bash -c '. "$1"; fm_wake_append signal task1 "signal: task1.status"; fm_wake_append signal task1 "signal: task1.status"' \
+    _ "$dir/bin/fm-wake-lib.sh"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "undrained wakes must block even with a healthy normal daemon"
+  assert_contains "$out" "queued wakes are not drained" "normal daemon guard did not require wake drain"
+  drain=$(FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" "$ROOT/bin/fm-wake-drain.sh")
+  [ "$(printf '%s\n' "$drain" | grep -c 'signal: task1.status' || true)" -eq 1 ] \
+    || fail "duplicate queued wake did not drain exactly once: $drain"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "drained queue plus healthy normal daemon must authorize turn end"
+
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "dead normal daemon must fail closed despite a live watcher"
+
+  sleep 60 & daemon2_pid=$!
+  daemon2_identity=$(watcher_identity "$dir" "$daemon2_pid")
+  printf '%s\n' "$daemon2_pid" > "$dir/state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon2_pid" > "$dir/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "identity mismatch" > "$dir/state/.supervise-daemon.lock/pid-identity"
+  printf '%s\n' "$daemon2_pid" > "$dir/state/.watch.lock/owner-pid"
+  printf '%s\n' "$daemon2_identity" > "$dir/state/.watch.lock/owner-identity"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon2_pid" "$watch_pid" 2>/dev/null || true
+  wait "$daemon2_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+  expect_code 2 "$status" "identity-mismatched daemon lock must fail closed"
+  pass "normal daemon ownership is identity-bound and queued wakes must drain exactly once"
+}
+
 test_hook_silent_in_secondmate_home() {
   local dir out status
   dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate")
@@ -822,6 +899,8 @@ test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
 test_hook_retry_stays_blocked_without_restored_supervision
+test_quiet_paused_checkpoint_reproduces_forced_continuation_loop
+test_normal_daemon_owner_is_durable_and_wake_drain_is_mandatory
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
 test_hook_blocks_without_working_jq

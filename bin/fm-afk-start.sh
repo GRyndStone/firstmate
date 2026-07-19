@@ -37,59 +37,16 @@ date '+%s' > "$STATE/.afk"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-daemon_lock_owner() {
-  local owner
-  if [ -L "$LOCK" ]; then
-    owner=$(readlink "$LOCK" 2>/dev/null) || return 1
-    [ -n "$owner" ] || return 1
-    case "$owner" in
-      /*) printf '%s\n' "$owner" ;;
-      *) printf '%s/%s\n' "$(dirname "$LOCK")" "$owner" ;;
-    esac
-    return 0
-  fi
-  [ -d "$LOCK" ] || return 1
-  printf '%s\n' "$LOCK"
-}
-
-daemon_pid_matches() {
-  local pid=$1 owner=$2 identity current command
-  identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
-  if [ -n "$identity" ]; then
-    current=$(fm_pid_identity "$pid") || return 1
-    [ "$current" = "$identity" ]
-    return
-  fi
-  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
-  esac
-  return 1
-}
-
-daemon_lock_pid() {
-  local owner
-  owner=$(daemon_lock_owner) || return 1
-  cat "$owner/pid" 2>/dev/null || true
-}
-
-daemon_lock_held_by_live_daemon() {
-  local owner pid
-  owner=$(daemon_lock_owner) || return 1
-  pid=$(cat "$owner/pid" 2>/dev/null || true)
-  fm_pid_alive "$pid" || return 1
-  daemon_pid_matches "$pid" "$owner"
-}
-
-pid=$(daemon_lock_pid 2>/dev/null || true)
-if daemon_lock_held_by_live_daemon; then
+pid=$(fm_identity_lock_live_pid "$LOCK" 2>/dev/null || true)
+if [ -n "$pid" ]; then
   echo "afk: daemon already running pid=$pid"
   exit 0
 fi
 
-if fm_pid_alive "$pid" && [ -n "$pid" ]; then
+if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
   fm_lock_remove_path "$LOCK" 2>/dev/null || true
 fi
 
 echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"
+export FM_SUPERVISE_MODE=away
 exec "$DAEMON"

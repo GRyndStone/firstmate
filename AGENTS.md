@@ -542,7 +542,7 @@ From there the task is an ordinary ship task through its mode-specific validatio
 ## 8. Supervision protocol
 
 The watcher is the backbone.
-Whenever at least one task is in flight, keep exactly one live supervision wait owned by the emitted primary-harness protocol from `bin/fm-session-start.sh`.
+Whenever at least one task is in flight, keep exactly one live supervision owner from the emitted primary-harness protocol from `bin/fm-session-start.sh`.
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when provably working).**
@@ -573,7 +573,8 @@ Empty polls, elapsed waiting time, and "still no change" are tool bookkeeping, n
 bin/fm-supervision-instructions.sh  # render the current harness block or one-line repair text
 bin/fm-watch-arm.sh                 # verified arm wrapper used by harness protocols that call it
 bin/fm-watch-arm.sh --restart       # home-scoped forced restart; never a broad pkill
-bin/fm-watch-checkpoint.sh          # bounded foreground watcher checkpoint for Codex-style protocols
+bin/fm-supervisor-start.sh          # durable normal-mode local supervisor for Codex
+bin/fm-watch-checkpoint.sh          # bounded foreground watcher diagnostic checkpoint
 bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat
 bin/fm-wake-drain.sh                # drain queued wake records at turn start; asserts guard after draining
 bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, pane, and status log
@@ -620,7 +621,7 @@ On every verified primary harness, "no turn ends blind" has a structural backsto
 `docs/turnend-guard.md` owns the per-harness hook mechanisms, empirical validation, scoping details, and documented fail-open tradeoffs.
 Watcher liveness is harness-aware.
 Do not assume one primary harness can use another harness's foreground or background shape.
-For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.
+For example, Claude uses a background-notify cycle, while Codex uses the identity-bound local supervisor daemon described in `docs/turnend-guard.md`.
 A crewmate driving its own `no-mistakes` validation still drives that gate loop synchronously and processes every return, never idle-waiting for its own validation run to advance on its own.
 
 Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.

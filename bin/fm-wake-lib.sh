@@ -122,6 +122,29 @@ fm_watcher_live_owner() {
   return 0
 }
 
+# Print the live pid held by an identity-bound portable lock.
+# The caller chooses the lock path; this helper verifies both pid liveness and
+# the exact process identity recorded in that lock, so pid reuse never counts as
+# durable ownership. It is shared by normal/away daemon starters and the
+# primary turn-end guard.
+fm_identity_lock_live_pid() {  # <lock-path>
+  local lockdir=$1 owner pid recorded_identity current_identity
+  if [ -L "$lockdir" ]; then
+    owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null) || return 1
+  elif [ -d "$lockdir" ]; then
+    owner=$lockdir
+  else
+    return 1
+  fi
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  recorded_identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
+  [ -n "$recorded_identity" ] || return 1
+  current_identity=$(fm_pid_identity "$pid") || return 1
+  [ "$current_identity" = "$recorded_identity" ] || return 1
+  printf '%s\n' "$pid"
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
@@ -423,6 +446,30 @@ fm_wake_append() {
   if [ "$status" -eq 0 ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
   fi
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
+# Remove every queued record whose payload exactly matches a wake the durable
+# normal-mode supervisor has conclusively self-handled in shell.
+# Concurrent appends are serialized by the existing queue lock, unrelated and
+# actionable records remain byte-for-byte and in order, and any failure leaves
+# the original queue in place so the turn-end guard still fails closed.
+fm_wake_ack_payload() {  # <payload>
+  local payload=$1 clean_payload tmp status=0
+  clean_payload=$(printf '%s' "$payload" | fm_wake_clean_field)
+  tmp="$STATE/.wake-queue.ack.$(fm_current_pid)"
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ ! -s "$FM_WAKE_QUEUE" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  if ! awk -F '\t' -v payload="$clean_payload" '$5 != payload { print }' "$FM_WAKE_QUEUE" > "$tmp"; then
+    status=1
+  elif ! mv -f "$tmp" "$FM_WAKE_QUEUE"; then
+    status=1
+  fi
+  rm -f "$tmp" 2>/dev/null || true
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   return "$status"
 }
