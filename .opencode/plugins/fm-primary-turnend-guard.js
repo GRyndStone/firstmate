@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
 
-let skipNextIdle = false;
+let followupDispatching = false;
 
 function runProcess(command, args, input = "") {
   return new Promise((resolve) => {
@@ -59,20 +59,17 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
   return {
     event: async ({ event }) => {
       if (event.type !== "session.idle") return;
-
-      if (skipNextIdle) {
-        skipNextIdle = false;
-        return;
-      }
+      if (followupDispatching) return;
 
       const sessionID = event.properties?.sessionID;
       if (!sessionID) return;
 
-      if (await letWatchArmRun(sessionID, client)) return;
+      await letWatchArmRun(sessionID, client);
 
       const result = await runGuard(root);
       if (result.code !== 2) return;
 
+      followupDispatching = true;
       try {
         await client.session.promptAsync({
           path: { id: sessionID },
@@ -88,9 +85,9 @@ export const FmPrimaryTurnendGuard = async ({ client, directory, worktree }) => 
             ],
           },
         });
-        skipNextIdle = true;
       } catch {
-        skipNextIdle = false;
+      } finally {
+        followupDispatching = false;
       }
     },
   };

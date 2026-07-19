@@ -8,8 +8,8 @@
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else the pane
-# busy-signature) and reconciles the possibly-stale log against it.
+# no-mistakes run-step attributed to this crew's branch, else a hard-bounded
+# backend read) and reconciles the possibly-stale log against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -33,10 +33,9 @@
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): read the recorded
-#      backend's busy|idle|unknown state within a hard bound. Live idle
-#      supersedes stale working history; an unproved state fails closed to
-#      unknown. Explicit declared external waits and terminal status events are
-#      preserved when the live pane is not busy.
+#      backend within a hard bound. Native Herdr busy|idle is authoritative, so
+#      live idle supersedes stale working history; an unproved state fails
+#      closed to unknown. Other backends retain the pane-busy/status-log fallback.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -84,8 +83,8 @@ bounded_run() {  # <seconds> <command...>
   local seconds=$1
   shift
   case "$HAVE_TIMEOUT" in
-    timeout) timeout "$seconds" "$@" ;;
-    gtimeout) gtimeout "$seconds" "$@" ;;
+    timeout) timeout -k 1 "$seconds" "$@" ;;
+    gtimeout) gtimeout -k 1 "$seconds" "$@" ;;
     perl)
       perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
       ;;
@@ -150,8 +149,9 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 
 # The run-step path stays authoritative regardless of pane liveness, so a
 # finished crew whose endpoint has closed still reports its run-step state.
-# Without a run, the backend probe below is tri-state and hard-bounded: positive
-# busy or idle evidence is authoritative, while timeout/unreadable stays unknown.
+# Without a run, every backend read is hard-bounded. Herdr's native state is
+# tri-state and authoritative; the other backends keep their established
+# pane-busy/status-log behavior.
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
@@ -168,27 +168,54 @@ backend_capture_bounded() {
     _ "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET" "$EXPECTED_LABEL"
 }
 
-CREW_PANE_STATE=unknown
-CREW_PANE_READABLE=0
-crew_pane_state() {
+pane_readable_bounded() {
+  case "$TASK_BACKEND" in
+    tmux)
+      bounded_run "$BACKEND_TIMEOUT" tmux display-message -p -t "$BACKEND_TARGET" '#{pane_id}' >/dev/null 2>&1
+      ;;
+    *)
+      backend_capture_bounded >/dev/null 2>&1
+      ;;
+  esac
+}
+
+crew_pane_is_busy_bounded() {
+  local tail40
+  case "$TASK_BACKEND" in
+    tmux)
+      bounded_run "$BACKEND_TIMEOUT" bash -c \
+        '. "$1"; fm_pane_is_busy "$2"' \
+        _ "$SCRIPT_DIR/fm-tmux-lib.sh" "$BACKEND_TARGET" >/dev/null 2>&1
+      ;;
+    *)
+      tail40=$(backend_capture_bounded 2>/dev/null) || return 1
+      printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
+        | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
+      ;;
+  esac
+}
+
+HERDR_PANE_STATE=unknown
+HERDR_PANE_READABLE=0
+herdr_pane_state() {
   local native tail40
-  CREW_PANE_STATE=unknown
-  CREW_PANE_READABLE=0
+  HERDR_PANE_STATE=unknown
+  HERDR_PANE_READABLE=0
   native=$(backend_busy_state_bounded 2>/dev/null) || return 0
   case "$native" in
     busy|idle)
-      CREW_PANE_STATE=$native
-      CREW_PANE_READABLE=1
+      HERDR_PANE_STATE=$native
+      HERDR_PANE_READABLE=1
       return 0
       ;;
   esac
   tail40=$(backend_capture_bounded 2>/dev/null) || return 0
-  CREW_PANE_READABLE=1
+  HERDR_PANE_READABLE=1
   if printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
     | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"; then
-    CREW_PANE_STATE=busy
+    HERDR_PANE_STATE=busy
   else
-    CREW_PANE_STATE=idle
+    HERDR_PANE_STATE=idle
   fi
 }
 
@@ -211,12 +238,7 @@ strip_quotes() {
 
 # Bounded no-mistakes call in the worktree; stdout only, never fails the script.
 nm_run() {  # <args...>
-  case "$HAVE_TIMEOUT" in
-    timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    gtimeout) ( cd "$WT" && gtimeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    *)        true ;;
-  esac
+  ( cd "$WT" && bounded_run "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true
 }
 
 # Scalar value of a TOON key in the captured run output ($RUN_OUT).
@@ -552,21 +574,34 @@ fi
 # is no run to consult, so a dead/unreadable target means the crew is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
-crew_pane_state
-[ "$CREW_PANE_READABLE" -eq 1 ] \
-  || emit unknown none "backend current state unavailable: $BACKEND_TARGET"
-[ "$CREW_PANE_STATE" = busy ] && emit working pane "harness busy"
+if [ "$TASK_BACKEND" = herdr ]; then
+  herdr_pane_state
+  [ "$HERDR_PANE_READABLE" -eq 1 ] \
+    || emit unknown none "backend current state unavailable: $BACKEND_TARGET"
+  [ "$HERDR_PANE_STATE" = busy ] && emit working pane "harness busy"
 
-if status_is_paused "$LOG_LINE"; then
-  emit paused status-log "$(status_line_note "$LOG_LINE")"
+  if status_is_paused "$LOG_LINE"; then
+    emit paused status-log "$(status_line_note "$LOG_LINE")"
+  fi
+  case "$LOG_VERB" in
+    needs-decision|blocked|done|failed)
+      emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")"
+      ;;
+    working)
+      emit idle pane "backend reports idle${SEP}status-log working superseded"
+      ;;
+  esac
+  emit idle pane "backend reports idle"
 fi
-case "$LOG_VERB" in
-  needs-decision|blocked|done|failed)
-    emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")"
-    ;;
-  working)
-    emit idle pane "backend reports idle${SEP}status-log working superseded"
-    ;;
-esac
 
-emit idle pane "backend reports idle"
+pane_readable_bounded || emit unknown none "backend target gone: $BACKEND_TARGET"
+
+if [ "$KIND" != secondmate ] && crew_pane_is_busy_bounded; then
+  emit working pane "harness busy"
+fi
+
+if [ -n "$LOG_VERB" ]; then
+  emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")"
+fi
+
+emit unknown none "no current-state source available"

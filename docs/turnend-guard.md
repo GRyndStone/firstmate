@@ -12,7 +12,7 @@ The primary can otherwise end a turn after handling wakes without resuming super
 On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about nine hours.
 
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
-When tasks are in flight, a harness hook must block the turn end or force a bounded follow-up unless queued wakes are drained and a live identity-matched watcher has a verified owner that survives turn yield.
+When tasks are in flight, a harness hook must block the turn end or keep forcing bounded follow-ups unless queued wakes are drained and a live identity-matched watcher has a verified owner that survives turn yield.
 
 ## Shared Predicate
 
@@ -25,8 +25,9 @@ For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
 If work is in flight, the durable wake queue must be empty and `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh` must succeed.
 Queue emptiness is the existing mechanical receipt that wake handling reached `bin/fm-wake-drain.sh`.
-The live watcher lock must also name a live identity-matched owner recorded by `bin/fm-watch.sh`.
+The live watcher lock must also name a live identity-matched owner declared by its wrapper and recorded by `bin/fm-watch.sh`.
 Normal supervision requires an `arm` owner, while away-mode supervision requires the matching live daemon owner and active `.afk` declaration.
+An `arm` owner is valid only while both the wrapper and its identity-matched harness tracker remain live.
 A foreground `checkpoint` owner never authorizes turn end because that owner cannot survive turn yield.
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
@@ -43,8 +44,8 @@ All verified primary harnesses have a tracked integration:
 
 - `claude`: `.claude/settings.json` registers a `Stop` hook command anchored through `"$CLAUDE_PROJECT_DIR"/bin/fm-turnend-guard.sh`.
 - `codex`: `.codex/hooks.json` registers a `Stop` hook that reads the hook payload once, anchors the executable to the hook command process working directory, verifies that root is firstmate-shaped and hook-bearing, and pipes the original payload to that checkout's `bin/fm-turnend-guard.sh`.
-- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, runs the shared guard only when that coordinator does not act, and uses `client.session.promptAsync` to force one follow-up prompt when the guard returns 2.
-- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard once per logical agent run, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to force one follow-up prompt when the guard returns 2.
+- `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator run first, rechecks the shared guard on every real idle event, and uses `client.session.promptAsync` to force another follow-up prompt whenever the guard returns 2.
+- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, rechecks the shared guard on every logical agent run, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to force another follow-up prompt whenever the guard returns 2.
 - `grok`: `.grok/hooks/fm-primary-turnend-guard.json` registers a `Stop` hook that invokes `bin/fm-turnend-guard-grok.sh`.
   The adapter runs the shared guard and, when it returns 2, invokes `grok --resume <sessionId> -p <guard-reason>` with `GROK_TURNEND_GUARD_ACTIVE=1`.
   It does not pass `--permission-mode`, so the passive Stop hook cannot grant stronger tool permissions than Grok's resumed-session default.
@@ -54,9 +55,9 @@ For those harnesses, exit status 2 plus stderr from `bin/fm-turnend-guard.sh` bl
 Both payloads include `stop_hook_active`; when it is true, the shared guard reports that the prior continuation did not restore durable supervision and keeps blocking until the predicate passes.
 
 OpenCode, Pi, and Grok expose passive lifecycle callbacks for this purpose.
-Their adapters fail open at the hook boundary to avoid corrupting a user session, but they force one follow-up turn when the shared predicate blocks.
-Each adapter carries its own in-process or environment loop guard so the forced follow-up does not recursively schedule another follow-up.
-Pi keeps that latch active across every internal tool turn and clears it only when the generated guard follow-up reaches `agent_settled`, or immediately when follow-up delivery fails.
+Their adapters fail open at the hook boundary to avoid corrupting a user session, but every real lifecycle callback rechecks the shared predicate and forces another follow-up while it remains blocked.
+Each adapter suppresses only callback reentrancy while it is dispatching a follow-up; it never skips the next completed follow-up's predicate check.
+Grok's outer adapter rechecks after each resumed process exits, while the nested Stop hook stays inert to avoid recursive adapter processes.
 If a passive adapter cannot call its SDK method, cannot find `grok`, or cannot recover the Grok session id, it fails open and relies on the pull-based `fm-guard.sh` warning at the next fleet command.
 That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it points back to the active harness protocol instead of hardcoding one background-arm command.
 
@@ -64,7 +65,7 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it poin
 
 On 2026-07-18, the focused supervision-substrate regression reproduced a real foreground checkpoint receiving an actionable signal and exiting while its beacon remained fresh.
 It also reproduced a live Herdr `idle` verdict masked by stale `working` status history.
-The regression now requires the live idle verdict to surface, bounds the Herdr state probe, rejects both the live checkpoint and post-signal fresh beacon, then permits turn end only after wake drain and a live durable arm owner.
+The regression now requires the live idle verdict to surface, hard-bounds a TERM-resistant Herdr state probe, rejects a foreground checkpoint and a shell-backgrounded arm, rejects queued wakes while a durable owner is live, then permits turn end only after wake drain.
 
 All harnesses were validated on 2026-07-08 in scratch repos or throwaway homes, not against the captain's live primary fleet state.
 

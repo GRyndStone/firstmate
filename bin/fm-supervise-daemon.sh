@@ -1466,8 +1466,15 @@ fm_super_main() {
   }
 
   start_watcher() {
+    local daemon_pid daemon_identity
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
+    daemon_pid=${BASHPID:-$$}
+    daemon_identity=$(cat "$LOCK/pid-identity" 2>/dev/null || true)
+    FM_WATCH_OWNER_KIND=daemon \
+    FM_WATCH_OWNER_MODE=away-inject \
+    FM_WATCH_OWNER_PID="$daemon_pid" \
+    FM_WATCH_OWNER_IDENTITY="$daemon_identity" \
+      "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
     WATCHER_PID=$!
   }
 

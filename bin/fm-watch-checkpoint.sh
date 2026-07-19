@@ -44,6 +44,11 @@ case "$SECONDS_ARG" in
   0) echo "error: --seconds must be greater than zero" >&2; exit 2 ;;
 esac
 
+FM_WATCH_OWNER_KIND=checkpoint
+FM_WATCH_OWNER_PID=${BASHPID:-$$}
+FM_WATCH_OWNER_IDENTITY=$(LC_ALL=C ps -p "$FM_WATCH_OWNER_PID" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+export FM_WATCH_OWNER_KIND FM_WATCH_OWNER_PID FM_WATCH_OWNER_IDENTITY
+
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
@@ -75,10 +80,10 @@ run_with_perl_timeout() {
 
 set +e
 if command -v timeout >/dev/null 2>&1; then
-  timeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
+  timeout -k 1 "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
   RC=$?
 elif command -v gtimeout >/dev/null 2>&1; then
-  gtimeout "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
+  gtimeout -k 1 "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
   RC=$?
 else
   run_with_perl_timeout >"$OUT" 2>"$ERR"

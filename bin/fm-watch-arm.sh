@@ -62,6 +62,37 @@ GRACE=${FM_GUARD_GRACE:-300}
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
+ARM_OWNER_PID=${BASHPID:-$$}
+ARM_OWNER_IDENTITY=$(fm_pid_identity "$ARM_OWNER_PID" 2>/dev/null || true)
+ARM_TRACKER_PID=${FM_WATCH_OWNER_TRACKER_PID:-${PPID:-}}
+ARM_TRACKER_IDENTITY=$(fm_pid_identity "$ARM_TRACKER_PID" 2>/dev/null || true)
+
+arm_owner_ready() {
+  case "$ARM_TRACKER_PID" in ''|*[!0-9]*|1) return 1 ;; esac
+  [ -n "$ARM_OWNER_IDENTITY" ] && [ -n "$ARM_TRACKER_IDENTITY" ] || return 1
+  fm_pid_alive "$ARM_OWNER_PID" && fm_pid_alive "$ARM_TRACKER_PID"
+}
+
+record_arm_owner() {
+  arm_owner_ready || return 1
+  printf '%s\n' arm > "$WATCH_LOCK/owner-kind" || return 1
+  printf '%s\n' '' > "$WATCH_LOCK/owner-mode" || return 1
+  printf '%s\n' "$ARM_OWNER_PID" > "$WATCH_LOCK/owner-pid" || return 1
+  printf '%s\n' "$ARM_OWNER_IDENTITY" > "$WATCH_LOCK/owner-identity" || return 1
+  printf '%s\n' "$ARM_TRACKER_PID" > "$WATCH_LOCK/owner-tracker-pid" || return 1
+  printf '%s\n' "$ARM_TRACKER_IDENTITY" > "$WATCH_LOCK/owner-tracker-identity" || return 1
+  fm_watcher_live_owner "$STATE" || return 1
+  [ "$FM_WATCHER_OWNER_KIND" = arm ] \
+    && [ "$FM_WATCHER_OWNER_PID" = "$ARM_OWNER_PID" ] \
+    && [ "$FM_WATCHER_OWNER_TRACKER_PID" = "$ARM_TRACKER_PID" ]
+}
+
+record_attached_arm_owner() {
+  if fm_watcher_live_owner "$STATE"; then
+    case "$FM_WATCHER_OWNER_KIND" in arm|daemon) return 0 ;; esac
+  fi
+  record_arm_owner
+}
 
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
@@ -135,6 +166,11 @@ case "${1:-}" in
   *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
 esac
 
+arm_owner_ready || {
+  echo "watcher: FAILED - no turn-surviving owner tracks this arm"
+  exit 1
+}
+
 if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
@@ -160,6 +196,10 @@ fi
 # then, not as an immediate empty wake. (--restart skips this: it just stopped
 # this home's watcher and wants a fresh one.)
 if [ "$mode" = arm ] && healthy_watcher; then
+  record_attached_arm_owner || {
+    echo "watcher: FAILED - no turn-surviving owner tracks this arm"
+    exit 1
+  }
   report_attached
   attach_and_wait "$HEALTHY_PID"
 fi
@@ -185,7 +225,12 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+FM_WATCH_OWNER_KIND=arm \
+FM_WATCH_OWNER_PID="$ARM_OWNER_PID" \
+FM_WATCH_OWNER_IDENTITY="$ARM_OWNER_IDENTITY" \
+FM_WATCH_OWNER_TRACKER_PID="$ARM_TRACKER_PID" \
+FM_WATCH_OWNER_TRACKER_IDENTITY="$ARM_TRACKER_IDENTITY" \
+  "$WATCH" >"$child_out" &
 child=$!
 child_done=0
 
@@ -196,6 +241,12 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
+      if ! fm_watcher_live_owner "$STATE" \
+        || [ "$FM_WATCHER_OWNER_KIND" != arm ] \
+        || [ "$FM_WATCHER_OWNER_PID" != "$ARM_OWNER_PID" ] \
+        || [ "$FM_WATCHER_OWNER_TRACKER_PID" != "$ARM_TRACKER_PID" ]; then
+        break
+      fi
       echo "watcher: started pid=$child (beacon fresh)"
       wait "$child"
       rc=$?
@@ -205,6 +256,12 @@ while :; do
     fi
     # Another watcher won the singleton; our child stood down.
     if [ "$mode" = arm ]; then
+      record_attached_arm_owner || {
+        echo "watcher: FAILED - no turn-surviving owner tracks this arm"
+        wait "$child" 2>/dev/null || true
+        rm -f "$child_out" 2>/dev/null || true
+        exit 1
+      }
       report_attached
       wait "$child" 2>/dev/null || true
       rm -f "$child_out" 2>/dev/null || true

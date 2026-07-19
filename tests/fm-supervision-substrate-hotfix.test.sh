@@ -24,7 +24,7 @@ if [ "${FM_SUPERVISION_HOTFIX_TEST_INNER:-0}" != 1 ]; then
   fi
 fi
 
-HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-/Users/cal/firstmate/bin/fm-herdr-lab.sh}
+HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
 TMP_ROOT=$(fm_test_tmproot fm-supervision-substrate-hotfix)
 PRIMARY="$TMP_ROOT/primary"
 CREW_WT="$TMP_ROOT/crew-worktree"
@@ -62,10 +62,29 @@ fail_later() {
   FAILURES=$((FAILURES + 1))
 }
 
-wait_for_file() {
+wait_for_absent() {
   local path=$1 attempt=0
   while [ "$attempt" -lt 100 ]; do
-    [ -e "$path" ] && return 0
+    [ ! -e "$path" ] && [ ! -L "$path" ] && return 0
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+wait_for_watcher_owner() {
+  local state=$1 expected_kind=$2 attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    if [ "$(cat "$state/.watch.lock/owner-kind" 2>/dev/null || true)" = "$expected_kind" ] \
+      && [ -s "$state/.watch.lock/owner-pid" ] \
+      && [ -s "$state/.watch.lock/owner-identity" ] \
+      && [ -e "$state/.last-watcher-beat" ]; then
+      if [ "$expected_kind" != arm ] \
+        || { [ -s "$state/.watch.lock/owner-tracker-pid" ] \
+          && [ -s "$state/.watch.lock/owner-tracker-identity" ]; }; then
+        return 0
+      fi
+    fi
     sleep 0.1
     attempt=$((attempt + 1))
   done
@@ -74,9 +93,9 @@ wait_for_file() {
 
 run_state_probe() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout 5 "$@"
+    timeout -k 1 5 "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout 5 "$@"
+    gtimeout -k 1 5 "$@"
   else
     perl -e '
       my $seconds = shift;
@@ -121,6 +140,10 @@ set -u
 helper=${HERDR_LAB_HELPER:?}
 session=${FM_HERDR_LAB_SESSION:?}
 real_path=${FM_REAL_PATH:?}
+if [ "${FM_FAKE_HERDR_IGNORE_TERM:-0}" = 1 ]; then
+  trap '' TERM
+  while :; do :; done
+fi
 [ -z "${FM_FAKE_HERDR_DELAY:-}" ] || sleep "$FM_FAKE_HERDR_DELAY"
 args=()
 while [ "$#" -gt 0 ]; do
@@ -168,7 +191,7 @@ esac
 slow_rc=0
 slow_state=$(run_state_probe env PATH="$FAKEBIN:$PATH" FM_REAL_PATH="$PATH" \
   HERDR_LAB_HELPER="$HERDR_LAB_HELPER" FM_HERDR_LAB_SESSION="$LAB_SESSION" \
-  FM_FAKE_HERDR_DELAY=3 FM_CREW_STATE_BACKEND_TIMEOUT=1 FM_HOME="$PRIMARY" \
+  FM_FAKE_HERDR_IGNORE_TERM=1 FM_CREW_STATE_BACKEND_TIMEOUT=1 FM_HOME="$PRIMARY" \
   "$PRIMARY/bin/fm-crew-state.sh" incident) || slow_rc=$?
 case "$slow_state" in
   'state: unknown'*'source: none'*'backend current state unavailable'*)
@@ -180,14 +203,35 @@ case "$slow_state" in
 esac
 
 rm -f "$PRIMARY/state/incident.meta" "$PRIMARY/state/incident.status"
+: > "$PRIMARY/state/ownership.meta"
+orphan_arm_out="$TMP_ROOT/orphan-arm.out"
+ARM_PID=$(FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+  bash -c '"$1" >"$2" 2>&1 & child=$!; i=0; while [ "$i" -lt 100 ] && [ ! -s "$3/.watch.lock/owner-tracker-identity" ]; do sleep 0.1; i=$((i + 1)); done; printf "%s\n" "$child"' _ \
+  "$PRIMARY/bin/fm-watch-arm.sh" "$orphan_arm_out" "$PRIMARY/state")
+wait_for_watcher_owner "$PRIMARY/state" arm \
+  || fail "shell-backgrounded arm never published its transient owner provenance"
+guard_out="$TMP_ROOT/guard-owner.out"
+guard_rc=0
+printf '{"stop_hook_active":false}' | FM_HOME="$PRIMARY" \
+  "$PRIMARY/bin/fm-turnend-guard.sh" >"$guard_out" 2>&1 || guard_rc=$?
+if [ "$guard_rc" -eq 2 ]; then
+  pass "turn end refuses an arm whose launch tracker already exited"
+else
+  fail_later "turn end accepted shell-backgrounded arm ownership (rc=$guard_rc): $(cat "$guard_out")"
+fi
+kill -TERM "$ARM_PID" 2>/dev/null || true
+wait_for_absent "$PRIMARY/state/.watch.lock" || fail "shell-backgrounded arm did not release the watcher lock"
+ARM_PID=
+rm -f "$PRIMARY/state/ownership.meta"
+
 : > "$PRIMARY/state/checkpoint.meta"
 checkpoint_out="$TMP_ROOT/checkpoint.out"
 checkpoint_err="$TMP_ROOT/checkpoint.err"
 FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
   "$PRIMARY/bin/fm-watch-checkpoint.sh" --seconds 20 >"$checkpoint_out" 2>"$checkpoint_err" &
 CHECKPOINT_PID=$!
-wait_for_file "$PRIMARY/state/.watch.lock/pid" || fail "foreground checkpoint never acquired the watcher lock"
-wait_for_file "$PRIMARY/state/.last-watcher-beat" || fail "foreground checkpoint never wrote a fresh beacon"
+wait_for_watcher_owner "$PRIMARY/state" checkpoint \
+  || fail "foreground checkpoint never published complete owner provenance and a fresh beacon"
 
 guard_out="$TMP_ROOT/guard-checkpoint.out"
 guard_rc=0
@@ -203,23 +247,23 @@ printf 'done: real checkpoint signal exit\n' > "$PRIMARY/state/checkpoint-signal
 wait "$CHECKPOINT_PID" || fail "foreground checkpoint did not return cleanly on its real signal"
 CHECKPOINT_PID=
 assert_contains "$(cat "$checkpoint_out")" "signal:" "checkpoint did not report its real signal exit"
-touch "$PRIMARY/state/.last-watcher-beat"
+arm_out="$TMP_ROOT/arm.out"
+FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+  "$PRIMARY/bin/fm-watch-arm.sh" >"$arm_out" 2>&1 &
+ARM_PID=$!
+wait_for_watcher_owner "$PRIMARY/state" arm \
+  || fail "durable arm never published complete tracked-owner provenance and a fresh beacon"
 
 guard_rc=0
 printf '{"stop_hook_active":true}' | FM_HOME="$PRIMARY" \
   "$PRIMARY/bin/fm-turnend-guard.sh" >"$guard_out" 2>&1 || guard_rc=$?
 if [ "$guard_rc" -eq 2 ]; then
-  pass "turn end remains refused after signal exit with a fresh beacon and queued wake"
+  pass "turn end refuses queued wakes even with a live durable watcher owner"
 else
-  fail_later "turn end accepted the post-signal fresh beacon before wake drain (rc=$guard_rc): $(cat "$guard_out")"
+  fail_later "turn end accepted a pending wake behind a live durable owner (rc=$guard_rc): $(cat "$guard_out")"
 fi
 
 FM_HOME="$PRIMARY" "$PRIMARY/bin/fm-wake-drain.sh" >/dev/null
-arm_out="$TMP_ROOT/arm.out"
-FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
-  "$PRIMARY/bin/fm-watch-arm.sh" >"$arm_out" 2>&1 &
-ARM_PID=$!
-wait_for_file "$PRIMARY/state/.watch.lock/pid" || fail "durable arm never acquired the watcher lock"
 guard_rc=0
 printf '{"stop_hook_active":true}' | FM_HOME="$PRIMARY" \
   "$PRIMARY/bin/fm-turnend-guard.sh" >"$guard_out" 2>&1 || guard_rc=$?

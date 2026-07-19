@@ -167,6 +167,7 @@ function spawnArm(paths, sessionID, client) {
     ...process.env,
     FM_HOME: paths.home,
     FM_ROOT_OVERRIDE: paths.root,
+    FM_WATCH_OWNER_TRACKER_PID: String(process.pid),
   };
   child = spawn("bash", ["-lc", 'config_dir="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"; [ -f "$config_dir/x-mode.env" ] && . "$config_dir/x-mode.env"; exec "$FM_ROOT_OVERRIDE/bin/fm-watch-arm.sh" --restart'], {
     cwd: paths.root,

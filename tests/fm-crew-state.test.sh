@@ -5,7 +5,7 @@
 # The status file (state/<id>.status) is a best-effort append-only EVENT LOG, so
 # `tail -1` of it reports the last event, not the current state. fm-crew-state
 # reads the AUTHORITATIVE source (a matching no-mistakes run-step, else a
-# bounded backend busy|idle|unknown read) and reconciles the possibly-stale log against it. These
+# hard-bounded backend read) and reconciles the possibly-stale log against it. These
 # cases pin every branch of that logic, hermetically, over real throwaway git
 # repos with a fake `no-mistakes` (run-step source) and a fake `tmux` (pane
 # source):
@@ -913,7 +913,7 @@ test_no_run_idle_pane_custom_paused_verb() {
   assert_contains "$out" "vendor maintenance window" "custom pause preserves its reason"
   printf 'paused: default verb no longer selected\n' > "$d/state/feat-custom-pause.status"
   out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
-  assert_contains "$out" "state: idle" "custom paused verb replaces the default"
+  assert_contains "$out" "state: unknown" "custom paused verb replaces the default"
   pass "no run + idle pane honors the configured paused verb"
 }
 
