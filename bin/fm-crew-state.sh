@@ -8,8 +8,9 @@
 # or blocked and the crew resumes (responds to the gate, the pipeline fixes, it
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
-# no-mistakes run-step attributed to this crew's branch, else a hard-bounded
-# backend read) and reconciles the possibly-stale log against it.
+# full no-mistakes run-step attributed to this crew's branch and current HEAD,
+# or the existing coarse cross-branch status, else a hard-bounded backend read)
+# and reconciles the possibly-stale log against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -19,8 +20,12 @@
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crew's branch and current HEAD, active or terminal
-#      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
+#   2. Full `axi status` evidence is attributed only when its branch matches and
+#      its recorded head resolves to this crew's current HEAD. A stale, missing,
+#      malformed, or unresolvable full-run head falls through to the live
+#      backend/status path. If the full answer is for another branch, the
+#      established branch-only `no-mistakes runs` fallback may still attribute
+#      that coarse status to this crew.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
