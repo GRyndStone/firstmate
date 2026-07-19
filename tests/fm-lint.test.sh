@@ -61,6 +61,11 @@ test_nomistakes_invokes_the_owner() {
   pass "no-mistakes pre-push lint calls the one-owner script"
 }
 
+test_nomistakes_isolates_gate_agents() {
+  grep -Fqx 'disable_project_settings: true' "$NM" || fail "no-mistakes gate agents must not inherit Firstmate project settings"
+  pass "no-mistakes gate agents are isolated from Firstmate project settings"
+}
+
 test_pins_an_explicit_version() {
   [ -n "$REQUIRED" ] || fail "fm-lint.sh --required-version printed nothing"
   # The captain-agreed pin: adopt ShellCheck 0.11.0's rule set consistently,
@@ -184,6 +189,7 @@ test_owner_exists_and_executable
 test_owner_defines_canonical_set
 test_ci_invokes_the_owner
 test_nomistakes_invokes_the_owner
+test_nomistakes_isolates_gate_agents
 test_pins_an_explicit_version
 test_ci_installs_and_logs_the_pinned_version
 test_rejects_wrong_shellcheck_version
