@@ -43,6 +43,9 @@
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
 #          1.31.2.
+#          Its install action builds only the authenticated projects/no-mistakes
+#          checkout after validating its private GRyndStone/no-mistakes origin.
+#          It installs the binary without starting or restarting the daemon.
 #          tasks-axi and quota-axi are required bootstrap tools (same class as
 #          lavish-axi). tasks-axi is also version and feature gated (0.1.1+
 #          with update --archive-body and mv [<id>...]); an installed but incompatible build
@@ -313,11 +316,99 @@ install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca) echo "brew install $1  # or the platform's package manager" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
-    no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
+    no-mistakes) echo "$SCRIPT_DIR/fm-bootstrap.sh install no-mistakes  # builds authenticated private checkout from https://github.com/GRyndStone/no-mistakes" ;;
     gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
     *) return 1 ;;
   esac
+}
+
+install_no_mistakes() {
+  local checkout origin built command_path target target_dir link tmp daemon_status rollback rollback_tmp
+  checkout="$PROJECTS/no-mistakes"
+  if ! git -C "$checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "error: no-mistakes install requires an authenticated private checkout at $checkout from https://github.com/GRyndStone/no-mistakes" >&2
+    return 1
+  fi
+  origin=$(git -C "$checkout" remote get-url origin 2>/dev/null) || origin=
+  case "$origin" in
+    https://github.com/GRyndStone/no-mistakes|https://github.com/GRyndStone/no-mistakes.git|git@github.com:GRyndStone/no-mistakes.git|ssh://git@github.com/GRyndStone/no-mistakes.git) ;;
+    *)
+      echo "error: no-mistakes checkout at $checkout must use the authenticated private origin https://github.com/GRyndStone/no-mistakes" >&2
+      return 1
+      ;;
+  esac
+  command -v make >/dev/null 2>&1 || {
+    echo "error: no-mistakes private checkout build requires make" >&2
+    return 1
+  }
+  command -v go >/dev/null 2>&1 || {
+    echo "error: no-mistakes private checkout build requires go" >&2
+    return 1
+  }
+  echo "building no-mistakes from authenticated private checkout: $checkout"
+  make -C "$checkout" build || return 1
+  built="$checkout/bin/no-mistakes"
+  [ -x "$built" ] || {
+    echo "error: private no-mistakes build did not produce executable: $built" >&2
+    return 1
+  }
+
+  target=${NM_PRIVATE_INSTALL_BIN:-}
+  if [ -z "$target" ]; then
+    command_path=$(command -v no-mistakes 2>/dev/null) || command_path=
+    target=${command_path:-${XDG_BIN_HOME:-$HOME/.local/bin}/no-mistakes}
+  fi
+  while [ -L "$target" ]; do
+    link=$(readlink "$target") || {
+      echo "error: cannot resolve no-mistakes install symlink: $target" >&2
+      return 1
+    }
+    case "$link" in
+      /*) target=$link ;;
+      *) target="$(cd "$(dirname "$target")" && pwd -P)/$link" ;;
+    esac
+  done
+  target_dir=$(dirname "$target")
+  mkdir -p "$target_dir" || return 1
+  rollback=
+  if [ -e "$target" ]; then
+    [ -x "$target" ] || {
+      echo "error: existing no-mistakes install target is not executable: $target" >&2
+      return 1
+    }
+    if ! daemon_status=$("$target" daemon status 2>&1); then
+      echo "error: cannot verify a safe stopped daemon boundary with $target: $daemon_status" >&2
+      return 1
+    fi
+    case "$daemon_status" in
+      *'daemon not running'*) ;;
+      *'daemon running'*)
+        echo "error: refusing to replace $target while its daemon is running; stop it at a safe boundary and retry" >&2
+        return 1
+        ;;
+      *)
+        echo "error: cannot verify a safe stopped daemon boundary with $target: unrecognized daemon status" >&2
+        return 1
+        ;;
+    esac
+    rollback="$target.rollback"
+    rollback_tmp=$(mktemp "$target_dir/.no-mistakes.rollback.XXXXXX") || return 1
+    if ! cp -p "$target" "$rollback_tmp" || ! mv -f "$rollback_tmp" "$rollback"; then
+      rm -f "$rollback_tmp"
+      return 1
+    fi
+  fi
+  tmp=$(mktemp "$target_dir/.no-mistakes.install.XXXXXX") || return 1
+  if ! install -m 755 "$built" "$tmp" || ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ -n "$rollback" ]; then
+    echo "installed no-mistakes: $target (daemon stopped; rollback: $rollback)"
+  else
+    echo "installed no-mistakes: $target (new install; no daemon command run)"
+  fi
 }
 
 BACKEND=$(fm_backend_name)
@@ -547,6 +638,10 @@ if [ "${1:-}" = "install" ]; then
   shift
   [ $# -gt 0 ] || { echo "usage: fm-bootstrap.sh install <tool>..." >&2; exit 1; }
   for t in "$@"; do
+    if [ "$t" = no-mistakes ]; then
+      install_no_mistakes || exit 1
+      continue
+    fi
     cmd=$(install_cmd "$t") || { echo "error: unknown tool $t" >&2; exit 1; }
     cmd=${cmd%%  #*}
     echo "installing $t: $cmd"

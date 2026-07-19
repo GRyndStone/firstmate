@@ -278,7 +278,7 @@ ROWS
 
 test_no_mistakes_min_version() {
   local label version mode case_dir fakebin out missing n
-  missing='MISSING: no-mistakes (install: curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh)'
+  missing="MISSING: no-mistakes (install: $ROOT/bin/fm-bootstrap.sh install no-mistakes  # builds authenticated private checkout from https://github.com/GRyndStone/no-mistakes)"
   n=0
   while IFS='^' read -r label version mode; do
     [ -n "$label" ] || continue
@@ -305,6 +305,67 @@ older no-mistakes patch reports an upgrade^no-mistakes version v1.31.1 (fake)^mi
 unparseable no-mistakes version reports an upgrade^no-mistakes development build^missing
 ROWS
   pass "bootstrap enforces no-mistakes minimum version"
+}
+
+test_no_mistakes_install_requires_canonical_private_checkout() {
+  local case_dir projects out status installed live_target safe_target
+  case_dir="$TMP_ROOT/no-mistakes-install"
+  projects="$case_dir/projects"
+  mkdir -p "$projects"
+
+  if out=$(FM_PROJECTS_OVERRIDE="$projects" "$ROOT/bin/fm-bootstrap.sh" install no-mistakes 2>&1); then
+    fail "no-mistakes install should fail without the private checkout"
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "no-mistakes install should fail without the private checkout"
+  assert_contains "$out" "requires an authenticated private checkout at $projects/no-mistakes from https://github.com/GRyndStone/no-mistakes" "missing private checkout should have a clear prerequisite"
+
+  mkdir -p "$projects/no-mistakes/docs"
+  git init -q "$projects/no-mistakes"
+  git -C "$projects/no-mistakes" remote add origin https://example.com/no-mistakes.git
+  if out=$(FM_PROJECTS_OVERRIDE="$projects" "$ROOT/bin/fm-bootstrap.sh" install no-mistakes 2>&1); then
+    fail "no-mistakes install should reject a non-canonical origin"
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "no-mistakes install should reject a non-canonical origin"
+  assert_contains "$out" "must use the authenticated private origin https://github.com/GRyndStone/no-mistakes" "non-canonical checkout should fail closed"
+
+  git -C "$projects/no-mistakes" remote set-url origin git@github.com:GRyndStone/no-mistakes.git
+  printf '%b\n' 'build:' '\tmkdir -p bin' '\tprintf '\''#!/usr/bin/env bash\\nprintf "private fixture\\n"\\n'\'' > bin/no-mistakes' '\tchmod +x bin/no-mistakes' > "$projects/no-mistakes/Makefile"
+  installed="$case_dir/installed/no-mistakes"
+  out=$(FM_PROJECTS_OVERRIDE="$projects" NM_PRIVATE_INSTALL_BIN="$installed" "$ROOT/bin/fm-bootstrap.sh" install no-mistakes)
+  [ -x "$installed" ] || fail "canonical private checkout build was not installed"
+  [ "$("$installed")" = "private fixture" ] || fail "installed private fixture command is not runnable"
+  assert_contains "$out" "building no-mistakes from authenticated private checkout: $projects/no-mistakes" "private build source should be explicit"
+  assert_contains "$out" "installed no-mistakes: $installed (new install; no daemon command run)" "missing-target install should not inspect daemon state"
+  [ ! -e "$installed.rollback" ] || fail "missing-target install should not create a rollback"
+
+  live_target="$case_dir/live/no-mistakes"
+  mkdir -p "$(dirname "$live_target")"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$*" = "daemon status" ]; then echo "daemon running"; else echo "live fixture"; fi' > "$live_target"
+  chmod +x "$live_target"
+  if out=$(FM_PROJECTS_OVERRIDE="$projects" NM_PRIVATE_INSTALL_BIN="$live_target" "$ROOT/bin/fm-bootstrap.sh" install no-mistakes 2>&1); then
+    fail "no-mistakes upgrade should refuse a running daemon"
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "running-daemon refusal should fail"
+  assert_contains "$out" "refusing to replace $live_target while its daemon is running" "running daemon should block binary replacement"
+  [ "$("$live_target")" = "live fixture" ] || fail "running-daemon refusal changed the existing command"
+  [ ! -e "$live_target.rollback" ] || fail "running-daemon refusal should not create a rollback"
+
+  safe_target="$case_dir/safe/no-mistakes"
+  mkdir -p "$(dirname "$safe_target")"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$*" = "daemon status" ]; then echo "daemon not running"; else echo "safe fixture"; fi' > "$safe_target"
+  chmod +x "$safe_target"
+  out=$(FM_PROJECTS_OVERRIDE="$projects" NM_PRIVATE_INSTALL_BIN="$safe_target" "$ROOT/bin/fm-bootstrap.sh" install no-mistakes)
+  [ "$("$safe_target")" = "private fixture" ] || fail "safe upgrade did not install the private build"
+  [ -x "$safe_target.rollback" ] || fail "safe upgrade did not create an executable rollback"
+  [ "$("$safe_target.rollback")" = "safe fixture" ] || fail "safe upgrade rollback is not the exact prior command"
+  assert_contains "$out" "installed no-mistakes: $safe_target (daemon stopped; rollback: $safe_target.rollback)" "safe upgrade should report its rollback path"
+  pass "bootstrap private install refuses live daemons and backs up safe upgrades"
 }
 
 test_git_is_required_with_supported_install_instruction() {
@@ -500,6 +561,7 @@ ROWS
 
 test_bootstrap_reporting
 test_no_mistakes_min_version
+test_no_mistakes_install_requires_canonical_private_checkout
 test_git_is_required_with_supported_install_instruction
 test_orca_backend_gates_orca_tool_only_when_selected
 test_fleet_sync_timeout_scales_with_origin_backed_project_count
