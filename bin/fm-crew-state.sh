@@ -183,6 +183,7 @@ crew_pane_is_busy_bounded() {
   local tail40
   case "$TASK_BACKEND" in
     tmux)
+      # shellcheck disable=SC2016 # Positional parameters expand inside the child bash.
       bounded_run "$BACKEND_TIMEOUT" bash -c \
         '. "$1"; fm_pane_is_busy "$2"' \
         _ "$SCRIPT_DIR/fm-tmux-lib.sh" "$BACKEND_TARGET" >/dev/null 2>&1
