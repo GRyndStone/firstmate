@@ -754,6 +754,7 @@ test_full_run_attribution_rejects_stale_head() {
       completed) FM_FAKE_AXI_STATUS="$(run_passed fm/feat-full-stale-head "$old_head")" ;;
       failed) FM_FAKE_AXI_STATUS="$(run_failed fm/feat-full-stale-head "$old_head")" ;;
     esac
+    FM_FAKE_RUNS_LIST="$full_status fm/feat-full-stale-head $old_head 2026-07-18 12:00"
     out=$(run_crew_state "$d" feat-full-stale-head)
     assert_contains "$out" "state: done" "stale full $full_status run overrode current status state"
     assert_contains "$out" "source: status-log" "stale full $full_status run retained run-step authority"

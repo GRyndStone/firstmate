@@ -443,9 +443,10 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
     run_head=$(strip_quotes "$(nm_field head)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] \
-       && run_head_is_current "$run_head"; then
-      HAVE_RUN=1
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+      if run_head_is_current "$run_head"; then
+        HAVE_RUN=1
+      fi
     else
       # The active-or-most-recent run is for another branch (the CLI is alive
       # and answered; only the attribution missed) - try the coarse fallback.
