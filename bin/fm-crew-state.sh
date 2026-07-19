@@ -19,7 +19,7 @@
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
-#   2. Matching no-mistakes run for this crew's branch, active or terminal
+#   2. Matching no-mistakes run for this crew's branch and current HEAD, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
@@ -247,6 +247,15 @@ RUN_OUT=""
 nm_field() {  # <key>
   printf '%s\n' "$RUN_OUT" | sed -n "s/^[[:space:]]*$1:[[:space:]]*\(.*\)/\1/p" | head -1
 }
+run_head_is_current() {  # <head>
+  local recorded=$1 resolved current
+  case "$recorded" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  resolved=$(git -C "$WT" rev-parse --verify "$recorded^{commit}" 2>/dev/null) || return 1
+  current=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
+  [ "$resolved" = "$current" ]
+}
 # Finding count from a findings[N]{...} table header; empty when none.
 nm_findings_count() {
   printf '%s\n' "$RUN_OUT" | grep -oE 'findings\[[0-9]+\]' | head -1 | grep -oE '[0-9]+'
@@ -433,7 +442,9 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+    run_head=$(strip_quotes "$(nm_field head)")
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] \
+       && run_head_is_current "$run_head"; then
       HAVE_RUN=1
     else
       # The active-or-most-recent run is for another branch (the CLI is alive

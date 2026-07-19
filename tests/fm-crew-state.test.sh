@@ -138,7 +138,14 @@ make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
 # Run the helper for one case dir. FM_FAKE_* env (run output, busy flag) are read
 # from the caller's environment by the fakes above.
 run_crew_state() {  # <case-dir> <id>
-  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" "$CREW_STATE" "$2"
+  local current_head axi_status axi_status_run runs_list
+  current_head=$(git -C "$1/wt" rev-parse --short HEAD 2>/dev/null || true)
+  axi_status=${FM_FAKE_AXI_STATUS//abc1234/$current_head}
+  axi_status_run=${FM_FAKE_AXI_STATUS_RUN//abc1234/$current_head}
+  runs_list=${FM_FAKE_RUNS_LIST//abc1234/$current_head}
+  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" \
+    FM_FAKE_AXI_STATUS="$axi_status" FM_FAKE_AXI_STATUS_RUN="$axi_status_run" \
+    FM_FAKE_RUNS_LIST="$runs_list" "$CREW_STATE" "$2"
 }
 
 new_case() {  # <name> -> echoes case dir with an empty state/
@@ -166,13 +173,14 @@ reset_fakes() {
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
 
-run_running() {  # <branch>
+run_running() {  # <branch> [head]
+  local head=${2:-abc1234}
   cat <<EOF
 run:
   id: "01RUN"
   branch: $1
   status: running
-  head: "abc1234"
+  head: "$head"
   pr: ""
   findings: none
   steps[2]{step,status,findings,duration_ms}:
@@ -255,26 +263,28 @@ steps[3]{step,status,findings,duration_ms}:
 EOF
 }
 
-run_passed() {  # <branch>
+run_passed() {  # <branch> [head]
+  local head=${2:-abc1234}
   cat <<EOF
 run:
   id: "01RUN"
   branch: $1
   status: completed
-  head: "abc1234"
+  head: "$head"
   pr: "https://github.com/o/r/pull/1"
   findings: none
 outcome: passed
 EOF
 }
 
-run_failed() {  # <branch>
+run_failed() {  # <branch> [head]
+  local head=${2:-abc1234}
   cat <<EOF
 run:
   id: "01RUN"
   branch: $1
   status: completed
-  head: "abc1234"
+  head: "$head"
   pr: ""
   findings: none
 outcome: failed
@@ -726,6 +736,32 @@ EOF
   pass "cross-branch attribution picks the branch's most recent row"
 }
 
+test_full_run_attribution_rejects_stale_head() {
+  reset_fakes
+  local d old_head full_status out; d=$(new_case full-run-stale-head)
+  make_repo_on_branch "$d/wt" fm/feat-full-stale-head
+  old_head=$(git -C "$d/wt" rev-parse --short HEAD)
+  printf 'advanced\n' > "$d/wt/advanced.txt"
+  git -C "$d/wt" add advanced.txt
+  git -C "$d/wt" commit -q -m advanced
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-full-stale-head.meta" "window=fm:fm-feat-full-stale-head" "worktree=$d/wt" "kind=ship"
+  printf 'done: current worktree has no active validation\n' > "$d/state/feat-full-stale-head.status"
+  FM_FAKE_BUSY=0
+  for full_status in running completed failed; do
+    case "$full_status" in
+      running) FM_FAKE_AXI_STATUS="$(run_running fm/feat-full-stale-head "$old_head")" ;;
+      completed) FM_FAKE_AXI_STATUS="$(run_passed fm/feat-full-stale-head "$old_head")" ;;
+      failed) FM_FAKE_AXI_STATUS="$(run_failed fm/feat-full-stale-head "$old_head")" ;;
+    esac
+    out=$(run_crew_state "$d" feat-full-stale-head)
+    assert_contains "$out" "state: done" "stale full $full_status run overrode current status state"
+    assert_contains "$out" "source: status-log" "stale full $full_status run retained run-step authority"
+    assert_not_contains "$out" "source: run-step" "stale full $full_status run was attributed to the advanced head"
+  done
+  pass "full run attribution rejects runs from an older branch head"
+}
+
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status() {
   reset_fakes
   local d; d=$(new_case coarse-ready-other-log)
@@ -1116,6 +1152,7 @@ test_terminal_passed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
+test_full_run_attribution_rejects_stale_head
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane
