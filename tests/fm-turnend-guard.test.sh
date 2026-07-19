@@ -156,7 +156,7 @@ watcher_identity() {
 }
 
 record_watcher_lock() {
-  local dir=$1 pid=$2 identity=$3 root bin_dir
+  local dir=$1 pid=$2 identity=$3 owner_kind=${4:-} owner_pid=${5:-} owner_identity=${6:-} owner_mode=${7:-} tracker_pid=${8:-} tracker_identity=${9:-} root bin_dir
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$dir/bin" && pwd)
   mkdir -p "$dir/state/.watch.lock"
@@ -164,6 +164,16 @@ record_watcher_lock() {
   printf '%s\n' "$root" > "$dir/state/.watch.lock/fm-home"
   printf '%s\n' "$bin_dir/fm-watch.sh" > "$dir/state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
+  if [ -n "$owner_kind" ]; then
+    printf '%s\n' "$owner_kind" > "$dir/state/.watch.lock/owner-kind"
+    printf '%s\n' "$owner_pid" > "$dir/state/.watch.lock/owner-pid"
+    printf '%s\n' "$owner_identity" > "$dir/state/.watch.lock/owner-identity"
+    printf '%s\n' "$owner_mode" > "$dir/state/.watch.lock/owner-mode"
+    if [ -n "$tracker_pid" ]; then
+      printf '%s\n' "$tracker_pid" > "$dir/state/.watch.lock/owner-tracker-pid"
+      printf '%s\n' "$tracker_identity" > "$dir/state/.watch.lock/owner-tracker-identity"
+    fi
+  fi
 }
 
 test_hook_silent_when_no_work_in_flight() {
@@ -200,24 +210,65 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon() {
 }
 
 test_hook_silent_with_live_lock_and_fresh_beacon() {
-  local dir pid identity out status
+  local dir pid identity owner_pid owner_identity tracker_identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-fresh")
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  sleep 60 &
+  owner_pid=$!
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
+    kill "$owner_pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
     fail "could not identify live watcher holder"
   }
-  record_watcher_lock "$dir" "$pid" "$identity"
+  owner_identity=$(watcher_identity "$dir" "$owner_pid") || {
+    kill "$pid" "$owner_pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "could not identify live watcher owner"
+  }
+  tracker_identity=$(watcher_identity "$dir" "$$") || {
+    kill "$pid" "$owner_pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "could not identify live watcher owner tracker"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity" arm "$owner_pid" "$owner_identity" '' "$$" "$tracker_identity"
   touch "$dir/state/.last-watcher-beat"
   out=$(run_hook "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
+  kill "$owner_pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
   expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
   [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+}
+
+test_hook_blocks_when_arm_tracker_is_dead() {
+  local dir pid identity owner_pid owner_identity tracker_pid tracker_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-dead-arm-tracker")
+  : > "$dir/state/task1.meta"
+  sleep 60 & pid=$!
+  sleep 60 & owner_pid=$!
+  sleep 60 & tracker_pid=$!
+  identity=$(watcher_identity "$dir" "$pid")
+  owner_identity=$(watcher_identity "$dir" "$owner_pid")
+  tracker_identity=$(watcher_identity "$dir" "$tracker_pid")
+  record_watcher_lock "$dir" "$pid" "$identity" arm "$owner_pid" "$owner_identity" '' "$tracker_pid" "$tracker_identity"
+  touch "$dir/state/.last-watcher-beat"
+  kill "$tracker_pid" 2>/dev/null || true
+  wait "$tracker_pid" 2>/dev/null || true
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" "$owner_pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when an arm's launch tracker has exited"
+  assert_contains "$out" "healthy watcher has no live owner provenance" "dead tracker must invalidate arm provenance"
+  pass "fm-turnend-guard: rejects an arm whose launch tracker has exited"
 }
 
 test_hook_blocks_with_live_lock_and_stale_beacon() {
@@ -302,14 +353,14 @@ test_hook_uses_state_override() {
   pass "fm-turnend-guard: uses FM_STATE_OVERRIDE ahead of FM_HOME/state"
 }
 
-test_hook_loop_guard_allows_retry() {
+test_hook_retry_stays_blocked_without_restored_supervision() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-loopguard")
   : > "$dir/state/task1.meta"
   out=$(run_hook "$dir" true); status=$?
-  expect_code 0 "$status" "hook must allow the stop when stop_hook_active is already true"
-  [ -z "$out" ] || fail "hook produced output on the loop-guarded retry: $out"
-  pass "fm-turnend-guard: stop_hook_active=true always allows the stop (never blocks twice in one turn)"
+  expect_code 2 "$status" "hook must keep blocking when the forced continuation did not restore supervision"
+  assert_contains "$out" "prior forced continuation did not drain wakes" "retry block must explain the unmet boundary"
+  pass "fm-turnend-guard: stop_hook_active does not authorize a blind retry"
 }
 
 test_hook_silent_in_secondmate_home() {
@@ -334,30 +385,31 @@ test_hook_silent_in_crewmate_worktree() {
   pass "fm-turnend-guard: inert in a crewmate/scout task worktree (linked git worktree) even when unhealthy"
 }
 
-test_hook_silent_without_jq() {
-  local dir out status fakebin tool tool_path
+test_hook_blocks_without_working_jq() {
+  local dir out status fakebin
   dir=$(make_primary_dir "$TMP_ROOT/hook-nojq")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/hook-nojq-fake")
-  for tool in bash sh git cat printf date uname stat mkdir dirname; do
-    tool_path=$(command -v "$tool") || fail "test host must provide $tool"
-    ln -s "$tool_path" "$fakebin/$tool"
-  done
-  out=$(printf '{"stop_hook_active":false}' | PATH="$fakebin" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$fakebin/jq"
+  out=$(printf '{"stop_hook_active":false}' | PATH="$fakebin:$PATH" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
   status=$?
-  expect_code 0 "$status" "hook must fail open (exit 0) when jq is unavailable"
-  [ -z "$out" ] || fail "hook produced output without jq: $out"
-  pass "fm-turnend-guard: fails open (never blocks) when jq is missing"
+  expect_code 2 "$status" "hook must fail closed when jq is unavailable"
+  assert_contains "$out" "TURN WOULD END BLIND" "hook must still enforce the predicate without jq"
+  pass "fm-turnend-guard: does not require jq to block a blind turn end"
 }
 
-test_hook_silent_without_stdin() {
+test_hook_blocks_without_stdin() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-nostdin")
   : > "$dir/state/task1.meta"
   out=$(bash "$dir/bin/fm-turnend-guard.sh" < /dev/null 2>&1); status=$?
-  expect_code 0 "$status" "hook must exit 0 on empty/absent stdin"
-  [ -z "$out" ] || fail "hook produced output on empty stdin: $out"
-  pass "fm-turnend-guard: silent no-op on empty stdin"
+  expect_code 2 "$status" "hook must fail closed on empty/absent stdin"
+  assert_contains "$out" "TURN WOULD END BLIND" "empty stdin must not bypass the shared predicate"
+  pass "fm-turnend-guard: empty stdin cannot authorize a blind turn end"
 }
 
 test_hook_runs_fast() {
@@ -371,13 +423,13 @@ test_hook_runs_fast() {
   pass "fm-turnend-guard: runs well under the generous timing margin (${elapsed_s}s)"
 }
 
-test_grok_adapter_forces_one_resume_when_unhealthy() {
+test_grok_adapter_rechecks_until_healthy() {
   local dir fakebin log out status
   dir=$(make_primary_dir "$TMP_ROOT/grok-adapter-block")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/grok-adapter-fakebin")
   log="$TMP_ROOT/grok-adapter-call.log"
-  cat > "$fakebin/grok" <<EOF
+cat > "$fakebin/grok" <<EOF
 #!/usr/bin/env bash
 {
   printf 'active=%s\n' "\${GROK_TURNEND_GUARD_ACTIVE:-}"
@@ -388,6 +440,8 @@ test_grok_adapter_forces_one_resume_when_unhealthy() {
   done
   printf '\n'
 } >> "$log"
+calls=\$(grep -c '^active=' "$log" 2>/dev/null || true)
+[ "\$calls" -lt 2 ] || rm -f "$dir/state/task1.meta"
 EOF
   chmod +x "$fakebin/grok"
   out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
@@ -399,7 +453,8 @@ EOF
   assert_not_contains "$(cat "$log")" '<--permission-mode>' "grok adapter must not add a stronger permission mode"
   assert_not_contains "$(cat "$log")" '<bypassPermissions>' "grok adapter must not bypass permissions on forced resume"
   assert_contains "$(cat "$log")" 'TURN WOULD END BLIND' "grok adapter must carry the guard reason into the forced resume"
-  pass "fm-turnend-guard-grok: forces one same-session resume when the shared predicate blocks"
+  [ "$(grep -c '^active=' "$log")" -eq 2 ] || fail "grok adapter did not recheck and resume until the predicate passed"
+  pass "fm-turnend-guard-grok: rechecks the shared predicate after every forced resume"
 }
 
 test_grok_adapter_loop_guard_skips_resume() {
@@ -520,7 +575,8 @@ test_opencode_plugin_forces_followup() {
   assert_contains "$content" 'session.idle' "OpenCode plugin must run on session.idle"
   assert_contains "$content" 'fm-turnend-guard.sh' "OpenCode plugin must invoke the shared guard"
   assert_contains "$content" 'promptAsync' "OpenCode plugin must force a follow-up turn"
-  assert_contains "$content" 'skipNextIdle' "OpenCode plugin must carry a loop guard"
+  assert_contains "$content" 'followupDispatching' "OpenCode plugin must suppress only reentrant follow-up dispatch"
+  assert_not_contains "$content" 'skipNextIdle' "OpenCode plugin must not skip the next real idle predicate check"
   assert_contains "$content" 'worktree' "OpenCode plugin must anchor the guard from the git worktree path"
   pass ".opencode primary plugin: session.idle forces one follow-up through the shared guard"
 }
@@ -571,6 +627,42 @@ EOF
   pass ".opencode primary plugin: guard path is anchored to worktree, not directory"
 }
 
+test_opencode_plugin_rechecks_after_forced_followup() {
+  local plugin worktree_dir log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
+  worktree_dir="$TMP_ROOT/opencode-plugin-recheck"
+  log="$TMP_ROOT/opencode-plugin-recheck.log"
+  mkdir -p "$worktree_dir/bin"
+  cat > "$worktree_dir/bin/fm-turnend-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'guard\n' >> "${FM_GUARD_LOG:?}"
+printf 'guard-fired\n' >&2
+exit 2
+EOF
+  chmod +x "$worktree_dir/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$worktree_dir" FM_GUARD_LOG="$log" node 2>&1 <<'EOF'
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompts = 0;
+const client = { session: { promptAsync: async () => { prompts += 1; } } };
+const hooks = await mod.FmPrimaryTurnendGuard({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+const idle = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
+await hooks.event(idle);
+await hooks.event(idle);
+if (prompts !== 2) throw new Error(`expected two forced follow-ups, saw ${prompts}`);
+const runs = readFileSync(process.env.FM_GUARD_LOG, "utf8").trim().split("\n").length;
+if (runs !== 2) throw new Error(`expected two predicate checks, saw ${runs}`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode plugin must recheck the predicate after a forced follow-up"
+  [ -z "$out" ] || fail "OpenCode predicate-recheck test printed output: $out"
+  pass ".opencode primary plugin: every real idle event rechecks the shared predicate"
+}
+
 test_pi_extension_forces_followup() {
   local ext content
   ext="$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
@@ -580,7 +672,8 @@ test_pi_extension_forces_followup() {
   assert_contains "$content" 'fm-turnend-guard.sh' "pi extension must invoke the shared guard"
   assert_contains "$content" 'sendUserMessage' "pi extension must force a follow-up turn"
   assert_contains "$content" 'deliverAs: "followUp"' "pi extension must queue the follow-up safely"
-  assert_contains "$content" 'guardFollowupActive' "pi extension must carry a logical-run loop guard"
+  assert_contains "$content" 'guardFollowupDispatching' "pi extension must suppress only reentrant follow-up dispatch"
+  assert_not_contains "$content" 'guardFollowupActive' "pi extension must not skip the next real settled predicate check"
   assert_not_contains "$content" 'skipNextTurnEnd' "pi extension kept the internal-turn loop guard"
   assert_contains "$content" 'session-start operating block' "pi extension must use harness-neutral repair wording"
   assert_contains "$content" '.pi-turnend-extension-loaded' "pi extension must write its loaded marker for session-start diagnostics"
@@ -721,19 +814,20 @@ test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_blocks_when_arm_tracker_is_dead
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
-test_hook_loop_guard_allows_retry
+test_hook_retry_stays_blocked_without_restored_supervision
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
-test_hook_silent_without_jq
-test_hook_silent_without_stdin
+test_hook_blocks_without_working_jq
+test_hook_blocks_without_stdin
 test_hook_runs_fast
-test_grok_adapter_forces_one_resume_when_unhealthy
+test_grok_adapter_rechecks_until_healthy
 test_grok_adapter_loop_guard_skips_resume
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
@@ -741,6 +835,7 @@ test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
 test_codex_hook_ignores_nested_git_root_guard
 test_opencode_plugin_forces_followup
 test_opencode_plugin_anchors_guard_to_worktree
+test_opencode_plugin_rechecks_after_forced_followup
 test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure

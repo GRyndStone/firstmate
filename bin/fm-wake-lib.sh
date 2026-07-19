@@ -79,11 +79,60 @@ fm_watcher_healthy() {
   return 0
 }
 
+FM_WATCHER_OWNER_KIND=
+FM_WATCHER_OWNER_PID=
+FM_WATCHER_OWNER_MODE=
+FM_WATCHER_OWNER_TRACKER_PID=
+fm_watcher_live_owner() {
+  local state=$1 lockdir kind mode pid recorded_identity current_identity tracker_pid tracker_identity current_tracker_identity
+  FM_WATCHER_OWNER_KIND=
+  FM_WATCHER_OWNER_PID=
+  FM_WATCHER_OWNER_MODE=
+  FM_WATCHER_OWNER_TRACKER_PID=
+  lockdir="$state/.watch.lock"
+  kind=$(cat "$lockdir/owner-kind" 2>/dev/null || true)
+  mode=$(cat "$lockdir/owner-mode" 2>/dev/null || true)
+  pid=$(cat "$lockdir/owner-pid" 2>/dev/null || true)
+  recorded_identity=$(cat "$lockdir/owner-identity" 2>/dev/null || true)
+  case "$kind" in
+    arm|checkpoint|daemon) ;;
+    *) return 1 ;;
+  esac
+  fm_pid_alive "$pid" || return 1
+  [ -n "$recorded_identity" ] || return 1
+  current_identity=$(fm_pid_identity "$pid") || return 1
+  [ "$current_identity" = "$recorded_identity" ] || return 1
+  if [ "$kind" = arm ]; then
+    tracker_pid=$(cat "$lockdir/owner-tracker-pid" 2>/dev/null || true)
+    tracker_identity=$(cat "$lockdir/owner-tracker-identity" 2>/dev/null || true)
+    [ "$tracker_pid" != 1 ] || return 1
+    fm_pid_alive "$tracker_pid" || return 1
+    [ -n "$tracker_identity" ] || return 1
+    current_tracker_identity=$(fm_pid_identity "$tracker_pid") || return 1
+    [ "$current_tracker_identity" = "$tracker_identity" ] || return 1
+    # shellcheck disable=SC2034 # Read by callers after fm_watcher_live_owner returns.
+    FM_WATCHER_OWNER_TRACKER_PID=$tracker_pid
+  fi
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_live_owner returns.
+  FM_WATCHER_OWNER_KIND=$kind
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_live_owner returns.
+  FM_WATCHER_OWNER_PID=$pid
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_live_owner returns.
+  FM_WATCHER_OWNER_MODE=$mode
+  return 0
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
     "$lockdir/pid" \
     "$lockdir/fm-home" \
+    "$lockdir/owner-identity" \
+    "$lockdir/owner-kind" \
+    "$lockdir/owner-mode" \
+    "$lockdir/owner-pid" \
+    "$lockdir/owner-tracker-identity" \
+    "$lockdir/owner-tracker-pid" \
     "$lockdir/pid-identity" \
     "$lockdir/watcher-path" \
     2>/dev/null || true

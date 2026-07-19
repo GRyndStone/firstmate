@@ -568,8 +568,8 @@ fm_backend_worktree_path() {  # <backend> <worktree-id>
 # where this gets real semantics beyond pane-regex). Backends with no such
 # primitive (tmux) report unknown. Callers own the fallback policy: fm-watch.sh
 # uses unknown as the cue for its pane-hash + FM_BUSY_REGEX detection, while
-# fm-crew-state.sh also corroborates native idle verdicts before treating a
-# no-run crew as not busy.
+# fm-crew-state.sh trusts Herdr's native busy or idle verdict and uses pane text
+# only when Herdr returns unknown.
 fm_backend_busy_state() {  # <backend> <target>
   local backend=$1
   shift

@@ -709,6 +709,34 @@ handle_push_transition() {  # <backend> <session> <record>
   wake "$reason"
 }
 
+# Accept ownership only from a wrapper that declares its live process identity.
+# Arm ownership also carries the live process that tracks the wrapper across a
+# turn yield; command-name ancestry is not ownership evidence.
+watch_owner_from_env() {
+  local current_identity current_tracker_identity
+  WATCH_OWNER_KIND=${FM_WATCH_OWNER_KIND:-}
+  WATCH_OWNER_PID=${FM_WATCH_OWNER_PID:-}
+  WATCH_OWNER_IDENTITY=${FM_WATCH_OWNER_IDENTITY:-}
+  WATCH_OWNER_MODE=${FM_WATCH_OWNER_MODE:-}
+  WATCH_OWNER_TRACKER_PID=${FM_WATCH_OWNER_TRACKER_PID:-}
+  WATCH_OWNER_TRACKER_IDENTITY=${FM_WATCH_OWNER_TRACKER_IDENTITY:-}
+  case "$WATCH_OWNER_KIND" in arm|checkpoint|daemon) ;; *) return 1 ;; esac
+  fm_pid_alive "$WATCH_OWNER_PID" || return 1
+  case "$WATCH_OWNER_KIND" in
+    arm|daemon) [ "$WATCH_OWNER_PID" = "${PPID:-}" ] || return 1 ;;
+  esac
+  [ -n "$WATCH_OWNER_IDENTITY" ] || return 1
+  current_identity=$(fm_pid_identity "$WATCH_OWNER_PID") || return 1
+  [ "$current_identity" = "$WATCH_OWNER_IDENTITY" ] || return 1
+  if [ "$WATCH_OWNER_KIND" = arm ]; then
+    [ "$WATCH_OWNER_TRACKER_PID" != 1 ] || return 1
+    fm_pid_alive "$WATCH_OWNER_TRACKER_PID" || return 1
+    [ -n "$WATCH_OWNER_TRACKER_IDENTITY" ] || return 1
+    current_tracker_identity=$(fm_pid_identity "$WATCH_OWNER_TRACKER_PID") || return 1
+    [ "$current_tracker_identity" = "$WATCH_OWNER_TRACKER_IDENTITY" ] || return 1
+  fi
+}
+
 # --- Main entry: the runtime below runs only when this file is executed as a
 # script. When sourced (unit tests loading the functions above), return here
 # before acquiring the singleton lock or entering the blocking loop.
@@ -743,6 +771,16 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+if watch_owner_from_env; then
+  printf '%s\n' "$WATCH_OWNER_KIND" > "$WATCH_LOCK/owner-kind" || true
+  printf '%s\n' "$WATCH_OWNER_MODE" > "$WATCH_LOCK/owner-mode" || true
+  printf '%s\n' "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-pid" || true
+  printf '%s\n' "$WATCH_OWNER_IDENTITY" > "$WATCH_LOCK/owner-identity" || true
+  if [ "$WATCH_OWNER_KIND" = arm ]; then
+    printf '%s\n' "$WATCH_OWNER_TRACKER_PID" > "$WATCH_LOCK/owner-tracker-pid" || true
+    printf '%s\n' "$WATCH_OWNER_TRACKER_IDENTITY" > "$WATCH_LOCK/owner-tracker-identity" || true
+  fi
+fi
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 

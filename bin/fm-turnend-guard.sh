@@ -8,8 +8,8 @@
 # This script is push-based: verified harness turn-end hooks invoke it every time
 # the primary is about to end a turn.
 # Claude and codex can block directly by preserving exit status 2 and stderr.
-# OpenCode, pi, and grok adapters use the same predicate and force one bounded
-# follow-up because their turn-end events are passive.
+# OpenCode, pi, and grok adapters use the same predicate and keep forcing
+# bounded follow-ups because their turn-end events are passive.
 # See docs/turnend-guard.md for the per-harness mechanics, validation evidence,
 # and fail-open tradeoffs.
 #
@@ -20,15 +20,9 @@
 # (treehouse-leased or git-cloned). It must therefore scope itself to the
 # PRIMARY at runtime and stay a silent, fast no-op everywhere else.
 #
-# Loop-guard: never block twice in the same turn. Claude Code and codex Stop
-# payloads carry stop_hook_active=true when the CURRENT stop attempt was itself
-# already forced by an earlier block this turn; on that signal we always allow
-# the stop, whether or not watcher supervision actually got resumed. Passive
-# harness adapters provide their own one-follow-up guard before calling this
-# script.
-# That bounds this to at most one forced continuation per turn - never a wedged,
-# un-endable session - while still nagging again on a later turn if the problem
-# persists.
+# A blocked stop guarantees another continuation, but it is not permission for
+# the retry to end blind. The retry stays blocked until queued wakes are drained
+# and a turn-surviving owner holds the live watcher cycle.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,18 +36,14 @@ WATCH="$SCRIPT_DIR/fm-watch.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 
-# Read the whole turn-end hook payload once; never block on unreadable/absent
-# stdin.
+# Read the whole turn-end hook payload once. The payload is diagnostic only;
+# malformed or missing input cannot bypass the primary-scoped predicate.
 PAYLOAD=$(cat 2>/dev/null || true)
-[ -n "$PAYLOAD" ] || exit 0
-
-# jq is the repo's established JSON dependency (bin/fm-x-poll.sh uses the same
-# "missing jq -> silent no-op" degrade). Without it we cannot safely read the
-# loop-guard field, so we must never block - fail open, not noisy.
-command -v jq >/dev/null 2>&1 || exit 0
-
-STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2>/dev/null) || exit 0
-[ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
+PAYLOAD_COMPACT=$(printf '%s' "$PAYLOAD" | tr -d '[:space:]')
+STOP_HOOK_ACTIVE=false
+case "$PAYLOAD_COMPACT" in
+  *'"stop_hook_active":true'*) STOP_HOOK_ACTIVE=true ;;
+esac
 
 # --- scope precisely to the PRIMARY checkout --------------------------------
 # Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
@@ -78,7 +68,38 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
-fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+
+daemon_owner_is_active() {
+  local owner_pid=$1 owner_identity daemon_pid daemon_lock_pid daemon_lock_identity
+  [ "$FM_WATCHER_OWNER_MODE" = away-inject ] || return 1
+  [ -e "$STATE/.afk" ] || return 1
+  daemon_pid=$(cat "$STATE/.supervise-daemon.pid" 2>/dev/null || true)
+  daemon_lock_pid=$(cat "$STATE/.supervise-daemon.lock/pid" 2>/dev/null || true)
+  daemon_lock_identity=$(cat "$STATE/.supervise-daemon.lock/pid-identity" 2>/dev/null || true)
+  [ "$daemon_pid" = "$owner_pid" ] || return 1
+  [ "$daemon_lock_pid" = "$owner_pid" ] || return 1
+  [ "$daemon_lock_identity" = "$owner_identity" ]
+}
+
+WATCH_OWNER_DESC="no healthy watcher"
+if [ "$FM_SUP_QUEUE_PENDING" = true ]; then
+  WATCH_OWNER_DESC="queued wakes are not drained"
+elif fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+  WATCH_OWNER_DESC="healthy watcher has no live owner provenance"
+  if fm_watcher_live_owner "$STATE"; then
+    case "$FM_WATCHER_OWNER_KIND" in
+      arm) exit 0 ;;
+      daemon)
+        owner_identity=$(cat "$STATE/.watch.lock/owner-identity" 2>/dev/null || true)
+        if daemon_owner_is_active "$FM_WATCHER_OWNER_PID" "$owner_identity"; then
+          exit 0
+        fi
+        WATCH_OWNER_DESC="daemon owner is not active in declared away mode"
+        ;;
+      checkpoint) WATCH_OWNER_DESC="foreground checkpoint owner cannot survive turn yield" ;;
+    esac
+  fi
+fi
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
@@ -89,8 +110,11 @@ REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 {
   printf '●%s\n' "$rule"
-  printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-  printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+  printf '●  TURN WOULD END BLIND - DURABLE SUPERVISION IS OFF\n'
+  printf '●  %s task(s) in flight; %s (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$WATCH_OWNER_DESC" "$FM_SUP_BEACON_DESC"
+  if [ "$STOP_HOOK_ACTIVE" = true ]; then
+    printf '●  The prior forced continuation did not drain wakes and establish durable ownership.\n'
+  fi
   printf '●  %s\n' "$REASON"
   printf '●%s\n' "$rule"
 } >&2

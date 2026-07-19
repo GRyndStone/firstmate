@@ -263,9 +263,12 @@ This surfaced as a real fleet incident (2026-07-02): `bin/fm-watch.sh`'s absorb-
 At the same time, an independent no-mistakes run-step attribution fallback could miss this crew's branch when `axi status` reported another branch; current `bin/fm-crew-state.sh` falls back to top-level `no-mistakes runs --limit ${FM_CREW_STATE_RUNS_LIMIT:-200}` for that coarse cross-branch verdict.
 Together, those gaps let a genuinely still-working herdr crew read as not provably working, triggering an immediate stale wake instead of the intended absorb-then-escalate behavior.
 
-**Fix:** `bin/fm-crew-state.sh`'s `crew_pane_is_busy` now corroborates BOTH `idle` and unknown/unparseable native verdicts with the shared tail-regex before concluding "not busy" - only a bare `busy` verdict is trusted outright.
-The cross-branch attribution fallback now uses the real `no-mistakes runs` command, and the watcher checks provably-working evidence before a stale status-log verb can make a stale pane terminal.
-This does not mask a genuinely human-blocked agent (a permission dialog, not mid-tool-call): that pane does not render the busy banner, so the corroboration still correctly reports not-busy for it.
+The 2026-07-02 mitigation made `bin/fm-crew-state.sh` corroborate native `idle` with pane text before concluding that a no-run crew was not busy.
+The cross-branch attribution fallback also moved to the real `no-mistakes runs` command so an attributable long-running validation remains authoritative.
+
+The 2026-07-18 supervision incident established the opposite fail-closed rule for current state when no run is attributable: native Herdr `busy` or `idle` is authoritative, stale pane text and stale `working` status history cannot override it, and only `unknown` falls back to bounded pane capture.
+The backend read and capture are hard-bounded; timeout or unreadable state returns `unknown` instead of hanging supervision or trusting status history.
+This current-state rule is specific to `bin/fm-crew-state.sh`; injection safety and other callers retain their documented backend-specific corroboration policies.
 
 ## Slash/`$` autocomplete popup hazard (confirmed, same mitigation as tmux)
 

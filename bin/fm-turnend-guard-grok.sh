@@ -4,9 +4,9 @@
 # Grok Stop hooks are passive: exit 2 does not block or feed stderr back to the
 # model. This adapter still uses the shared primary-scoped predicate in
 # fm-turnend-guard.sh. When that predicate says the primary would end blind, the
-# adapter forces one same-session follow-up by running `grok --resume <session>`
-# with a guard instruction. GROK_TURNEND_GUARD_ACTIVE is the loop guard: the
-# nested turn's own Stop hook exits without spawning another nested turn.
+# adapter forces same-session follow-ups by running `grok --resume <session>`
+# with a guard instruction and rechecking after each resume. The active marker
+# keeps each nested turn's Stop hook from spawning another nested adapter.
 set -u
 
 PAYLOAD=$(cat 2>/dev/null || true)
@@ -29,18 +29,23 @@ SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.sessionId // empty' 2>/dev/null) |
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-turnend-grok.XXXXXX") || exit 0
 trap 'rm -f "$ERR"' EXIT
 
-printf '%s' "$PAYLOAD" | "$ROOT/bin/fm-turnend-guard.sh" 2>"$ERR"
-RC=$?
-[ "$RC" -eq 2 ] || exit 0
+GUARD_PAYLOAD=$PAYLOAD
+while :; do
+  : > "$ERR"
+  printf '%s' "$GUARD_PAYLOAD" | "$ROOT/bin/fm-turnend-guard.sh" 2>"$ERR"
+  RC=$?
+  [ "$RC" -eq 2 ] || exit 0
 
-REASON=$(cat "$ERR" 2>/dev/null || true)
-[ -n "$REASON" ] || REASON='tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn'
+  REASON=$(cat "$ERR" 2>/dev/null || true)
+  [ -n "$REASON" ] || REASON='tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn'
 
-GROK_TURNEND_GUARD_ACTIVE=1 \
-  GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
-  grok --resume "$SESSION_ID" \
-    --cwd "$ROOT" \
-    --output-format plain \
-    -p "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
+  GROK_TURNEND_GUARD_ACTIVE=1 \
+    GROK_HOME="${GROK_HOME:-$HOME/.grok}" \
+    grok --resume "$SESSION_ID" \
+      --cwd "$ROOT" \
+      --output-format plain \
+      -p "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.
 
-$REASON" >/dev/null 2>&1 || true
+$REASON" >/dev/null 2>&1 || exit 0
+  GUARD_PAYLOAD='{"stop_hook_active":true}'
+done
