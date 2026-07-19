@@ -223,8 +223,10 @@ _state_root() { printf '%s' "${FM_STATE_OVERRIDE:-$FM_HOME/state}"; }
 # --- portable stat (same trap as fm-watch.sh: no `stat -f || stat -c`) -------
 if [ "$(uname)" = Darwin ]; then
   _stat_file_mtime() { stat -f %m "$1" 2>/dev/null; }
+  _stat_file_event_sig() { stat -f '%d:%i:%z:%Fm:%Fc' "$1" 2>/dev/null; }
 else
   _stat_file_mtime() { stat -c %Y "$1" 2>/dev/null; }
+  _stat_file_event_sig() { stat -c '%d:%i:%s:%y:%z' "$1" 2>/dev/null; }
 fi
 _now() {
   case "${FM_TEST_NOW_EPOCH:-}" in
@@ -509,11 +511,15 @@ pause_marker_remove() {  # <window> <state>
 }
 
 pause_activity_fingerprint() {  # <state> <task>
-  local state=$1 task=$2 status turn status_sig=absent turn_sig=absent
+  local state=$1 task=$2 status turn status_sig=absent turn_sig=absent turn_content turn_event
   status="$state/$task.status"
   turn="$state/$task.turn-ended"
   [ ! -e "$status" ] || status_sig=$(cksum "$status" 2>/dev/null || echo unreadable)
-  [ ! -e "$turn" ] || turn_sig=$(cksum "$turn" 2>/dev/null || echo unreadable)
+  if [ -e "$turn" ]; then
+    turn_content=$(cksum "$turn" 2>/dev/null || echo unreadable)
+    turn_event=$(_stat_file_event_sig "$turn" 2>/dev/null || echo unreadable)
+    turn_sig="${turn_content}|${turn_event}"
+  fi
   _hash_text "status=${status_sig}|turn=${turn_sig}"
 }
 

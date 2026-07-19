@@ -444,6 +444,46 @@ test_normal_supervisor_direct_pause_activity_wakes_once() {
   pass "direct activity produces one wake and stays deduped after unrelated drain until endpoint state changes"
 }
 
+test_normal_supervisor_empty_turn_receipt_rearms_activity_once() {
+  local dir state fakebin win pane key wake_log latch before after wakes
+  dir=$(make_supercase normal-turn-receipt-event)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-normal-r1"; pane="$dir/pane.txt"
+  key=$(printf '%s' "held-normal-r1" | tr ':/.' '___')
+  latch="$state/.subsuper-pause-active-$key"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-normal-r1.meta"
+  printf 'paused: waiting for upstream\n' > "$state/held-normal-r1.status"
+  : > "$state/held-normal-r1.turn-ended"
+  printf 'Working...\n' > "$pane"
+  printf '1000\n' > "$state/.subsuper-paused-$key"
+  wake_log="$dir/model-wakes.log"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1001 \
+      housekeeping "$state"
+    escalate_flush "$state"
+  ) || fail "initial direct-activity receipt handling failed"
+  [ -e "$latch" ] || fail "initial direct activity did not record its latch"
+  before=$(cat "$latch")
+  touch "$state/held-normal-r1.turn-ended"
+  [ ! -s "$state/held-normal-r1.turn-ended" ] || fail "turn receipt update changed its empty-file contract"
+  after=$(pause_activity_fingerprint "$state" held-normal-r1)
+  [ "$after" != "$before" ] || fail "repeated empty-file touch did not change the turn event fingerprint"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1002 \
+      housekeeping "$state"
+    escalate_flush "$state"
+    housekeeping "$state"
+    escalate_flush "$state"
+  ) || fail "new empty turn-receipt event handling failed"
+  wakes=$(wc -l < "$wake_log" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 2 ] || fail "distinct empty turn receipt produced $wakes total wakes instead of exactly two event wakes"
+  [ "$(cat "$latch")" = "$after" ] || fail "new turn event did not replace the activity latch fingerprint"
+  pass "a repeated empty turn-receipt touch re-arms exactly one later distinct activity wake"
+}
+
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake() {
   local dir state queue reason
   dir=$(make_supercase normal-exact-ack)
@@ -1875,6 +1915,7 @@ test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_normal_supervisor_quiet_hour_is_shell_only
 test_normal_supervisor_direct_pause_activity_wakes_once
+test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
