@@ -15,7 +15,7 @@
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -32,8 +32,11 @@
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
-#   4. No run for this crew (pre-validation, or kind=scout): fall back to the
-#      recorded backend's pane busy state, then the status log's last line.
+#   4. No run for this crew (pre-validation, or kind=scout): read the recorded
+#      backend's busy|idle|unknown state within a hard bound. Live idle
+#      supersedes stale working history; an unproved state fails closed to
+#      unknown. Explicit declared external waits and terminal status events are
+#      preserved when the live pane is not busy.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -61,6 +64,8 @@ META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
+BACKEND_TIMEOUT=${FM_CREW_STATE_BACKEND_TIMEOUT:-3}
+case "$BACKEND_TIMEOUT" in ''|*[!0-9]*|0) BACKEND_TIMEOUT=3 ;; esac
 # How many of the most recent `no-mistakes runs` rows the cross-branch fallback
 # (nm_runs_status_for_branch, below) scans. Generous enough to still find a
 # branch's own run on a busy multi-crew fleet without listing the entire
@@ -68,6 +73,25 @@ case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
 case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;; esac
 SEP=' · '
+
+HAVE_TIMEOUT=none
+if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then HAVE_TIMEOUT=gtimeout
+elif command -v perl >/dev/null 2>&1; then HAVE_TIMEOUT=perl
+fi
+
+bounded_run() {  # <seconds> <command...>
+  local seconds=$1
+  shift
+  case "$HAVE_TIMEOUT" in
+    timeout) timeout "$seconds" "$@" ;;
+    gtimeout) gtimeout "$seconds" "$@" ;;
+    perl)
+      perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
+      ;;
+    *) return 1 ;;
+  esac
+}
 
 # Emit the one canonical line and exit 0. Detail is optional.
 emit() {  # <state> <source> [detail]
@@ -124,61 +148,48 @@ map_log_state() {  # <line>
 LOG_LINE=$(log_last_line || true)
 LOG_VERB=$(status_line_verb "$LOG_LINE")
 
-# pane_readable is consulted ONLY in the no-run fallback below. The run-step path
-# stays authoritative regardless of pane liveness - judge by the run-step, not the
-# shell - so a finished crew whose endpoint has closed still reports its run-step
-# state (e.g. done) instead of being masked as unknown. Backend-aware
-# (fm_backend_of_meta defaults absent backend= to tmux, the P1 contract): a
-# herdr task is read through fm_backend_capture instead of a bare tmux probe.
+# The run-step path stays authoritative regardless of pane liveness, so a
+# finished crew whose endpoint has closed still reports its run-step state.
+# Without a run, the backend probe below is tri-state and hard-bounded: positive
+# busy or idle evidence is authoritative, while timeout/unreadable stays unknown.
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
-pane_readable() {  # <target>
-  case "$TASK_BACKEND" in
-    tmux) tmux display-message -p -t "$1" '#{pane_id}' >/dev/null 2>&1 ;;
-    *) fm_backend_capture "$TASK_BACKEND" "$1" 1 "$EXPECTED_LABEL" >/dev/null 2>&1 ;;
-  esac
+backend_busy_state_bounded() {
+  # shellcheck disable=SC2016 # Positional parameters expand inside the child bash.
+  bounded_run "$BACKEND_TIMEOUT" bash -c \
+    '. "$1"; fm_backend_busy_state "$2" "$3"' \
+    _ "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET"
 }
-# crew_pane_is_busy: the busy-signature fallback, backend-aware the same way -
-# fm_backend_busy_state's native semantic state (herdr's agent.get) when
-# available, else the shared tmux pane-regex reader (fm_pane_is_busy,
-# bin/fm-tmux-lib.sh) unchanged for tmux/unknown.
-#
-# `busy` alone is trusted outright. Both `idle` and unknown/unparseable fall
-# through to the shared tail-regex corroboration, NOT just unknown: herdr's
-# agent.get reports generation state ("working" while the model is streaming
-# a turn, "done"/"idle" once it is not - docs/herdr-backend.md "Busy state"),
-# which is a narrower signal than "this crew's turn/tool call is still in
-# progress". A crew blocked on its own long-running foreground tool call (e.g.
-# `no-mistakes axi run` without --yes, which blocks synchronously until a gate
-# or outcome - AGENTS.md section 11) is not generating for that whole span, so
-# agent.get can read idle/blocked (bin/backends/herdr.sh maps both to `idle`)
-# while the pane's own rendered text still shows the harness's busy banner
-# (BUSY_REGEX, e.g. "esc to interrupt") for the entire tool call, exactly like
-# tmux's regex-only reader would correctly report. Trusting herdr's `idle`
-# outright (skipping that corroboration) is what let a still-working crew read
-# as not-busy here, and - combined with a no-mistakes run-step lookup that also
-# missed attribution (see nm_runs_status_for_branch) - as not provably working in
-# fm-classify-lib.sh, triggering an immediate (non-wedge) stale wake instead of
-# the absorb-then-escalate path. A genuinely human-blocked agent (a permission
-# dialog, not mid-tool-call) does not render the busy banner, so this
-# corroboration does not mask that case: it stays correctly not-busy.
-crew_pane_is_busy() {  # <target>
-  case "$TASK_BACKEND" in
-    tmux) fm_pane_is_busy "$1" ;;
-    *)
-      local bs tail40
-      bs=$(fm_backend_busy_state "$TASK_BACKEND" "$1" 2>/dev/null)
-      case "$bs" in
-        busy) return 0 ;;
-        *)
-          tail40=$(fm_backend_capture "$TASK_BACKEND" "$1" 40 "$EXPECTED_LABEL" 2>/dev/null) || return 1
-          printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
-            | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
-          ;;
-      esac
+backend_capture_bounded() {
+  # shellcheck disable=SC2016 # Positional parameters expand inside the child bash.
+  bounded_run "$BACKEND_TIMEOUT" bash -c \
+    '. "$1"; fm_backend_capture "$2" "$3" 40 "$4"' \
+    _ "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET" "$EXPECTED_LABEL"
+}
+
+CREW_PANE_STATE=unknown
+CREW_PANE_READABLE=0
+crew_pane_state() {
+  local native tail40
+  CREW_PANE_STATE=unknown
+  CREW_PANE_READABLE=0
+  native=$(backend_busy_state_bounded 2>/dev/null) || return 0
+  case "$native" in
+    busy|idle)
+      CREW_PANE_STATE=$native
+      CREW_PANE_READABLE=1
+      return 0
       ;;
   esac
+  tail40=$(backend_capture_bounded 2>/dev/null) || return 0
+  CREW_PANE_READABLE=1
+  if printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
+    | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"; then
+    CREW_PANE_STATE=busy
+  else
+    CREW_PANE_STATE=idle
+  fi
 }
 
 # --- no-mistakes run lookup (authoritative when a run matches this branch) --
@@ -199,11 +210,6 @@ strip_quotes() {
 }
 
 # Bounded no-mistakes call in the worktree; stdout only, never fails the script.
-HAVE_TIMEOUT=none
-if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=timeout
-elif command -v gtimeout >/dev/null 2>&1; then HAVE_TIMEOUT=gtimeout
-elif command -v perl >/dev/null 2>&1; then HAVE_TIMEOUT=perl
-fi
 nm_run() {  # <args...>
   case "$HAVE_TIMEOUT" in
     timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
@@ -546,16 +552,21 @@ fi
 # is no run to consult, so a dead/unreadable target means the crew is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
-pane_readable "$BACKEND_TARGET" || emit unknown none "backend target gone: $BACKEND_TARGET"
+crew_pane_state
+[ "$CREW_PANE_READABLE" -eq 1 ] \
+  || emit unknown none "backend current state unavailable: $BACKEND_TARGET"
+[ "$CREW_PANE_STATE" = busy ] && emit working pane "harness busy"
 
-# Secondmates idle on their own watcher (idle pane = healthy), so the busy
-# signature is not meaningful for them; read their state from the status log only.
-if [ "$KIND" != secondmate ] && crew_pane_is_busy "$BACKEND_TARGET"; then
-  emit working pane "harness busy"
+if status_is_paused "$LOG_LINE"; then
+  emit paused status-log "$(status_line_note "$LOG_LINE")"
 fi
+case "$LOG_VERB" in
+  needs-decision|blocked|done|failed)
+    emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")"
+    ;;
+  working)
+    emit idle pane "backend reports idle${SEP}status-log working superseded"
+    ;;
+esac
 
-if [ -n "$LOG_VERB" ]; then
-  emit "$(map_log_state "$LOG_LINE")" status-log "$(status_line_note "$LOG_LINE")"
-fi
-
-emit unknown none "no current-state source available"
+emit idle pane "backend reports idle"

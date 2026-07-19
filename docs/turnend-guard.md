@@ -12,7 +12,7 @@ The primary can otherwise end a turn after handling wakes without resuming super
 On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about nine hours.
 
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
-When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
+When tasks are in flight, a harness hook must block the turn end or force a bounded follow-up unless queued wakes are drained and a live identity-matched watcher has a verified owner that survives turn yield.
 
 ## Shared Predicate
 
@@ -23,14 +23,19 @@ It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist
 
 For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
-If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
-That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
+If work is in flight, the durable wake queue must be empty and `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh` must succeed.
+Queue emptiness is the existing mechanical receipt that wake handling reached `bin/fm-wake-drain.sh`.
+The live watcher lock must also name a live identity-matched owner recorded by `bin/fm-watch.sh`.
+Normal supervision requires an `arm` owner, while away-mode supervision requires the matching live daemon owner and active `.afk` declaration.
+A foreground `checkpoint` owner never authorizes turn end because that owner cannot survive turn yield.
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+It also blocks after an actionable watcher exit until queued wakes are drained and a new turn-surviving owner is verifiably live.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
-If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 because it cannot safely read loop-guard fields.
+Hook input and `stop_hook_active` are diagnostic only.
+Missing `jq`, malformed input, empty input, or a forced-continuation retry cannot bypass the shared predicate.
 
 ## Harness Integrations
 
@@ -46,7 +51,7 @@ All verified primary harnesses have a tracked integration:
 
 Claude and Codex support a direct blocking Stop hook.
 For those harnesses, exit status 2 plus stderr from `bin/fm-turnend-guard.sh` blocks the stop and feeds the reason back into the model.
-Both payloads include `stop_hook_active`; when it is true, the shared guard exits 0 so the harness can end after one forced continuation.
+Both payloads include `stop_hook_active`; when it is true, the shared guard reports that the prior continuation did not restore durable supervision and keeps blocking until the predicate passes.
 
 OpenCode, Pi, and Grok expose passive lifecycle callbacks for this purpose.
 Their adapters fail open at the hook boundary to avoid corrupting a user session, but they force one follow-up turn when the shared predicate blocks.
@@ -56,6 +61,10 @@ If a passive adapter cannot call its SDK method, cannot find `grok`, or cannot r
 That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it points back to the active harness protocol instead of hardcoding one background-arm command.
 
 ## Empirical Validation
+
+On 2026-07-18, the focused supervision-substrate regression reproduced a real foreground checkpoint receiving an actionable signal and exiting while its beacon remained fresh.
+It also reproduced a live Herdr `idle` verdict masked by stale `working` status history.
+The regression now requires the live idle verdict to surface, bounds the Herdr state probe, rejects both the live checkpoint and post-signal fresh beacon, then permits turn end only after wake drain and a live durable arm owner.
 
 All harnesses were validated on 2026-07-08 in scratch repos or throwaway homes, not against the captain's live primary fleet state.
 
@@ -114,6 +123,7 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, durable owner provenance, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-closed behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-supervision-substrate-hotfix.test.sh` is the bounded live-Herdr end-to-end regression for the 2026-07-18 incident sequence.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

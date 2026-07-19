@@ -4,8 +4,8 @@
 #
 # The status file (state/<id>.status) is a best-effort append-only EVENT LOG, so
 # `tail -1` of it reports the last event, not the current state. fm-crew-state
-# reads the AUTHORITATIVE source (a matching no-mistakes run-step, else the
-# pane busy-signature) and reconciles the possibly-stale log against it. These
+# reads the AUTHORITATIVE source (a matching no-mistakes run-step, else a
+# bounded backend busy|idle|unknown read) and reconciles the possibly-stale log against it. These
 # cases pin every branch of that logic, hermetically, over real throwaway git
 # repos with a fake `no-mistakes` (run-step source) and a fake `tmux` (pane
 # source):
@@ -15,7 +15,8 @@
 #   (d) terminal run-step (passed/failed) is authoritative        -> run-step
 #   (e) cross-branch attribution: this branch's own run found via list lookup
 #   (f) no run + busy pane                                        -> pane
-#   (g) no run + idle pane falls to the status-log verb           -> status-log
+#   (g) no run + idle pane supersedes stale working history, while declared
+#       waits and terminal status events retain their explicit semantics
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
@@ -803,18 +804,10 @@ test_no_run_herdr_unknown_uses_backend_capture() {
   pass "herdr unknown native state falls back to backend capture busy regex"
 }
 
-# Regression: herdr's agent.get reports generation state ("working" only while
-# the model is actively streaming a turn - docs/herdr-backend.md "Busy state"),
-# not "this crew's tool call is still in progress". A crew blocked on its own
-# long-running foreground `no-mistakes axi run` (no --yes; blocks until a gate
-# or outcome) is not generating for that whole span, so agent.get can read
-# idle while the pane's own rendered text still shows the busy banner
-# (BUSY_REGEX) for the entire call. `idle` must be corroborated with that text
-# exactly like `unknown` already is, not trusted outright - the bug this
-# regression pins: crew_pane_is_busy previously returned "not busy" on a bare
-# `idle` verdict without ever looking at the pane.
-test_no_run_herdr_idle_agent_status_corroborated_by_busy_pane() {
-  command -v jq >/dev/null 2>&1 || { pass "herdr idle corroboration skipped without jq"; return; }
+# Herdr's native live state is authoritative when available.
+# A stale busy-looking pane must not override a native idle verdict.
+test_no_run_herdr_idle_agent_status_overrides_busy_pane() {
+  command -v jq >/dev/null 2>&1 || { pass "herdr idle authority skipped without jq"; return; }
   reset_fakes
   local d; d=$(new_case herdr-idle-busy-pane)
   make_repo_on_branch "$d/wt" fm/feat-herdr-idle
@@ -829,13 +822,12 @@ test_no_run_herdr_idle_agent_status_corroborated_by_busy_pane() {
   FM_FAKE_HERDR_AGENT_STATUS=idle
   FM_FAKE_HERDR_BUSY=1
   local out; out=$(run_crew_state "$d" feat-herdr-idle)
-  assert_contains "$out" "state: working" "herdr idle agent_status with a busy-banner pane -> working"
-  assert_contains "$out" "source: pane" "herdr idle agent_status with a busy-banner pane -> pane source"
-  pass "herdr idle agent_status is corroborated by the pane text, not trusted outright"
+  assert_contains "$out" "state: idle" "herdr idle agent_status overrides stale busy-looking pane text"
+  assert_contains "$out" "source: pane" "herdr idle agent_status is reported from the live pane source"
+  pass "herdr native idle state is authoritative over stale pane text"
 }
 
-# The corroboration must not mask a genuinely idle/human-blocked agent: idle
-# agent_status AND an idle-looking pane (no busy banner) still reads not-busy.
+# A live idle verdict also supersedes stale working status history.
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle() {
   command -v jq >/dev/null 2>&1 || { pass "herdr idle+idle-pane skipped without jq"; return; }
   reset_fakes
@@ -850,9 +842,10 @@ test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle() {
   FM_FAKE_HERDR_AGENT_STATUS=idle
   FM_FAKE_HERDR_BUSY=0
   local out; out=$(run_crew_state "$d" feat-herdr-stopped)
-  assert_not_contains "$out" "source: pane" "herdr idle agent_status with an idle pane must not read as busy from the pane"
-  assert_contains "$out" "source: status-log" "herdr idle agent_status with an idle pane falls to the status log"
-  pass "herdr idle agent_status with a genuinely idle pane stays not-busy (no regression for a human-blocked agent)"
+  assert_contains "$out" "state: idle" "herdr idle agent_status supersedes stale working history"
+  assert_contains "$out" "source: pane" "herdr idle agent_status is the current-state source"
+  assert_contains "$out" "status-log working superseded" "stale working history is labeled superseded"
+  pass "herdr native idle state supersedes stale working status history"
 }
 
 # (g) no run + idle pane -> the status-log verb, as-is
@@ -920,7 +913,7 @@ test_no_run_idle_pane_custom_paused_verb() {
   assert_contains "$out" "vendor maintenance window" "custom pause preserves its reason"
   printf 'paused: default verb no longer selected\n' > "$d/state/feat-custom-pause.status"
   out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
-  assert_contains "$out" "state: unknown" "custom paused verb replaces the default"
+  assert_contains "$out" "state: idle" "custom paused verb replaces the default"
   pass "no run + idle pane honors the configured paused verb"
 }
 
@@ -1127,7 +1120,7 @@ test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
 test_other_branch_run_ignored
 test_no_run_busy_pane
 test_no_run_herdr_unknown_uses_backend_capture
-test_no_run_herdr_idle_agent_status_corroborated_by_busy_pane
+test_no_run_herdr_idle_agent_status_overrides_busy_pane
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle
 test_no_run_idle_pane_uses_log
 test_no_run_idle_pane_uses_keyed_log

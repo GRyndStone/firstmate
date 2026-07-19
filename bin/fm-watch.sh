@@ -709,6 +709,44 @@ handle_push_transition() {  # <backend> <session> <record>
   wake "$reason"
 }
 
+# Resolve the process that owns this watcher cycle.
+# The watcher may sit behind timeout/perl inside a foreground checkpoint, so
+# inspect a bounded ancestor chain and record the first known wrapper process.
+# A live watcher pid alone is not evidence that its owner survives turn yield.
+watch_owner_from_ancestors() {
+  local pid=${PPID:-} attempt=0 comm command parent
+  WATCH_OWNER_KIND=${FM_WATCH_OWNER_KIND:-}
+  WATCH_OWNER_PID=${FM_WATCH_OWNER_PID:-}
+  WATCH_OWNER_MODE=${FM_WATCH_OWNER_MODE:-}
+  case "$WATCH_OWNER_KIND" in arm|checkpoint|daemon) return 0 ;; esac
+  WATCH_OWNER_KIND=
+  WATCH_OWNER_PID=
+  WATCH_OWNER_MODE=
+  while [ "$attempt" -lt 4 ]; do
+    case "$pid" in ''|*[!0-9]*|1) return 1 ;; esac
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    comm=${comm##*/}
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case "$comm" in
+      bash|sh|zsh)
+        case "$command" in
+          *bin/fm-watch-checkpoint.sh*) WATCH_OWNER_KIND=checkpoint ;;
+          *bin/fm-watch-arm.sh*) WATCH_OWNER_KIND=arm ;;
+          *bin/fm-supervise-daemon.sh*) WATCH_OWNER_KIND=daemon; WATCH_OWNER_MODE=away-inject ;;
+        esac
+        if [ -n "$WATCH_OWNER_KIND" ]; then
+          WATCH_OWNER_PID=$pid
+          return 0
+        fi
+        ;;
+    esac
+    parent=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]') || return 1
+    pid=$parent
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 # --- Main entry: the runtime below runs only when this file is executed as a
 # script. When sourced (unit tests loading the functions above), return here
 # before acquiring the singleton lock or entering the blocking loop.
@@ -743,6 +781,15 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+if watch_owner_from_ancestors && fm_pid_alive "$WATCH_OWNER_PID"; then
+  owner_identity=$(fm_pid_identity "$WATCH_OWNER_PID" 2>/dev/null || true)
+  if [ -n "$owner_identity" ]; then
+    printf '%s\n' "$WATCH_OWNER_KIND" > "$WATCH_LOCK/owner-kind" || true
+    printf '%s\n' "$WATCH_OWNER_MODE" > "$WATCH_LOCK/owner-mode" || true
+    printf '%s\n' "$WATCH_OWNER_PID" > "$WATCH_LOCK/owner-pid" || true
+    printf '%s\n' "$owner_identity" > "$WATCH_LOCK/owner-identity" || true
+  fi
+fi
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 

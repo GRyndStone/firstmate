@@ -156,7 +156,7 @@ watcher_identity() {
 }
 
 record_watcher_lock() {
-  local dir=$1 pid=$2 identity=$3 root bin_dir
+  local dir=$1 pid=$2 identity=$3 owner_kind=${4:-} owner_pid=${5:-} owner_identity=${6:-} owner_mode=${7:-} root bin_dir
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$dir/bin" && pwd)
   mkdir -p "$dir/state/.watch.lock"
@@ -164,6 +164,12 @@ record_watcher_lock() {
   printf '%s\n' "$root" > "$dir/state/.watch.lock/fm-home"
   printf '%s\n' "$bin_dir/fm-watch.sh" > "$dir/state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
+  if [ -n "$owner_kind" ]; then
+    printf '%s\n' "$owner_kind" > "$dir/state/.watch.lock/owner-kind"
+    printf '%s\n' "$owner_pid" > "$dir/state/.watch.lock/owner-pid"
+    printf '%s\n' "$owner_identity" > "$dir/state/.watch.lock/owner-identity"
+    printf '%s\n' "$owner_mode" > "$dir/state/.watch.lock/owner-mode"
+  fi
 }
 
 test_hook_silent_when_no_work_in_flight() {
@@ -200,21 +206,33 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon() {
 }
 
 test_hook_silent_with_live_lock_and_fresh_beacon() {
-  local dir pid identity out status
+  local dir pid identity owner_pid owner_identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-fresh")
   : > "$dir/state/task1.meta"
   sleep 60 &
   pid=$!
+  sleep 60 &
+  owner_pid=$!
   identity=$(watcher_identity "$dir" "$pid") || {
     kill "$pid" 2>/dev/null || true
+    kill "$owner_pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
     fail "could not identify live watcher holder"
   }
-  record_watcher_lock "$dir" "$pid" "$identity"
+  owner_identity=$(watcher_identity "$dir" "$owner_pid") || {
+    kill "$pid" "$owner_pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "could not identify live watcher owner"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity" arm "$owner_pid" "$owner_identity"
   touch "$dir/state/.last-watcher-beat"
   out=$(run_hook "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
+  kill "$owner_pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
   expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
   [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
@@ -302,14 +320,14 @@ test_hook_uses_state_override() {
   pass "fm-turnend-guard: uses FM_STATE_OVERRIDE ahead of FM_HOME/state"
 }
 
-test_hook_loop_guard_allows_retry() {
+test_hook_retry_stays_blocked_without_restored_supervision() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-loopguard")
   : > "$dir/state/task1.meta"
   out=$(run_hook "$dir" true); status=$?
-  expect_code 0 "$status" "hook must allow the stop when stop_hook_active is already true"
-  [ -z "$out" ] || fail "hook produced output on the loop-guarded retry: $out"
-  pass "fm-turnend-guard: stop_hook_active=true always allows the stop (never blocks twice in one turn)"
+  expect_code 2 "$status" "hook must keep blocking when the forced continuation did not restore supervision"
+  assert_contains "$out" "prior forced continuation did not drain wakes" "retry block must explain the unmet boundary"
+  pass "fm-turnend-guard: stop_hook_active does not authorize a blind retry"
 }
 
 test_hook_silent_in_secondmate_home() {
@@ -334,30 +352,31 @@ test_hook_silent_in_crewmate_worktree() {
   pass "fm-turnend-guard: inert in a crewmate/scout task worktree (linked git worktree) even when unhealthy"
 }
 
-test_hook_silent_without_jq() {
-  local dir out status fakebin tool tool_path
+test_hook_blocks_without_working_jq() {
+  local dir out status fakebin
   dir=$(make_primary_dir "$TMP_ROOT/hook-nojq")
   : > "$dir/state/task1.meta"
   fakebin=$(fm_fakebin "$TMP_ROOT/hook-nojq-fake")
-  for tool in bash sh git cat printf date uname stat mkdir dirname; do
-    tool_path=$(command -v "$tool") || fail "test host must provide $tool"
-    ln -s "$tool_path" "$fakebin/$tool"
-  done
-  out=$(printf '{"stop_hook_active":false}' | PATH="$fakebin" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  cat > "$fakebin/jq" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$fakebin/jq"
+  out=$(printf '{"stop_hook_active":false}' | PATH="$fakebin:$PATH" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
   status=$?
-  expect_code 0 "$status" "hook must fail open (exit 0) when jq is unavailable"
-  [ -z "$out" ] || fail "hook produced output without jq: $out"
-  pass "fm-turnend-guard: fails open (never blocks) when jq is missing"
+  expect_code 2 "$status" "hook must fail closed when jq is unavailable"
+  assert_contains "$out" "TURN WOULD END BLIND" "hook must still enforce the predicate without jq"
+  pass "fm-turnend-guard: does not require jq to block a blind turn end"
 }
 
-test_hook_silent_without_stdin() {
+test_hook_blocks_without_stdin() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-nostdin")
   : > "$dir/state/task1.meta"
   out=$(bash "$dir/bin/fm-turnend-guard.sh" < /dev/null 2>&1); status=$?
-  expect_code 0 "$status" "hook must exit 0 on empty/absent stdin"
-  [ -z "$out" ] || fail "hook produced output on empty stdin: $out"
-  pass "fm-turnend-guard: silent no-op on empty stdin"
+  expect_code 2 "$status" "hook must fail closed on empty/absent stdin"
+  assert_contains "$out" "TURN WOULD END BLIND" "empty stdin must not bypass the shared predicate"
+  pass "fm-turnend-guard: empty stdin cannot authorize a blind turn end"
 }
 
 test_hook_runs_fast() {
@@ -727,11 +746,11 @@ test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
-test_hook_loop_guard_allows_retry
+test_hook_retry_stays_blocked_without_restored_supervision
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
-test_hook_silent_without_jq
-test_hook_silent_without_stdin
+test_hook_blocks_without_working_jq
+test_hook_blocks_without_stdin
 test_hook_runs_fast
 test_grok_adapter_forces_one_resume_when_unhealthy
 test_grok_adapter_loop_guard_skips_resume
