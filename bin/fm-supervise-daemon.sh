@@ -13,14 +13,14 @@
 # wedge), and a declared-pause recheck reach the LLM, and even then as one
 # pre-read digest per batch window.
 #
-# PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
-# injects ONLY when the durable away-mode flag state/.afk is present. Invoking
-# the /afk skill sets that flag and starts this daemon; any real (unmarked)
-# user message clears it and firstmate resumes full responsiveness.
-# When afk is off, normal fm-watch.sh always-on triage is the active mechanism.
-# Any buffered daemon escalations that remain while afk is off survive in
-# state/.subsuper-escalations and are flushed on the next "while you were out"
-# catch-up or when afk is re-entered.
+# OPERATING MODES. FM_SUPERVISE_MODE=away preserves the /afk presence gate:
+# injection is allowed only while state/.afk exists. FM_SUPERVISE_MODE=normal
+# is the durable model-free primary supervisor: it owns the same watcher and
+# shell classifier without setting .afk, silently handles routine/unchanged
+# work, and injects one deduplicated actionable digest when firstmate must wake.
+# If .afk appears under a normal daemon, away-mode classification wins until
+# the flag clears, so entering away mode never creates a second daemon or
+# weakens its existing semantics.
 #
 # IN-BAND SENTINEL MARKER. Every daemon injection is prefixed with
 # FM_INJECT_MARK (ASCII unit separator, 0x1f) — a byte a human would never type
@@ -226,7 +226,12 @@ if [ "$(uname)" = Darwin ]; then
 else
   _stat_file_mtime() { stat -c %Y "$1" 2>/dev/null; }
 fi
-_now() { date +%s; }
+_now() {
+  case "${FM_TEST_NOW_EPOCH:-}" in
+    ''|*[!0-9]*) date +%s ;;
+    *) printf '%s\n' "$FM_TEST_NOW_EPOCH" ;;
+  esac
+}
 _file_age() {  # seconds since mtime; very large if missing
   local f=$1 m
   m=$(_stat_file_mtime "$f") || { echo 999999; return; }
@@ -242,6 +247,18 @@ _hash_text() {
 # afk_active: 0 if the durable away-mode flag exists, 1 otherwise.
 afk_active() {  # <state>
   [ -e "$1/$AFK_FLAG_NAME" ]
+}
+
+normal_supervision_enabled() {
+  [ "${FM_SUPERVISE_MODE:-away}" = normal ]
+}
+
+normal_supervision_active() {  # <state>
+  normal_supervision_enabled && ! afk_active "$1"
+}
+
+daemon_delivery_enabled() {  # <state>
+  afk_active "$1" || normal_supervision_enabled
 }
 
 # afk_enter / afk_exit: write/clear the away-mode flag. Called by the /afk
@@ -491,12 +508,28 @@ pause_marker_remove() {  # <window> <state>
   rm -f "$state/.subsuper-paused-$key"
 }
 
+pause_activity_fingerprint() {  # <state> <task>
+  local state=$1 task=$2 status turn status_sig=absent turn_sig=absent
+  status="$state/$task.status"
+  turn="$state/$task.turn-ended"
+  [ ! -e "$status" ] || status_sig=$(cksum "$status" 2>/dev/null || echo unreadable)
+  [ ! -e "$turn" ] || turn_sig=$(cksum "$turn" 2>/dev/null || echo unreadable)
+  _hash_text "status=${status_sig}|turn=${turn_sig}"
+}
+
+pause_activity_latch_record() {  # <window> <state>
+  local win=$1 state=$2 task key
+  task=$(window_to_task "$win" "$state")
+  key=$(_stale_key "$task")
+  pause_activity_fingerprint "$state" "$task" > "$state/.subsuper-pause-active-$key"
+}
+
 clear_pause_tracking() {  # <window> <state>
   local win=$1 state=$2 task key watcher_key
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   watcher_key=$(_stale_key "$win")
-  rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
+  rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-pause-active-$key" "$state/.subsuper-stale-$key" \
     "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
@@ -516,7 +549,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
 }
 
 migrate_watcher_pause_markers() {  # <state>
-  local state=$1 meta win task key last watcher_key
+  local state=$1 meta win task key last watcher_key active
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
@@ -525,6 +558,13 @@ migrate_watcher_pause_markers() {  # <state>
     key=$(_stale_key "$task")
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
+    active="$state/.subsuper-pause-active-$key"
+    if [ -e "$active" ]; then
+      if [ "$(cat "$active" 2>/dev/null || true)" = "$(pause_activity_fingerprint "$state" "$task")" ]; then
+        continue
+      fi
+      rm -f "$active"
+    fi
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
     fi
@@ -648,6 +688,9 @@ stale_window_is_busy() {  # <window> <state>
 escalate_add() {  # <state> <distilled-item>
   local state=$1 item=$2 buf
   buf="$state/.subsuper-escalations"
+  if [ -s "$buf" ] && grep -Fqx -- "$item" "$buf" 2>/dev/null; then
+    return 0
+  fi
   [ -s "$buf" ] || _now > "${buf}.since"
   printf '%s\n' "$item" >> "$buf"
 }
@@ -659,7 +702,7 @@ escalate_flush() {  # <state>
   local state=$1 buf item n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
-  n=$(wc -l < "$buf" 2>/dev/null || echo 0)
+  n=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
@@ -990,7 +1033,7 @@ housekeeping() {  # <state>
   # retry the normal delivery path. If that still cannot confirm, raise a loud
   # wedge alarm while preserving the buffer.
   max_defer=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
-  if afk_active "$state" && [ "$max_defer" -gt 0 ] && [ -s "$state/.subsuper-escalations" ]; then
+  if daemon_delivery_enabled "$state" && [ "$max_defer" -gt 0 ] && [ -s "$state/.subsuper-escalations" ]; then
     oldest=$(_oldest_line_age "$state/.subsuper-escalations")
     # Throttle the alarm to once per max-defer window (the wedge marker doubles
     # as the throttle). A successful flush clears the buffer; a failed one alarms
@@ -1041,6 +1084,34 @@ housekeeping() {  # <state>
   # still declaring the pause -> escalate a recheck digest and reset the marker so
   # the window repeats.
   pause_secs=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+
+  # A direct-activity latch is event/state-bound, not drain-bound. The same
+  # unchanged busy endpoint stays deduped across unrelated queue drains. A
+  # status/turn fingerprint change is handled by migration above; an endpoint
+  # transition back to idle clears the latch and re-arms quiet pause tracking.
+  for marker in "$state"/.subsuper-pause-active-*; do
+    [ -e "$marker" ] || continue
+    key="${marker##*.subsuper-pause-active-}"
+    win=$(window_for_task "$key" "$state" 2>/dev/null || true)
+    [ -n "$win" ] || { rm -f "$marker"; continue; }
+    task=$(window_to_task "$win" "$state")
+    if [ "$(cat "$marker" 2>/dev/null || true)" != "$(pause_activity_fingerprint "$state" "$task")" ]; then
+      rm -f "$marker"
+      reconcile_pause_tracking "$win" "$state" "$(last_status_line "$state/$task.status")"
+      continue
+    fi
+    stale_window_is_busy "$win" "$state"
+    case "$?" in
+      0) log "normal direct-activity event remains busy and deduped: $win" ;;
+      2) log "normal direct-activity endpoint unreadable; latch retained fail-closed: $win" ;;
+      *)
+        rm -f "$marker"
+        last=$(last_status_line "$state/$task.status")
+        status_is_paused "$last" && pause_marker_record "$win" "$state"
+        ;;
+    esac
+  done
+
   for marker in "$state"/.subsuper-paused-*; do
     [ -e "$marker" ] || continue
     key="${marker##*.subsuper-paused-}"
@@ -1051,21 +1122,52 @@ housekeeping() {  # <state>
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
     if [ -z "$last" ] || ! status_is_paused "$last"; then
+      if normal_supervision_active "$state"; then
+        escalate_add "$state" "paused endpoint changed state directly: $win (${last:-no status}; inspect before continuing)"
+      fi
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
+    fi
+    if normal_supervision_active "$state"; then
+      stale_window_is_busy "$win" "$state"
+      case "$?" in
+        0)
+          escalate_add "$state" "paused endpoint became active directly: $win (inspect before continuing)"
+          pause_activity_latch_record "$win" "$state"
+          rm -f "$marker"
+          continue
+          ;;
+        2)
+          rm -f "$marker"
+          continue
+          ;;
+      esac
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
-      0) rm -f "$marker" ;;
+      0)
+        if normal_supervision_active "$state"; then
+          escalate_add "$state" "paused endpoint became active directly: $win (inspect before continuing)"
+          pause_activity_latch_record "$win" "$state"
+        fi
+        rm -f "$marker"
+        ;;
       2) rm -f "$marker" ;;
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          if normal_supervision_active "$state"; then
+            log "normal recheck self-handled: unchanged paused endpoint after ${age}s: $win"
+          else
+            escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          fi
           _now > "$marker"
         else
+          if normal_supervision_active "$state"; then
+            escalate_add "$state" "paused endpoint changed state during recheck: $win (${last:-no status}; inspect before continuing)"
+          fi
           rm -f "$marker"
         fi
         ;;
@@ -1129,10 +1231,10 @@ window_for_task() {  # <task-key> [state]
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer
   state="${2:-$(_state_root)}"
-  # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
-  # daemon self-handles and stays quiet; firstmate drives the normal always-on
-  # watcher triage. Escalations buffer and survive for the next catch-up flush.
-  afk_active "$state" || { log "inject deferred: afk inactive"; return 1; }
+  # (1) Mode gate. Away mode remains presence-gated by state/.afk. Normal mode
+  # is explicitly started as the primary's durable model-free supervisor and
+  # may wake the primary without creating .afk.
+  daemon_delivery_enabled "$state" || { log "inject deferred: away mode inactive"; return 1; }
   # (2) Single-line digest: collapse any embedded newlines so submission via
   # send-keys + Enter is unambiguous regardless of how the TUI composer treats
   # them. Then prepend the sentinel marker - firstmate's afk-exit contract
@@ -1287,6 +1389,13 @@ handle_wake() {  # <reason> <state>
       log "self-handle: $reason -> $distilled"
       ;;
   esac
+  if [ "$action" != escalate ] && normal_supervision_active "$state" \
+    && command -v fm_wake_ack_payload >/dev/null 2>&1; then
+    if ! fm_wake_ack_payload "$reason"; then
+      log "ERROR: normal supervisor could not acknowledge self-handled wake: $reason"
+      escalate_add "$state" "supervisor queue acknowledgement failed; drain wakes before continuing"
+    fi
+  fi
 }
 
 # --- log --------------------------------------------------------------------
@@ -1372,7 +1481,7 @@ fm_super_main() {
   # harness-verification discipline). This is the clear refusal the task calls
   # for, instead of a confusing "does not resolve to a tmux pane" error.
   if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+    echo "error: supervisor daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
     log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
@@ -1422,7 +1531,7 @@ fm_super_main() {
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); mode=${FM_SUPERVISE_MODE:-away}; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
@@ -1466,12 +1575,13 @@ fm_super_main() {
   }
 
   start_watcher() {
-    local daemon_pid daemon_identity
+    local daemon_pid daemon_identity owner_mode=away-inject
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
     daemon_pid=${BASHPID:-$$}
     daemon_identity=$(cat "$LOCK/pid-identity" 2>/dev/null || true)
+    normal_supervision_enabled && owner_mode=normal-inject
     FM_WATCH_OWNER_KIND=daemon \
-    FM_WATCH_OWNER_MODE=away-inject \
+    FM_WATCH_OWNER_MODE="$owner_mode" \
     FM_WATCH_OWNER_PID="$daemon_pid" \
     FM_WATCH_OWNER_IDENTITY="$daemon_identity" \
       "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &

@@ -12,6 +12,7 @@ set -u
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
+SUPERVISOR_START="$ROOT/bin/fm-supervisor-start.sh"
 # Source the daemon's pure functions once. Its main loop is skipped under sourcing
 # via a BASH_SOURCE guard, so only classify_*/housekeeping/escalate_*/afk_* and the
 # pane/submit helpers become defined.
@@ -73,6 +74,24 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a stale daemon lock with a reused pid"
   assert_not_contains "$out" "another fm-supervise-daemon is already running" "daemon singleton lock still trusted the reused pid"
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
+}
+
+test_normal_start_reuses_one_identity_bound_daemon_per_home() {
+  local dir state lock pid identity out status
+  dir=$(make_supercase normal-start-live-daemon)
+  state="$dir/state"; lock="$state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  sleep 60 & pid=$!
+  identity=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//')
+  printf '%s\n' "$pid" > "$lock/pid"
+  printf '%s\n' "$identity" > "$lock/pid-identity"
+  out=$(FM_STATE_OVERRIDE="$state" "$SUPERVISOR_START" 2>&1); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$status" -eq 0 ] || fail "normal supervisor start rejected a live identity-bound daemon: $out"
+  assert_contains "$out" "daemon already running pid=$pid" "normal start did not reuse the per-home daemon"
+  [ ! -e "$state/.afk" ] || fail "normal start created the afk flag"
+  pass "normal start reuses one identity-bound daemon per FM_HOME without entering afk"
 }
 
 test_daemon_state_root_uses_fm_home() {
@@ -356,6 +375,95 @@ test_housekeeping_paused_resurfaces_and_resets() {
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
+test_normal_supervisor_quiet_hour_is_shell_only() {
+  local dir state fakebin win pane key wake_log
+  dir=$(make_supercase normal-quiet-hour)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-normal-q1"; pane="$dir/pane.txt"
+  key=$(printf '%s' "held-normal-q1" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-normal-q1.meta"
+  printf 'paused: waiting for the scheduled release window\n' > "$state/held-normal-q1.status"
+  printf 'idle prompt $\n' > "$pane"
+  printf '1000\n' > "$state/.subsuper-paused-$key"
+  wake_log="$dir/model-wakes.log"
+  (
+    inject_msg() { printf 'wake\n' >> "$wake_log"; return 0; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=4600 \
+      FM_PAUSE_RESURFACE_SECS=3600 housekeeping "$state"
+  ) || fail "normal quiet-hour housekeeping failed"
+  [ ! -s "$wake_log" ] || fail "unchanged quiet hour requested a model wake"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "unchanged quiet hour buffered an escalation"
+  [ "$(cat "$state/.subsuper-paused-$key")" = 4600 ] || fail "shell-only recheck did not reset the pause window"
+  pass "normal supervisor observes a deterministic quiet hour and unchanged recheck with zero model wakes"
+}
+
+test_normal_supervisor_direct_pause_activity_wakes_once() {
+  local dir state fakebin win pane key wake_log wakes drain_out
+  dir=$(make_supercase normal-direct-activity)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-normal-a1"; pane="$dir/pane.txt"
+  key=$(printf '%s' "held-normal-a1" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/held-normal-a1.meta"
+  printf 'paused: waiting for upstream\n' > "$state/held-normal-a1.status"
+  printf 'Working...\n' > "$pane"
+  printf '1000\n' > "$state/.subsuper-paused-$key"
+  wake_log="$dir/model-wakes.log"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1001 \
+      housekeeping "$state"
+    escalate_flush "$state"
+    housekeeping "$state"
+    escalate_flush "$state"
+  ) || fail "normal direct-activity handling failed"
+  wakes=$(wc -l < "$wake_log" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 1 ] || fail "one direct activity event requested $wakes model wakes"
+  grep -F 'paused endpoint became active directly' "$wake_log" >/dev/null \
+    || fail "direct activity wake lacked the fail-closed reason"
+  [ -e "$state/.subsuper-pause-active-$key" ] || fail "direct activity did not retain its event-bound dedupe latch"
+  append_wake "$state" heartbeat unrelated-heartbeat "heartbeat"
+  touch "$state/.last-watcher-beat"
+  drain_out=$(FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-wake-drain.sh")
+  assert_contains "$drain_out" "heartbeat" "unrelated wake was not drained"
+  [ -e "$state/.subsuper-pause-active-$key" ] || fail "unrelated wake drain re-armed direct activity"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=2000 \
+      housekeeping "$state"
+    escalate_flush "$state"
+  ) || fail "post-drain direct-activity dedupe failed"
+  wakes=$(wc -l < "$wake_log" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 1 ] || fail "unchanged busy endpoint requested a second wake after drain ($wakes total)"
+  printf 'idle prompt $\n' > "$pane"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=2001 \
+    housekeeping "$state"
+  [ ! -e "$state/.subsuper-pause-active-$key" ] || fail "idle endpoint transition did not resolve direct activity"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "idle endpoint transition did not re-arm pause tracking"
+  pass "direct activity produces one wake and stays deduped after unrelated drain until endpoint state changes"
+}
+
+test_normal_supervisor_self_handle_ack_preserves_unrelated_wake() {
+  local dir state queue reason
+  dir=$(make_supercase normal-exact-ack)
+  state="$dir/state"; queue="$state/.wake-queue"
+  printf 'working: unchanged routine progress\n' > "$state/quiet.status"
+  reason="signal: $state/quiet.status"
+  append_wake "$state" signal quiet "$reason"
+  append_wake "$state" check actionable "check: $state/actionable.check.sh: ready"
+  FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1"
+    . "$2"
+    handle_wake "$3" "$4"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$reason" "$state"
+  grep -F "$reason" "$queue" >/dev/null 2>&1 && fail "normal self-handler retained its handled wake"
+  grep -F "check: $state/actionable.check.sh: ready" "$queue" >/dev/null 2>&1 \
+    || fail "normal self-handler removed an unrelated actionable wake"
+  pass "normal supervisor acknowledges only its self-handled wake and preserves unrelated actionables"
+}
+
 # A pause whose pane became busy again (the crew resumed) drops its marker without
 # escalating, exactly like a resumed wedge.
 test_housekeeping_paused_resumed_cleared() {
@@ -597,6 +705,24 @@ test_escalate_batches_into_one_digest() {
   pass "multiple escalations flush as a single batched digest"
 }
 
+test_normal_supervisor_deduplicates_one_event_one_wake() {
+  local dir state wake_log wakes
+  dir=$(make_supercase normal-one-event)
+  state="$dir/state"; wake_log="$dir/model-wakes.log"
+  escalate_add "$state" "needs-decision: choose release window"
+  escalate_add "$state" "needs-decision: choose release window"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    FM_SUPERVISE_MODE=normal escalate_flush "$state"
+    FM_SUPERVISE_MODE=normal escalate_flush "$state"
+  ) || fail "normal deduplicated flush failed"
+  wakes=$(wc -l < "$wake_log" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 1 ] || fail "one deduplicated event requested $wakes model wakes"
+  grep -F 'Supervisor escalate (1 event(s))' "$wake_log" >/dev/null \
+    || fail "deduplicated batch did not contain exactly one event: $(cat "$wake_log")"
+  pass "one actionable event produces one deduplicated normal-mode wake"
+}
+
 test_escalate_batch_age_uses_first_append() {
   local dir state fakebin sent capture
   dir=$(make_supercase batch-age)
@@ -730,6 +856,21 @@ test_afk_absent_daemon_does_not_inject() {
   [ -s "$sent" ] && fail "daemon injected while afk inactive"
   [ -s "$state/.subsuper-escalations" ] || fail "buffer not preserved when afk inactive"
   pass "afk flag absent: daemon does not inject, buffer preserved"
+}
+
+test_normal_mode_injects_without_entering_afk() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase normal-inject)
+  state="$dir/state"; fakebin="$dir/fakebin"; sent="$dir/sent.log"; capture="$dir/pane.txt"
+  : > "$sent"; : > "$capture"
+  escalate_add "$state" "done: PR 1"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_SUPERVISE_MODE=normal escalate_flush "$state" \
+    || fail "normal-mode escalation did not inject"
+  [ ! -e "$state/.afk" ] || fail "normal supervisor implicitly entered away mode"
+  [ "$(grep -c '\[ENTER\]' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "normal supervisor did not submit exactly one wake"
+  pass "normal daemon injects one marked wake without creating the afk flag"
 }
 
 test_busy_guard_defers_when_supervisor_busy() {
@@ -1712,6 +1853,7 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
+test_normal_start_reuses_one_identity_bound_daemon_per_home
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
@@ -1731,6 +1873,9 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_normal_supervisor_quiet_hour_is_shell_only
+test_normal_supervisor_direct_pause_activity_wakes_once
+test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
@@ -1740,6 +1885,7 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale
 test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
+test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
@@ -1749,6 +1895,7 @@ test_terminal_stale_escalate_leaves_no_marker
 test_signal_escalate_marks_seen_no_catchall_refire
 test_collapse_newlines_pure
 test_afk_absent_daemon_does_not_inject
+test_normal_mode_injects_without_entering_afk
 test_busy_guard_defers_when_supervisor_busy
 test_marker_detection
 test_afk_turn_exemption

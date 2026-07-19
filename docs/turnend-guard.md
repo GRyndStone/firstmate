@@ -13,6 +13,7 @@ On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about
 
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
 When tasks are in flight, a harness hook must block the turn end or keep forcing bounded follow-ups unless queued wakes are drained and a live identity-matched watcher has a verified owner that survives turn yield.
+Codex normal supervision uses the same local sub-supervisor daemon as away mode without creating `state/.afk`.
 
 ## Shared Predicate
 
@@ -26,7 +27,16 @@ If no task is in flight, it exits silently.
 If work is in flight, the durable wake queue must be empty and `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh` must succeed.
 Queue emptiness is the existing mechanical receipt that wake handling reached `bin/fm-wake-drain.sh`.
 The live watcher lock must also name a live identity-matched owner declared by its wrapper and recorded by `bin/fm-watch.sh`.
-Normal supervision requires an `arm` owner, while away-mode supervision requires the matching live daemon owner and active `.afk` declaration.
+Claude and Grok normal supervision require an `arm` owner.
+Codex normal supervision requires a `daemon` owner with mode `normal-inject`; that owner remains valid if `.afk` later appears, while an `away-inject` owner is accepted only while `.afk` is active.
+Both daemon modes must match `state/.supervise-daemon.pid` and the live identity recorded in `state/.supervise-daemon.lock`.
+The daemon owns one watcher child and one singleton lock per `FM_HOME`; a dead or identity-mismatched daemon invalidates ownership even if an orphaned watcher and fresh beacon remain.
+In normal mode routine wakes, unchanged declared pauses, and scheduled unchanged-pause rechecks stay in shell and consume no model turns.
+One deduplicated actionable batch may inject one marked wake, after which queue emptiness requires `bin/fm-wake-drain.sh` before turn end.
+Direct activity or a status transition in a formerly paused endpoint is actionable in normal mode rather than silently clearing pause tracking.
+Its dedupe latch is bound to the paused status, turn receipt, and endpoint activity state; draining any wake queue does not re-arm unchanged activity.
+An authoritative status or turn change, an endpoint transition back to idle, or an explicit recorded disposition resolves that event and permits a later distinct event to wake once.
+If `.afk` appears under a normal daemon, the existing away-mode classification and pause re-surface behavior take precedence until away mode exits.
 An `arm` owner is valid only while both the wrapper and its identity-matched harness tracker remain live.
 A foreground `checkpoint` owner never authorizes turn end because that owner cannot survive turn yield.
 A stale beacon blocks even if a watcher pid is still live.

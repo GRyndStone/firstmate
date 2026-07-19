@@ -33,8 +33,8 @@ batched digest rather than per-wake injections.
    Codex/herdr can reap fire-and-forget shell children after a tool call
    returns; a tracked background terminal/session keeps the daemon attached to
    the harness lifecycle and survived the real incident reproduction.
-   The daemon is **presence-gated**: it injects escalations only while
-   `state/.afk` exists, and stays quiet otherwise.
+   Away behavior is **presence-gated** by `state/.afk`.
+   A Codex normal-mode daemon may already be live; the helper reuses it, and the flag makes away-mode classification take precedence without creating a second daemon.
 
 3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
    its child; the singleton lock no-ops a stray arm harmlessly.
@@ -47,7 +47,8 @@ batched digest rather than per-wake injections.
 No `/back` is needed. The first genuine message is the return signal:
 
 - A message **without** the sentinel marker and **not** starting with `/afk` -> the captain is back.
-  Clear `state/.afk`, stop the daemon, flush one distilled "while you were out" catch-up (drain `state/.wake-queue`, summarize any pending escalations from `state/.subsuper-escalations` and any `state/.subsuper-inject-wedged` marker), and resume full per-wake responsiveness through the emitted primary-harness supervision protocol from session start.
+  Clear `state/.afk`, flush one distilled "while you were out" catch-up (drain `state/.wake-queue`, summarize any pending escalations from `state/.subsuper-escalations` and any `state/.subsuper-inject-wedged` marker), and resume full per-wake responsiveness through the emitted primary-harness supervision protocol from session start.
+  Retain a Codex normal-mode daemon because clearing the flag returns it to normal classification; otherwise stop the away daemon before resuming the emitted protocol.
 - A message **with** the sentinel marker (`FM_INJECT_MARK`, ASCII 0x1f) -> it
   is a daemon escalation; stay afk and process it.
 - Re-invoking `/afk` while already away -> stay afk (refresh the flag); this

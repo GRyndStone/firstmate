@@ -86,7 +86,6 @@ case "$HARNESS" in
 esac
 [ -f "$SNIPPET" ] || SNIPPET="$DOC_DIR/unknown.md"
 
-checkpoint_seconds=${FM_CODEX_WATCH_CHECKPOINT:-180}
 pi_ext="$FM_ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 pi_turnend_ext="$FM_ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
 x_mode_env="$CONFIG/x-mode.env"
@@ -137,7 +136,7 @@ repair_line() {
       printf '%s%s\n' "$prefix" 'resume supervision with bin/fm-watch-arm.sh as its own Claude Code background task, never shell &.'
       ;;
     codex)
-      printf '%s%s%s%s\n' "$prefix" 'resume supervision with a foreground checkpoint: bin/fm-watch-checkpoint.sh --seconds ' "$checkpoint_seconds" '.'
+      printf '%s%s\n' "$prefix" 'resume supervision with bin/fm-supervisor-start.sh as its own Codex tracked background task, never shell &.'
       ;;
     pi)
       printf '%s%s%s%s%s%s\n' "$prefix" 'resume supervision with the Pi tool fm_watch_arm_pi or restart Pi with -e ' "$pi_turnend_ext" ' -e ' "$pi_ext" ' if the extension is not loaded.'

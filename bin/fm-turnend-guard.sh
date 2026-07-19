@@ -70,15 +70,17 @@ fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 
 daemon_owner_is_active() {
-  local owner_pid=$1 owner_identity daemon_pid daemon_lock_pid daemon_lock_identity
-  [ "$FM_WATCHER_OWNER_MODE" = away-inject ] || return 1
-  [ -e "$STATE/.afk" ] || return 1
+  local owner_pid=$1 daemon_pid daemon_lock_pid
+  case "$FM_WATCHER_OWNER_MODE" in
+    away-inject) [ -e "$STATE/.afk" ] || return 1 ;;
+    normal-inject) ;;
+    *) return 1 ;;
+  esac
   daemon_pid=$(cat "$STATE/.supervise-daemon.pid" 2>/dev/null || true)
-  daemon_lock_pid=$(cat "$STATE/.supervise-daemon.lock/pid" 2>/dev/null || true)
-  daemon_lock_identity=$(cat "$STATE/.supervise-daemon.lock/pid-identity" 2>/dev/null || true)
+  daemon_lock_pid=$(fm_identity_lock_live_pid "$STATE/.supervise-daemon.lock" 2>/dev/null) || return 1
   [ "$daemon_pid" = "$owner_pid" ] || return 1
   [ "$daemon_lock_pid" = "$owner_pid" ] || return 1
-  [ "$daemon_lock_identity" = "$owner_identity" ]
+  return 0
 }
 
 WATCH_OWNER_DESC="no healthy watcher"
@@ -90,11 +92,10 @@ elif fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
     case "$FM_WATCHER_OWNER_KIND" in
       arm) exit 0 ;;
       daemon)
-        owner_identity=$(cat "$STATE/.watch.lock/owner-identity" 2>/dev/null || true)
-        if daemon_owner_is_active "$FM_WATCHER_OWNER_PID" "$owner_identity"; then
+        if daemon_owner_is_active "$FM_WATCHER_OWNER_PID"; then
           exit 0
         fi
-        WATCH_OWNER_DESC="daemon owner is not active in declared away mode"
+        WATCH_OWNER_DESC="daemon owner is dead, identity-mismatched, or not active for its declared mode"
         ;;
       checkpoint) WATCH_OWNER_DESC="foreground checkpoint owner cannot survive turn yield" ;;
     esac
