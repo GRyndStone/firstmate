@@ -578,9 +578,11 @@ printf 'watcher: started pid=1 (beacon fresh)\n'
 SH
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
+[ -f "${FM_ARM_LOG:?}" ] || {
+  printf 'guard ran before watch arm\n' >&2
+  exit 2
+}
 printf 'guard\n' >> "${FM_GUARD_LOG:?}"
-printf 'guard should not run\n' >&2
-exit 2
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh" "$repo/bin/fm-turnend-guard.sh"
   out=$(ARM_PLUGIN="$arm_plugin" GUARD_PLUGIN="$guard_plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_GUARD_LOG="$guard_log" node 2>&1 <<'EOF'
@@ -616,8 +618,8 @@ if (!existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm did not run");
   process.exit(1);
 }
-if (existsSync(process.env.FM_GUARD_LOG)) {
-  console.error("turn-end guard ran before the watch arm could establish supervision");
+if (!existsSync(process.env.FM_GUARD_LOG)) {
+  console.error("turn-end guard did not verify supervision after the watch arm ran");
   process.exit(1);
 }
 if (promptBody) {
