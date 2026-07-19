@@ -324,7 +324,7 @@ install_cmd() {
 }
 
 install_no_mistakes() {
-  local checkout origin built command_path target target_dir link tmp
+  local checkout origin built command_path target target_dir link tmp daemon_status rollback rollback_tmp
   checkout="$PROJECTS/no-mistakes"
   if ! git -C "$checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "error: no-mistakes install requires an authenticated private checkout at $checkout from https://github.com/GRyndStone/no-mistakes" >&2
@@ -371,12 +371,44 @@ install_no_mistakes() {
   done
   target_dir=$(dirname "$target")
   mkdir -p "$target_dir" || return 1
+  rollback=
+  if [ -e "$target" ]; then
+    [ -x "$target" ] || {
+      echo "error: existing no-mistakes install target is not executable: $target" >&2
+      return 1
+    }
+    if ! daemon_status=$("$target" daemon status 2>&1); then
+      echo "error: cannot verify a safe stopped daemon boundary with $target: $daemon_status" >&2
+      return 1
+    fi
+    case "$daemon_status" in
+      *'daemon not running'*) ;;
+      *'daemon running'*)
+        echo "error: refusing to replace $target while its daemon is running; stop it at a safe boundary and retry" >&2
+        return 1
+        ;;
+      *)
+        echo "error: cannot verify a safe stopped daemon boundary with $target: unrecognized daemon status" >&2
+        return 1
+        ;;
+    esac
+    rollback="$target.rollback"
+    rollback_tmp=$(mktemp "$target_dir/.no-mistakes.rollback.XXXXXX") || return 1
+    if ! cp -p "$target" "$rollback_tmp" || ! mv -f "$rollback_tmp" "$rollback"; then
+      rm -f "$rollback_tmp"
+      return 1
+    fi
+  fi
   tmp=$(mktemp "$target_dir/.no-mistakes.install.XXXXXX") || return 1
   if ! install -m 755 "$built" "$tmp" || ! mv -f "$tmp" "$target"; then
     rm -f "$tmp"
     return 1
   fi
-  echo "installed no-mistakes: $target (daemon unchanged)"
+  if [ -n "$rollback" ]; then
+    echo "installed no-mistakes: $target (daemon stopped; rollback: $rollback)"
+  else
+    echo "installed no-mistakes: $target (new install; no daemon command run)"
+  fi
 }
 
 BACKEND=$(fm_backend_name)
