@@ -366,6 +366,22 @@ SH
   pass "existing blocked wait omissions fail loudly once and can be repaired in flight"
 }
 
+test_unobservable_parked_wait_fails_loudly_once() {
+  local dir state live out token
+  dir=$(make_reconcile_case unobservable-parked)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'paused: merge gate has no observer\n' > "$state/task.status"
+  printf 'state: parked · source: run-step · merge gate has no observer\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'external-wait-unobservable' "parked wait omission did not fail loudly"
+  assert_contains "$out" 'parked task has no' "parked omission wake did not identify its missing observer"
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
+  [ -z "$(observe "$state" "$live")" ] || fail "unchanged parked observer omission stormed"
+  pass "unobservable parked waits fail loudly once"
+}
+
 test_unacknowledged_transition_is_not_replaced_by_newer_state() {
   local dir state live first second token first_version second_version
   dir=$(make_reconcile_case pending-race)
@@ -743,6 +759,21 @@ SH
   pass "registered legacy checks complete exactly once through reconciliation"
 }
 
+test_unmanaged_legacy_check_remains_supported_with_generation_metadata() {
+  local dir state live out
+  dir=$(make_reconcile_case unmanaged-legacy-check)
+  state="$dir/state"
+  live="$dir/live"
+  printf '#!/usr/bin/env bash\nprintf "custom condition complete\\n"\n' > "$state/task.check.sh"
+  chmod +x "$state/task.check.sh"
+  printf 'state: parked · source: status-log · waiting for custom condition\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'external-wait-complete' "unmanaged legacy check was rejected under generation metadata"
+  assert_contains "$out" 'custom condition complete' "unmanaged legacy check lost its completion evidence"
+  assert_not_contains "$out" 'has no task lifecycle generation' "unmanaged legacy check was mistaken for a malformed managed registration"
+  pass "unmanaged per-task checks remain supported across lifecycle generation upgrades"
+}
+
 test_legacy_check_registration_requires_atomic_commit() {
   local dir state generation check_tmp registration
   dir=$(make_reconcile_case legacy-check-commit)
@@ -963,6 +994,61 @@ EOF
     assert_contains "$evidence" 'exited' "owned command $seam race lost its completion evidence"
   done
   pass "owned command exits during observation complete without false failures"
+}
+
+test_owned_command_revalidates_identity_after_progress_observation() {
+  local evaluation result evidence working identity_counter
+  identity_counter="$TMP_ROOT/post-identity-calls"
+  printf '0\n' > "$identity_counter"
+  evaluation=$(
+    fm_reconcile_pid_alive() { return 0; }
+    fm_reconcile_process_identity() {
+      identity_calls=$(cat "$identity_counter")
+      identity_calls=$((identity_calls + 1))
+      printf '%s\n' "$identity_calls" > "$identity_counter"
+      if [ "$identity_calls" -eq 1 ]; then printf 'recorded identity'; else printf 'replacement identity'; fi
+    }
+    fm_reconcile_process_cwd() { printf '/tmp/fm-owned-command-reuse'; }
+    fm_reconcile_process_tree_signature() { printf 'replacement-progress'; }
+    FM_RECONCILE_WAIT_PRESENT=1
+    FM_RECONCILE_WAIT_KIND=process
+    FM_RECONCILE_WAIT_DESCRIPTION='reused owned command pid'
+    FM_RECONCILE_WAIT_SIGNATURE=process-post-identity-race
+    FM_RECONCILE_WAIT_PID=4242
+    FM_RECONCILE_WAIT_PID_IDENTITY='recorded identity'
+    FM_RECONCILE_WAIT_ROLE=working-command
+    FM_RECONCILE_WAIT_PROGRESS_GRACE=30
+    FM_RECONCILE_WAIT_OWNER_WORKTREE=/tmp/fm-owned-command-reuse
+    FM_RECONCILE_WAIT_OWNER_TASKTMP=
+    FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
+    FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION='legacy:1:2'
+    FM_RECONCILE_WAIT_UNMANAGED_LEGACY=0
+    fm_reconcile_wait_evaluate /dev/null 10
+    printf '%s\t%s\t%s\n' "$FM_RECONCILE_WAIT_RESULT" "$FM_RECONCILE_WAIT_EVIDENCE" "$FM_RECONCILE_WAIT_WORKING"
+  )
+  IFS=$(printf '\t') read -r result evidence working <<EOF
+$evaluation
+EOF
+  [ "$result" = complete ] || fail "post-observation pid reuse was classified as $result"
+  [ "$working" = 0 ] || fail "post-observation pid reuse became positive working evidence"
+  assert_contains "$evidence" 'identity changed' "post-observation pid reuse lost its completion evidence"
+  pass "owned command identity is revalidated after progress sampling"
+}
+
+test_spawn_claim_rechecks_endpoint_after_treehouse_absence() {
+  bash -c '
+    . "$1/bin/fm-backend.sh"
+    calls=0
+    fm_backend_spawn_label_absent() {
+      calls=$((calls + 1))
+      [ "$calls" -eq 1 ]
+    }
+    fm_backend_treehouse_lease_absent() { return 0; }
+    fm_backend_spawn_claim_absent tmux fm-task firstmate "" /project task
+    rc=$?
+    [ "$rc" -eq 1 ] && [ "$calls" -eq 2 ]
+  ' _ "$ROOT" || fail "spawn claim accepted lease absence without rechecking its endpoint"
+  pass "spawn claim rechecks endpoint absence after treehouse lease proof"
 }
 
 test_owned_command_cannot_mask_newer_terminal_state() {
@@ -1227,6 +1313,7 @@ test_unchanged_terminal_wait_does_not_mask_live_transition
 test_signaled_predicate_is_not_reported_complete
 test_unobservable_pause_fails_loudly_and_busy_stays_quiet
 test_inflight_unregistered_blocked_wait_fails_loudly_once
+test_unobservable_parked_wait_fails_loudly_once
 test_unacknowledged_transition_is_not_replaced_by_newer_state
 test_unacknowledged_transition_folds_newer_sparse_event
 test_acknowledgement_race_preserves_notified_token
@@ -1240,6 +1327,7 @@ test_owned_command_does_not_override_first_terminal_observation
 test_owned_command_overrides_older_persisted_idle
 test_owned_command_overrides_historical_wait_events
 test_registered_legacy_check_completes_once_in_reconciliation
+test_unmanaged_legacy_check_remains_supported_with_generation_metadata
 test_legacy_check_registration_requires_atomic_commit
 test_failed_legacy_check_output_is_failure
 test_repository_identity_failure_preserves_proven_binding
@@ -1247,12 +1335,14 @@ test_lifecycle_generation_prevents_metadata_aba_publication
 test_delivery_version_is_unique_across_task_lifecycles
 test_process_identity_toctou_classifies_exit_as_complete
 test_owned_command_observation_races_classify_exit_as_complete
+test_owned_command_revalidates_identity_after_progress_observation
 test_owned_command_cannot_mask_newer_terminal_state
 test_generation_cas_and_spawn_claim_revalidate_lifecycle
 test_teardown_claim_is_live_and_generation_bound
 test_teardown_refuses_active_spawn_claim
 test_partial_spawn_rescue_claim_survives_owner_exit
 test_treehouse_rescue_reconciles_by_persisted_holder
+test_spawn_claim_rechecks_endpoint_after_treehouse_absence
 test_dead_spawn_claim_after_creation_started_is_retained
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

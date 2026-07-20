@@ -813,6 +813,8 @@ test_tab_absence_requires_parseable_inventory() {
   printf '[{"tab_id":3,"name":"renamed-task"}]\n' > "$dir/responses/1.out"
   printf '{}\n' > "$dir/responses/2.out"
   printf '[]\n' > "$dir/responses/3.out"
+  printf '[{"tab_id":"3","name":7}]\n' > "$dir/responses/4.out"
+  printf '[{"id":7,"tab_id":3}]\n' > "$dir/responses/5.out"
   fb=$(make_zellij_fakebin "$dir")
   set +e
   PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
@@ -833,7 +835,19 @@ test_tab_absence_requires_parseable_inventory() {
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate 3 fm-task' "$ROOT" \
     || fail "empty parseable zellij inventory was not recognized as absent"
   set +e
-  pass "zellij absence distinguishes empty inventories from failed reads"
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate 3 fm-task' "$ROOT"
+  status=$?
+  expect_code 2 "$status" "malformed zellij tab records must remain unknown"
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate "" "" 7' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed zellij pane records must remain unknown"
+  set +e
+  pass "zellij absence validates every inventory record before returning absent"
 }
 
 test_tab_absence_ignores_plugin_id_collisions() {

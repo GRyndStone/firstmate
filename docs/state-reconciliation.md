@@ -22,7 +22,7 @@ Fleet view and bearings consume that snapshot, and bearings never substitutes th
 
 ## Observable external waits
 
-Register an observer before appending `paused:` or `blocked:` and parking foreground work.
+Register an observer before appending `paused:`, `blocked:`, or a parked wait and parking foreground work.
 A predicate is an executable with no shell evaluation: exit 0 means complete, exit 1 means pending, and any other exit or a timeout is an actionable failure.
 A process registration captures both the pid and its operating-system identity, so process exit or pid reuse is completion while the identical live process remains pending.
 
@@ -40,7 +40,7 @@ Registration refuses a command whose current directory is outside the task's rec
 The reconciler follows only descendants of the exact registered pid and compares their pid, start-time, and CPU-time shape with the last persisted observation; process names never select or classify the work, and no cross-home discovery occurs.
 Fresh descendant progress is `working` evidence with source `owned-command`, while a live but unchanged tree ages out after the registered grace instead of masking a wedge forever.
 The exact process exit or identity change remains an immediate model-free completion signal.
-A `paused` or `blocked` task with no registration or legacy per-task check emits one `external-wait-unobservable` wake, including an existing task first observed after supervisor rollout, and a missing, non-executable, timed-out, or failed predicate emits one `external-wait-failed` wake.
+A `paused`, `blocked`, or `parked` task with no registration or legacy per-task check emits one `external-wait-unobservable` wake, including an existing task first observed after supervisor rollout, and a missing, non-executable, timed-out, or failed predicate emits one `external-wait-failed` wake.
 An unchanged pending registration stays quiet, and acknowledged completion or failure stays deduplicated across watcher and daemon restarts.
 An unacknowledged transition token cannot be replaced by a newer observation during crash recovery; the wake retains the original event evidence, folds in any newer actionable condition, and persists the newer live state separately as current truth.
 Newer status and turn-end evidence is folded into that pending wake before its exact suppressor signatures advance.

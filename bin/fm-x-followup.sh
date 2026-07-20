@@ -143,10 +143,14 @@ META="$STATE/$ID.meta"
 FOLLOWUP_LOCK_HELD=0
 PAYLOAD_TEXT=
 PAYLOAD_IMAGE=
+IMAGE_PAYLOAD_FILE=
+REQUEST_BODY_FILE=
 # shellcheck disable=SC2329
 followup_lock_release() {
   [ -z "$PAYLOAD_TEXT" ] || rm -f "$PAYLOAD_TEXT"
   [ -z "$PAYLOAD_IMAGE" ] || rm -f "$PAYLOAD_IMAGE"
+  [ -z "$IMAGE_PAYLOAD_FILE" ] || rm -f "$IMAGE_PAYLOAD_FILE"
+  [ -z "$REQUEST_BODY_FILE" ] || rm -f "$REQUEST_BODY_FILE"
   if [ "$FOLLOWUP_LOCK_HELD" -eq 1 ]; then
     fm_reconcile_lock_release "$STATE" "$ID"
     FOLLOWUP_LOCK_HELD=0
@@ -259,20 +263,52 @@ followup_sha256() {
   fi
 }
 
-TEXT_SIZE=$(wc -c < "$PAYLOAD_TEXT" | tr -d '[:space:]') || exit 1
-IMAGE_SIZE=0
-[ -z "$PAYLOAD_IMAGE" ] || IMAGE_SIZE=$(wc -c < "$PAYLOAD_IMAGE" | tr -d '[:space:]') || exit 1
+command -v jq >/dev/null 2>&1 || { echo "fm-x-followup: jq not found" >&2; exit 1; }
+fmx_load_config
+INBOX_CONTEXT=$(fmx_request_inbox_context "$STATE" "$RID") || {
+  echo "fm-x-followup: failed to inspect request platform context" >&2
+  exit 1
+}
+EFFECTIVE_PLATFORM=$(printf '%s' "$INBOX_CONTEXT" | jq -r '.platform // ""')
+EFFECTIVE_REPLY_MAX_RAW=$(printf '%s' "$INBOX_CONTEXT" | jq -r '.reply_max_chars // ""')
+case "$REQ_PLATFORM" in discord|x) EFFECTIVE_PLATFORM=$REQ_PLATFORM ;; esac
+case "$REQ_REPLY_MAX" in ''|*[!0-9]*) ;; *) EFFECTIVE_REPLY_MAX_RAW=$REQ_REPLY_MAX ;; esac
+case "$EFFECTIVE_PLATFORM" in
+  discord|x|'') ;;
+  twitter) EFFECTIVE_PLATFORM=x ;;
+  *) EFFECTIVE_PLATFORM= ;;
+esac
+EFFECTIVE_REPLY_MAX=$(fmx_reply_limit_for_platform "$EFFECTIVE_PLATFORM" "$EFFECTIVE_REPLY_MAX_RAW")
+CHUNKS=$(printf '%s' "$TEXT" | fmx_split_thread "$EFFECTIVE_REPLY_MAX" "$FMX_THREAD_MAX") || {
+  echo "fm-x-followup: failed to split reply into a thread" >&2
+  exit 1
+}
+CHUNK_COUNT=$(printf '%s' "$CHUNKS" | jq 'length' 2>/dev/null) || CHUNK_COUNT=
+case "$CHUNK_COUNT" in ''|*[!0-9]*) echo "fm-x-followup: failed to split reply into a thread" >&2; exit 1 ;; esac
+[ "$CHUNK_COUNT" -gt 0 ] || { echo "fm-x-followup: empty follow-up text" >&2; exit 2; }
+if [ -n "$PAYLOAD_IMAGE" ]; then
+  IMAGE_PAYLOAD_FILE="$STATE/.$ID.x-followup-image-payload.${BASHPID:-$$}"
+  fmx_image_payload_file "$PAYLOAD_IMAGE" fm-x-followup "$IMAGE_PAYLOAD_FILE" >/dev/null || exit 1
+fi
+REQUEST_BODY_FILE="$STATE/.$ID.x-followup-request-body.${BASHPID:-$$}"
+if [ -n "$IMAGE_PAYLOAD_FILE" ]; then
+  fmx_reply_payload_json "$RID" "$CHUNKS" "$CHUNK_COUNT" "$IMAGE_PAYLOAD_FILE" > "$REQUEST_BODY_FILE" || exit 1
+else
+  fmx_reply_payload_json "$RID" "$CHUNKS" "$CHUNK_COUNT" > "$REQUEST_BODY_FILE" || exit 1
+fi
+REQUEST_BODY_SIZE=$(wc -c < "$REQUEST_BODY_FILE" | tr -d '[:space:]') || exit 1
 PAYLOAD_HASH=$({
-  printf 'schema=fm-x-followup-payload.v1\n'
+  printf 'schema=fm-x-followup-payload.v2\n'
   printf 'generation=%s\n' "$META_GENERATION"
   printf 'request_id=%s\n' "$RID"
   printf 'followup_count=%s\n' "$COUNT"
   printf 'final=%s\n' "$FINAL"
-  printf 'text_bytes=%s\n' "$TEXT_SIZE"
-  cat "$PAYLOAD_TEXT"
-  printf '\nimage_bytes=%s\n' "$IMAGE_SIZE"
-  printf 'image_media_type=%s\n' "$IMAGE_MEDIA_TYPE"
-  [ -z "$PAYLOAD_IMAGE" ] || cat "$PAYLOAD_IMAGE"
+  printf 'endpoint=followup\n'
+  printf 'platform=%s\n' "$EFFECTIVE_PLATFORM"
+  printf 'reply_max_chars=%s\n' "$EFFECTIVE_REPLY_MAX"
+  printf 'thread_max=%s\n' "$FMX_THREAD_MAX"
+  printf 'request_body_bytes=%s\n' "$REQUEST_BODY_SIZE"
+  cat "$REQUEST_BODY_FILE"
 } | followup_sha256) || {
   echo "fm-x-followup: no SHA-256 implementation available for payload idempotency" >&2
   exit 1
@@ -290,7 +326,7 @@ followup_operation_write() {  # <prepared|delivered> <key>
   local state=$1 key=$2 tmp
   tmp="$FOLLOWUP_OP.tmp.${BASHPID:-$$}"
   {
-    printf 'schema=fm-x-followup-operation.v2\n'
+    printf 'schema=fm-x-followup-operation.v3\n'
     printf 'state=%s\n' "$state"
     printf 'generation=%s\n' "$META_GENERATION"
     printf 'request_id=%s\n' "$RID"
@@ -308,11 +344,11 @@ if [ -f "$FOLLOWUP_OP" ] \
   && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
   && [ "$(followup_operation_value request_id)" = "$RID" ] \
   && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
-  if [ "$(followup_operation_value schema)" != fm-x-followup-operation.v2 ] \
+  if [ "$(followup_operation_value schema)" != fm-x-followup-operation.v3 ] \
     || [ "$(followup_operation_value payload_digest)" != "$PAYLOAD_DIGEST" ] \
     || [ "$(followup_operation_value final)" != "$FINAL" ] \
     || [ "$(followup_operation_value idempotency_key)" != "$EXPECTED_OP_KEY" ]; then
-    echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original text, attachment, and finality" >&2
+    echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
     exit 1
   fi
   OP_STATE=$(followup_operation_value state)
@@ -341,13 +377,11 @@ declare -a REPLY_ENV=()
 declare -a REPLY_ARGS=(--text-file "$PAYLOAD_TEXT")
 [ -z "$PAYLOAD_IMAGE" ] || REPLY_ARGS=(--image "$PAYLOAD_IMAGE" "${REPLY_ARGS[@]}")
 REPLY_ENV+=("FMX_IDEMPOTENCY_KEY=$OP_KEY")
-case "$REQ_PLATFORM" in
-  discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$REQ_PLATFORM") ;;
+case "$EFFECTIVE_PLATFORM" in
+  discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$EFFECTIVE_PLATFORM") ;;
 esac
-case "$REQ_REPLY_MAX" in
-  ''|*[!0-9]*) ;;
-  *) REPLY_ENV+=("FMX_REPLY_MAX_CHARS=$REQ_REPLY_MAX") ;;
-esac
+REPLY_ENV+=("FMX_REPLY_MAX_CHARS=$EFFECTIVE_REPLY_MAX")
+REPLY_ENV+=("FMX_X_THREAD_MAX=$FMX_THREAD_MAX")
 if [ "$OP_STATE" = delivered ]; then
   post_rc=0
 elif [ "${#REPLY_ENV[@]}" -gt 0 ]; then

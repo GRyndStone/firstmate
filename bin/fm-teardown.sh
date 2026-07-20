@@ -1137,6 +1137,15 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH" || exit 1
 fi
 
+if [ "$BACKEND" != orca ]; then
+  cleanup_recorded_partial_herdr "$META" || exit 1
+  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if ! verify_recorded_endpoint_absent "$META" "$ID"; then
+    echo "error: could not verify cleanup of task $ID $BACKEND endpoint; preserving $META" >&2
+    exit 1
+  fi
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -1182,14 +1191,6 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$BACKEND" != orca ]; then
-  cleanup_recorded_partial_herdr "$META" || exit 1
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  if ! verify_recorded_endpoint_absent "$META" "$ID"; then
-    echo "error: could not verify cleanup of task $ID $BACKEND endpoint; preserving $META" >&2
-    exit 1
-  fi
-fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit 1

@@ -917,7 +917,7 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
 }
 
 test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
-  local dir proj invalid data state config log fb out status id
+  local dir proj invalid data state config log fb out status id kill_line lease_recheck_line
   dir="$TMP_ROOT/spawn-invalid-treehouse"
   proj="$dir/project"
   invalid="$dir/not-a-worktree"
@@ -956,6 +956,10 @@ SH
   [ "$status" -ne 0 ] || fail "non-worktree treehouse path unexpectedly passed spawn validation"
   assert_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force'$'\x1f'"$invalid" \
     "spawn validation failure did not clean its uncertain treehouse worktree"
+  kill_line=$(grep -nF $'tmux\x1f''kill-window' "$log" | tail -1 | cut -d: -f1)
+  lease_recheck_line=$(grep -nF $'treehouse\x1f''status' "$log" | tail -1 | cut -d: -f1)
+  [ -n "$kill_line" ] && [ -n "$lease_recheck_line" ] && [ "$kill_line" -lt "$lease_recheck_line" ] \
+    || fail "spawn cleanup did not recheck treehouse lease absence after endpoint cleanup"
   [ ! -e "$state/$id.spawn-claim" ] \
     || fail "verified treehouse cleanup retained spawn ownership"
   assert_contains "$out" 'did not yield an isolated worktree' \
@@ -999,10 +1003,8 @@ run_teardown_case() {
     "$script" "$id"
 }
 
-test_teardown_conformance_old_vs_new() {
-  local old_bin fb proj wt id
-  local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new absence_probe
-  old_bin=$(build_old_bin teardown-old)
+test_teardown_quiesces_endpoint_before_treehouse_return() {
+  local fb proj wt id state config data log out rc absence_probe kill_line absence_line return_line
   proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
   id="teardownconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
@@ -1012,36 +1014,31 @@ test_teardown_conformance_old_vs_new() {
   mkdir -p "$data/$id"
   printf 'scout findings\n' > "$data/$id/report.md"
 
-  state_old="$TMP_ROOT/teardown-state-old"; state_new="$TMP_ROOT/teardown-state-new"
-  config_old="$TMP_ROOT/teardown-config-old"; config_new="$TMP_ROOT/teardown-config-new"
-  mkdir -p "$state_old" "$state_new" "$config_old" "$config_new"
-
-  fm_write_meta "$state_old/$id.meta" \
+  state="$TMP_ROOT/teardown-state"; config="$TMP_ROOT/teardown-config"
+  mkdir -p "$state" "$config"
+  fm_write_meta "$state/$id.meta" \
     "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off"
-  fm_write_meta "$state_new/$id.meta" \
-    "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off"
-  touch "$state_old/.last-watcher-beat" "$state_new/.last-watcher-beat"
+  touch "$state/.last-watcher-beat"
 
-  log_old="$TMP_ROOT/teardown-old.log"; log_new="$TMP_ROOT/teardown-new.log"
-  out_old=$(run_teardown_case "$old_bin/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_old" "$state_old" "$data" "$config_old" "$id" 2>&1)
-  rc_old=$?
-  out_new=$(run_teardown_case "$ROOT/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_new" "$state_new" "$data" "$config_new" "$id" 2>&1)
-  rc_new=$?
+  log="$TMP_ROOT/teardown.log"
+  out=$(run_teardown_case "$ROOT/bin/fm-teardown.sh" "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$id" 2>&1)
+  rc=$?
 
-  expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
-  expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
+  expect_code 0 "$rc" "fm-teardown.sh (scout, report present) should succeed"$'\n'"$out"
   absence_probe="tmux"$'\x1f'"list-windows"$'\x1f'"-a"$'\x1f'"-F"$'\x1f'"#{session_name}:#{window_name}"
-  assert_contains "$(cat "$log_new")" "$absence_probe" \
+  assert_contains "$(cat "$log")" "$absence_probe" \
     "teardown did not inventory tmux windows before releasing cleanup ownership"
-  grep -Fvx "$absence_probe" "$log_new" > "$TMP_ROOT/teardown-new-mutating.log" || true
-  diff -u "$log_old" "$TMP_ROOT/teardown-new-mutating.log" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
-    || fail "fm-teardown.sh: mutating tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
-  assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
+  assert_contains "$(cat "$log")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
-  assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
+  assert_contains "$(cat "$log")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
     "teardown did not call tmux kill-window -t <window>"
+  kill_line=$(grep -nF "tmux"$'\x1f''kill-window' "$log" | head -1 | cut -d: -f1)
+  absence_line=$(grep -nF "$absence_probe" "$log" | head -1 | cut -d: -f1)
+  return_line=$(grep -nF "treehouse"$'\x1f''return' "$log" | head -1 | cut -d: -f1)
+  [ "$kill_line" -lt "$absence_line" ] && [ "$absence_line" -lt "$return_line" ] \
+    || fail "teardown did not quiesce and verify its endpoint before returning the worktree"
 
-  pass "fm-teardown.sh: mutating cleanup commands remain old-compatible after absence verification"
+  pass "fm-teardown.sh quiesces and verifies endpoints before returning worktrees"
 }
 
 # --- backend selection loudly refuses an unknown backend --------------------
@@ -1222,7 +1219,7 @@ test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
 test_spawn_validation_failure_cleans_uncertain_treehouse_worktree
-test_teardown_conformance_old_vs_new
+test_teardown_quiesces_endpoint_before_treehouse_return
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag
 test_spawn_refuses_unknown_fm_backend_env

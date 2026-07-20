@@ -215,7 +215,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? cleanup_failed=0 rescue token creation_uncertain=0
+  local status=$? cleanup_failed=0 endpoint_cleanup_failed=0 rescue token creation_uncertain=0
   [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
   if [ "$SPAWN_CREATION_STARTED" -eq 1 ] \
     && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 0 ]; then
@@ -272,13 +272,13 @@ spawn_abort_cleanup() {
         if [ -n "${HERDR_TAB_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
           fm_backend_herdr_cli "$HERDR_SES" tab close "$HERDR_TAB_ID" >/dev/null 2>&1 || true
           fm_backend_herdr_tab_absent "$HERDR_SES" "${HERDR_WORKSPACE_ID:-}" "$HERDR_TAB_ID" \
-            || cleanup_failed=1
+            || endpoint_cleanup_failed=1
         elif [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
           fm_backend_kill herdr "$HERDR_SES:$HERDR_PANE_ID" 2>/dev/null || true
           fm_backend_herdr_pane_absent "$HERDR_SES" "$HERDR_PANE_ID" || true
-          cleanup_failed=1
+          endpoint_cleanup_failed=1
         else
-          cleanup_failed=1
+          endpoint_cleanup_failed=1
         fi
         ;;
       zellij)
@@ -286,31 +286,42 @@ spawn_abort_cleanup() {
           fm_backend_kill zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
           if ! fm_backend_target_absent zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" \
             "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}"; then
-            cleanup_failed=1
+            endpoint_cleanup_failed=1
           fi
         else
-          cleanup_failed=1
+          endpoint_cleanup_failed=1
         fi
         ;;
       cmux)
         if [ -n "${CMUX_WORKSPACE_ID:-}" ] || [ "$SPAWN_PARTIAL_ENDPOINT" -eq 1 ]; then
           fm_backend_kill cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" '' "${W:-fm-${ID:-}}" 2>/dev/null || true
           fm_backend_target_absent cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" \
-            '' "${W:-fm-${ID:-}}" || cleanup_failed=1
+            '' "${W:-fm-${ID:-}}" || endpoint_cleanup_failed=1
         else
-          cleanup_failed=1
+          endpoint_cleanup_failed=1
         fi
         ;;
       *)
         if [ -n "${T:-}" ]; then
           fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
-          fm_backend_target_absent "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" || cleanup_failed=1
+          fm_backend_target_absent "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" || endpoint_cleanup_failed=1
         else
-          cleanup_failed=1
+          endpoint_cleanup_failed=1
         fi
         ;;
     esac
-    [ "$cleanup_failed" -eq 1 ] || SPAWN_ENDPOINT_CREATED=0
+    if [ "$endpoint_cleanup_failed" -eq 1 ]; then
+      cleanup_failed=1
+    else
+      SPAWN_ENDPOINT_CREATED=0
+    fi
+  fi
+  if [ "${BACKEND:-}" != orca ] && [ "${KIND:-}" != secondmate ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 0 ] \
+    && [ -n "${PROJ_ABS:-}" ] \
+    && ! fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+    SPAWN_WORKTREE_CREATED=1
+    cleanup_failed=1
   fi
   if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend" 2>/dev/null || true

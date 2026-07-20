@@ -42,9 +42,19 @@ CHECK_TMP="$STATE/$ID.check.sh.tmp.${BASHPID:-$$}"
 {
   printf '#!/usr/bin/env bash\n'
   # shellcheck disable=SC2016
-  printf 'state=$(gh pr view %q --json state -q .state 2>/dev/null)\n' "$URL"
+  printf 'if ! state=$(gh pr view %q --json state -q .state 2>&1); then\n' "$URL"
   # shellcheck disable=SC2016
-  printf '[ "$state" = "MERGED" ] && echo "merged"\n'
+  printf '  printf "PR state query failed: %%s\\n" "$state" >&2\n'
+  printf '  exit 2\n'
+  printf 'fi\n'
+  # shellcheck disable=SC2016
+  printf 'case "$state" in\n'
+  printf '  MERGED) printf "merged\\n"; exit 0 ;;\n'
+  printf '  OPEN) exit 1 ;;\n'
+  printf '  CLOSED) printf "PR closed without merge\\n" >&2; exit 2 ;;\n'
+  # shellcheck disable=SC2016
+  printf '  *) printf "unexpected PR state: %%s\\n" "$state" >&2; exit 2 ;;\n'
+  printf 'esac\n'
 } > "$CHECK_TMP"
 if ! fm_reconcile_legacy_check_register "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$CHECK_TMP" "PR merge poll for $URL"; then
   echo "error: task $ID lifecycle changed while arming its PR merge poll" >&2

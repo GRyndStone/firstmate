@@ -247,10 +247,17 @@ fm_backend_orca_worktree_absent() {  # <worktree-id>
 }
 
 fm_backend_orca_worktree_name_absent() {
-  local project=${1:-} name=${2:-} repo_out repo_id list_out
+  local project=${1:-} name=${2:-} repo_out repo_id list_out repo_state
   [ -n "$project" ] && [ -n "$name" ] || return 2
   fm_backend_orca_tool_check || return 2
   repo_out=$(orca repo show --repo "path:$project" --json 2>&1) || true
+  if printf '%s' "$repo_out" | fm_backend_orca_absence_from_json \
+    repo_not_found repository_not_found repo_path_not_found repository_path_not_found; then
+    return 0
+  else
+    repo_state=$?
+  fi
+  [ "$repo_state" -eq 1 ] || return 2
   repo_id=$(printf '%s' "$repo_out" | fm_backend_orca_json_get repo-id 2>/dev/null) || return 2
   list_out=$(orca worktree list --repo "id:$repo_id" --json 2>&1) || true
   printf '%s' "$list_out" | node -e '

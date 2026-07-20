@@ -510,14 +510,22 @@ test_snapshot_separates_reconciled_truth_event_history_and_wait() {
   bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bearings-snapshot.sh" --json)
   printf '%s' "$bearings" | jq -e '
     .in_flight[] | select(.id == "reconciled-task")
-    | .state == "done" and (.doing | contains("checks green"))
-  ' >/dev/null || fail "captain-facing bearings did not consume reconciled snapshot truth"
-  assert_not_contains "$bearings" 'stale OAuth label' "bearings presented the last event prose as current truth"
+    | .state == "done"
+      and .source == "run-step"
+      and (.evidence | contains("checks green"))
+      and .freshness == "fresh"
+      and (.age_seconds | type) == "number"
+      and (.doing | contains("checks green"))
+      and (.status_event | contains("stale OAuth label"))
+      and .prior_state == "working / run-step"
+      and (.current_wait | contains("predicate:"))
+      and (.current_wait | contains("complete"))
+  ' >/dev/null || fail "captain-facing bearings did not separate current truth, evidence, history, and wait state"
   pass "snapshot and captain-facing views separate reconciled truth from stale event history"
 }
 
 test_snapshot_rejects_stale_generation_reconciliation() {
-  local home fakebin out now bearings
+  local home fakebin out now bearings view
   home=$(make_home stale-generation)
   mkdir -p "$home/projects/generation-task"
   fm_write_meta "$home/state/generation-task.meta" \
@@ -575,8 +583,13 @@ test_snapshot_rejects_stale_generation_reconciliation() {
   printf '%s' "$bearings" | jq -e '
     .in_flight[] | select(.id == "generation-task")
     | .doing == "current lifecycle event"
+      and .current_wait == "-"
+      and (.status_event | contains("current lifecycle event"))
   ' >/dev/null || fail "bearings promoted a stale-generation wait description to current work: $bearings"
   assert_not_contains "$bearings" 'old lifecycle wait' "bearings exposed a stale-generation wait as current work"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" 'historical: predicate: old lifecycle wait' \
+    "fleet view rendered a stale-generation wait as active"
   pass "snapshot rejects stale-generation reconciliation data"
 }
 

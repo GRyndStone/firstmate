@@ -365,6 +365,8 @@ test_worktree_name_absence_is_repository_scoped_and_fail_closed() {
   printf '{"ok":true,"result":{"worktrees":[]}}\n' > "$RESP/4.out"
   printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/5.out"
   printf '{}\n' > "$RESP/6.out"
+  printf '{"ok":false,"error":{"code":"repository_not_found"}}\n' > "$RESP/7.out"
+  printf '{"ok":false,"error":{"code":"permission_denied"}}\n' > "$RESP/8.out"
   set +e
   PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
@@ -380,10 +382,19 @@ test_worktree_name_absence_is_repository_scoped_and_fail_closed() {
   status=$?
   set -e
   expect_code 2 "$status" "malformed Orca worktree inventory must remain unknown"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT" \
+    || fail "typed repository absence was not recognized as worktree-name absence"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "non-absence repository errors must remain unknown"
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''list'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--json' \
     "Orca name absence did not bind inventory to the persisted repository"
   set +e
-  pass "Orca worktree-name absence is repository-scoped and fail-closed"
+  pass "Orca worktree-name absence is repository-scoped, typed, and fail-closed"
 }
 
 test_orca_create_failures_report_unknown_partial_state() {

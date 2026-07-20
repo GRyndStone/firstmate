@@ -508,7 +508,7 @@ fm_wake_reconcile_claim_owner_live() {  # <claim-file>
 }
 
 fm_wake_reconcile_claimed_marker_locked() {
-  local claim="$STATE/.wake-queue.reconcile-claim" delivery_key owner_state
+  local claim="$STATE/.wake-queue.reconcile-claim" delivery_key delivery_state owner_state
   [ -f "$claim" ] || return 1
   if fm_wake_reconcile_claim_owner_live "$claim"; then
     owner_state=0
@@ -521,10 +521,12 @@ fm_wake_reconcile_claimed_marker_locked() {
   fi
   if [ "$owner_state" -eq 1 ]; then
     delivery_key=$(fm_wake_reconcile_claim_value "$claim" delivery_key)
-    if [ -n "$delivery_key" ]; then
-      fm_wake_reconcile_claim_value "$claim" marker
-      return
-    fi
+    delivery_state=$(fm_wake_reconcile_claim_value "$claim" delivery_state)
+    case "$delivery_state" in
+      submitted|delivered|acknowledged)
+        [ -z "$delivery_key" ] || { fm_wake_reconcile_claim_value "$claim" marker; return; }
+        ;;
+    esac
     rm -f "$claim"
     return 1
   fi

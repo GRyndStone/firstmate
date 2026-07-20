@@ -724,30 +724,14 @@ EOF
   return 0
 }
 
-fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [treehouse-project] [treehouse-holder]
-  local backend=$1 label=$2 scope=${3:-} rescue=${4:-} claim_treehouse_project=${5:-} claim_treehouse_holder=${6:-}
-  local endpoint_uncertain worktree_uncertain target resource_id worktree_id project holder endpoint_rc=2 worktree_rc=0
+fm_backend_spawn_claim_endpoint_absent() {  # <backend> <label> <scope> [rescue-meta]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-}
+  local endpoint_uncertain target resource_id endpoint_rc=2
   if [ ! -f "$rescue" ]; then
-    if fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
-      endpoint_rc=0
-    else
-      endpoint_rc=$?
-    fi
-    if [ -z "$claim_treehouse_holder" ]; then
-      return "$endpoint_rc"
-    fi
-    if fm_backend_treehouse_lease_absent "$claim_treehouse_project" "$claim_treehouse_holder"; then
-      worktree_rc=0
-    else
-      worktree_rc=$?
-    fi
-    [ "$endpoint_rc" -ne 1 ] || return 1
-    [ "$worktree_rc" -ne 1 ] || return 1
-    [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] && return 0
-    return 2
+    fm_backend_spawn_label_absent "$backend" "$label" "$scope"
+    return $?
   fi
   endpoint_uncertain=$(fm_meta_get "$rescue" spawn_endpoint_uncertain)
-  worktree_uncertain=$(fm_meta_get "$rescue" spawn_worktree_uncertain)
   case "$endpoint_uncertain" in
     0) endpoint_rc=0 ;;
     1)
@@ -809,6 +793,33 @@ fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [tr
       fi
       ;;
   esac
+  return "$endpoint_rc"
+}
+
+fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [treehouse-project] [treehouse-holder]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-} claim_treehouse_project=${5:-} claim_treehouse_holder=${6:-}
+  local worktree_uncertain worktree_id project holder endpoint_rc=2 worktree_rc=0
+  if fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"; then
+    endpoint_rc=0
+  else
+    endpoint_rc=$?
+  fi
+  if [ ! -f "$rescue" ]; then
+    if [ -z "$claim_treehouse_holder" ]; then
+      return "$endpoint_rc"
+    fi
+    if fm_backend_treehouse_lease_absent "$claim_treehouse_project" "$claim_treehouse_holder"; then
+      worktree_rc=0
+    else
+      worktree_rc=$?
+    fi
+    [ "$endpoint_rc" -ne 1 ] || return 1
+    [ "$worktree_rc" -ne 1 ] || return 1
+    [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] || return 2
+    fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"
+    return $?
+  fi
+  worktree_uncertain=$(fm_meta_get "$rescue" spawn_worktree_uncertain)
   case "$worktree_uncertain" in
     ''|0) worktree_rc=0 ;;
     1)
@@ -846,6 +857,7 @@ fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [tr
   [ "$endpoint_rc" -ne 1 ] || return 1
   [ "$worktree_rc" -ne 1 ] || return 1
   [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] || return 2
+  fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"
 }
 
 fm_backend_worktree_path() {  # <backend> <worktree-id>

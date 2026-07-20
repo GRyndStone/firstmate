@@ -59,6 +59,11 @@ case "\${1:-} \${2:-}" in
   "pr view")
     case " \$* " in
       *headRefOid*) printf '%s\n' '$head' ; exit 0 ;;
+      *state*)
+        [ "\${FM_FAKE_PR_QUERY_FAIL:-0}" = 0 ] || { printf 'query unavailable\n' >&2; exit 1; }
+        printf '%s\n' "\${FM_FAKE_PR_STATE:-OPEN}"
+        exit 0
+        ;;
     esac
     ;;
 esac
@@ -96,7 +101,7 @@ run_pr_merge() {
 }
 
 test_records_pr_and_head_before_merging() {
-  local case_dir rc generation
+  local case_dir rc generation old_path
   case_dir=$(make_case records-before-merge)
   mkdir -p "$case_dir/wt"
   printf 'pr_head=stale-head\n' >> "$case_dir/state/task-x1.meta"
@@ -121,12 +126,61 @@ test_records_pr_and_head_before_merging() {
   assert_grep "lifecycle_generation=$generation" "$case_dir/state/task-x1.wait" \
     "records-before-merge: merge poll registration was not bound to the current lifecycle"
   fm_reconcile_wait_load "$case_dir/state" task-x1
+  old_path=$PATH
+  PATH="$case_dir/fakebin:$PATH"
   fm_reconcile_wait_evaluate /dev/null
-  [ "$FM_RECONCILE_WAIT_RESULT" = registered ] \
-    || fail "records-before-merge: lifecycle-owned merge poll evaluated as $FM_RECONCILE_WAIT_RESULT"
+  PATH=$old_path
+  [ "$FM_RECONCILE_WAIT_RESULT" = pending ] \
+    || fail "records-before-merge: lifecycle-owned merge poll evaluated as $FM_RECONCILE_WAIT_RESULT ($FM_RECONCILE_WAIT_EVIDENCE)"
   grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
   pass "fm-pr-merge records pr= and pr_head= before invoking gh-axi pr merge"
+}
+
+test_pr_check_distinguishes_pending_complete_and_failed_predicates() {
+  local case_dir check out rc
+  case_dir=$(make_case exact-pr-predicate)
+  mkdir -p "$case_dir/wt"
+  touch "$case_dir/state/.last-watcher-beat"
+  add_gh_mocks "$case_dir" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" PATH="$case_dir/fakebin:$PATH" \
+    "$ROOT/bin/fm-pr-check.sh" task-x1 https://github.com/example/repo/pull/9 >/dev/null \
+    || fail "exact PR predicate fixture could not arm its poll"
+  check="$case_dir/state/task-x1.check.sh"
+  assert_grep 'OPEN) exit 1' "$check" "armed PR predicate omitted its explicit pending branch"
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_STATE=OPEN gh pr view \
+    https://github.com/example/repo/pull/9 --json state -q .state 2>&1); rc=$?
+  expect_code 0 "$rc" "open PR fixture query failed"
+  [ "$out" = OPEN ] || fail "open PR fixture returned '$out' instead of OPEN"
+
+  set +e
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_STATE=OPEN bash "$check" 2>&1); rc=$?
+  set -e
+  expect_code 1 "$rc" "open PR must remain pending (output: $out)"
+  [ -z "$out" ] || fail "open PR predicate emitted completion or failure output"
+
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_STATE=MERGED bash "$check" 2>&1); rc=$?
+  expect_code 0 "$rc" "merged PR must complete"
+  [ "$out" = merged ] || fail "merged PR predicate lost its completion evidence"
+
+  set +e
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_STATE=CLOSED bash "$check" 2>&1); rc=$?
+  set -e
+  expect_code 2 "$rc" "closed unmerged PR must fail actionably"
+  assert_contains "$out" 'closed without merge' "closed PR failure lost its evidence"
+
+  set +e
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_QUERY_FAIL=1 bash "$check" 2>&1); rc=$?
+  set -e
+  expect_code 2 "$rc" "unreadable PR state must fail actionably"
+  assert_contains "$out" 'query failed' "PR query failure lost its evidence"
+
+  set +e
+  out=$(PATH="$case_dir/fakebin:$PATH" FM_FAKE_PR_STATE=UNKNOWN bash "$check" 2>&1); rc=$?
+  set -e
+  expect_code 2 "$rc" "malformed PR state must fail actionably"
+  assert_contains "$out" 'unexpected PR state' "malformed PR state lost its evidence"
+  pass "PR checks distinguish exact pending, completion, and failure outcomes"
 }
 
 test_merge_failure_propagates_after_recording() {
@@ -309,6 +363,7 @@ test_parses_pr_url_for_gh_axi() {
 }
 
 test_records_pr_and_head_before_merging
+test_pr_check_distinguishes_pending_complete_and_failed_predicates
 test_merge_failure_propagates_after_recording
 test_extra_merge_args_forwarded
 test_missing_meta_refuses_before_merge

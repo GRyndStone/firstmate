@@ -287,6 +287,7 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
   FM_RECONCILE_WAIT_OWNER_TASKTMP=
   FM_RECONCILE_WAIT_REGISTRATION_ID=
   FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
+  FM_RECONCILE_WAIT_UNMANAGED_LEGACY=0
   FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)
   if [ -f "$wait_file" ]; then
     FM_RECONCILE_WAIT_PRESENT=1
@@ -323,6 +324,7 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
     FM_RECONCILE_WAIT_DESCRIPTION='legacy per-task check (cadenced)'
     FM_RECONCILE_WAIT_TARGET=$legacy
     FM_RECONCILE_WAIT_SIGNATURE="legacy:$(fm_reconcile_file_signature "$legacy")"
+    FM_RECONCILE_WAIT_UNMANAGED_LEGACY=1
   fi
 }
 
@@ -357,7 +359,7 @@ fm_reconcile_legacy_check_registration_valid() {  # <state-dir> <id>
 }
 
 fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/EVIDENCE/progress
-  local record=${1:-} now=${2:-} out='' rc=0 current_identity current_cwd current_progress rc_file
+  local record=${1:-} now=${2:-} out='' rc=0 current_identity post_identity current_cwd current_progress rc_file
   local old_registration old_progress old_progress_at progress_age old_checked old_state old_evidence check_age
   [ -n "$now" ] || now=$(date +%s)
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
@@ -390,7 +392,8 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
     case "$FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION" in
       legacy:*) ;;
       *)
-        if [ -z "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" ]; then
+        if [ -z "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" ] \
+          && [ "${FM_RECONCILE_WAIT_UNMANAGED_LEGACY:-0}" -ne 1 ]; then
           FM_RECONCILE_WAIT_RESULT=failed
           FM_RECONCILE_WAIT_EVIDENCE='external-wait registration has no task lifecycle generation'
           return
@@ -484,6 +487,17 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
                       FM_RECONCILE_WAIT_RESULT=failed
                       FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID progress is not observable"
                     fi
+                  elif ! post_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID"); then
+                    if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+                      FM_RECONCILE_WAIT_RESULT=complete
+                      FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
+                    else
+                      FM_RECONCILE_WAIT_RESULT=failed
+                      FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID post-observation identity is unreadable"
+                    fi
+                  elif [ "$post_identity" != "$FM_RECONCILE_WAIT_PID_IDENTITY" ]; then
+                    FM_RECONCILE_WAIT_RESULT=complete
+                    FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID identity changed or exited"
                   else
                     FM_RECONCILE_WAIT_PROGRESS_SIGNATURE=$current_progress
                     if [ -z "$old_progress" ] || [ "$current_progress" != "$old_progress" ]; then
@@ -808,7 +822,7 @@ fm_reconcile_legacy_check_register() {  # <state-dir> <id> <expected-generation>
   [ -f "$check_tmp" ] || return 1
   registration_id=$(fm_task_identity_new_token) || return 1
   wait_tmp="$wait_file.tmp.${BASHPID:-$$}"
-  check_publish_tmp="$check_file.tmp.${BASHPID:-$$}"
+  check_publish_tmp="$check_file.publish.tmp.${BASHPID:-$$}"
   commit_tmp="$commit_file.tmp.${BASHPID:-$$}"
   {
     cat "$check_tmp"
@@ -1213,15 +1227,18 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   fi
 
   case "$current_state" in
-    paused|blocked)
+    paused|blocked|parked)
       if [ "$FM_RECONCILE_WAIT_PRESENT" -eq 0 ]; then
-        if [ "$old_wait_state" != unobservable ] || [ "$(fm_reconcile_record_value "$record" status_signature)" != "$status_sig" ]; then
-          wait_seq=$((old_wait_seq + 1))
-          candidate_token="wait:$wait_seq:unobservable"
-          candidate_reason="external-wait-unobservable ($current_state task has no state/$id.wait predicate/process registration or legacy check; blocked work requires immediate intervention unless an observable external wait is registered; last status event sequence $status_seq: ${last_status:-none})"
-        fi
         FM_RECONCILE_WAIT_RESULT=unobservable
         FM_RECONCILE_WAIT_EVIDENCE='no completion predicate or process signal registered'
+        if [ "$positive_working" -eq 1 ]; then
+          candidate_token="transition:$transition_seq"
+          candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail}; external-wait-unobservable: $current_state task has no completion observer)"
+        elif [ "$old_wait_state" != unobservable ] || [ "$(fm_reconcile_record_value "$record" status_signature)" != "$status_sig" ]; then
+          wait_seq=$((old_wait_seq + 1))
+          candidate_token="wait:$wait_seq:unobservable"
+          candidate_reason="external-wait-unobservable ($current_state task has no state/$id.wait predicate/process registration or legacy check; non-working waits require immediate intervention unless an observable external wait is registered; last status event sequence $status_seq: ${last_status:-none})"
+        fi
       elif [ "$positive_working" -eq 1 ]; then
         candidate_token="transition:$transition_seq"
         candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"

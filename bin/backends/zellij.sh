@@ -316,7 +316,13 @@ fm_backend_zellij_tab_absent() {  # <session> <tab-id> <label> [pane-id]
     *)
       usable=1
       panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 2
-      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+      printf '%s' "$panes" | jq -e '
+        type == "array"
+        and all(.[]; type == "object"
+          and (.id | type) == "number"
+          and (.tab_id | type) == "number"
+          and (.is_plugin | type) == "boolean")
+      ' >/dev/null 2>&1 || return 2
       if printf '%s' "$panes" | jq -e --argjson id "$pane_id" \
         '[.[]? | select(.id == $id and .is_plugin == false)] | length > 0' >/dev/null 2>&1; then
         return 1
@@ -324,7 +330,12 @@ fm_backend_zellij_tab_absent() {  # <session> <tab-id> <label> [pane-id]
       ;;
   esac
   tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) || return 2
-  printf '%s' "$tabs" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$tabs" | jq -e '
+    type == "array"
+    and all(.[]; type == "object"
+      and (.tab_id | type) == "number"
+      and (.name | type) == "string")
+  ' >/dev/null 2>&1 || return 2
   case "$tab_id" in
     ''|*[!0-9]*) ;;
     *)

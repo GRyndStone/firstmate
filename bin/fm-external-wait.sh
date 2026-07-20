@@ -17,9 +17,9 @@
 # task's recorded worktree/tasktmp and treats exact-pid descendant CPU/lifecycle
 # progress as positive working evidence for a bounded grace window.
 #
-# Register the observer BEFORE appending paused:/blocked: and parking the
-# foreground agent.  The watcher fails loudly on an unobservable paused or
-# blocked task.
+# Register the observer BEFORE appending paused:/blocked:/parked wait state and
+# parking the foreground agent.  The watcher fails loudly on an unobservable
+# paused, blocked, or parked task.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

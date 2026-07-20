@@ -716,8 +716,16 @@ fm_supervisor_delivery_ack() {  # <state> <delivery-key>
   left=${key%%:*}
   right=${key#*:}
   [ "$left" != "$key" ] || return 2
-  case "$left" in ''|*[!0-9]*) return 2 ;; esac
-  case "$right" in ''|*[!0-9]*) return 2 ;; esac
+  case "$left" in
+    sha256)
+      case "$right" in ''|*[!0-9a-f]*) return 2 ;; esac
+      [ "${#right}" -eq 64 ] || return 2
+      ;;
+    *)
+      case "$left" in ''|*[!0-9]*) return 2 ;; esac
+      case "$right" in ''|*[!0-9]*) return 2 ;; esac
+      ;;
+  esac
   mkdir -p "$state" || return 1
   ack="$state/.subsuper-escalation-ack"
   tmp="$ack.tmp.${BASHPID:-$$}"
@@ -856,13 +864,30 @@ escalation_transfer_to_buffer() {  # <state> <skip-prefix> [ack-key]
   escalation_transfer_finalize "$state" "$ack_key"
 }
 
+escalation_delivery_key() {  # <message>
+  local digest
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | shasum -a 256 | awk '{print $1}') || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | sha256sum | awk '{print $1}') || return 1
+  else
+    return 1
+  fi
+  case "$digest" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#digest}" -eq 64 ] || return 1
+  printf 'sha256:%s\n' "$digest"
+}
+
 escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
   local buf=$1 key=$2 total i=1 msg candidate
   total=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
   while [ "$i" -le "$total" ]; do
     msg=$(head -n "$i" "$buf" | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
     msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$i" "$msg")
-    candidate=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+    case "$key" in
+      sha256:*) candidate=$(escalation_delivery_key "$msg") || return 1 ;;
+      *) candidate=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}') ;;
+    esac
     if [ "$candidate" = "$key" ]; then
       printf '%s\n' "$i"
       return 0
@@ -899,7 +924,7 @@ escalate_flush() {  # <state>
     n=$(wc -l < "$inflight" 2>/dev/null | tr -d '[:space:]' || echo 0)
     msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$inflight" 2>/dev/null)
     msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-    delivery_key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+    delivery_key=$(escalation_delivery_key "$msg") || return 1
     claim_delivery_key=
     if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
       && command -v fm_wake_reconcile_claim_delivery_key >/dev/null 2>&1; then

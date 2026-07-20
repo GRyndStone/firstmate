@@ -78,7 +78,9 @@ usage: fm-bearings-snapshot.sh [--json] [--include-prs] [--fields <list>]
 Compact bearings projection over fm-fleet-snapshot.sh. TOON by default.
 Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
-Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
+Default fields: schema, home, generated, prs,
+  in_flight{id,kind,state,source,evidence,observed_at,freshness,age_seconds,
+  doing,status_event,prior_state,current_wait},
   decisions_open{id,key,verb,summary}, landed{id,what,artifact},
   gates{id,title,blocked_by,reason}, reports{id,path}, recorded_prs{id,url},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
@@ -264,10 +266,21 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | ([ .tasks[] | {
         id, kind,
         state: .current_state.state,
+        source: .current_state.source,
+        evidence: ((.current_state.evidence // "-") | trunc(100)),
+        observed_at: .current_state.observed_at,
+        freshness: .current_state.freshness,
+        age_seconds: .current_state.age_seconds,
         doing: ((.current_state.detail // "") as $d
                 | (if $d != "" then $d
                    elif (.external_wait.registered and .external_wait.lifecycle_current) then .external_wait.description
-                   else "no reconciled detail" end) | trunc(90))
+                   else "no reconciled detail" end) | trunc(90)),
+        status_event: ("#\(.last_status_event.sequence) " + ((.last_status_event.event.raw // "-") | trunc(90))),
+        prior_state: (if .prior_observed_state.state == null then "-"
+                      else "\(.prior_observed_state.state) / \(.prior_observed_state.source)" end),
+        current_wait: (if .external_wait.registered and .external_wait.lifecycle_current then
+                         "\(.external_wait.kind): \(.external_wait.description // "-") / \(.external_wait.observation.state)"
+                       else "-" end)
       } ]) as $in_flight_all
   | ([ .tasks[] as $t | ($t.hints.open_decisions // [])[]
        | {id:$t.id, key, verb, summary:(.summary | trunc(90))} ]) as $decisions_all

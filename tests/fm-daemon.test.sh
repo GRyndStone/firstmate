@@ -25,7 +25,7 @@ fi
 fm_test_tmproot TMP_ROOT fm-daemon-tests
 
 delivery_key_from_message() {
-  printf '%s\n' "$1" | sed -n 's/.*\[fm-delivery=\([0-9][0-9]*:[0-9][0-9]*\)\].*/\1/p' | tail -1
+  printf '%s\n' "$1" | sed -n 's/.*\[fm-delivery=\(sha256:[0-9a-f][0-9a-f]*\)\].*/\1/p' | tail -1
 }
 
 acknowledge_injected_delivery() {
@@ -686,7 +686,7 @@ test_prepared_escalation_receipt_does_not_claim_delivery() {
   n=$(wc -l < "$buf" | tr -d '[:space:]')
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf")
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key "$msg")
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   delivered="$dir/delivered"
   (
@@ -703,7 +703,7 @@ test_sink_verified_escalation_is_not_replayed() {
   dir=$(make_supercase sink-verified-receipt)
   state="$dir/state"
   escalate_add "$state" 'terminal outcome already submitted'
-  key=$(printf '%s' 'Supervisor escalate (1 event(s)): terminal outcome already submitted (pre-read; re-arm not needed — watcher daemon-managed)' | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key 'Supervisor escalate (1 event(s)): terminal outcome already submitted (pre-read; re-arm not needed — watcher daemon-managed)')
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   fm_supervisor_delivery_ack "$state" "$key" || fail "sink acknowledgement setup failed"
   unexpected="$dir/unexpected-inject"
@@ -741,7 +741,7 @@ test_delivered_escalation_prefix_is_not_replayed() {
   delivered="$dir/delivered"
   escalate_add "$state" 'prefix A'
   msg='Supervisor escalate (1 event(s)): prefix A (pre-read; re-arm not needed — watcher daemon-managed)'
-  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key "$msg")
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   fm_supervisor_delivery_ack "$state" "$key" || fail "delivered-prefix sink acknowledgement setup failed"
   escalate_add "$state" 'later B'
@@ -841,7 +841,7 @@ test_acknowledged_prefix_transfer_recovers_after_commit_crash() {
   printf 'prefix A\nlater B\n' > "$inflight"
   printf 'later C\n' > "$buf"
   msg='Supervisor escalate (1 event(s)): prefix A (pre-read; re-arm not needed — watcher daemon-managed)'
-  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key "$msg")
   escalation_receipt_write "$receipt" "$key" submitted || fail "acknowledged transfer receipt setup failed"
   fm_supervisor_delivery_ack "$state" "$key" || fail "acknowledged transfer sink setup failed"
   (
@@ -945,6 +945,30 @@ test_drain_preserves_delivered_dead_owner_claim() {
   pass "drains preserve delivered dead-owner claims for idempotent adoption"
 }
 
+test_drain_surfaces_prepared_dead_owner_claim() {
+  local dir state reason marker drain_out
+  dir=$(make_supercase prepared-dead-claim)
+  state="$dir/state"
+  reason='stale: session:fm-task reconciled-transition [fm-reconcile=task,transition:1,version-one]'
+  marker='[fm-reconcile=task,transition:1,version-one]'
+  append_wake "$state" stale session:fm-task "$reason"
+  fm_write_meta "$state/.wake-queue.reconcile-claim" \
+    'schema=fm-wake-reconcile-claim.v1' \
+    "marker=$marker" \
+    "payload=$reason" \
+    'queue_sequence=1' \
+    'owner_pid=999999' \
+    'owner_identity=dead-owner' \
+    'delivery_key=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'delivery_state=prepared'
+  drain_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-wake-drain.sh") \
+    || fail "drain failed while recovering a prepared dead-owner claim"
+  assert_contains "$drain_out" "$reason" "drain hid a prepared claim whose owner had stopped"
+  [ ! -e "$state/.wake-queue.reconcile-claim" ] \
+    || fail "drain retained a prepared claim whose owner had stopped"
+  pass "drains surface prepared claims after their owner stops"
+}
+
 test_reconciled_claim_retains_post_submit_receipt_until_completion() {
   local dir state record reason claimed_file delivered
   dir=$(make_supercase reconcile-post-submit-receipt)
@@ -971,7 +995,7 @@ test_reconciled_claim_retains_post_submit_receipt_until_completion() {
     claimed=$(cat "$FM_TEST_CLAIMED")
     inject_msg() {
       printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"
-      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\([0-9][0-9]*:[0-9][0-9]*\\)\\].*/\\1/p")
+      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\(sha256:[0-9a-f][0-9a-f]*\\)\\].*/\\1/p")
       fm_supervisor_delivery_ack "$FM_STATE_OVERRIDE" "$key"
     }
     FM_RECONCILE_CLAIM_PAYLOAD="$claimed" FM_SUPERVISE_MODE=normal FM_ESCALATE_BATCH_SECS=0 \
@@ -1045,7 +1069,7 @@ test_reconciled_escalation_acknowledges_before_immediate_flush() {
     . "$1"
     inject_msg() {
       printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"
-      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\([0-9][0-9]*:[0-9][0-9]*\\)\\].*/\\1/p")
+      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\(sha256:[0-9a-f][0-9a-f]*\\)\\].*/\\1/p")
       fm_supervisor_delivery_ack "$FM_STATE_OVERRIDE" "$key"
     }
     FM_SUPERVISE_MODE=normal escalate_flush "$2"
@@ -1886,7 +1910,7 @@ test_max_defer_prepared_receipt_does_not_suppress_alarm() {
   escalate_add "$state" "needs-decision: prepared only"
   echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
   msg='Supervisor escalate (1 event(s)): needs-decision: prepared only (pre-read; re-arm not needed — watcher daemon-managed)'
-  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key "$msg")
   escalation_receipt_write "$state/.subsuper-escalation-delivered" "$key" prepared \
     || fail "prepared max-defer receipt setup failed"
   afk_enter "$state"
@@ -1909,7 +1933,7 @@ test_max_defer_submitted_receipt_alarms_without_replay() {
   escalate_add "$state" "needs-decision: submitted receipt"
   echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
   msg='Supervisor escalate (1 event(s)): needs-decision: submitted receipt (pre-read; re-arm not needed — watcher daemon-managed)'
-  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  key=$(escalation_delivery_key "$msg")
   receipt="$state/.subsuper-escalation-delivered"
   escalation_receipt_write "$receipt" "$key" submitted \
     || fail "submitted max-defer receipt setup failed"
@@ -2602,6 +2626,7 @@ test_afk_contract_distinguishes_receipt_restart_states
 test_acknowledged_prefix_transfer_recovers_after_commit_crash
 test_failed_inflight_transfer_recovers_after_commit_crash
 test_drain_preserves_delivered_dead_owner_claim
+test_drain_surfaces_prepared_dead_owner_claim
 test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup

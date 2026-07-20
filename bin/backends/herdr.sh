@@ -680,7 +680,10 @@ fm_backend_herdr_tab_absent() {  # <session> <workspace-id> <tab-id>
   local session=$1 wsid=$2 tab_id=$3 list
   [ -n "$session" ] && [ -n "$wsid" ] && [ -n "$tab_id" ] || return 2
   list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 2
-  printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$list" | jq -e '
+    (.result.tabs | type) == "array"
+    and all(.result.tabs[]; type == "object" and (.tab_id | type) == "string" and (.tab_id | length) > 0)
+  ' >/dev/null 2>&1 || return 2
   if printf '%s' "$list" | jq -e --arg id "$tab_id" '.result.tabs[]? | select(.tab_id == $id)' >/dev/null 2>&1; then
     return 1
   fi

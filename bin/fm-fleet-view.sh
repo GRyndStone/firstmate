@@ -58,8 +58,10 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def event_of($t):
     "#\($t.last_status_event.sequence) \(dash($t.last_status_event.event.raw))";
   def wait_of($t):
-    if $t.external_wait.registered then
+    if $t.external_wait.registered and $t.external_wait.lifecycle_current then
       "\($t.external_wait.kind): \(dash($t.external_wait.description)) / \($t.external_wait.observation.state)"
+    elif $t.external_wait.registered then
+      "historical: \($t.external_wait.kind): \(dash($t.external_wait.description))"
     else "-" end;
   def task_row($t):
     "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) | \(freshness_of($t)) | \(prior_of($t)) | \(event_of($t)) | \(wait_of($t)) |";

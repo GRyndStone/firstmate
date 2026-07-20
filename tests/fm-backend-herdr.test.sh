@@ -652,16 +652,19 @@ test_partial_cleanup_absence_probes_fail_closed() {
   printf '{"result":{"tabs":[]}}\n' > "$resp/1.out"
   printf '{"error":{"code":"pane_not_found"}}\n' > "$resp/2.out"
   printf '{}\n' > "$resp/3.out"
+  printf '{"result":{"tabs":[{"label":"fm-task"}]}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" bash -c '
     . "$0/bin/backends/herdr.sh"
     fm_backend_herdr_tab_absent fmtest w1 w1:t9 || exit 1
     fm_backend_herdr_pane_absent fmtest w1:p9 || exit 1
     fm_backend_herdr_tab_absent fmtest w1 w1:t9
+    [ "$?" -eq 2 ] || exit 1
+    fm_backend_herdr_tab_absent fmtest w1 w1:t9
   ' "$ROOT"
   status=$?
-  [ "$status" -eq 2 ] || fail "malformed cleanup verification must return unknown, got $status"
-  pass "partial Herdr cleanup probes distinguish absence from unreadable state"
+  [ "$status" -eq 2 ] || fail "malformed cleanup record verification must return unknown, got $status"
+  pass "partial Herdr cleanup probes validate inventory records before absence"
 }
 
 test_task_label_absence_requires_valid_workspace_inventory() {
