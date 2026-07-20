@@ -704,18 +704,39 @@ escalate_add() {  # <state> <distilled-item>
     return 0
   fi
   if [ ! -s "$buf" ]; then
-    [ -s "$inflight" ] || [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] || rm -f "$state/.subsuper-escalation-delivered"
+    [ -s "$inflight" ] || [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      || rm -f "$state/.subsuper-escalation-delivered" "$state/.subsuper-escalation-ack"
     _now > "${buf}.since"
   fi
   printf '%s\n' "$item" >> "$buf"
 }
 
-escalation_sink_has_delivery() {  # <delivery-key>
-  local key=$1 target backend capture
-  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
-  backend="${FM_SUPERVISOR_BACKEND:-tmux}"
-  capture=$(fm_backend_capture "$backend" "$target" 2000 2>/dev/null) || return 1
-  printf '%s\n' "$capture" | grep -Fq -- "[fm-delivery=$key]"
+fm_supervisor_delivery_ack() {  # <state> <delivery-key>
+  local state=$1 key=$2 left right ack tmp
+  left=${key%%:*}
+  right=${key#*:}
+  [ "$left" != "$key" ] || return 2
+  case "$left" in ''|*[!0-9]*) return 2 ;; esac
+  case "$right" in ''|*[!0-9]*) return 2 ;; esac
+  mkdir -p "$state" || return 1
+  ack="$state/.subsuper-escalation-ack"
+  tmp="$ack.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-escalation-sink-ack.v1\n'
+    printf 'delivery_key=%s\n' "$key"
+    printf 'acknowledged_at=%s\n' "$(date +%s)"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$ack" || { rm -f "$tmp"; return 1; }
+}
+
+escalation_sink_delivery_key() {  # <state>
+  fm_reconcile_record_value "$1/.subsuper-escalation-ack" delivery_key
+}
+
+escalation_sink_clear_delivery() {  # <state> <delivery-key>
+  local key=$2 ack="$1/.subsuper-escalation-ack"
+  [ "$(fm_reconcile_record_value "$ack" delivery_key)" = "$key" ] || return 0
+  rm -f "$ack"
 }
 
 escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
@@ -735,10 +756,12 @@ escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
-# supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
-# inject failure (buffer preserved for retry / catch-up).
+# supervisor pane. Returns 0 after a durable sink acknowledgement (or an empty
+# buffer), 3 after a locally confirmed submit still awaiting that acknowledgement,
+# and another non-zero status on inject failure. The buffer is preserved on every
+# non-zero return.
 escalate_flush() {  # <state>
-  local state=$1 buf inflight n msg sink_msg receipt delivery_key receipt_tmp claim_delivery_key claim_delivery_state retry_tmp receipt_key prefix_count
+  local state=$1 buf inflight n msg sink_msg receipt delivery_key receipt_tmp claim_delivery_key claim_delivery_state retry_tmp receipt_key prefix_count sink_ack_key injected=0
   buf="$state/.subsuper-escalations"
   inflight="$state/.subsuper-escalations.inflight"
   receipt="$state/.subsuper-escalation-delivered"
@@ -746,7 +769,7 @@ escalate_flush() {  # <state>
     if [ ! -s "$inflight" ]; then
       rm -f "$inflight"
       if [ ! -s "$buf" ]; then
-        rm -f "$receipt"
+        rm -f "$receipt" "$state/.subsuper-escalation-ack"
         return 0
       fi
       mv -f "$buf" "$inflight" || return 1
@@ -770,24 +793,15 @@ escalate_flush() {  # <state>
       claim_delivery_state=$(fm_wake_reconcile_claim_delivery_state "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
     fi
     receipt_key=$(cat "$receipt" 2>/dev/null || true)
-    if { [ "$claim_delivery_key" = "$delivery_key" ] && [ "$claim_delivery_state" = delivered ]; } \
-      || { { [ "$claim_delivery_key" = "$delivery_key" ] || [ "$receipt_key" = "$delivery_key" ]; } \
-        && escalation_sink_has_delivery "$delivery_key"; }; then
-      if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
-        && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
-        fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1
-      fi
-      rm -f "$inflight" || return 1
-      rm -f "$receipt"
-      if [ ! -s "$buf" ]; then
-        rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
-        return 0
-      fi
-      continue
-    fi
-    if [ -n "$receipt_key" ]; then
-      prefix_count=$(escalation_prefix_count_for_key "$inflight" "$receipt_key" 2>/dev/null || true)
-      if [ -n "$prefix_count" ] && escalation_sink_has_delivery "$receipt_key"; then
+    sink_ack_key=$(escalation_sink_delivery_key "$state" 2>/dev/null || true)
+    if [ -n "$sink_ack_key" ]; then
+      prefix_count=$(escalation_prefix_count_for_key "$inflight" "$sink_ack_key" 2>/dev/null || true)
+      if [ -n "$prefix_count" ]; then
+        if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+          && [ "$claim_delivery_key" = "$sink_ack_key" ] \
+          && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+          fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$sink_ack_key" acknowledged || return 1
+        fi
         retry_tmp="$buf.retry.${BASHPID:-$$}"
         if ! { tail -n "+$((prefix_count + 1))" "$inflight"; cat "$buf"; } > "$retry_tmp"; then
           rm -f "$retry_tmp"
@@ -795,17 +809,46 @@ escalate_flush() {  # <state>
         fi
         mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
         rm -f "$inflight" "$receipt"
+        escalation_sink_clear_delivery "$state" "$sink_ack_key" || return 1
+        if [ ! -s "$buf" ]; then
+          rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+          return 0
+        fi
         continue
       fi
-      rm -f "$receipt"
     fi
-    receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
-    printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
-    mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+    if [ -z "$receipt_key" ] && [ -n "$claim_delivery_key" ]; then
+      case "$claim_delivery_state" in prepared|delivered|acknowledged) receipt_key=$claim_delivery_key ;; esac
+    fi
+    if [ -n "$receipt_key" ]; then
+      prefix_count=$(escalation_prefix_count_for_key "$inflight" "$receipt_key" 2>/dev/null || true)
+      if [ -n "$prefix_count" ]; then
+        n=$prefix_count
+        msg=$(head -n "$n" "$inflight" | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+        msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+        delivery_key=$receipt_key
+      else
+        rm -f "$receipt"
+        if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+          && [ "$claim_delivery_key" = "$receipt_key" ] \
+          && command -v fm_wake_reconcile_claim_clear_delivery >/dev/null 2>&1; then
+          fm_wake_reconcile_claim_clear_delivery "$FM_RECONCILE_CLAIM_PAYLOAD" "$receipt_key" || return 1
+        fi
+        receipt_key=
+      fi
+    fi
+    if [ -z "$receipt_key" ]; then
+      receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
+      printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
+      mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+    elif [ ! -s "$receipt" ]; then
+      receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
+      printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
+      mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+    fi
     if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
       && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
       if ! fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" prepared; then
-        rm -f "$receipt"
         retry_tmp="$buf.retry.${BASHPID:-$$}"
         { cat "$inflight"; cat "$buf"; } > "$retry_tmp" \
           && mv -f "$retry_tmp" "$buf" \
@@ -814,23 +857,13 @@ escalate_flush() {  # <state>
         return 1
       fi
     fi
-    sink_msg="$msg [fm-delivery=$delivery_key]"
+    sink_msg="$msg [fm-delivery=$delivery_key] (acknowledge first: bin/fm-supervise-daemon.sh --ack-delivery $delivery_key)"
+    injected=0
     if inject_msg "$sink_msg" "$state"; then
-      if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
-        && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
-        fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1
+      injected=1
+      if [ "$(escalation_sink_delivery_key "$state" 2>/dev/null || true)" = "$delivery_key" ]; then
+        continue
       fi
-      rm -f "$inflight" || return 1
-      rm -f "$receipt"
-      if [ ! -s "$buf" ]; then
-        rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
-      fi
-      return 0
-    fi
-    rm -f "$receipt"
-    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
-      && command -v fm_wake_reconcile_claim_clear_delivery >/dev/null 2>&1; then
-      fm_wake_reconcile_claim_clear_delivery "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
     fi
     retry_tmp="$buf.retry.${BASHPID:-$$}"
     if ! { cat "$inflight"; cat "$buf"; } > "$retry_tmp"; then
@@ -839,6 +872,7 @@ escalate_flush() {  # <state>
     fi
     mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
     rm -f "$inflight"
+    [ "$injected" -eq 0 ] || return 3
     return 1
   done
 }
@@ -1146,12 +1180,14 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs flush_rc receipt_was_old
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
   # (1) batch flush
-  if [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
+  if [ -s "$state/.subsuper-escalation-ack" ]; then
+    escalate_flush "$state" || true
+  elif [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
     escalate_flush "$state" || true
   else
     due=$(_oldest_line_age "$state/.subsuper-escalations")
@@ -1171,12 +1207,32 @@ housekeeping() {  # <state>
     # and waits.
     if [ "$oldest" -ge "$max_defer" ] \
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
-      if escalate_flush "$state"; then
-        log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
-        rm -f "$state/.subsuper-inject-wedged"
+      receipt_was_old=0
+      if [ -s "$state/.subsuper-escalation-delivered" ] \
+        && [ "$(_file_age "$state/.subsuper-escalation-delivered")" -lt "$max_defer" ]; then
+        flush_rc=3
       else
-        inject_wedge_alarm "$state" "$oldest"
+        [ ! -s "$state/.subsuper-escalation-delivered" ] || receipt_was_old=1
+        if escalate_flush "$state"; then
+          flush_rc=0
+        else
+          flush_rc=$?
+        fi
       fi
+      case "$flush_rc" in
+        0)
+          log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
+          rm -f "$state/.subsuper-inject-wedged"
+          ;;
+        3)
+          if [ "$receipt_was_old" -eq 1 ]; then
+            inject_wedge_alarm "$state" "$oldest"
+          else
+            log "inject submitted: awaiting durable sink acknowledgement"
+          fi
+          ;;
+        *) inject_wedge_alarm "$state" "$oldest" ;;
+      esac
     fi
   fi
 
@@ -1448,9 +1504,19 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last verdict
+  local reason=$1 state=$2 decision action distilled task last verdict claim_delivery_key claim_delivery_state
   local kind="" arg=""
   if fm_reconcile_action_parse "$reason" && ! fm_reconcile_action_pending "$state" "$reason"; then
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ]; then
+      claim_delivery_key=$(fm_wake_reconcile_claim_delivery_key "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
+      claim_delivery_state=$(fm_wake_reconcile_claim_delivery_state "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
+      if [ -n "$claim_delivery_key" ] && [ "$claim_delivery_state" != acknowledged ]; then
+        if [ ! -s "$state/.subsuper-escalations" ] && [ ! -s "$state/.subsuper-escalations.inflight" ]; then
+          escalate_add "$state" "${reason#stale: }" || return 1
+        fi
+        escalate_flush "$state" || return 1
+      fi
+    fi
     log "wake already accepted by durable consumer: $reason"
     return 0
   fi
@@ -1541,7 +1607,11 @@ handle_wake() {  # <reason> <state>
     return 1
   fi
   if [ "$action" = escalate ] && [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
-    escalate_flush "$state" || true
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ]; then
+      escalate_flush "$state" || return 1
+    else
+      escalate_flush "$state" || true
+    fi
   fi
 }
 
@@ -1855,7 +1925,12 @@ fm_super_main() {
 
 # Run only when executed, not when sourced (tests source the classifiers).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  fm_super_main "$@"
+  if [ "${1:-}" = --ack-delivery ]; then
+    [ "$#" -eq 2 ] || { echo "usage: fm-supervise-daemon.sh --ack-delivery <delivery-key>" >&2; exit 2; }
+    fm_supervisor_delivery_ack "$(_state_root)" "$2"
+  else
+    fm_super_main "$@"
+  fi
 else
   # Library mode: these functions were SOURCED (only tests do this - production
   # execs the daemon, see bin/fm-afk-start.sh). Make it structurally impossible

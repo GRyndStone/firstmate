@@ -554,13 +554,18 @@ fm_backend_remove_worktree() {  # <backend> <worktree-id>
 }
 
 fm_backend_target_absent() {  # <backend> <target> [resource-id] [expected-label]
-  local backend=$1 target=$2 resource_id=${3:-} expected_label=${4:-} session pane workspace
+  local backend=$1 target=$2 resource_id=${3:-} expected_label=${4:-} session pane workspace probe_rc
   fm_backend_source "$backend" || return 2
   case "$backend" in
     tmux)
       [ -n "$target" ] || return 2
-      fm_backend_tmux_target_exists "$target" "$expected_label" && return 1
-      return 0
+      if fm_backend_tmux_target_exists "$target" "$expected_label"; then
+        return 1
+      else
+        probe_rc=$?
+      fi
+      [ "$probe_rc" -eq 1 ] && return 0
+      return 2
       ;;
     herdr)
       session=${target%%:*}

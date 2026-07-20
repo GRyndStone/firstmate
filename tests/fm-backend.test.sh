@@ -598,6 +598,43 @@ test_backend_of_selector_matches_explicit_target_meta() {
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
 }
 
+test_tmux_absence_probe_is_fail_closed_on_inventory_errors() {
+  fm_backend_source tmux || fail "could not load tmux backend adapter"
+  (
+    local status
+    fm_backend_tmux_target_exists() { return 0; }
+    if fm_backend_target_absent tmux firstmate:fm-task '' fm-task; then
+      fail "a live tmux target was reported absent"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 1 ] || fail "a live tmux target did not return the present verdict"
+
+    fm_backend_tmux_target_exists() { return 1; }
+    fm_backend_target_absent tmux firstmate:fm-task '' fm-task \
+      || fail "a confirmed tmux inventory miss was not reported absent"
+
+    fm_backend_tmux_target_exists() { return 2; }
+    if fm_backend_target_absent tmux firstmate:fm-task '' fm-task; then
+      fail "a failed tmux inventory query was reported absent"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 2 ] || fail "a failed tmux inventory query did not propagate unknown"
+  )
+  (
+    local status
+    tmux() { return 73; }
+    if fm_backend_tmux_target_exists firstmate:fm-task fm-task; then
+      fail "a failed tmux inventory query reported the target present"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 2 ] || fail "tmux inventory failures collapsed into confirmed misses"
+  )
+  pass "tmux absence verification propagates inventory failures"
+}
+
 # --- old vs new: fm-send.sh --------------------------------------------------
 
 make_send_fakebin() {  # <dir> -> echoes fakebin dir; logs every tmux call to $FM_TMUX_LOG
@@ -915,7 +952,7 @@ run_teardown_case() {
 
 test_teardown_conformance_old_vs_new() {
   local old_bin fb proj wt id
-  local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new
+  local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new absence_probe
   old_bin=$(build_old_bin teardown-old)
   proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
   id="teardownconform1"
@@ -944,14 +981,18 @@ test_teardown_conformance_old_vs_new() {
 
   expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
   expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
-  diff -u "$log_old" "$log_new" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
-    || fail "fm-teardown.sh: tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
+  absence_probe="tmux"$'\x1f'"list-windows"$'\x1f'"-a"$'\x1f'"-F"$'\x1f'"#{session_name}:#{window_name}"
+  assert_contains "$(cat "$log_new")" "$absence_probe" \
+    "teardown did not inventory tmux windows before releasing cleanup ownership"
+  grep -Fvx "$absence_probe" "$log_new" > "$TMP_ROOT/teardown-new-mutating.log" || true
+  diff -u "$log_old" "$TMP_ROOT/teardown-new-mutating.log" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
+    || fail "fm-teardown.sh: mutating tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
   assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
   assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
     "teardown did not call tmux kill-window -t <window>"
 
-  pass "fm-teardown.sh: treehouse return + tmux kill-window command log is byte-identical old vs new for a scout task"
+  pass "fm-teardown.sh: mutating cleanup commands remain old-compatible after absence verification"
 }
 
 # --- backend selection loudly refuses an unknown backend --------------------
@@ -1085,6 +1126,7 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_tmux_absence_probe_is_fail_closed_on_inventory_errors
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

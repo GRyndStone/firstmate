@@ -24,6 +24,24 @@ fi
 
 fm_test_tmproot TMP_ROOT fm-daemon-tests
 
+delivery_key_from_message() {
+  printf '%s\n' "$1" | sed -n 's/.*\[fm-delivery=\([0-9][0-9]*:[0-9][0-9]*\)\].*/\1/p' | tail -1
+}
+
+acknowledge_injected_delivery() {
+  local state=$1 key
+  key=$(delivery_key_from_message "$2")
+  [ -n "$key" ] || return 1
+  fm_supervisor_delivery_ack "$state" "$key"
+}
+
+acknowledge_last_sent_delivery() {
+  local state=$1 sent=$2 key
+  key=$(delivery_key_from_message "$(cat "$sent" 2>/dev/null || true)")
+  [ -n "$key" ] || return 1
+  fm_supervisor_delivery_ack "$state" "$key"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -447,7 +465,7 @@ test_normal_supervisor_direct_pause_activity_wakes_once() {
   printf '1000\n' > "$state/.subsuper-paused-$key"
   wake_log="$dir/model-wakes.log"
   (
-    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; acknowledge_injected_delivery "$state" "$1"; }
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
       FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1001 \
       housekeeping "$state"
@@ -466,7 +484,7 @@ test_normal_supervisor_direct_pause_activity_wakes_once() {
   assert_contains "$drain_out" "heartbeat" "unrelated wake was not drained"
   [ -e "$state/.subsuper-pause-active-$key" ] || fail "unrelated wake drain re-armed direct activity"
   (
-    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; acknowledge_injected_delivery "$state" "$1"; }
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
       FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=2000 \
       housekeeping "$state"
@@ -496,7 +514,7 @@ test_normal_supervisor_empty_turn_receipt_rearms_activity_once() {
   printf '1000\n' > "$state/.subsuper-paused-$key"
   wake_log="$dir/model-wakes.log"
   (
-    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; acknowledge_injected_delivery "$state" "$1"; }
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
       FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1001 \
       housekeeping "$state"
@@ -509,7 +527,7 @@ test_normal_supervisor_empty_turn_receipt_rearms_activity_once() {
   after=$(pause_activity_fingerprint "$state" held-normal-r1)
   [ "$after" != "$before" ] || fail "repeated empty-file touch did not change the turn event fingerprint"
   (
-    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; acknowledge_injected_delivery "$state" "$1"; }
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
       FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal FM_TEST_NOW_EPOCH=1002 \
       housekeeping "$state"
@@ -639,8 +657,7 @@ test_prepared_escalation_receipt_does_not_claim_delivery() {
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   delivered="$dir/delivered"
   (
-    inject_msg() { printf '%s\n' "$1" > "$delivered"; }
-    fm_backend_capture() { return 1; }
+    inject_msg() { printf '%s\n' "$1" > "$delivered"; acknowledge_injected_delivery "$state" "$1"; }
     escalate_flush "$state"
   ) || fail "prepared escalation could not be retried"
   assert_grep "[fm-delivery=$key]" "$delivered" "retried escalation did not carry its sink-verifiable delivery key"
@@ -655,9 +672,9 @@ test_sink_verified_escalation_is_not_replayed() {
   escalate_add "$state" 'terminal outcome already submitted'
   key=$(printf '%s' 'Supervisor escalate (1 event(s)): terminal outcome already submitted (pre-read; re-arm not needed — watcher daemon-managed)' | cksum | awk '{print $1 ":" $2}')
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
+  fm_supervisor_delivery_ack "$state" "$key" || fail "sink acknowledgement setup failed"
   unexpected="$dir/unexpected-inject"
   (
-    fm_backend_capture() { printf 'captured user turn [fm-delivery=%s]\n' "$key"; }
     inject_msg() { touch "$unexpected"; return 1; }
     escalate_flush "$state"
   ) || fail "sink-verified post-submit replay did not complete"
@@ -676,6 +693,7 @@ test_escalation_receipt_precedes_external_submit() {
       [ -s "$state/.subsuper-escalation-delivered" ] || return 71
       [ -s "$state/.subsuper-escalations.inflight" ] || return 72
       printf '%s\n' "$1" > "$delivered"
+      acknowledge_injected_delivery "$state" "$1"
     }
     escalate_flush "$state"
   ) || fail "escalation submit began before its durable receipt"
@@ -692,11 +710,12 @@ test_delivered_escalation_prefix_is_not_replayed() {
   msg='Supervisor escalate (1 event(s)): prefix A (pre-read; re-arm not needed — watcher daemon-managed)'
   key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
+  fm_supervisor_delivery_ack "$state" "$key" || fail "delivered-prefix sink acknowledgement setup failed"
   escalate_add "$state" 'later B'
   (
-    fm_backend_capture() { printf 'captured user turn [fm-delivery=%s]\n' "$key"; }
     inject_msg() {
       printf '%s\n' "$1" >> "$delivered"
+      acknowledge_injected_delivery "$state" "$1"
     }
     escalate_flush "$state"
   ) || fail "delivered escalation prefix was not isolated from later appends"
@@ -708,6 +727,44 @@ test_delivered_escalation_prefix_is_not_replayed() {
   [ "$count" -eq 1 ] \
     || fail "later buffer item B was not submitted exactly once"
   pass "delivered escalation prefixes remain isolated from later buffer appends"
+}
+
+test_escalation_requires_durable_sink_acknowledgement() {
+  local dir state delivered key status
+  dir=$(make_supercase durable-sink-ack)
+  state="$dir/state"
+  delivered="$dir/delivered"
+  escalate_add "$state" 'terminal outcome awaiting sink acknowledgement'
+  (
+    inject_msg() { printf '%s\n' "$1" > "$delivered"; return 0; }
+    fm_backend_capture() { fail "delivery verification read pane or composer content"; }
+    escalate_flush "$state"
+  )
+  status=$?
+  [ "$status" -eq 3 ] || fail "a locally confirmed submit without sink acknowledgement returned $status instead of 3"
+  key=$(delivery_key_from_message "$(cat "$delivered")")
+  [ -n "$key" ] || fail "submitted escalation omitted its delivery key"
+  [ -s "$state/.subsuper-escalations" ] || fail "unacknowledged submit trimmed its durable buffer"
+  [ "$(cat "$state/.subsuper-escalation-delivered" 2>/dev/null)" = "$key" ] \
+    || fail "unacknowledged submit lost its retry receipt"
+  (
+    fm_backend_capture() { printf 'unsubmitted composer [fm-delivery=%s]\n' "$key"; }
+    inject_msg() { return 1; }
+    if escalate_flush "$state"; then
+      fail "a pane-visible marker without sink acknowledgement retired delivery"
+    fi
+  )
+  [ -s "$state/.subsuper-escalations" ] || fail "pane-visible composer text trimmed the escalation"
+  FM_STATE_OVERRIDE="$state" "$DAEMON" --ack-delivery "$key" \
+    || fail "sink could not persist its delivery acknowledgement"
+  (
+    fm_backend_capture() { return 1; }
+    inject_msg() { fail "durably acknowledged delivery was replayed"; }
+    escalate_flush "$state"
+  ) || fail "durable sink acknowledgement did not retire delivery after scrollback loss"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "sink-acknowledged escalation remained buffered"
+  [ ! -e "$state/.subsuper-escalation-ack" ] || fail "consumed sink acknowledgement was not cleared"
+  pass "sink acknowledgements exclude composer state and survive scrollback loss"
 }
 
 test_watcher_reconciled_exit_dispatches_through_claim() {
@@ -786,7 +843,11 @@ test_reconciled_claim_retains_post_submit_receipt_until_completion() {
     . "$2"
     fm_wake_reconcile_claim_payload > "$FM_TEST_CLAIMED"
     claimed=$(cat "$FM_TEST_CLAIMED")
-    inject_msg() { printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"; }
+    inject_msg() {
+      printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"
+      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\([0-9][0-9]*:[0-9][0-9]*\\)\\].*/\\1/p")
+      fm_supervisor_delivery_ack "$FM_STATE_OVERRIDE" "$key"
+    }
     FM_RECONCILE_CLAIM_PAYLOAD="$claimed" FM_SUPERVISE_MODE=normal FM_ESCALATE_BATCH_SECS=0 \
       handle_wake "$claimed" "$3"
   ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$state" \
@@ -797,6 +858,8 @@ test_reconciled_claim_retains_post_submit_receipt_until_completion() {
   [ -s "$state/.wake-queue.reconcile-claim" ] || fail "submission cleared its claim before atomic completion"
   assert_grep 'delivery_key=' "$state/.wake-queue.reconcile-claim" \
     "confirmed submission did not persist its delivery receipt on the claim"
+  assert_grep 'delivery_state=acknowledged' "$state/.wake-queue.reconcile-claim" \
+    "sink acknowledgement was not distinguished from an unverified local receipt"
   FM_STATE_OVERRIDE="$state" FM_TEST_DELIVERED="$delivered" bash -c '
     . "$1"
     . "$2"
@@ -854,7 +917,11 @@ test_reconciled_escalation_acknowledges_before_immediate_flush() {
   delivered="$dir/delivered"
   FM_STATE_OVERRIDE="$state" FM_TEST_DELIVERED="$delivered" bash -c '
     . "$1"
-    inject_msg() { printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"; }
+    inject_msg() {
+      printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"
+      key=$(printf "%s\n" "$1" | sed -n "s/.*\\[fm-delivery=\\([0-9][0-9]*:[0-9][0-9]*\\)\\].*/\\1/p")
+      fm_supervisor_delivery_ack "$FM_STATE_OVERRIDE" "$key"
+    }
     FM_SUPERVISE_MODE=normal escalate_flush "$2"
   ' _ "$DAEMON" "$state" || fail "restart could not flush the preserved escalation buffer"
   [ "$(wc -l < "$delivered" 2>/dev/null || echo 0)" -eq 1 ] \
@@ -1116,7 +1183,7 @@ test_housekeeping_orca_persistent_stale_resolves_terminal() {
 }
 
 test_escalate_batches_into_one_digest() {
-  local dir state fakebin sent capture n
+  local dir state fakebin sent capture n status
   dir=$(make_supercase batch)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -1125,9 +1192,15 @@ test_escalate_batches_into_one_digest() {
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
-    || fail "escalate_flush failed"
+  if PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state"; then
+    fail "locally submitted escalation completed before sink acknowledgement"
+  else
+    status=$?
+  fi
+  [ "$status" -eq 3 ] || fail "locally submitted escalation did not report pending sink acknowledgement"
+  acknowledge_last_sent_delivery "$state" "$sent" || fail "batch sink acknowledgement failed"
+  escalate_flush "$state" || fail "sink-acknowledged batch did not complete"
   grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
   grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
   grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
@@ -1146,7 +1219,7 @@ test_normal_supervisor_deduplicates_one_event_one_wake() {
   escalate_add "$state" "needs-decision: choose release window"
   escalate_add "$state" "needs-decision: choose release window"
   (
-    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; return 0; }
+    inject_msg() { printf '%s\n' "$1" >> "$wake_log"; acknowledge_injected_delivery "$state" "$1"; }
     FM_SUPERVISE_MODE=normal escalate_flush "$state"
     FM_SUPERVISE_MODE=normal escalate_flush "$state"
   ) || fail "normal deduplicated flush failed"
@@ -1171,6 +1244,8 @@ test_escalate_batch_age_uses_first_append() {
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
     FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 \
     housekeeping "$state"
+  acknowledge_last_sent_delivery "$state" "$sent" || fail "backdated batch sink acknowledgement failed"
+  housekeeping "$state"
   grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
     || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
@@ -1293,14 +1368,20 @@ test_afk_absent_daemon_does_not_inject() {
 }
 
 test_normal_mode_injects_without_entering_afk() {
-  local dir state fakebin sent capture
+  local dir state fakebin sent capture status
   dir=$(make_supercase normal-inject)
   state="$dir/state"; fakebin="$dir/fakebin"; sent="$dir/sent.log"; capture="$dir/pane.txt"
   : > "$sent"; : > "$capture"
   escalate_add "$state" "done: PR 1"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$capture" FM_SUPERVISE_MODE=normal escalate_flush "$state" \
-    || fail "normal-mode escalation did not inject"
+  if PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_SUPERVISE_MODE=normal escalate_flush "$state"; then
+    fail "normal-mode escalation completed before sink acknowledgement"
+  else
+    status=$?
+  fi
+  [ "$status" -eq 3 ] || fail "normal-mode submit did not await sink acknowledgement"
+  acknowledge_last_sent_delivery "$state" "$sent" || fail "normal-mode sink acknowledgement failed"
+  FM_SUPERVISE_MODE=normal escalate_flush "$state" || fail "normal-mode sink acknowledgement was not consumed"
   [ ! -e "$state/.afk" ] || fail "normal supervisor implicitly entered away mode"
   [ "$(grep -c '\[ENTER\]' "$sent" 2>/dev/null || true)" -eq 1 ] \
     || fail "normal supervisor did not submit exactly one wake"
@@ -1644,6 +1725,8 @@ test_max_defer_flushes_empty_idle_pane() {
   PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
     FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
     housekeeping "$state"
+  acknowledge_last_sent_delivery "$state" "$sent" || fail "max-defer sink acknowledgement failed"
+  housekeeping "$state"
   [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a recovered max-defer flush"
   [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge alarm left behind after a successful max-defer flush"
   pass "max-defer flushes and clears the buffer on an empty bordered pane"
@@ -1669,16 +1752,22 @@ test_max_defer_pending_composer_alarms_without_typing() {
 }
 
 test_normal_flush_clears_stale_wedge_marker() {
-  local dir state fakebin sent
+  local dir state fakebin sent status
   dir=$(make_bordered_case normal-clears-wedge)
   state="$dir/state"; fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
   printf 'old wedge\n' > "$state/.subsuper-inject-wedged"
   escalate_add "$state" "done: PR https://x/y/pull/2"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
-    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
-    || fail "normal escalate_flush failed"
+  if PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state"; then
+    fail "normal flush completed before sink acknowledgement"
+  else
+    status=$?
+  fi
+  [ "$status" -eq 3 ] || fail "normal flush did not await sink acknowledgement"
+  acknowledge_last_sent_delivery "$state" "$sent" || fail "normal flush sink acknowledgement failed"
+  escalate_flush "$state" || fail "normal flush did not consume sink acknowledgement"
   [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after normal flush"
   [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge marker survived successful normal flush"
   pass "normal flush clears a stale wedge marker"
@@ -2332,6 +2421,7 @@ test_prepared_escalation_receipt_does_not_claim_delivery
 test_sink_verified_escalation_is_not_replayed
 test_escalation_receipt_precedes_external_submit
 test_delivered_escalation_prefix_is_not_replayed
+test_escalation_requires_durable_sink_acknowledgement
 test_drain_preserves_delivered_dead_owner_claim
 test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append

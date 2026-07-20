@@ -839,6 +839,10 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 W="fm-$ID"
+if ! fm_reconcile_spawn_claim_mark_creation_started "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$BACKEND" "$W"; then
+  echo "error: task $ID lifecycle ownership changed before backend creation; refusing resource creation" >&2
+  exit 1
+fi
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)

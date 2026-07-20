@@ -517,7 +517,7 @@ test_snapshot_separates_reconciled_truth_event_history_and_wait() {
 }
 
 test_snapshot_rejects_stale_generation_reconciliation() {
-  local home fakebin out now
+  local home fakebin out now bearings
   home=$(make_home stale-generation)
   mkdir -p "$home/projects/generation-task"
   fm_write_meta "$home/state/generation-task.meta" \
@@ -571,6 +571,12 @@ test_snapshot_rejects_stale_generation_reconciliation() {
       and .external_wait.observation.state == "unobserved"
       and .external_wait.observation.checked_at == null
   ' >/dev/null || fail "snapshot accepted stale-generation reconciliation data: $out"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bearings-snapshot.sh" --json)
+  printf '%s' "$bearings" | jq -e '
+    .in_flight[] | select(.id == "generation-task")
+    | .doing == "current lifecycle event"
+  ' >/dev/null || fail "bearings promoted a stale-generation wait description to current work: $bearings"
+  assert_not_contains "$bearings" 'old lifecycle wait' "bearings exposed a stale-generation wait as current work"
   pass "snapshot rejects stale-generation reconciliation data"
 }
 

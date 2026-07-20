@@ -1010,6 +1010,32 @@ test_partial_spawn_rescue_claim_survives_owner_exit() {
   pass "partial spawn ownership survives until rescue metadata is published"
 }
 
+test_dead_spawn_claim_after_creation_started_is_retained() {
+  local dir state claim generation
+  dir="$TMP_ROOT/spawn-creation-started-claim"
+  state="$dir/state"
+  mkdir -p "$state"
+  generation=lifecycle-one
+  fm_write_meta "$state/task.meta" "generation=$generation" 'window=session:fm-task' 'kind=scout'
+  fm_reconcile_spawn_claim "$state" task spawn-creating || fail "spawn claim setup failed"
+  fm_reconcile_spawn_claim_mark_creation_started "$state" task spawn-creating tmux fm-task \
+    || fail "spawn claim could not persist backend-creation phase"
+  claim="$state/task.spawn-claim"
+  assert_grep 'creation_phase=backend-creation' "$claim" "spawn claim omitted its creation phase"
+  assert_grep 'backend=tmux' "$claim" "spawn claim omitted its backend"
+  assert_grep 'backend_label=fm-task' "$claim" "spawn claim omitted its backend label"
+  sed 's/^owner_pid=.*/owner_pid=999999/' "$claim" > "$claim.tmp"
+  mv "$claim.tmp" "$claim"
+  if fm_reconcile_spawn_claim "$state" task replacement; then
+    fail "replacement spawn discarded a dead claim after backend creation may have begun"
+  fi
+  if fm_reconcile_teardown_begin "$state" task "$generation"; then
+    fail "teardown discarded a dead claim after backend creation may have begun"
+  fi
+  assert_grep 'creation_phase=backend-creation' "$claim" "dead creation-phase claim was not retained"
+  pass "dead spawn claims retain ownership after backend creation may have begun"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -1044,5 +1070,6 @@ test_generation_cas_and_spawn_claim_revalidate_lifecycle
 test_teardown_claim_is_live_and_generation_bound
 test_teardown_refuses_active_spawn_claim
 test_partial_spawn_rescue_claim_survives_owner_exit
+test_dead_spawn_claim_after_creation_started_is_retained
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"
