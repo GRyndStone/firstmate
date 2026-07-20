@@ -24,6 +24,12 @@
 #   whose wall-clock exceeds your harness's foreground command budget.
 #   The tab stays open after the run so its output stays inspectable; the
 #   watcher never adopts it because the label does not start with fm-.
+#   Launch preflight rolls back its created tab and owned exit-state directory
+#   on failures through the target-readiness check. Rollback refuses an
+#   ambiguous tab identity and refuses to close the workspace's last tab, so
+#   the safe failure may preserve an unused tab instead of deleting a workspace.
+#   After readiness, a failed atomic pane-run has an ambiguous launch outcome;
+#   the tab and exit state are preserved for inspection rather than rolled back.
 #   Exit code 96 is RESERVED for every wait-side abort - a run tab that
 #   closed before recording an exit code, an unreadable-pane-state streak,
 #   and a mid-wait herdr server restart - so a scripted caller can tell "the

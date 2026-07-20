@@ -14,19 +14,20 @@
 #   fm-cleanup-stale-test-roots.sh --base DIR   # scan DIR (default: TMPDIR or /tmp)
 #
 # Safety gates (all required for a path to be eligible):
-#   1. Exact path prefix: basename matches <prefix>.* under the scan base only
-#      (no recursion into unrelated trees; no symlink escape of the base).
-#   2. Owner: directory owner UID equals the invoking user (id -u).
-#   3. Age/freshness: the newest mtime and (when available) birth time anywhere
+#   1. Exact path prefix under the scan base only, with no symlink escape.
+#   2. The candidate is not a mount, has no mount descendant, and every entry
+#      stays on the candidate root's device.
+#   3. Owner: directory owner UID equals the invoking user (id -u).
+#   4. Age/freshness: the newest mtime and (when available) birth time anywhere
 #      in the tree are both older than --min-age-hours (default 6).
-#   4. Live process references: no process command line or cwd/root points at
-#      the path (best-effort via ps and lsof).
-#   5. Open files: lsof reports no open handles under the path.
+#   5. No live process command line or cwd/root points at the path.
+#   6. Open files: lsof reports no open handles under the path.
 #
 # Ambiguous or live targets are listed under REFUSED and never deleted.
 # --apply refuses the entire run if any candidate was refused (fail closed),
 # unless --apply-eligible is passed to delete only the green set after the
 # same manifest is printed.
+# Apply mode fully rechecks each path before same-device delete; drift is skipped.
 #
 # This tool does not replace the tests/lib.sh root fix; it is for already-leaked
 # inventory after that fix lands. Remeasure at execution time - never treat an
