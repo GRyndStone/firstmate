@@ -62,10 +62,6 @@ if pid=$(fm_identity_lock_live_pid "$LOCK"); then
   fi
 fi
 
-if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
-  fm_lock_remove_path "$LOCK" 2>/dev/null || true
-fi
-
 echo "supervisor: starting normal daemon in foreground; keep this command as a tracked background task"
 export FM_SUPERVISE_MODE=normal
 exec "$DAEMON"

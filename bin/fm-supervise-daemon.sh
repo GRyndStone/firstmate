@@ -1325,7 +1325,7 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last verdict
+  local reason=$1 state=$2 decision action distilled task last verdict reconciled_acked=0
   local kind="" arg=""
   if fm_reconcile_action_parse "$reason" && ! fm_reconcile_action_pending "$state" "$reason"; then
     log "wake already accepted by durable consumer: $reason"
@@ -1368,6 +1368,11 @@ handle_wake() {  # <reason> <state>
     escalate)
       log "escalate: $reason -> $distilled"
       escalate_add "$state" "$distilled" || return 1
+      if ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
+        log "ERROR: normal supervisor could not acknowledge reconciled action: $reason"
+        return 1
+      fi
+      reconciled_acked=1
       # A terminal-stale escalate must not leave a persistence marker behind, or
       # housekeeping re-escalates the same pane as a false wedge later.
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
@@ -1411,7 +1416,7 @@ handle_wake() {  # <reason> <state>
       return 1
     fi
   fi
-  if ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
+  if [ "$reconciled_acked" -eq 0 ] && ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
     log "ERROR: normal supervisor could not acknowledge reconciled action: $reason"
     return 1
   fi
@@ -1470,7 +1475,7 @@ fm_super_main() {
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 
   # --- single instance (portable lock, no flock dependency) ------------------
-  if ! fm_lock_try_acquire "$LOCK"; then
+  if ! fm_lock_try_acquire "$LOCK" 1; then
     if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
       echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
     else

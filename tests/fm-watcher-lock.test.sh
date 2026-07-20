@@ -275,14 +275,17 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
 }
 
 test_lock_does_not_steal_live_lock() {
-  local dir state lockdir live out lockpid
+  local dir state lockdir live identity out lockpid
   dir=$(make_case lock-live-noop)
   state="$dir/state"
   lockdir="$state/.contend.lock"
   sleep 300 &
   live=$!
+  identity=$(LC_ALL=C ps -p "$live" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//')
+  [ -n "$identity" ] || fail "could not capture live lock holder identity"
   mkdir "$lockdir"
   printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' "$identity" > "$lockdir/pid-identity"
   out=$(FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
@@ -301,6 +304,29 @@ test_lock_does_not_steal_live_lock() {
   lockpid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$lockpid" = "$live" ] || fail "live holder's lock pid was clobbered (got '$lockpid')"
   pass "live-held lock is not stolen"
+}
+
+test_lock_reclaims_reused_pid_identity() {
+  local dir state lockdir live out newpid
+  dir=$(make_case lock-reused-pid)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' 'stale process identity' > "$lockdir/pid-identity"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then cat "$2/pid"; else exit 7; fi
+  ' _ "$LIB" "$lockdir") || fail "identity-mismatched live-pid lock was not reclaimed"
+  kill -0 "$live" 2>/dev/null || fail "reclaiming an identity-mismatched lock killed the reused pid"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  newpid=$out
+  [ -n "$newpid" ] && [ "$newpid" != "$live" ] \
+    || fail "identity-mismatched lock retained the reused pid: $out"
+  pass "identity-mismatched live-pid lock is reclaimed without signaling the reused process"
 }
 
 test_lock_empty_pid_uses_minimum_grace() {
@@ -713,6 +739,7 @@ test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock
+test_lock_reclaims_reused_pid_identity
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal

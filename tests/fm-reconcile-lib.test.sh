@@ -66,6 +66,33 @@ test_active_review_parks_once_past_stale_pause() {
   pass "active review working -> parked wakes once despite a stale paused event"
 }
 
+test_notified_observation_does_not_mask_newer_live_transition() {
+  local dir state live out token record
+  dir=$(make_reconcile_case notified-observation)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'paused: historical review event\n' > "$state/task.status"
+  printf 'state: working · source: run-step · validation running\n' > "$live"
+  observe "$state" "$live" >/dev/null
+
+  printf 'state: parked · source: run-step · review findings ready\n' > "$live"
+  out=$(observe "$state" "$live")
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token" || fail "parked transition could not be acknowledged"
+  fm_reconcile_is_quiet_notified "$state" task session:fm-task \
+    || fail "acknowledged parked observation was not quiet"
+
+  printf 'state: failed · source: run-step · validation failed after review\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  record="$state/task.reconciled"
+  [ "$(fm_reconcile_record_value "$record" transition_sequence)" -gt 1 ] \
+    || fail "newer failed observation did not advance the transition sequence"
+  if fm_reconcile_is_quiet_notified "$state" task session:fm-task; then
+    fail "acknowledged parked token masked the newer failed observation"
+  fi
+  pass "quiet suppression is bound to the exact notified live observation"
+}
+
 test_stopped_endpoint_without_claimed_done_wakes_once() {
   local dir state live out token record
   dir=$(make_reconcile_case missing-done)
@@ -175,6 +202,39 @@ SH
   out=$(FM_WAIT_TEST_STATE="$dir/wait-state" observe "$state" "$live")
   assert_contains "$out" 'external-wait-failed' "failed predicate did not fail loudly"
   pass "registered OAuth predicate wakes on completion, dedupes, and fails loudly"
+}
+
+test_live_process_with_unreadable_identity_fails_observation() {
+  local dir state live identity out record
+  dir=$(make_reconcile_case unreadable-process-identity)
+  state="$dir/state"
+  live="$dir/live"
+  identity=$(fm_reconcile_process_identity "$$") \
+    || fail "could not capture the test process identity"
+  printf 'paused: waiting for a tracked process\n' > "$state/task.status"
+  printf 'state: paused · source: status-log · waiting for a tracked process\n' > "$live"
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=tracked process with transiently unreadable identity' \
+    "pid=$$" \
+    "pid_identity=$identity" \
+    'role=external-wait' \
+    'registered_at=1'
+
+  out=$(
+    fm_reconcile_process_identity() { return 1; }
+    observe "$state" "$live"
+  )
+  assert_contains "$out" 'external-wait-failed' \
+    "unreadable live process identity was not surfaced as an observer failure"
+  assert_contains "$out" 'identity is unreadable' \
+    "unreadable live process identity lost its failure evidence"
+  case "$out" in *external-wait-complete*) fail "unreadable live process identity was reported complete" ;; esac
+  record="$state/task.reconciled"
+  [ "$(fm_reconcile_record_value "$record" wait_state)" = failed ] \
+    || fail "unreadable live process identity persisted a non-failed wait state"
+  pass "live process identity observation fails closed when ps is unreadable"
 }
 
 test_unchanged_terminal_wait_does_not_mask_live_transition() {
@@ -462,10 +522,12 @@ test_restart_preserves_transition_dedup() {
 }
 
 test_active_review_parks_once_past_stale_pause
+test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
 test_same_repository_endpoint_replacement_preserves_working_baseline
 test_positive_working_source_loss_wakes_past_stale_working_event
 test_external_wait_completion_and_failures
+test_live_process_with_unreadable_identity_fails_observation
 test_unchanged_terminal_wait_does_not_mask_live_transition
 test_signaled_predicate_is_not_reported_complete
 test_unobservable_pause_fails_loudly_and_busy_stays_quiet

@@ -35,16 +35,31 @@ fm_task_identity_git_common_dir() {  # <path>
   fi
 }
 
+fm_task_identity_directory_identity() {  # <path>
+  local path=$1 identity
+  if [ "$(uname)" = Darwin ]; then
+    identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
+  else
+    identity=$(stat -c '%d:%i' "$path" 2>/dev/null) || return 1
+  fi
+  case "$identity" in ''|*[!0-9:]*) return 1 ;; esac
+  printf '%s\n' "$identity"
+}
+
 fm_task_identity_repository_key() {  # <path>
-  local path=$1 resolved
+  local path=$1 resolved identity
   resolved=$(fm_task_identity_git_common_dir "$path" 2>/dev/null || true)
   if [ -n "$resolved" ]; then
-    printf 'git:%s\n' "$resolved"
+    identity=$(fm_task_identity_directory_identity "$resolved" 2>/dev/null || true)
+    [ -n "$identity" ] || return 1
+    printf 'git:%s:%s\n' "$identity" "$resolved"
     return 0
   fi
   resolved=$(fm_task_identity_real_dir "$path" 2>/dev/null || true)
   [ -n "$resolved" ] || return 1
-  printf 'dir:%s\n' "$resolved"
+  identity=$(fm_task_identity_directory_identity "$resolved" 2>/dev/null || true)
+  [ -n "$identity" ] || return 1
+  printf 'dir:%s:%s\n' "$identity" "$resolved"
 }
 
 fm_task_identity_meta_value() {  # <meta> <key>
@@ -78,6 +93,10 @@ fm_task_identity_validate() {  # <state-dir> <task-id> <proposed-project>
 fm_task_identity_bind() {  # <state-dir> <task-id> <proposed-project>
   local state=$1 id=$2 proposed=$3 identity lock proposed_key tmp bind_rc=0 clean_project
   case "$id" in ''|*[!A-Za-z0-9._-]*) echo "error: invalid task id '$id' for repository binding." >&2; return 1 ;; esac
+  if ! mkdir -p "$state"; then
+    echo "error: cannot create task identity state directory '$state'." >&2
+    return 1
+  fi
   proposed_key=$(fm_task_identity_repository_key "$proposed" 2>/dev/null || true)
   [ -n "$proposed_key" ] || {
     echo "error: cannot prove repository identity for task '$id' from '$proposed'." >&2
@@ -91,7 +110,7 @@ fm_task_identity_bind() {  # <state-dir> <task-id> <proposed-project>
       tmp="$identity.tmp.${BASHPID:-$$}"
       clean_project=$(printf '%s' "$proposed" | LC_ALL=C tr '\t\r\n' '   ')
       {
-        printf 'schema=fm-task-identity.v1\n'
+        printf 'schema=fm-task-identity.v2\n'
         printf 'task=%s\n' "$id"
         printf 'repository_identity=%s\n' "$proposed_key"
         printf 'project=%s\n' "$clean_project"

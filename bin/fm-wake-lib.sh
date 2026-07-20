@@ -145,6 +145,16 @@ fm_identity_lock_live_pid() {  # <lock-path>
   printf '%s\n' "$pid"
 }
 
+fm_lock_pid_is_live_owner() {  # <lock-path> <pid> [identity-bound]
+  local lockdir=$1 pid=$2 identity_bound=${3:-0} recorded_identity current_identity
+  fm_pid_alive "$pid" || return 1
+  [ "$identity_bound" -eq 1 ] || return 0
+  recorded_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  [ -n "$recorded_identity" ] || return 0
+  current_identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 0
+  [ "$current_identity" = "$recorded_identity" ]
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
@@ -303,7 +313,7 @@ fm_lock_mid_acquire_is_fresh() {
 }
 
 fm_lock_recheck_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 identity_bound=${4:-0} actual_pid
   if [ -n "$expected_owner" ]; then
     fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
   elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
@@ -311,7 +321,7 @@ fm_lock_recheck_stale_owner() {
   fi
   actual_pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$actual_pid" = "$expected_pid" ] || return 1
-  if fm_pid_alive "$actual_pid"; then
+  if fm_lock_pid_is_live_owner "$lockdir" "$actual_pid" "$identity_bound"; then
     return 1
   fi
   if fm_lock_mid_acquire_is_fresh "$lockdir" "$actual_pid"; then
@@ -321,7 +331,7 @@ fm_lock_recheck_stale_owner() {
 }
 
 fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 identity_bound=${2:-0} pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
 
@@ -330,7 +340,7 @@ fm_lock_try_acquire() {
   fi
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$pid"; then
+  if fm_lock_pid_is_live_owner "$lockdir" "$pid" "$identity_bound"; then
     FM_LOCK_HELD_PID=$pid
     return 1
   fi
@@ -348,7 +358,7 @@ fm_lock_try_acquire() {
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$cur"; then
+  if fm_lock_pid_is_live_owner "$lockdir" "$cur" "$identity_bound"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$cur
     FM_LOCK_OWNER_DIR=
@@ -372,7 +382,7 @@ fm_lock_try_acquire() {
     primary_owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
   fi
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur"; then
+  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur" "$identity_bound"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=

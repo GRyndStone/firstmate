@@ -13,10 +13,18 @@ state="$TMP_ROOT/state"
 repo="$TMP_ROOT/repo"
 same_wt="$TMP_ROOT/same-worktree"
 other="$TMP_ROOT/other"
+fresh_state="$TMP_ROOT/fresh-state"
 mkdir -p "$state"
 fm_git_init_commit "$repo"
 git -C "$repo" worktree add --quiet -b recovery "$same_wt"
 fm_git_init_commit "$other"
+
+fm_task_identity_bind "$fresh_state" fresh "$repo" \
+  || fail "task identity binding could not create its missing state directory"
+[ -f "$fresh_state/fresh.identity" ] \
+  || fail "task identity binding did not persist into its newly created state directory"
+pass "task identity binding creates its lock parent on a clean home"
+
 fm_write_meta "$state/task.meta" \
   'window=session:fm-task' \
   "project=$repo" \
@@ -73,5 +81,15 @@ fi
 grep -F "task id 'task' is already bound" "$err" >/dev/null \
   || fail "durable cross-repository refusal lost the bound task id"
 pass "task identity remains repository-bound after volatile metadata removal"
+
+retired_repo="$TMP_ROOT/retired-repo"
+mv "$repo" "$retired_repo"
+fm_git_init_commit "$repo"
+if fm_task_identity_validate "$state" task "$repo" 2> "$err"; then
+  fail "repository replacement at the same path reused a durable task id"
+fi
+grep -F "task id 'task' is already bound" "$err" >/dev/null \
+  || fail "same-path repository replacement refusal lost the bound task id"
+pass "task identity rejects a replacement repository at the recorded path"
 
 echo "# fm-task-identity.test.sh: all assertions passed"
