@@ -9,10 +9,12 @@
 #
 # The validated registration is written atomically to state/<id>.wait using the
 # schema owned by bin/fm-reconcile-lib.sh.  A predicate is executed directly with
-# no shell evaluation on every durable watcher classification cycle: exit 0 means
-# complete, exit 1 means pending, and any other exit or timeout is actionable
-# failure.  A process registration captures the exact process identity, so exit
-# or pid reuse becomes completion while the same live process remains pending.
+# no shell evaluation on every durable watcher classification cycle: exit 0 plus
+# non-empty stdout means complete, exit 0 with empty stdout or exit 1 means
+# pending, and any other exit or timeout is actionable failure.  Stderr is
+# diagnostic only and never completion evidence.  A process registration
+# captures the exact process identity, so exit or pid reuse becomes completion
+# while the same live process remains pending.
 # A command registration additionally verifies the process cwd belongs to the
 # task's recorded worktree/tasktmp and treats exact-pid descendant CPU/lifecycle
 # progress as positive working evidence for a bounded grace window.

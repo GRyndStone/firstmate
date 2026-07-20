@@ -105,34 +105,17 @@ esac
 
 FINAL=0
 IMAGE_PATH=
+TS_ARGS=()
+CHECK_ARGC=0
 if [ "${1:-}" = --check ]; then
   MODE=check
   ID=${2:-}
-  if [ -z "$ID" ] || [ "$#" -gt 2 ]; then usage; exit 2; fi
+  CHECK_ARGC=$#
+  if [ -z "$ID" ]; then usage; exit 2; fi
 else
   ID=${1:-}
   if [ -z "$ID" ]; then usage; exit 2; fi
   shift
-  TS_ARGS=()
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --final)
-        FINAL=1
-        ;;
-      --image)
-        shift
-        if [ "$#" -lt 1 ] || [ -z "$1" ]; then
-          echo "fm-x-followup: missing --image path" >&2
-          usage
-          exit 2
-        fi
-        IMAGE_PATH=$1
-        ;;
-      *) TS_ARGS+=("$1") ;;
-    esac
-    shift
-  done
-  if [ "${#TS_ARGS[@]}" -lt 1 ]; then usage; exit 2; fi
 fi
 
 case "$ID" in
@@ -140,11 +123,34 @@ case "$ID" in
 esac
 
 META="$STATE/$ID.meta"
+FOLLOWUP_OP="$STATE/$ID.x-followup-op"
 FOLLOWUP_LOCK_HELD=0
 PAYLOAD_TEXT=
 PAYLOAD_IMAGE=
 IMAGE_PAYLOAD_FILE=
 REQUEST_BODY_FILE=
+followup_operation_value() {  # <key>
+  fm_reconcile_record_value "$FOLLOWUP_OP" "$1"
+}
+
+followup_delivery_finalize() {
+  local op_final=$1 new_count
+  new_count=$((COUNT + 1))
+  if [ "$op_final" = 1 ] || [ "$new_count" -ge "$MAX_COUNT" ]; then
+    if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
+      return 1
+    fi
+  elif ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" set "$new_count"; then
+    if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
+      return 1
+    fi
+    echo "fm-x-followup: warning: posted but could not record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
+  fi
+  rm -f "$FOLLOWUP_OP"
+}
+
 # shellcheck disable=SC2329
 followup_lock_release() {
   [ -z "$PAYLOAD_TEXT" ] || rm -f "$PAYLOAD_TEXT"
@@ -170,6 +176,60 @@ REQ_REPLY_MAX=$(fmx_meta_get "$META" x_reply_max_chars)
 case "$COUNT" in
   ''|*[!0-9]*) COUNT=0 ;;
 esac
+
+if [ -n "$RID" ] \
+  && [ -n "$META_GENERATION" ] \
+  && [ "$(followup_operation_value schema)" = fm-x-followup-operation.v2 ] \
+  && [ "$(followup_operation_value state)" = delivered ] \
+  && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
+  && [ "$(followup_operation_value request_id)" = "$RID" ] \
+  && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
+  OP_DIGEST=$(followup_operation_value payload_digest)
+  OP_KEY=$(followup_operation_value idempotency_key)
+  OP_FINAL=$(followup_operation_value final)
+  OP_HASH=${OP_DIGEST#sha256:}
+  if [ "$OP_DIGEST" = "$OP_HASH" ] \
+    || [ "${#OP_HASH}" -ne 64 ] \
+    || [[ "$OP_HASH" == *[!0-9A-Fa-f]* ]] \
+    || [ "$OP_KEY" != "fmx-$OP_HASH" ]; then
+    echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2
+    exit 1
+  fi
+  case "$OP_FINAL" in
+    0|1) ;;
+    *) echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1 ;;
+  esac
+  followup_delivery_finalize "$OP_FINAL" || exit 1
+  if [ "$MODE" = check ]; then
+    exit 1
+  fi
+  printf '%s\n' "$RID"
+  exit 0
+fi
+
+if [ "$MODE" = check ]; then
+  if [ "$CHECK_ARGC" -gt 2 ]; then usage; exit 2; fi
+else
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --final)
+        FINAL=1
+        ;;
+      --image)
+        shift
+        if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+          echo "fm-x-followup: missing --image path" >&2
+          usage
+          exit 2
+        fi
+        IMAGE_PATH=$1
+        ;;
+      *) TS_ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  if [ "${#TS_ARGS[@]}" -lt 1 ]; then usage; exit 2; fi
+fi
 
 # Not linked: this task did not originate from an X-mode mention. Detection fails;
 # a post is simply a no-op success (firstmate need not special-case it).
@@ -316,12 +376,6 @@ PAYLOAD_HASH=$({
 PAYLOAD_DIGEST="sha256:$PAYLOAD_HASH"
 EXPECTED_OP_KEY="fmx-$PAYLOAD_HASH"
 
-FOLLOWUP_OP="$STATE/$ID.x-followup-op"
-
-followup_operation_value() {  # <key>
-  fm_reconcile_record_value "$FOLLOWUP_OP" "$1"
-}
-
 followup_operation_write() {  # <prepared|delivered> <key>
   local state=$1 key=$2 tmp
   tmp="$FOLLOWUP_OP.tmp.${BASHPID:-$$}"
@@ -356,17 +410,6 @@ if [ -f "$FOLLOWUP_OP" ] \
         exit 1
       fi
       OP_KEY=$EXPECTED_OP_KEY
-      ;;
-    fm-x-followup-operation.v2:delivered)
-      OP_DIGEST=$(followup_operation_value payload_digest)
-      OP_KEY=$(followup_operation_value idempotency_key)
-      OP_FINAL=$(followup_operation_value final)
-      case "$OP_DIGEST:$OP_KEY:$OP_FINAL" in
-        sha256:*:fmx-*:0|sha256:*:fmx-*:1) ;;
-        *) echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1 ;;
-      esac
-      [ "$OP_KEY" = "fmx-${OP_DIGEST#sha256:}" ] \
-        || { echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1; }
       ;;
     *)
       echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
@@ -424,23 +467,7 @@ case "$post_rc" in
         exit 1
       }
     fi
-    NEWCOUNT=$((COUNT + 1))
-    if [ "$OP_FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
-      if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
-        echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
-        exit 1
-      fi
-      rm -f "$FOLLOWUP_OP"
-    elif ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" set "$NEWCOUNT"; then
-      if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
-        echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
-        exit 1
-      fi
-      rm -f "$FOLLOWUP_OP"
-      echo "fm-x-followup: warning: posted but could not record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
-    else
-      rm -f "$FOLLOWUP_OP"
-    fi
+    followup_delivery_finalize "$OP_FINAL" || exit 1
     printf '%s\n' "$RID"
     exit 0
     ;;

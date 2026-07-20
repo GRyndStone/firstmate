@@ -29,10 +29,12 @@
 #   owner_worktree=<physical path>       # required for working-command
 #   owner_tasktmp=<physical path>        # optional task-scoped alternate root
 #
-# Predicate exit 0 means complete, exit 1 means still pending, and every other
-# exit or timeout means failed.  Process identity match means pending; exit or
-# pid reuse means complete.  A working-command registration is also positive
-# working evidence while its exact pid/descendant tree is observably advancing.
+# Predicate exit 0 plus non-empty stdout means complete; exit 0 with empty stdout
+# or exit 1 means still pending; every other exit or timeout means failed.  Stderr
+# is diagnostic only and never completion evidence.  Process identity match means
+# pending; exit or pid reuse means complete.  A working-command registration is
+# also positive working evidence while its exact pid/descendant tree is
+# observably advancing.
 # It never matches process names or searches for commands outside the registered
 # root tree.  fm-external-wait.sh is the validated writer.
 # A legacy state/<id>.check.sh remains observable park-anchor evidence, but only

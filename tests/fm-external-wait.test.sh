@@ -9,7 +9,7 @@ set -u
 
 WAIT="$ROOT/bin/fm-external-wait.sh"
 RECONCILE="$ROOT/bin/fm-reconcile-lib.sh"
-TMP_ROOT=$(fm_test_tmproot fm-external-wait)
+fm_test_tmproot TMP_ROOT fm-external-wait
 state="$TMP_ROOT/state"
 wt="$TMP_ROOT/worktree"
 live="$TMP_ROOT/live"
@@ -232,8 +232,12 @@ SH
 }
 
 test_help_without_task_id() {
-  FM_STATE_OVERRIDE="$state" "$WAIT" --help >/dev/null \
+  local out
+  out=$(FM_STATE_OVERRIDE="$state" "$WAIT" --help) \
     || fail "external-wait help incorrectly required a task id"
+  assert_contains "$out" 'exit 0 plus' "external-wait help omitted the successful predicate exit requirement"
+  assert_contains "$out" 'non-empty stdout means complete' "external-wait help omitted the predicate completion signal requirement"
+  assert_contains "$out" 'never completion evidence' "external-wait help treated stderr as predicate completion evidence"
   pass "external-wait help is available without task metadata"
 }
 

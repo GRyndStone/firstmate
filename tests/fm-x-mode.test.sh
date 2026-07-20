@@ -1698,9 +1698,11 @@ test_delivered_followup_operation_recovers_without_repost() {
 }
 
 test_delivered_v2_followup_operation_migrates_without_repost() {
-  local home fakebin log meta op generation out rc hash
+  local home fakebin log meta op generation out rc hash final_meta final_op final_generation
   home="$TMP_ROOT/followup-delivered-v2"; mkdir -p "$home/state"
   fakebin=$(make_fake_curl "$home")
+  printf '#!/usr/bin/env bash\nexit 99\n' > "$fakebin/jq"
+  chmod +x "$fakebin/jq"
   log="$home/curl.log"
   mk_linked_task "$home" task-delivered-v2 req-delivered-v2 1700000000 0
   meta="$home/state/task-delivered-v2.meta"
@@ -1716,9 +1718,8 @@ test_delivered_v2_followup_operation_migrates_without_repost() {
     "payload_digest=sha256:$hash" \
     'final=0' \
     "idempotency_key=fmx-$hash"
-  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
-    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
-    "$ROOT/bin/fm-x-followup.sh" task-delivered-v2 - <<<"new renderer context must not repost")
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1800000000 \
+    FAKE_CURL_LOG="$log" "$ROOT/bin/fm-x-followup.sh" task-delivered-v2)
   rc=$?
   expect_code 0 "$rc" "delivered v2 follow-up migration exit"
   [ "$out" = req-delivered-v2 ] || fail "delivered v2 migration returned the wrong request id"
@@ -1726,7 +1727,28 @@ test_delivered_v2_followup_operation_migrates_without_repost() {
     || fail "delivered v2 follow-up operation posted again during migration"
   assert_grep 'x_followups=1' "$meta" "delivered v2 migration did not commit its counter"
   [ ! -e "$op" ] || fail "delivered v2 migration retained its operation record"
-  pass "delivered v2 follow-up operations migrate locally without reposting"
+
+  mk_linked_task "$home" task-delivered-v2-final req-delivered-v2-final 1700000000 1
+  final_meta="$home/state/task-delivered-v2-final.meta"
+  final_op="$home/state/task-delivered-v2-final.x-followup-op"
+  final_generation=$(bash -c '. "$1"; fm_reconcile_meta_generation "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$final_meta")
+  fm_write_meta "$final_op" \
+    'schema=fm-x-followup-operation.v2' \
+    'state=delivered' \
+    "generation=$final_generation" \
+    'request_id=req-delivered-v2-final' \
+    'followup_count=1' \
+    "payload_digest=sha256:$hash" \
+    'final=1' \
+    "idempotency_key=fmx-$hash"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1800000000 \
+    FAKE_CURL_LOG="$log" "$ROOT/bin/fm-x-followup.sh" task-delivered-v2-final --image)
+  rc=$?
+  expect_code 0 "$rc" "delivered final v2 follow-up migration exit"
+  [ "$out" = req-delivered-v2-final ] || fail "delivered final v2 migration returned the wrong request id"
+  assert_no_grep 'x_request=' "$final_meta" "delivered final v2 migration did not clear its link"
+  [ ! -e "$final_op" ] || fail "delivered final v2 migration retained its operation record"
+  pass "delivered v2 follow-up operations finalize before expiry, input, or rendering"
 }
 
 test_followup_operation_rejects_payload_mutation() {
