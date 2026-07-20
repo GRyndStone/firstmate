@@ -178,6 +178,13 @@ PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
 
 SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
 
+# Keep unstarted-run rollback armed through deterministic pre-send readiness.
+# Once the target is ready, clear the trap so an ambiguous pane-run failure
+# preserves the tab and exit-file dir rather than destroying live work.
+fm_backend_herdr_target_ready "$TARGET" || {
+  echo "error: herdr target $TARGET is not ready for run tab $LABEL" >&2
+  exit 1
+}
 trap - EXIT
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
   echo "error: run launch outcome is ambiguous for herdr tab $LABEL (target $TARGET); the tab and exit state at $EXIT_FILE were preserved" >&2
