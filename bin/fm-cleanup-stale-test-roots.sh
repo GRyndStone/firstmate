@@ -299,9 +299,7 @@ classify_path() {
     add_class_reason open-files-cwd-root-or-lsof-unavailable
   fi
 
-  # Refuse trees that contain a different filesystem (bind mount / volume).
-  # rm -rf would otherwise traverse and delete outside the temp root.
-  if has_cross_device_descendant "$resolved"; then
+  if has_mount_descendant "$resolved"; then
     add_class_reason cross-device-or-mount-descendant
   fi
 
@@ -312,21 +310,33 @@ classify_path() {
   CLASS_KIND=OK
 }
 
-has_cross_device_descendant() {
-  local p=$1 all_count=0 xdev_count=0 _
-  # Compare full walk vs same-device-only walk. Any difference means a mount
-  # point or foreign device lives under the candidate; fail closed on probe
-  # failure so apply never rm -rf across filesystems. Count in pure bash so
-  # restricted PATH fixtures (no wc/tr) still work.
-  while IFS= read -r -d '' _; do
-    all_count=$((all_count + 1))
-  done < <(find "$p" -print0 2>/dev/null) || return 0
-  while IFS= read -r -d '' _; do
-    xdev_count=$((xdev_count + 1))
-  done < <(find "$p" -xdev -print0 2>/dev/null) || return 0
-  if [ "$all_count" -ne "$xdev_count" ]; then
-    return 0
-  fi
+has_mount_descendant() {
+  local p=$1 output line mount_path seen=0
+  command -v mount >/dev/null 2>&1 || return 0
+  output=$(mount 2>/dev/null) || return 0
+  [ -n "$output" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^.*[[:space:]]on[[:space:]](.+)[[:space:]]type[[:space:]][^[:space:]]+[[:space:]]\( ]]; then
+      mount_path=${BASH_REMATCH[1]}
+    elif [[ "$line" =~ ^.*[[:space:]]on[[:space:]](.+)[[:space:]]\( ]]; then
+      mount_path=${BASH_REMATCH[1]}
+    else
+      return 0
+    fi
+    mount_path=${mount_path//\\040/ }
+    mount_path=${mount_path//\\011/$'\t'}
+    mount_path=${mount_path//\\012/$'\n'}
+    mount_path=${mount_path//\\134/\\}
+    case "$mount_path" in
+      /*) : ;;
+      *) return 0 ;;
+    esac
+    seen=$((seen + 1))
+    case "$mount_path" in
+      "$p"|"$p"/*) return 0 ;;
+    esac
+  done <<< "$output"
+  [ "$seen" -gt 0 ] || return 0
   return 1
 }
 
@@ -421,10 +431,8 @@ for p in "${eligible[@]:-}"; do
   classify_path "$p"
   case "$CLASS_KIND" in
     OK)
-      # Same-device-only delete first so a race-introduced mount cannot be
-      # traversed; then remove the root if it remains empty.
       if find "$CLASS_PATH" -xdev -depth -delete 2>/dev/null \
-        && { [ ! -e "$CLASS_PATH" ] || rm -rf "$CLASS_PATH"; }; then
+        && [ ! -e "$CLASS_PATH" ]; then
         deleted=$((deleted + 1))
         deleted_bytes=$((deleted_bytes + CLASS_BYTES))
         printf 'deleted: %s\t%q\n' "$CLASS_BYTES" "$CLASS_PATH"

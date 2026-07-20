@@ -35,6 +35,140 @@ SH
   printf '%s\n' "$fb"
 }
 
+test_mount_entries_and_probe_failures_refuse_candidate() {
+  local candidate fb log out
+  candidate=$(make_candidate fm-secondmate-safety.mounted)
+  mkdir -p "$candidate/empty-mount"
+  fb=$(make_lsof_fake "$TMP_ROOT/mount-fake")
+  log="$TMP_ROOT/mount-lsof.log"; : > "$log"
+  cat > "$fb/mount" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' 'same-device on $candidate/empty-mount (bind, local)'
+EOF
+  chmod +x "$fb/mount"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "same-device bind mount was not refused"
+  assert_present "$candidate" "dry-run removed a mount-containing candidate"
+
+  cat > "$fb/mount" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fb/mount"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "failed mount probe did not fail closed"
+  assert_present "$candidate" "failed mount probe removed its candidate"
+  pass "cleanup helper: mount entries and probe failures refuse candidates"
+}
+
+test_dry_run_and_explicit_apply_modes() {
+  local candidate refused fb log out status
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  fb=$(make_lsof_fake "$TMP_ROOT/apply-modes-fake")
+  log="$TMP_ROOT/apply-modes-lsof.log"; : > "$log"
+  candidate=$(make_candidate fm-secondmate-safety.default-dry)
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "action: dry-run (no deletions performed)" "default mode was not dry-run"
+  assert_present "$candidate" "default dry-run deleted an eligible candidate"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply)
+  assert_absent "$candidate" "explicit --apply did not delete its eligible candidate"
+
+  candidate=$(make_candidate fm-secondmate-safety.apply-eligible)
+  refused=$(make_candidate fm-secondmate-safety.refused-fresh)
+  touch -t 209901010000 "$refused/nested/open-file"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply 2>&1) && status=0 || status=$?
+  expect_code 3 "$status" "--apply must refuse the whole run when any candidate is refused"
+  assert_present "$candidate" "refused --apply deleted an otherwise eligible candidate"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply-eligible)
+  assert_absent "$candidate" "explicit --apply-eligible did not delete the eligible set"
+  assert_present "$refused" "--apply-eligible deleted a refused candidate"
+  pass "cleanup helper: only explicit apply modes delete eligible candidates"
+}
+
+test_owner_and_resolved_path_checks_fail_closed() {
+  local candidate fb log out status real_stat base outside real_find
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.wrong-owner)
+  fb=$(make_lsof_fake "$TMP_ROOT/owner-fake")
+  log="$TMP_ROOT/owner-lsof.log"; : > "$log"
+  real_stat=$(command -v stat)
+  cat > "$fb/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  '-c %u'|'-f %u') printf '%s\n' "${FM_OTHER_UID:?}"; exit 0 ;;
+esac
+exec "${FM_REAL_STAT:?}" "$@"
+SH
+  chmod +x "$fb/stat"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    FM_REAL_STAT="$real_stat" FM_OTHER_UID=4294967294 \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply 2>&1) && status=0 || status=$?
+  expect_code 3 "$status" "owner mismatch must refuse --apply"
+  assert_contains "$out" "owner-uid-4294967294-ne-" "owner mismatch refusal lost its reason"
+  assert_present "$candidate" "owner mismatch deleted its candidate"
+
+  base="$TMP_ROOT/escape-base"; outside="$TMP_ROOT/escape-outside"
+  mkdir -p "$base/fm-secondmate-safety.escape" "$outside"
+  : > "$outside/sentinel"
+  candidate="$base/fm-secondmate-safety.escape"
+  fb="$TMP_ROOT/escape-fake/fakebin"; mkdir -p "$fb"
+  real_find=$(command -v find)
+  cat > "$fb/find" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = -maxdepth ]; then
+    printf '%s\0' "${FM_ESCAPE_CANDIDATE:?}"
+    /bin/rm -rf "$FM_ESCAPE_CANDIDATE"
+    /bin/ln -s "${FM_ESCAPE_OUTSIDE:?}" "$FM_ESCAPE_CANDIDATE"
+    exit 0
+  fi
+done
+exec "${FM_REAL_FIND:?}" "$@"
+SH
+  chmod +x "$fb/find"
+  out=$(PATH="$fb:$PATH" FM_ESCAPE_CANDIDATE="$candidate" FM_ESCAPE_OUTSIDE="$outside" FM_REAL_FIND="$real_find" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$base" --min-age-hours 0 --apply 2>&1) && status=0 || status=$?
+  expect_code 3 "$status" "resolved path escape must refuse --apply"
+  assert_contains "$out" "escaped-base-via-symlink-or-resolve" "resolved path escape refusal lost its reason"
+  assert_present "$outside/sentinel" "resolved path escape deleted outside content"
+  pass "cleanup helper: owner and resolved path gates fail closed"
+}
+
+test_reappearing_path_is_not_deleted_without_recheck() {
+  local candidate fb log out status real_find
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.reappears)
+  fb=$(make_lsof_fake "$TMP_ROOT/reappears-fake")
+  log="$TMP_ROOT/reappears-lsof.log"; : > "$log"
+  real_find=$(command -v find)
+  cat > "$fb/find" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = -delete ]; then
+    "${FM_REAL_FIND:?}" "$@" || exit $?
+    mkdir -p "${FM_REAPPEAR_PATH:?}"
+    : > "$FM_REAPPEAR_PATH/replacement"
+    exit 0
+  fi
+done
+exec "${FM_REAL_FIND:?}" "$@"
+SH
+  chmod +x "$fb/find"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    FM_REAL_FIND="$real_find" FM_REAPPEAR_PATH="$candidate" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply-eligible 2>&1) && status=0 || status=$?
+  expect_code 4 "$status" "replacement tree after delete must fail the apply"
+  assert_contains "$out" "delete-failed:" "replacement tree did not report deletion failure"
+  assert_present "$candidate/replacement" "replacement tree was deleted without a fresh safety recheck"
+  pass "cleanup helper: a reappearing path is preserved and reported"
+}
+
 test_descendant_handles_refuse_candidate() {
   local candidate fb log out
   candidate=$(make_candidate fm-secondmate-safety.descendant)
@@ -209,6 +343,10 @@ SH
 test_descendant_handles_refuse_candidate
 test_missing_lsof_refuses_candidate
 test_clear_recursive_probe_allows_candidate
+test_mount_entries_and_probe_failures_refuse_candidate
+test_dry_run_and_explicit_apply_modes
+test_owner_and_resolved_path_checks_fail_closed
+test_reappearing_path_is_not_deleted_without_recheck
 test_apply_rechecks_gates_before_delete
 test_pipe_names_remain_structured
 test_large_ps_match_refuses_candidate

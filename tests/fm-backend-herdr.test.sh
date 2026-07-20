@@ -522,6 +522,7 @@ test_create_task_refuses_when_preexisting_husk_tab_remains() {
   [ "$status" -ne 0 ] || fail "create_task must fail when a preexisting same-labeled husk remains after close-and-replace"
   assert_contains "$out" "failed to remove preexisting herdr tab" "create_task did not report the stale preexisting husk tab"
   assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t2' "create_task did not close the stale husk by tab id"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t3' "failed husk replacement did not roll back the created tab"
   assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close'$'\x1f''w1:p2' "create_task should not rely on pane close for a preexisting husk"
   pass "fm_backend_herdr_create_task: refuses success when a preexisting husk tab remains after replacement"
 }
@@ -589,6 +590,22 @@ test_create_task_creates_and_parses_ids() {
   assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''close' \
     "create_task must never prune when called with no seeded default tab id (the 4th arg defaults to empty)"
   pass "fm_backend_herdr_create_task: creates a tab and parses tab_id/pane_id from the JSON response, prunes nothing when no seeded tab id is given"
+}
+
+test_create_task_rolls_back_unparseable_created_tab() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/create-task-unparseable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[]}}\n' > "$resp/1.out"
+  printf '{"result":{}}\n' > "$resp/2.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-unparseable","workspace_id":"w1"}]}}\n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-unparseable /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task must fail when the created tab response has no ids"
+  assert_contains "$out" "could not parse tab/pane id" "unparseable create response lost its error"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t2' "unparseable create response leaked its created tab"
+  pass "fm_backend_herdr_create_task: unparseable post-create response rolls back the new tab"
 }
 
 # --- container_ensure / create_task: --no-focus and per-home label ----------
@@ -2106,6 +2123,7 @@ test_create_task_refuses_when_preexisting_husk_tab_remains
 test_create_task_refuses_when_agent_state_ambiguous
 test_create_task_husk_replacement_creates_before_closing
 test_create_task_creates_and_parses_ids
+test_create_task_rolls_back_unparseable_created_tab
 test_create_task_creates_with_no_focus_flag
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only

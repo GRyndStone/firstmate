@@ -62,8 +62,20 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
-  "tab list") printf '{"result":{"tabs":[]}}\n' ;;
-  "tab create") printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' ;;
+  "tab list")
+    if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ] && grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
+      printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)"
+    else
+      printf '{"result":{"tabs":[]}}\n'
+    fi
+    ;;
+  "tab create")
+    if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ]; then
+      printf '{"result":{}}\n'
+    else
+      printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n'
+    fi
+    ;;
   "pane get")
     if [ "${FM_FAKE_PANE_GONE:-0}" = 1 ]; then
       if [ -n "${FM_FAKE_DEAD_EXIT:-}" ]; then
@@ -162,6 +174,22 @@ test_state_setup_failure_closes_created_tab() {
   assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
     "state-directory setup failure left the created herdr tab open"
   pass "fm-gsd-run.sh: state setup failure closes the created run tab"
+}
+
+test_post_create_failure_closes_created_tab() {
+  local dir fb log proj out status
+  dir="$TMP_ROOT/post-create-failure"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_TAB_CREATE_UNPARSEABLE=1 \
+    FM_GSD_RUN_STATE_DIR="$dir/state" "$ROOT/bin/fm-gsd-run.sh" --no-wait task-c1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "post-create parsing failure must fail the launch"
+  assert_contains "$out" "could not parse tab/pane id" "post-create failure lost its parsing error"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
+    "post-create failure leaked the created herdr tab"
+  assert_absent "$dir/state" "post-create failure created exit state before readiness"
+  pass "fm-gsd-run.sh: post-create failures roll back the created run tab"
 }
 
 test_ambiguous_send_failure_preserves_tab_and_state() {
@@ -362,6 +390,7 @@ test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
 test_state_setup_failure_closes_created_tab
+test_post_create_failure_closes_created_tab
 test_ambiguous_send_failure_preserves_tab_and_state
 test_no_wait_launches_visible_tab
 test_same_second_runs_get_unique_labels
