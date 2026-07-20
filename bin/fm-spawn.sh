@@ -194,6 +194,7 @@ SPAWN_CLAIMED=0
 SPAWN_META_PUBLISHED=0
 SPAWN_ENDPOINT_CREATED=0
 SPAWN_WORKTREE_CREATED=0
+SPAWN_PARTIAL_ENDPOINT=0
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -213,7 +214,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? cleanup_failed=0 rescue token
+  local status=$? cleanup_failed=0 rescue token remaining
   [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
   if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" = orca ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
     fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
@@ -226,8 +227,51 @@ spawn_abort_cleanup() {
       (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1 || cleanup_failed=1
     fi
   fi
-  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
-    fm_backend_kill "${BACKEND:-tmux}" "${T:-$ORCA_TERMINAL}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" != orca ]; then
+    case "${BACKEND:-tmux}" in
+      herdr)
+        if [ -n "${HERDR_TAB_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
+          fm_backend_herdr_cli "$HERDR_SES" tab close "$HERDR_TAB_ID" >/dev/null 2>&1 || true
+          remaining=$(fm_backend_herdr_cli "$HERDR_SES" tab list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null \
+            | jq -r --arg id "$HERDR_TAB_ID" '.result.tabs[]? | select(.tab_id == $id) | .tab_id' 2>/dev/null || true)
+          [ -z "$remaining" ] || cleanup_failed=1
+        elif [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
+          fm_backend_kill herdr "$HERDR_SES:$HERDR_PANE_ID" 2>/dev/null || true
+          fm_backend_target_exists herdr "$HERDR_SES:$HERDR_PANE_ID" && cleanup_failed=1
+        else
+          cleanup_failed=1
+        fi
+        ;;
+      zellij)
+        if [ -n "${ZELLIJ_SES:-}" ] && { [ -n "${ZELLIJ_TAB_ID:-}" ] || [ -n "${ZELLIJ_PANE_ID:-}" ]; }; then
+          fm_backend_kill zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+          if [ -n "${ZELLIJ_TAB_ID:-}" ] \
+            && fm_backend_zellij_tab_matches_label "$ZELLIJ_SES" "$ZELLIJ_TAB_ID" "${W:-fm-${ID:-}}"; then
+            cleanup_failed=1
+          fi
+        else
+          cleanup_failed=1
+        fi
+        ;;
+      cmux)
+        if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+          fm_backend_kill cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" 2>/dev/null || true
+          remaining=$(fm_backend_cmux_workspace_id_for_label "$(fm_backend_cmux_scoped_title "${W:-fm-${ID:-}}")")
+          [ "$remaining" != "$CMUX_WORKSPACE_ID" ] || cleanup_failed=1
+        else
+          cleanup_failed=1
+        fi
+        ;;
+      *)
+        if [ -n "${T:-}" ]; then
+          fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+          fm_backend_target_exists "${BACKEND:-tmux}" "$T" "${W:-fm-${ID:-}}" && cleanup_failed=1
+        else
+          cleanup_failed=1
+        fi
+        ;;
+    esac
+    [ "$cleanup_failed" -eq 1 ] || SPAWN_ENDPOINT_CREATED=0
   fi
   if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend" 2>/dev/null || true
@@ -252,6 +296,8 @@ spawn_abort_cleanup() {
       echo "tasktmp=${TASK_TMP:-}"
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
+      echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
+      echo "spawn_backend_label=${W:-fm-$ID}"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
       [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
       [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
@@ -278,6 +324,18 @@ spawn_abort_cleanup() {
   return "$status"
 }
 trap spawn_abort_cleanup EXIT
+
+parse_partial_create_result() {
+  local raw=$1 rest
+  case "$raw" in partial$'\t'*) ;; *) return 1 ;; esac
+  rest=${raw#partial$'\t'}
+  PARTIAL_CREATE_FIRST=${rest%%$'\t'*}
+  if [ "$rest" = "$PARTIAL_CREATE_FIRST" ]; then
+    PARTIAL_CREATE_SECOND=
+  else
+    PARTIAL_CREATE_SECOND=${rest#*$'\t'}
+  fi
+}
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -787,7 +845,22 @@ case "$BACKEND" in
     if [ "$KIND" = secondmate ]; then
       HERDR_LABEL_HOME=$PROJ_ABS
     fi
-    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
+    set +e
+    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$HERDR_CONTAINER_RAW"; then
+        CONTAINER=$PARTIAL_CREATE_FIRST
+        HERDR_SEEDED_DEFAULT_TAB_ID=$PARTIAL_CREATE_SECOND
+        HERDR_SES=${CONTAINER%%:*}
+        HERDR_WORKSPACE_ID=${CONTAINER#*:}
+        T="$HERDR_SES:partial-$ID"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
     # (the second field empty when this call ADOPTED a pre-existing workspace
     # rather than creating a fresh one). Split on the guaranteed single tab
@@ -798,7 +871,20 @@ case "$BACKEND" in
     HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
     HERDR_SES=${CONTAINER%%:*}
     HERDR_WORKSPACE_ID=${CONTAINER#*:}
-    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+    set +e
+    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$HERDR_TASK_IDS"; then
+        HERDR_TAB_ID=$PARTIAL_CREATE_FIRST
+        HERDR_PANE_ID=$PARTIAL_CREATE_SECOND
+        T="$HERDR_SES:${HERDR_PANE_ID:-partial-$ID}"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -811,7 +897,20 @@ EOF
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    set +e
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$ZELLIJ_TASK_IDS"; then
+        ZELLIJ_TAB_ID=$PARTIAL_CREATE_FIRST
+        ZELLIJ_PANE_ID=$PARTIAL_CREATE_SECOND
+        T="$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial-$ID}"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -824,7 +923,20 @@ EOF
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    set +e
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$CMUX_TASK_IDS"; then
+        CMUX_WORKSPACE_ID=$PARTIAL_CREATE_FIRST
+        CMUX_SURFACE_ID=$PARTIAL_CREATE_SECOND
+        T="${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial-$ID}"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF

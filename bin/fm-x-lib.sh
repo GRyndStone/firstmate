@@ -556,3 +556,35 @@ fmx_meta_link_clear() {
   fm_reconcile_meta_update "$state" "$id" "$expected_generation" \
     --remove x_request --remove x_request_ts --remove x_followups --remove x_platform --remove x_reply_max_chars
 }
+
+fmx_meta_link_tuple_matches_locked() {  # <meta> <generation> <request-id> <count>
+  local meta=$1 generation=$2 rid=$3 count=$4 current_count
+  [ "$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ "$(fmx_meta_get "$meta" x_request)" = "$rid" ] || return 1
+  current_count=$(fmx_meta_get "$meta" x_followups)
+  case "$current_count" in ''|*[!0-9]*) current_count=0 ;; esac
+  [ "$current_count" = "$count" ]
+}
+
+fmx_meta_followup_commit_locked() {  # <meta> <generation> <request-id> <count> <set|clear> [new-count]
+  local meta=$1 generation=$2 rid=$3 count=$4 mode=$5 new_count=${6:-} tmp
+  fmx_meta_link_tuple_matches_locked "$meta" "$generation" "$rid" "$count" || return 3
+  tmp="$meta.x-followup.${BASHPID:-$$}"
+  case "$mode" in
+    set)
+      case "$new_count" in ''|*[!0-9]*) return 2 ;; esac
+      awk -v value="$new_count" '
+        BEGIN { wrote = 0 }
+        /^x_followups=/ { if (!wrote) print "x_followups=" value; wrote = 1; next }
+        { print }
+        END { if (!wrote) print "x_followups=" value }
+      ' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+      ;;
+    clear)
+      awk '!/^(x_request|x_request_ts|x_followups|x_platform|x_reply_max_chars)=/' "$meta" > "$tmp" \
+        || { rm -f "$tmp"; return 1; }
+      ;;
+    *) return 2 ;;
+  esac
+  mv -f "$tmp" "$meta"
+}

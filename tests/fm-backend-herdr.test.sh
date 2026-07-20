@@ -615,6 +615,37 @@ test_create_task_rolls_back_unparseable_created_tab() {
   pass "fm_backend_herdr_create_task: unparseable post-create response rolls back the new tab"
 }
 
+test_create_task_reports_partial_ids_on_incomplete_create_response() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/create-task-partial"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[]}}\n' > "$resp/1.out"
+  printf '{"result":{"tab":{"tab_id":"w1:t2"}}}\n' > "$resp/2.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-partial /tmp/proj' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 2 ] || fail "create_task must distinguish a possibly-created herdr tab (got $status)"
+  [ "$out" = $'partial\tw1:t2\t' ] || fail "create_task must return known partial herdr ids, got '$out'"
+  pass "fm_backend_herdr_create_task: reports known ids from incomplete creation"
+}
+
+test_container_ensure_reports_partial_workspace_after_ambiguous_create() {
+  local dir log resp fb out status
+  dir="$TMP_ROOT/container-partial"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"client":{"version":"0.7.1","protocol":14}}\n' > "$resp/1.out"
+  printf '{"server":{"running":true}}\n' > "$resp/2.out"
+  printf '{"result":{"workspaces":[]}}\n' > "$resp/3.out"
+  printf '{}\n' > "$resp/4.out"
+  printf '{"result":{"workspaces":[{"workspace_id":"w7","label":"firstmate"}]}}\n' > "$resp/5.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 HERDR_SESSION=fmtest \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 2 ] || fail "container_ensure must distinguish a possibly-created herdr workspace (got $status)"
+  [ "$out" = $'partial\tfmtest:w7\t' ] || fail "container_ensure must return the recovered partial workspace id, got '$out'"
+  pass "fm_backend_herdr_container_ensure: reports ambiguous workspace creation"
+}
+
 # --- container_ensure / create_task: --no-focus and per-home label ----------
 
 test_container_ensure_creates_with_no_focus_flag() {
@@ -2131,6 +2162,8 @@ test_create_task_refuses_when_agent_state_ambiguous
 test_create_task_husk_replacement_creates_before_closing
 test_create_task_creates_and_parses_ids
 test_create_task_rolls_back_unparseable_created_tab
+test_create_task_reports_partial_ids_on_incomplete_create_response
+test_container_ensure_reports_partial_workspace_after_ambiguous_create
 test_create_task_creates_with_no_focus_flag
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only

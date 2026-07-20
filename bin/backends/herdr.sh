@@ -327,9 +327,10 @@ fm_backend_herdr_workspace_prune_seeded_default_tab() {  # <session> <workspace_
 # attach to). --no-focus is passed unconditionally anyway, for defense in
 # depth and because it is a no-op in the already-safe case.
 fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
-  local session=$1 cwd=$2 wsid out label
+  local session=$1 cwd=$2 wsid out label create_rc=0
   FM_BACKEND_HERDR_WS_ID=""
   FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
+  FM_BACKEND_HERDR_WS_PARTIAL=0
   wsid=$(fm_backend_herdr_workspace_find "$session")
   if [ -n "$wsid" ]; then
     FM_BACKEND_HERDR_WS_ID=$wsid
@@ -337,9 +338,18 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
     return 0
   fi
   label=$(fm_backend_herdr_workspace_label)
-  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  if ! out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null); then
+    create_rc=1
+  fi
   wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
-  [ -n "$wsid" ] || return 1
+  if [ -z "$wsid" ]; then
+    wsid=$(fm_backend_herdr_workspace_find "$session")
+    FM_BACKEND_HERDR_WS_PARTIAL=1
+  fi
+  if [ -z "$wsid" ]; then
+    [ "$create_rc" -eq 0 ] || FM_BACKEND_HERDR_WS_PARTIAL=1
+    return 2
+  fi
   FM_BACKEND_HERDR_WS_ID=$wsid
   # Herdr seeds a new workspace with one auto-created default tab firstmate
   # never uses. It is NOT pruned here: at this instant it is the workspace's
@@ -350,6 +360,7 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
   # this exact captured tab_id.
   FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   printf '%s' "$wsid"
+  [ "$create_rc" -eq 0 ] && [ "$FM_BACKEND_HERDR_WS_PARTIAL" -eq 0 ] || return 2
 }
 
 # fm_backend_herdr_container_ensure: the full spawn-time container-ensure
@@ -361,11 +372,20 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
 # must be threaded through to fm_backend_herdr_create_task, which is the only
 # function allowed to prune it (fm_backend_herdr_workspace_prune_seeded_default_tab).
 fm_backend_herdr_container_ensure() {  # <cwd-for-a-fresh-workspace>
-  local cwd=${1:-$PWD} session label
+  local cwd=${1:-$PWD} session label ensure_rc=0
   fm_backend_herdr_version_check || return 1
   session=$(fm_backend_herdr_session)
   fm_backend_herdr_server_ensure "$session" || return 1
-  fm_backend_herdr_workspace_ensure "$session" "$cwd" >/dev/null || { label=$(fm_backend_herdr_workspace_label); echo "error: failed to ensure herdr workspace '$label' in session '$session'" >&2; return 1; }
+  fm_backend_herdr_workspace_ensure "$session" "$cwd" >/dev/null || ensure_rc=$?
+  if [ "$ensure_rc" -ne 0 ]; then
+    label=$(fm_backend_herdr_workspace_label)
+    echo "error: failed to ensure herdr workspace '$label' in session '$session'" >&2
+    if [ "$ensure_rc" -eq 2 ]; then
+      printf 'partial\t%s:%s\t%s' "$session" "$FM_BACKEND_HERDR_WS_ID" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
+      return 2
+    fi
+    return 1
+  fi
   if [ -z "$FM_BACKEND_HERDR_WS_ID" ]; then
     label=$(fm_backend_herdr_workspace_label)
     echo "error: failed to ensure herdr workspace '$label' in session '$session'" >&2
@@ -595,13 +615,19 @@ fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_ta
 $dup_tabs
 EOF
   fi
-  out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  if ! out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null); then
+    printf 'partial\t\t'
+    return 2
+  fi
   tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
     echo "error: could not parse tab/pane id from herdr tab create output" >&2
-    fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
-    return 1
+    if fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids"; then
+      return 1
+    fi
+    printf 'partial\t%s\t%s' "$tab_id" "$pane_id"
+    return 2
   fi
   [ -z "$seeded_tab_id" ] || fm_backend_herdr_workspace_prune_seeded_default_tab "$session" "$wsid" "$seeded_tab_id"
   if [ -n "$dup_tab_ids" ]; then
@@ -613,21 +639,30 @@ $dup_tab_ids
 EOF
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
       echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
-      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
-      return 1
+      if fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids"; then
+        return 1
+      fi
+      printf 'partial\t%s\t%s' "$tab_id" "$pane_id"
+      return 2
     }
     if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
-      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
-      return 1
+      if fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids"; then
+        return 1
+      fi
+      printf 'partial\t%s\t%s' "$tab_id" "$pane_id"
+      return 2
     fi
     remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
       '.result.tabs[]? | select(.label == $want and .tab_id != $replacement) | .tab_id' 2>/dev/null)
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
-      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
-      return 1
+      if fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids"; then
+        return 1
+      fi
+      printf 'partial\t%s\t%s' "$tab_id" "$pane_id"
+      return 2
     fi
   fi
   printf '%s %s' "$tab_id" "$pane_id"

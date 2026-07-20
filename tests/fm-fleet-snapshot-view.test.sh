@@ -230,12 +230,14 @@ test_event_hints_follow_reconciled_current_state() {
     "project=alpha" \
     "harness=codex" \
     "kind=ship" \
-    "mode=ship"
+    "mode=ship" \
+    "generation=stale-observation-generation"
   printf 'needs-decision [key=fresh-question]: choose the current API shape\n' > "$home/state/stale-observation.status"
   fm_write_meta "$home/state/stale-observation.reconciled" \
     'schema=fm-reconciled.v1' \
     'task=stale-observation' \
     'endpoint=firstmate:fm-stale-observation' \
+    'lifecycle_generation=stale-observation-generation' \
     'state=working' \
     'source=pane' \
     'evidence=state: working · source: pane · old busy evidence' \
@@ -443,19 +445,22 @@ test_snapshot_separates_reconciled_truth_event_history_and_wait() {
     'project=alpha' \
     'harness=codex' \
     'kind=ship' \
-    'mode=ship'
+    'mode=ship' \
+    'generation=reconciled-generation'
   printf 'paused: stale OAuth label from before callback completion\n' > "$home/state/reconciled-task.status"
   fm_write_meta "$home/state/reconciled-task.wait" \
     'schema=fm-external-wait.v1' \
     'kind=predicate' \
     'description=xAI OAuth callback' \
     'predicate=/tmp/oauth-completion-predicate' \
+    'lifecycle_generation=reconciled-generation' \
     'registered_at=1'
   now=$(date +%s)
   fm_write_meta "$home/state/reconciled-task.reconciled" \
     'schema=fm-reconciled.v1' \
     'task=reconciled-task' \
     'endpoint=firstmate:fm-reconciled-task' \
+    'lifecycle_generation=reconciled-generation' \
     'state=done' \
     'source=run-step' \
     'detail=checks green: PR ready for review' \
@@ -509,6 +514,64 @@ test_snapshot_separates_reconciled_truth_event_history_and_wait() {
   ' >/dev/null || fail "captain-facing bearings did not consume reconciled snapshot truth"
   assert_not_contains "$bearings" 'stale OAuth label' "bearings presented the last event prose as current truth"
   pass "snapshot and captain-facing views separate reconciled truth from stale event history"
+}
+
+test_snapshot_rejects_stale_generation_reconciliation() {
+  local home fakebin out now
+  home=$(make_home stale-generation)
+  mkdir -p "$home/projects/generation-task"
+  fm_write_meta "$home/state/generation-task.meta" \
+    'window=firstmate:fm-generation-task' \
+    "worktree=$home/projects/generation-task" \
+    'project=alpha' \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship' \
+    'generation=current-generation'
+  printf 'working: current lifecycle event\n' > "$home/state/generation-task.status"
+  fm_write_meta "$home/state/generation-task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=old lifecycle wait' \
+    'predicate=/tmp/old-lifecycle-predicate' \
+    'lifecycle_generation=old-generation' \
+    'registered_at=1'
+  now=$(date +%s)
+  fm_write_meta "$home/state/generation-task.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=generation-task' \
+    'endpoint=firstmate:fm-generation-task' \
+    'lifecycle_generation=old-generation' \
+    'state=done' \
+    'source=run-step' \
+    'evidence=state: done · source: run-step · old lifecycle' \
+    "observed_at=$now" \
+    'prior_endpoint=firstmate:fm-generation-task' \
+    'prior_state=working' \
+    'prior_source=pane' \
+    'prior_evidence=state: working · source: pane · old lifecycle' \
+    "prior_observed_at=$((now - 1))" \
+    'status_sequence=1' \
+    'status_signature=old-status-signature' \
+    'last_status_event=done: old lifecycle completion' \
+    'wait_signature=old-wait-signature' \
+    'wait_state=complete' \
+    'wait_evidence=old lifecycle completion' \
+    "wait_checked_at=$now"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "generation-task")
+    | .current_state.persisted == false
+      and .current_state.state != "done"
+      and .prior_observed_state.state == null
+      and .last_status_event.supervisor_observation.observed_at == null
+      and .last_status_event.supervisor_observation.freshness == "unobserved"
+      and .external_wait.lifecycle_current == false
+      and .external_wait.observation.state == "unobserved"
+      and .external_wait.observation.checked_at == null
+  ' >/dev/null || fail "snapshot accepted stale-generation reconciliation data: $out"
+  pass "snapshot rejects stale-generation reconciliation data"
 }
 
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
@@ -672,3 +735,4 @@ test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
 test_snapshot_separates_reconciled_truth_event_history_and_wait
+test_snapshot_rejects_stale_generation_reconciliation

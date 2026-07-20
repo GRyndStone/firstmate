@@ -101,6 +101,8 @@ FORCE=${2:-}
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$META") \
+  || { echo "error: cannot resolve task lifecycle generation for $ID" >&2; exit 1; }
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
@@ -860,7 +862,7 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc remove_rc
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc remove_rc child_generation
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -871,6 +873,7 @@ cleanup_firstmate_home_children() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_generation=$(fm_reconcile_meta_generation "$child_meta") || return 1
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
     else
@@ -882,7 +885,7 @@ cleanup_firstmate_home_children() {
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       fi
     fi
-    fm_reconcile_teardown_begin "$sub_state" "$child_id" || return 1
+    fm_reconcile_teardown_begin "$sub_state" "$child_id" "$child_generation" || return 1
     if [ -n "$child_t" ]; then
       # Tombstone for the child home's own watcher, same contract as the main
       # task path: a mid-teardown gone endpoint is teardown, not a crew death.
@@ -924,10 +927,16 @@ cleanup_firstmate_home_children() {
         safe_rm_rf_child_worktree "$child_wt" "$child_proj"
       fi
     fi
-    remove_grok_turnend_auth "$sub_state" "$child_id"
     fm_reconcile_lock_acquire "$sub_state" "$child_id"
     remove_rc=0
-    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
+    if fm_reconcile_teardown_matches_locked "$sub_state" "$child_id" "$child_generation"; then
+      remove_grok_turnend_auth "$sub_state" "$child_id"
+      rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
+    else
+      [ "$(fm_reconcile_record_value "$sub_state/$child_id.tearing-down" lifecycle_generation)" != "$child_generation" ] \
+        || rm -f "$sub_state/$child_id.tearing-down"
+      remove_rc=3
+    fi
     fm_reconcile_lock_release "$sub_state" "$child_id"
     [ "$remove_rc" -eq 0 ] || return "$remove_rc"
   done
@@ -1008,7 +1017,7 @@ fi
 if [ "$KIND" != secondmate ]; then
   fm_task_identity_bind "$STATE" "$ID" "$PROJ" || exit 1
 fi
-fm_reconcile_teardown_begin "$STATE" "$ID" || exit 1
+fm_reconcile_teardown_begin "$STATE" "$ID" "$LIFECYCLE_GENERATION" || exit 1
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
@@ -1058,15 +1067,23 @@ if [ "$KIND" = secondmate ]; then
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
   remove_secondmate_registry_entry "$ID"
 fi
-remove_grok_turnend_auth "$STATE" "$ID"
-fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
-# Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
-[ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 fm_reconcile_lock_acquire "$STATE" "$ID"
 remove_rc=0
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
+if fm_reconcile_teardown_matches_locked "$STATE" "$ID" "$LIFECYCLE_GENERATION"; then
+  remove_grok_turnend_auth "$STATE" "$ID"
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
+else
+  [ "$(fm_reconcile_record_value "$STATE/$ID.tearing-down" lifecycle_generation)" != "$LIFECYCLE_GENERATION" ] \
+    || rm -f "$STATE/$ID.tearing-down"
+  remove_rc=3
+fi
 fm_reconcile_lock_release "$STATE" "$ID"
+if [ "$remove_rc" -eq 3 ]; then
+  echo "error: task $ID lifecycle changed during teardown; preserved replacement lifecycle state" >&2
+  exit 1
+fi
 [ "$remove_rc" -eq 0 ] || exit "$remove_rc"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

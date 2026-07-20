@@ -483,6 +483,24 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_zellij_create_task: creates a home-scoped tab and parses tab_id/pane_id from the response"
 }
 
+test_create_task_recovers_partial_tab_after_ambiguous_create() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-task-partial"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-partial)
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '1\n' > "$dir/responses/2.exit"
+  printf '[{"tab_id":3,"name":"%s","active":false}]\n' "$title" > "$dir/responses/3.out"
+  printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/4.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/proj' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 2 ] || fail "create_task must distinguish a possibly-created zellij tab (got $status)"
+  [ "$out" = $'partial\t3\t7' ] || fail "create_task must return recovered partial zellij ids, got '$out'"
+  pass "fm_backend_zellij_create_task: recovers partial tab ids after ambiguous creation"
+}
+
 test_create_task_restores_previously_active_tab() {
   local dir fb out
   dir="$TMP_ROOT/focus-restore"; mkdir -p "$dir/responses"
@@ -1036,6 +1054,7 @@ test_dispatch_routes_zellij_backend
 test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
+test_create_task_recovers_partial_tab_after_ambiguous_create
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
 test_capture_small_reads_use_viewport_and_trim

@@ -76,6 +76,10 @@ FM_EXTERNAL_WAIT_TIMEOUT=${FM_EXTERNAL_WAIT_TIMEOUT:-5}
 case "$FM_EXTERNAL_WAIT_TIMEOUT" in ''|*[!0-9]*|0) FM_EXTERNAL_WAIT_TIMEOUT=5 ;; esac
 FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES=${FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES:-4096}
 case "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES" in ''|*[!0-9]*|0) FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES=4096 ;; esac
+FM_LEGACY_CHECK_INTERVAL=${FM_LEGACY_CHECK_INTERVAL:-${FM_CHECK_INTERVAL:-300}}
+case "$FM_LEGACY_CHECK_INTERVAL" in ''|*[!0-9]*) FM_LEGACY_CHECK_INTERVAL=300 ;; esac
+FM_LEGACY_CHECK_TIMEOUT=${FM_LEGACY_CHECK_TIMEOUT:-${FM_CHECK_TIMEOUT:-30}}
+case "$FM_LEGACY_CHECK_TIMEOUT" in ''|*[!0-9]*|0) FM_LEGACY_CHECK_TIMEOUT=30 ;; esac
 FM_TEARDOWN_TOMBSTONE_SECS=${FM_TEARDOWN_TOMBSTONE_SECS:-120}
 case "$FM_TEARDOWN_TOMBSTONE_SECS" in ''|*[!0-9]*|0) FM_TEARDOWN_TOMBSTONE_SECS=120 ;; esac
 FM_RECONCILE_META_UPDATED_GENERATION=
@@ -314,13 +318,17 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
 
 fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/EVIDENCE/progress
   local record=${1:-} now=${2:-} out='' rc=0 current_identity current_cwd current_progress rc_file
-  local old_registration old_progress old_progress_at progress_age
+  local old_registration old_progress old_progress_at progress_age old_checked old_state old_evidence check_age
   [ -n "$now" ] || now=$(date +%s)
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
   old_registration=$(fm_reconcile_record_value "$record" wait_signature)
   old_progress=$(fm_reconcile_record_value "$record" wait_progress_signature)
   old_progress_at=$(fm_reconcile_record_value "$record" wait_progress_at)
+  old_checked=$(fm_reconcile_record_value "$record" wait_checked_at)
+  old_state=$(fm_reconcile_record_value "$record" wait_state)
+  old_evidence=$(fm_reconcile_record_value "$record" wait_evidence)
   case "$old_progress_at" in ''|*[!0-9]*) old_progress_at=0 ;; esac
+  case "$old_checked" in ''|*[!0-9]*) old_checked=0 ;; esac
   if [ "$old_registration" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
     || [ "$FM_RECONCILE_WAIT_ROLE" != working-command ]; then
     old_progress=
@@ -331,6 +339,7 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
   FM_RECONCILE_WAIT_WORKING=0
   FM_RECONCILE_WAIT_PROGRESS_SIGNATURE=$old_progress
   FM_RECONCILE_WAIT_PROGRESS_AT=$old_progress_at
+  FM_RECONCILE_WAIT_CHECKED_AT=$now
   if [ "$FM_RECONCILE_WAIT_PRESENT" -eq 1 ]; then
     if [ -n "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" ] \
       && [ "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" != "$FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION" ]; then
@@ -452,12 +461,56 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
       esac
       ;;
     legacy-check)
-      if [ -f "$FM_RECONCILE_WAIT_TARGET" ]; then
-        FM_RECONCILE_WAIT_RESULT=registered
-        FM_RECONCILE_WAIT_EVIDENCE='legacy check is evaluated by the watcher check cadence'
-      else
+      if [ ! -f "$FM_RECONCILE_WAIT_TARGET" ]; then
         FM_RECONCILE_WAIT_RESULT=failed
         FM_RECONCILE_WAIT_EVIDENCE="legacy check is missing: ${FM_RECONCILE_WAIT_TARGET:-<empty>}"
+        return
+      fi
+      if [ "$old_registration" = "$FM_RECONCILE_WAIT_SIGNATURE" ] && [ "$old_state" = complete ]; then
+        FM_RECONCILE_WAIT_RESULT=$old_state
+        FM_RECONCILE_WAIT_EVIDENCE=$old_evidence
+        FM_RECONCILE_WAIT_CHECKED_AT=$old_checked
+        return
+      fi
+      check_age=$((now - old_checked))
+      [ "$check_age" -ge 0 ] || check_age=0
+      if [ "$old_registration" = "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+        && [ "$old_checked" -gt 0 ] && [ "$check_age" -lt "$FM_LEGACY_CHECK_INTERVAL" ]; then
+        FM_RECONCILE_WAIT_RESULT=${old_state:-pending}
+        FM_RECONCILE_WAIT_EVIDENCE=${old_evidence:-legacy check pending}
+        FM_RECONCILE_WAIT_CHECKED_AT=$old_checked
+        return
+      fi
+      rc_file="$FM_RECONCILE_WAIT_FILE.check-rc.${BASHPID:-$$}"
+      out=$(
+        fm_reconcile_bounded "$FM_LEGACY_CHECK_TIMEOUT" bash "$FM_RECONCILE_WAIT_TARGET" 2>&1 | {
+          head -c "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES"
+          cat >/dev/null
+        }
+        printf '%s\n' "${PIPESTATUS[0]}" > "$rc_file"
+      )
+      rc=$(cat "$rc_file" 2>/dev/null || printf '125')
+      rm -f "$rc_file"
+      case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
+      out=$(fm_reconcile_clean_value "$out")
+      if [ -n "$out" ]; then
+        FM_RECONCILE_WAIT_RESULT=complete
+        FM_RECONCILE_WAIT_EVIDENCE=$out
+      else
+        case "$rc" in
+          0|1)
+            FM_RECONCILE_WAIT_RESULT=pending
+            FM_RECONCILE_WAIT_EVIDENCE='legacy check pending'
+            ;;
+          124|125)
+            FM_RECONCILE_WAIT_RESULT=failed
+            FM_RECONCILE_WAIT_EVIDENCE='legacy check timeout or no bounded runner'
+            ;;
+          *)
+            FM_RECONCILE_WAIT_RESULT=failed
+            FM_RECONCILE_WAIT_EVIDENCE="legacy check exited $rc"
+            ;;
+        esac
       fi
       ;;
     none) : ;;
@@ -563,9 +616,22 @@ fm_reconcile_meta_generation() {  # <meta>
 }
 
 fm_reconcile_tombstone_active() {  # <state-dir> <id>
-  local tombstone="$1/$2.tearing-down"
+  local tombstone="$1/$2.tearing-down" owner_pid owner_identity current_identity
   [ -e "$tombstone" ] || return 1
+  owner_pid=$(fm_reconcile_record_value "$tombstone" owner_pid)
+  owner_identity=$(fm_reconcile_record_value "$tombstone" owner_identity)
+  current_identity=$(fm_reconcile_process_identity "$owner_pid" 2>/dev/null || true)
+  if fm_reconcile_pid_alive "$owner_pid" \
+    && [ -n "$owner_identity" ] && [ "$current_identity" = "$owner_identity" ]; then
+    return 0
+  fi
   [ "$(fm_path_age "$tombstone")" -lt "$FM_TEARDOWN_TOMBSTONE_SECS" ]
+}
+
+fm_reconcile_teardown_matches_locked() {  # <state-dir> <id> <generation>
+  local state=$1 id=$2 generation=$3 tombstone="$1/$2.tearing-down"
+  [ "$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)" = "$generation" ] \
+    && [ "$(fm_reconcile_record_value "$tombstone" lifecycle_generation)" = "$generation" ]
 }
 
 fm_reconcile_meta_matches() {  # <state-dir> <id> <signature> <generation>
@@ -900,7 +966,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     wait_seq=$((old_wait_seq + 1))
   fi
   if [ "$FM_RECONCILE_WAIT_RESULT" = pending ] && [ "$FM_RECONCILE_WAIT_WORKING" -eq 1 ] \
-    && { [ -z "$old_state" ] || [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ]; }; then
+    && { [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ]; }; then
     current_state=working
     current_source=owned-command
     current_detail=$FM_RECONCILE_WAIT_EVIDENCE
@@ -1037,7 +1103,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   FM_RECONCILE_WRITE_WAIT_SIGNATURE=$FM_RECONCILE_WAIT_SIGNATURE
   FM_RECONCILE_WRITE_WAIT_STATE=$FM_RECONCILE_WAIT_RESULT
   FM_RECONCILE_WRITE_WAIT_EVIDENCE=$FM_RECONCILE_WAIT_EVIDENCE
-  FM_RECONCILE_WRITE_WAIT_CHECKED_AT=$now
+  FM_RECONCILE_WRITE_WAIT_CHECKED_AT=$FM_RECONCILE_WAIT_CHECKED_AT
   FM_RECONCILE_WRITE_WAIT_SEQUENCE=$wait_seq
   FM_RECONCILE_WRITE_WAIT_PROGRESS_SIGNATURE=$FM_RECONCILE_WAIT_PROGRESS_SIGNATURE
   FM_RECONCILE_WRITE_WAIT_PROGRESS_AT=$FM_RECONCILE_WAIT_PROGRESS_AT
@@ -1303,10 +1369,29 @@ fm_reconcile_ack() {  # <state-dir> <id> <token> <version>
   return "$ack_rc"
 }
 
-fm_reconcile_teardown_begin() {  # <state-dir> <id>
-  local state=$1 id=$2 mark_rc=0
+fm_reconcile_teardown_begin() {  # <state-dir> <id> [expected-generation]
+  local state=$1 id=$2 expected_generation=${3:-} mark_rc=0 tombstone tmp owner_pid owner_identity current_generation
+  tombstone="$state/$id.tearing-down"
+  owner_pid=${BASHPID:-$$}
+  owner_identity=$(fm_reconcile_process_identity "$owner_pid") || return 1
   fm_reconcile_lock_acquire "$state" "$id"
-  touch "$state/$id.tearing-down" || mark_rc=$?
+  current_generation=$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)
+  [ -n "$expected_generation" ] || expected_generation=$current_generation
+  if [ -z "$expected_generation" ] || [ "$current_generation" != "$expected_generation" ] \
+    || fm_reconcile_tombstone_active "$state" "$id"; then
+    mark_rc=3
+  else
+    tmp="$tombstone.tmp.$owner_pid"
+    {
+      printf 'schema=fm-teardown-tombstone.v1\n'
+      printf 'lifecycle_generation=%s\n' "$expected_generation"
+      printf 'owner_pid=%s\n' "$owner_pid"
+      printf 'owner_identity=%s\n' "$(fm_reconcile_clean_value "$owner_identity")"
+      printf 'started_at=%s\n' "$(date +%s)"
+    } > "$tmp" || mark_rc=1
+    if [ "$mark_rc" -eq 0 ] && ! mv -f "$tmp" "$tombstone"; then mark_rc=1; fi
+    rm -f "$tmp"
+  fi
   fm_reconcile_lock_release "$state" "$id"
   return "$mark_rc"
 }

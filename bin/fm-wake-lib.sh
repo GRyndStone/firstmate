@@ -491,6 +491,150 @@ fm_wake_reconcile_payloads() {
   return "$status"
 }
 
+fm_wake_reconcile_claim_value() {  # <claim-file> <key>
+  local file=$1 key=$2
+  [ -f "$file" ] || return 0
+  grep "^$key=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+fm_wake_reconcile_claim_owner_live() {  # <claim-file>
+  local claim=$1 pid identity current
+  pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
+  identity=$(fm_wake_reconcile_claim_value "$claim" owner_identity)
+  fm_pid_alive "$pid" || return 1
+  [ -n "$identity" ] || return 1
+  current=$(fm_pid_identity "$pid") || return 1
+  [ "$current" = "$identity" ]
+}
+
+fm_wake_reconcile_claimed_marker_locked() {
+  local claim="$STATE/.wake-queue.reconcile-claim"
+  [ -f "$claim" ] || return 1
+  if ! fm_wake_reconcile_claim_owner_live "$claim"; then
+    rm -f "$claim"
+    return 1
+  fi
+  fm_wake_reconcile_claim_value "$claim" marker
+}
+
+fm_wake_reconcile_claim_payload() {
+  local claim="$STATE/.wake-queue.reconcile-claim" tmp selected marker payload queue_sequence='' owner_pid owner_identity
+  local existing_pid delivery_key='' status=0
+  owner_pid=${BASHPID:-$$}
+  owner_identity=$(fm_pid_identity "$owner_pid") || return 1
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ -f "$claim" ]; then
+    existing_pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
+    if fm_wake_reconcile_claim_owner_live "$claim" && [ "$existing_pid" != "$owner_pid" ]; then
+      fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+      return 2
+    fi
+    marker=$(fm_wake_reconcile_claim_value "$claim" marker)
+    payload=$(fm_wake_reconcile_claim_value "$claim" payload)
+    queue_sequence=$(fm_wake_reconcile_claim_value "$claim" queue_sequence)
+    delivery_key=$(fm_wake_reconcile_claim_value "$claim" delivery_key)
+  else
+    selected=$(awk -F '\t' '
+      NF >= 5 && match($5, /\[fm-reconcile=[^]]+\]/) {
+        marker = substr($5, RSTART, RLENGTH)
+        if (!(marker in seen)) order[++count] = marker
+        seen[marker] = 1
+        payload[marker] = $5
+        sequence[marker] = $2
+      }
+      END {
+        if (count > 0) print order[1] "\t" sequence[order[1]] "\t" payload[order[1]]
+      }
+    ' "$FM_WAKE_QUEUE" 2>/dev/null)
+    if [ -z "$selected" ]; then
+      fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+      return 1
+    fi
+    marker=${selected%%$'\t'*}
+    selected=${selected#*$'\t'}
+    queue_sequence=${selected%%$'\t'*}
+    payload=${selected#*$'\t'}
+  fi
+  tmp="$claim.tmp.$owner_pid"
+  {
+    printf 'schema=fm-wake-reconcile-claim.v1\n'
+    printf 'marker=%s\n' "$marker"
+    printf 'payload=%s\n' "$payload"
+    printf 'queue_sequence=%s\n' "$queue_sequence"
+    printf 'owner_pid=%s\n' "$owner_pid"
+    printf 'owner_identity=%s\n' "$owner_identity"
+    [ -z "$delivery_key" ] || printf 'delivery_key=%s\n' "$delivery_key"
+  } > "$tmp" || status=1
+  if [ "$status" -eq 0 ] && ! mv -f "$tmp" "$claim"; then status=1; fi
+  rm -f "$tmp"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  [ "$status" -eq 0 ] || return "$status"
+  # shellcheck disable=SC2034
+  FM_WAKE_RECONCILE_CLAIMED_PAYLOAD=$payload
+  printf '%s\n' "$payload"
+}
+
+fm_wake_reconcile_claim_delivery_key() {  # <payload>
+  local payload=$1 claim="$STATE/.wake-queue.reconcile-claim"
+  [ "$(fm_wake_reconcile_claim_value "$claim" payload)" = "$payload" ] || return 1
+  fm_wake_reconcile_claim_value "$claim" delivery_key
+}
+
+fm_wake_reconcile_claim_mark_delivered() {  # <payload> <delivery-key>
+  local payload=$1 delivery_key=$2 claim="$STATE/.wake-queue.reconcile-claim" tmp marker queue_sequence owner_pid owner_identity status=0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ "$(fm_wake_reconcile_claim_value "$claim" payload)" != "$payload" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 1
+  fi
+  marker=$(fm_wake_reconcile_claim_value "$claim" marker)
+  queue_sequence=$(fm_wake_reconcile_claim_value "$claim" queue_sequence)
+  owner_pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
+  owner_identity=$(fm_wake_reconcile_claim_value "$claim" owner_identity)
+  tmp="$claim.tmp.$(fm_current_pid)"
+  {
+    printf 'schema=fm-wake-reconcile-claim.v1\n'
+    printf 'marker=%s\n' "$marker"
+    printf 'payload=%s\n' "$payload"
+    printf 'queue_sequence=%s\n' "$queue_sequence"
+    printf 'owner_pid=%s\n' "$owner_pid"
+    printf 'owner_identity=%s\n' "$owner_identity"
+    printf 'delivery_key=%s\n' "$delivery_key"
+  } > "$tmp" || status=1
+  if [ "$status" -eq 0 ] && ! mv -f "$tmp" "$claim"; then status=1; fi
+  rm -f "$tmp"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
+fm_wake_reconcile_claim_complete() {  # <payload>
+  local payload=$1 claim="$STATE/.wake-queue.reconcile-claim" marker queue_sequence tmp status=0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ "$(fm_wake_reconcile_claim_value "$claim" payload)" != "$payload" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 1
+  fi
+  marker=$(fm_wake_reconcile_claim_value "$claim" marker)
+  queue_sequence=$(fm_wake_reconcile_claim_value "$claim" queue_sequence)
+  case "$queue_sequence" in ''|*[!0-9]*) fm_lock_release "$FM_WAKE_QUEUE_LOCK"; return 1 ;; esac
+  tmp="$STATE/.wake-queue.claim-ack.$(fm_current_pid)"
+  if ! awk -F '\t' -v claimed="$marker" -v claimed_sequence="$queue_sequence" '
+    {
+      marker = ""
+      if (NF >= 5 && match($5, /\[fm-reconcile=[^]]+\]/)) marker = substr($5, RSTART, RLENGTH)
+      if (marker != claimed || $2 > claimed_sequence) print
+    }
+  ' "$FM_WAKE_QUEUE" > "$tmp"; then
+    status=1
+  elif ! mv -f "$tmp" "$FM_WAKE_QUEUE"; then
+    status=1
+  fi
+  rm -f "$tmp"
+  if [ "$status" -eq 0 ]; then rm -f "$claim" || status=$?; fi
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
 # Remove every queued record whose payload exactly matches a wake the durable
 # normal-mode supervisor has conclusively self-handled in shell.
 # Concurrent appends are serialized by the existing queue lock, unrelated and

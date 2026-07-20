@@ -587,7 +587,7 @@ test_malformed_live_state_values_are_rejected() {
   pass "live-state parser rejects noncanonical and multiline observations"
 }
 
-test_owned_command_overrides_historical_run_state_once() {
+test_owned_command_does_not_override_first_terminal_observation() {
   local dir state live pid identity physical_wt out
   command -v pgrep >/dev/null 2>&1 || { pass "owned-command run override skipped without pgrep"; return; }
   dir=$(make_reconcile_case owned-command-run-override)
@@ -614,12 +614,73 @@ test_owned_command_overrides_historical_run_state_once() {
   out=$(observe "$state" "$live")
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  [ -z "$out" ] || fail "new owned-command working baseline unexpectedly woke: $out"
+  [ -z "$out" ] || fail "first terminal observation unexpectedly woke: $out"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = done ] \
+    || fail "progressing owned command masked the first terminal observation"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = run-step ] \
+    || fail "owned command replaced the first authoritative terminal source"
+  pass "progressing owned commands do not mask terminal truth on first observation"
+}
+
+test_owned_command_overrides_older_persisted_idle() {
+  local dir state live pid identity physical_wt
+  command -v pgrep >/dev/null 2>&1 || { pass "owned-command idle override skipped without pgrep"; return; }
+  dir=$(make_reconcile_case owned-command-idle-override)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'state: idle · source: pane · foreground turn ended\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  physical_wt=$(cd "$dir/worktree" && pwd -P)
+  sh -c 'cd "$1" || exit 1; while :; do sleep 0.1; done' _ "$physical_wt" &
+  pid=$!
+  sleep 0.1
+  identity=$(fm_reconcile_process_identity "$pid") || { kill "$pid" 2>/dev/null || true; fail "could not identify owned command"; }
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=background validation' \
+    "pid=$pid" \
+    "pid_identity=$identity" \
+    'role=working-command' \
+    'progress_grace=30' \
+    "owner_worktree=$physical_wt" \
+    'owner_tasktmp=' \
+    'registered_at=1'
+  observe "$state" "$live" >/dev/null
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = working ] \
-    || fail "historical terminal run masked a progressing owned command"
+    || fail "new progressing command did not override older persisted idle"
   [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = owned-command ] \
-    || fail "owned command was not the single reconciled live-state source"
-  pass "progressing owned commands override historical run state in one observation"
+    || fail "new progressing command did not become the reconciled source"
+  pass "new progressing commands override older persisted idle"
+}
+
+test_registered_legacy_check_completes_once_in_reconciliation() {
+  local dir state live generation check_tmp out token version
+  dir=$(make_reconcile_case registered-legacy-check)
+  state="$dir/state"
+  live="$dir/live"
+  generation=$(fm_reconcile_meta_generation "$state/task.meta")
+  check_tmp="$state/task.check.tmp"
+  cat > "$check_tmp" <<'SH'
+#!/usr/bin/env bash
+n=$(cat "$FM_LEGACY_COUNT" 2>/dev/null || echo 0)
+printf '%s\n' "$((n + 1))" > "$FM_LEGACY_COUNT"
+printf 'merged\n'
+SH
+  fm_reconcile_legacy_check_register "$state" task "$generation" "$check_tmp" 'merge poll' \
+    || fail "legacy check registration failed"
+  printf 'state: parked · source: status-log · waiting for merge\n' > "$live"
+  out=$(FM_LEGACY_COUNT="$dir/check-count" observe "$state" "$live")
+  assert_contains "$out" 'external-wait-complete' "registered legacy completion did not use reconciliation"
+  token=$(printf '%s' "$out" | cut -f2)
+  version=$(printf '%s' "$out" | cut -f3)
+  fm_reconcile_ack "$state" task "$token" "$version" || fail "legacy completion acknowledgement failed"
+  [ -z "$(FM_LEGACY_COUNT="$dir/check-count" observe "$state" "$live")" ] \
+    || fail "acknowledged legacy completion emitted again"
+  [ "$(cat "$dir/check-count")" = 1 ] || fail "registered legacy check ran more than once after completion"
+  pass "registered legacy checks complete exactly once through reconciliation"
 }
 
 test_repository_identity_failure_preserves_proven_binding() {
@@ -837,6 +898,30 @@ test_generation_cas_and_spawn_claim_revalidate_lifecycle() {
   pass "metadata CAS and spawn claims reject replacement-lifecycle races"
 }
 
+test_teardown_claim_is_live_and_generation_bound() {
+  local dir state tombstone
+  dir="$TMP_ROOT/teardown-generation-claim"
+  state="$dir/state"
+  tombstone="$state/task.tearing-down"
+  mkdir -p "$state"
+  fm_write_meta "$state/task.meta" 'generation=lifecycle-one' 'window=session:fm-task' 'kind=scout'
+  fm_reconcile_teardown_begin "$state" task lifecycle-one || fail "generation-bound teardown claim failed"
+  touch -t 200001010000 "$tombstone"
+  fm_reconcile_tombstone_active "$state" task \
+    || fail "live teardown owner stopped holding its tombstone after the age bound"
+  if fm_reconcile_spawn_claim "$state" task replacement-spawn; then
+    fail "replacement spawn acquired a task while its teardown owner was live"
+  fi
+  fm_write_meta "$state/task.meta" 'generation=lifecycle-two' 'window=session:fm-task' 'kind=scout'
+  fm_reconcile_lock_acquire "$state" task
+  if fm_reconcile_teardown_matches_locked "$state" task lifecycle-one; then
+    fm_reconcile_lock_release "$state" task
+    fail "old teardown claim matched replacement lifecycle metadata"
+  fi
+  fm_reconcile_lock_release "$state" task
+  pass "teardown claims stay live and reject replacement lifecycle cleanup"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -857,12 +942,15 @@ test_restart_preserves_transition_dedup
 test_stale_teardown_tombstone_stops_suppressing_observation
 test_predicate_output_is_capped_with_exit_status_preserved
 test_malformed_live_state_values_are_rejected
-test_owned_command_overrides_historical_run_state_once
+test_owned_command_does_not_override_first_terminal_observation
+test_owned_command_overrides_older_persisted_idle
+test_registered_legacy_check_completes_once_in_reconciliation
 test_repository_identity_failure_preserves_proven_binding
 test_lifecycle_generation_prevents_metadata_aba_publication
 test_delivery_version_is_unique_across_task_lifecycles
 test_process_identity_toctou_classifies_exit_as_complete
 test_owned_command_cannot_mask_newer_terminal_state
 test_generation_cas_and_spawn_claim_revalidate_lifecycle
+test_teardown_claim_is_live_and_generation_bound
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

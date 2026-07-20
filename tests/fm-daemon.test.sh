@@ -579,6 +579,122 @@ test_normal_supervisor_replays_unaccepted_reconciled_wake() {
   pass "normal supervisor replays the latest pending-token evidence exactly once"
 }
 
+test_reconciled_queue_claim_excludes_concurrent_drain() {
+  local dir state reason newer claimant ready release drain_out pid
+  dir=$(make_supercase reconcile-claim-drain)
+  state="$dir/state"
+  reason='stale: session:fm-task reconciled-transition [fm-reconcile=task,transition:1,version-one]'
+  newer='stale: session:fm-task reconciled-transition; newer evidence [fm-reconcile=task,transition:1,version-one]'
+  append_wake "$state" stale session:fm-task "$reason"
+  claimant="$dir/claimant.sh"
+  ready="$dir/claim-ready"
+  release="$dir/claim-release"
+  cat > "$claimant" <<'SH'
+#!/usr/bin/env bash
+set -eu
+. "$1"
+fm_wake_reconcile_claim_payload > "$2"
+reason=$FM_WAKE_RECONCILE_CLAIMED_PAYLOAD
+while [ ! -e "$3" ]; do sleep 0.02; done
+fm_wake_reconcile_claim_complete "$reason"
+SH
+  chmod +x "$claimant"
+  FM_STATE_OVERRIDE="$state" "$claimant" "$ROOT/bin/fm-wake-lib.sh" "$ready" "$release" &
+  pid=$!
+  for _ in $(seq 1 100); do [ -s "$ready" ] && break; sleep 0.02; done
+  [ -s "$ready" ] || { kill "$pid" 2>/dev/null || true; fail "reconciliation row was not claimed"; }
+  append_wake "$state" stale session:fm-task "$newer"
+  drain_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-wake-drain.sh") \
+    || { touch "$release"; wait "$pid" || true; fail "concurrent drain failed"; }
+  assert_not_contains "$drain_out" "$reason" "drain consumed a reconciliation row owned by the daemon"
+  grep -F "$reason" "$state/.wake-queue" >/dev/null \
+    || { touch "$release"; wait "$pid" || true; fail "claimed reconciliation row left the durable queue"; }
+  touch "$release"
+  wait "$pid" || fail "claimant could not acknowledge its row"
+  grep -F "$reason" "$state/.wake-queue" >/dev/null 2>&1 \
+    && fail "completed claim retained its queue row"
+  grep -F "$newer" "$state/.wake-queue" >/dev/null \
+    || fail "claim completion removed newer evidence appended after the claim"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_wake_reconcile_claim_payload >/dev/null
+    reason=$FM_WAKE_RECONCILE_CLAIMED_PAYLOAD
+    [ "$reason" = "$2" ]
+    fm_wake_reconcile_claim_complete "$reason"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$newer" || fail "newer post-claim evidence could not be consumed"
+  pass "reconciliation queue claims exclude drain and preserve post-claim evidence"
+}
+
+test_escalation_receipt_makes_post_submit_replay_idempotent() {
+  local dir state buf item n msg key unexpected
+  dir=$(make_supercase post-submit-receipt)
+  state="$dir/state"
+  buf="$state/.subsuper-escalations"
+  item='terminal outcome already submitted'
+  escalate_add "$state" "$item"
+  n=$(wc -l < "$buf" | tr -d '[:space:]')
+  msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf")
+  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
+  unexpected="$dir/unexpected-inject"
+  (
+    inject_msg() { touch "$unexpected"; return 1; }
+    escalate_flush "$state"
+  ) || fail "receipt-backed post-submit replay did not complete"
+  [ ! -e "$unexpected" ] || fail "post-submit replay injected the delivered digest again"
+  [ ! -s "$buf" ] || fail "post-submit receipt did not retire the delivered buffer"
+  pass "durable receipts make post-submit escalation replay idempotent"
+}
+
+test_reconciled_claim_retains_post_submit_receipt_until_completion() {
+  local dir state record reason claimed_file delivered
+  dir=$(make_supercase reconcile-post-submit-receipt)
+  state="$dir/state"
+  record="$state/task.reconciled"
+  delivered="$dir/delivered"
+  claimed_file="$dir/claimed"
+  reason='stale: session:fm-task reconciled-transition (working -> done from positive run-step evidence) [fm-reconcile=task,transition:1,1]'
+  fm_write_meta "$record" \
+    'schema=fm-reconciled.v1' \
+    'task=task' \
+    'state=done' \
+    'source=run-step' \
+    'pending_action_token=transition:1' \
+    'pending_action_version=1' \
+    'pending_action_reason=reconciled-transition (working -> done from positive run-step evidence)' \
+    'notified_action_token=' \
+    'notified_action_version=0'
+  append_wake "$state" stale session:fm-task "$reason"
+  FM_STATE_OVERRIDE="$state" FM_TEST_DELIVERED="$delivered" FM_TEST_CLAIMED="$claimed_file" bash -c '
+    . "$1"
+    . "$2"
+    fm_wake_reconcile_claim_payload > "$FM_TEST_CLAIMED"
+    claimed=$(cat "$FM_TEST_CLAIMED")
+    inject_msg() { printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"; }
+    FM_RECONCILE_CLAIM_PAYLOAD="$claimed" FM_SUPERVISE_MODE=normal FM_ESCALATE_BATCH_SECS=0 \
+      handle_wake "$claimed" "$3"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$state" \
+    || fail "claimed reconciliation row could not submit its escalation"
+  [ "$(cat "$claimed_file" 2>/dev/null)" = "$reason" ] || fail "post-submit seam claimed the wrong reconciliation row"
+  [ "$(wc -l < "$delivered" 2>/dev/null || echo 0)" -eq 1 ] \
+    || fail "initial claimed reconciliation submission did not occur exactly once"
+  [ -s "$state/.wake-queue.reconcile-claim" ] || fail "submission cleared its claim before atomic completion"
+  assert_grep 'delivery_key=' "$state/.wake-queue.reconcile-claim" \
+    "confirmed submission did not persist its delivery receipt on the claim"
+  FM_STATE_OVERRIDE="$state" FM_TEST_DELIVERED="$delivered" bash -c '
+    . "$1"
+    . "$2"
+    inject_msg() { printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"; }
+    FM_SUPERVISE_MODE=normal FM_ESCALATE_BATCH_SECS=0 replay_reconciled_queue "$3"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$state" \
+    || fail "restart could not retire the delivered reconciliation claim"
+  [ "$(wc -l < "$delivered" 2>/dev/null || echo 0)" -eq 1 ] \
+    || fail "restart submitted the already-delivered reconciliation digest again"
+  [ ! -e "$state/.wake-queue.reconcile-claim" ] || fail "completed replay retained its reconciliation claim"
+  pass "reconciliation claims retain delivery receipts through post-submit restart"
+}
+
 test_reconciled_escalation_acknowledges_before_immediate_flush() {
   local dir state record reason status count delivered queue
   dir=$(make_supercase reconcile-immediate-flush)
@@ -2083,7 +2199,9 @@ test_normal_supervisor_direct_pause_activity_wakes_once
 test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_normal_supervisor_replays_unaccepted_reconciled_wake
+test_reconciled_queue_claim_excludes_concurrent_drain
 test_reconciled_escalation_acknowledges_before_immediate_flush
+test_reconciled_claim_retains_post_submit_receipt_until_completion
 test_daemon_self_evicts_when_singleton_ownership_changes
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
@@ -2094,6 +2212,7 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale
 test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
+test_escalation_receipt_makes_post_submit_replay_idempotent
 test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup

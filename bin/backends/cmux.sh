@@ -357,14 +357,18 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux workspace '$title' already exists" >&2
     return 1
   fi
-  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1) || {
+  if ! out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1); then
+    wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+    sfid=
+    [ -z "$wsid" ] || sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
     echo "error: cmux new-workspace failed for '$title': $out" >&2
-    return 1
-  }
+    printf 'partial\t%s\t%s' "$wsid" "$sfid"
+    return 2
+  fi
   wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
-  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; printf 'partial\t\t'; return 2; }
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
-  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; return 1; }
+  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; printf 'partial\t%s\t' "$wsid"; return 2; }
   printf '%s %s' "$wsid" "$sfid"
 }
 

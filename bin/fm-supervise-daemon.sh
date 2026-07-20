@@ -699,7 +699,10 @@ escalate_add() {  # <state> <distilled-item>
   if [ -s "$buf" ] && grep -Fqx -- "$item" "$buf" 2>/dev/null; then
     return 0
   fi
-  [ -s "$buf" ] || _now > "${buf}.since"
+  if [ ! -s "$buf" ]; then
+    [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] || rm -f "$state/.subsuper-escalation-delivered"
+    _now > "${buf}.since"
+  fi
   printf '%s\n' "$item" >> "$buf"
 }
 
@@ -707,16 +710,47 @@ escalate_add() {  # <state> <distilled-item>
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf n msg receipt delivery_key receipt_tmp claim_delivery_key
   buf="$state/.subsuper-escalations"
-  [ -s "$buf" ] || return 0
+  receipt="$state/.subsuper-escalation-delivered"
+  if [ ! -s "$buf" ]; then
+    rm -f "$receipt"
+    return 0
+  fi
   n=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  delivery_key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  claim_delivery_key=
+  if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+    && command -v fm_wake_reconcile_claim_delivery_key >/dev/null 2>&1; then
+    claim_delivery_key=$(fm_wake_reconcile_claim_delivery_key "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
+  fi
+  if [ "$claim_delivery_key" = "$delivery_key" ] \
+    || [ "$(cat "$receipt" 2>/dev/null || true)" = "$delivery_key" ]; then
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+      fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
+    fi
+    : > "$buf"
+    rm -f "${buf}.since" "$state/.subsuper-inject-wedged" "$receipt"
+    return 0
+  fi
+  if inject_msg "$msg" "$state"; then
+    receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
+    printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
+    mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+      fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
+    fi
+    : > "$buf"
+    rm -f "${buf}.since" "$state/.subsuper-inject-wedged" "$receipt"
+    return 0
+  fi
   return 1
 }
 
@@ -1423,13 +1457,28 @@ handle_wake() {  # <reason> <state>
 }
 
 replay_reconciled_queue() {  # <state>
-  local state=$1 reason
-  while IFS= read -r reason; do
-    [ -n "$reason" ] || continue
-    fm_reconcile_action_pending "$state" "$reason" || continue
+  local state=$1 reason claim_rc
+  while :; do
+    reason=
+    FM_WAKE_RECONCILE_CLAIMED_PAYLOAD=
+    if fm_wake_reconcile_claim_payload >/dev/null; then
+      claim_rc=0
+      reason=$FM_WAKE_RECONCILE_CLAIMED_PAYLOAD
+    else
+      claim_rc=$?
+    fi
+    case "$claim_rc" in
+      0) ;;
+      1|2) return 0 ;;
+      *) return "$claim_rc" ;;
+    esac
+    [ -n "$reason" ] || return 0
     log "replay queued reconciled action: $reason"
+    FM_RECONCILE_CLAIM_PAYLOAD=$reason
     handle_wake "$reason" "$state" || return 1
-  done < <(fm_wake_reconcile_payloads)
+    fm_wake_reconcile_claim_complete "$reason" || return 1
+    FM_RECONCILE_CLAIM_PAYLOAD=
+  done
 }
 
 # --- log --------------------------------------------------------------------

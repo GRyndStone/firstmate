@@ -192,7 +192,7 @@ if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
     case "$reconciled_fresh_secs" in ''|*[!0-9]*|0) reconciled_fresh_secs=60 ;; esac
     if [ -n "$BACKEND_TARGET" ] \
       && [ "$reconciled_endpoint" = "$BACKEND_TARGET" ] \
-      && { [ -z "$META_GENERATION" ] || [ -z "$reconciled_generation" ] || [ "$reconciled_generation" = "$META_GENERATION" ]; } \
+      && [ -n "$META_GENERATION" ] && [ "$reconciled_generation" = "$META_GENERATION" ] \
       && [ -n "$reconciled_state" ] \
       && [ "$reconciled_source" != owned-command ] \
       && [ "$reconciled_observed" -gt 0 ] \

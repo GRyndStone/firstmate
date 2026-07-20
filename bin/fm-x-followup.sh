@@ -140,6 +140,19 @@ case "$ID" in
 esac
 
 META="$STATE/$ID.meta"
+FOLLOWUP_LOCK_HELD=0
+# shellcheck disable=SC2329
+followup_lock_release() {
+  if [ "$FOLLOWUP_LOCK_HELD" -eq 1 ]; then
+    fm_reconcile_lock_release "$STATE" "$ID"
+    FOLLOWUP_LOCK_HELD=0
+  fi
+}
+trap followup_lock_release EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fm_reconcile_lock_acquire "$STATE" "$ID"
+FOLLOWUP_LOCK_HELD=1
 META_GENERATION=$(fm_reconcile_meta_generation "$META" 2>/dev/null || true)
 RID=$(fmx_meta_get "$META" x_request)
 TS=$(fmx_meta_get "$META" x_request_ts)
@@ -180,7 +193,8 @@ if [ "$COUNT" -ge "$MAX_COUNT" ]; then
 fi
 
 if [ "$EXPIRED" = 1 ]; then
-  fmx_meta_link_clear "$META" "$META_GENERATION" || echo "fm-x-followup: warning: could not clear the elapsed link in state/$ID.meta" >&2
+  fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear \
+    || echo "fm-x-followup: warning: could not clear the elapsed link in state/$ID.meta" >&2
   if [ "$MODE" = check ]; then
     exit 1
   fi
@@ -216,12 +230,12 @@ case "$post_rc" in
   0)
     NEWCOUNT=$((COUNT + 1))
     if [ "$FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
-      if ! fmx_meta_link_clear "$META" "$META_GENERATION"; then
+      if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
         echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
         exit 1
       fi
-    elif ! fmx_meta_followups_set "$META" "$META_GENERATION" "$NEWCOUNT"; then
-      if ! fmx_meta_link_clear "$META" "$META_GENERATION"; then
+    elif ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" set "$NEWCOUNT"; then
+      if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
         echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
         exit 1
       fi
@@ -237,7 +251,8 @@ case "$post_rc" in
     # graceful-degradation path against an old relay that only ever supported
     # one follow-up, or a binding the relay already considers exhausted for any
     # other reason - either way, retrying would never succeed.
-    fmx_meta_link_clear "$META" "$META_GENERATION" || echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
+    fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear \
+      || echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
     echo "fm-x-followup: relay rejected the follow-up for $ID (cap or window exhausted); skipped and cleared the link" >&2
     exit 0
     ;;

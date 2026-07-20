@@ -400,7 +400,7 @@ clear_pause_tracking() {  # <window>
 # pause and regardless of afk. docs/architecture.md ("Event-driven supervision")
 # owns the classification rule.
 handle_gone_endpoint() {  # <window>
-  local w=$1 key marker reason meta tomb tomb_mtime tomb_age
+  local w=$1 key marker reason meta tomb tomb_age task
   key=$(window_key "$w")
   marker="$STATE/.endpoint-gone-$key"
   if fm_backend_target_exists "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null; then
@@ -420,10 +420,10 @@ handle_gone_endpoint() {  # <window>
   # unreadable stamp means a crashed teardown, and the death surfaces normally.
   tomb="${meta%.meta}.tearing-down"
   if [ -e "$tomb" ]; then
-    tomb_mtime=$(stat_mtime "$tomb")
-    case "$tomb_mtime" in ''|*[!0-9]*) tomb_mtime=0 ;; esac
-    tomb_age=$(( $(date +%s) - tomb_mtime ))
-    if [ "$tomb_mtime" -gt 0 ] && [ "$tomb_age" -lt "$TEARDOWN_TOMBSTONE_SECS" ]; then
+    task=${meta##*/}
+    task=${task%.meta}
+    tomb_age=$(age_of "$tomb")
+    if fm_reconcile_tombstone_active "$STATE" "$task"; then
       triage_log "absorbed endpoint-gone (teardown in progress, tombstone ${tomb_age}s old): $w"
       return 0
     fi
@@ -1022,7 +1022,16 @@ while :; do
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     for c in "$STATE"/*.check.sh; do
+      check_id=
+      check_wait=
       [ -e "$c" ] || continue
+      check_id=${c##*/}
+      check_id=${check_id%.check.sh}
+      check_wait="$STATE/$check_id.wait"
+      if [ "$(fm_reconcile_record_value "$check_wait" kind)" = legacy-check ] \
+        && [ "$(fm_reconcile_record_value "$check_wait" check)" = "$c" ]; then
+        continue
+      fi
       out=$(run_check "$c")
       if [ -n "$out" ]; then
         reason="check: $c: $out"

@@ -87,6 +87,13 @@ meta_value() {  # <meta-file> <key>
   fm_meta_get "$1" "$2"
 }
 
+reconciled_matches_lifecycle() {  # <id>
+  local id=$1 meta_generation record_generation
+  meta_generation=$(fm_reconcile_meta_generation "$STATE/$id.meta" 2>/dev/null || true)
+  record_generation=$(fm_reconcile_record_value "$STATE/$id.reconciled" lifecycle_generation)
+  [ -n "$meta_generation" ] && [ "$record_generation" = "$meta_generation" ]
+}
+
 last_nonempty_line() {  # <file>
   [ -f "$1" ] || return 1
   grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -1
@@ -129,6 +136,7 @@ crew_state_json() {  # <id>
   record="$STATE/$id.reconciled"
   meta="$STATE/$id.meta"
   [ -f "$record" ] || { live_crew_state_json "$id"; return; }
+  reconciled_matches_lifecycle "$id" || { live_crew_state_json "$id"; return; }
   target=$(fm_backend_target_of_meta "$meta")
   recorded_target=$(fm_reconcile_record_value "$record" endpoint)
   [ -n "$target" ] && [ "$target" = "$recorded_target" ] || { live_crew_state_json "$id"; return; }
@@ -162,6 +170,10 @@ crew_state_json() {  # <id>
 prior_observed_json() {  # <id>
   local record state source evidence endpoint observed
   record="$STATE/$1.reconciled"
+  if ! reconciled_matches_lifecycle "$1"; then
+    jq -n '{state:null,source:null,evidence:null,endpoint:null,observed_at:null}'
+    return
+  fi
   state=$(fm_reconcile_record_value "$record" prior_state)
   source=$(fm_reconcile_record_value "$record" prior_source)
   evidence=$(fm_reconcile_record_value "$record" prior_evidence)
@@ -179,15 +191,29 @@ prior_observed_json() {  # <id>
 
 external_wait_json() {  # <id>
   local id=$1 record observed_sig observed_state observed_evidence observed_at freshness registration current_sig
-  local progress_sig progress_at progress_age
+  local progress_sig progress_at progress_age meta_generation registration_generation registration_current=0
   record="$STATE/$id.reconciled"
   registration=$(fm_reconcile_wait_registration "$STATE" "$id")
+  meta_generation=$(fm_reconcile_meta_generation "$STATE/$id.meta" 2>/dev/null || true)
+  registration_generation=$(printf '%s' "$registration" | jq -r '.lifecycle_generation // ""')
+  if [ "$(printf '%s' "$registration" | jq -r '.registered')" = true ] \
+    && [ -n "$meta_generation" ] && [ "$registration_generation" = "$meta_generation" ]; then
+    registration_current=1
+  fi
   observed_sig=$(fm_reconcile_record_value "$record" wait_signature)
   observed_state=$(fm_reconcile_record_value "$record" wait_state)
   observed_evidence=$(fm_reconcile_record_value "$record" wait_evidence)
   observed_at=$(fm_reconcile_record_value "$record" wait_checked_at)
   progress_sig=$(fm_reconcile_record_value "$record" wait_progress_signature)
   progress_at=$(fm_reconcile_record_value "$record" wait_progress_at)
+  if ! reconciled_matches_lifecycle "$id"; then
+    observed_sig=
+    observed_state=
+    observed_evidence=
+    observed_at=0
+    progress_sig=
+    progress_at=0
+  fi
   case "$observed_at" in ''|*[!0-9]*) observed_at=0 ;; esac
   case "$progress_at" in ''|*[!0-9]*) progress_at=0 ;; esac
   progress_age=$(( $(date +%s) - progress_at ))
@@ -206,7 +232,8 @@ external_wait_json() {  # <id>
     --argjson checked_at "$observed_at" \
     --argjson progress_at "$progress_at" \
     --argjson progress_age "$progress_age" \
-    '$registration + {observation:{state:($state | if . == "" then "unobserved" else . end),evidence:$evidence,checked_at:($checked_at | if . == 0 then null else . end),freshness:$freshness,progress_signature:($progress_signature | if . == "" then null else . end),progress_at:($progress_at | if . == 0 then null else . end),progress_age_seconds:($progress_age | if $progress_at == 0 then null else . end)}}'
+    --argjson lifecycle_current "$(bool_json "$registration_current")" \
+    '$registration + {lifecycle_current:$lifecycle_current,observation:{state:($state | if . == "" then "unobserved" else . end),evidence:$evidence,checked_at:($checked_at | if . == 0 then null else . end),freshness:$freshness,progress_signature:($progress_signature | if . == "" then null else . end),progress_at:($progress_at | if . == 0 then null else . end),progress_age_seconds:($progress_age | if $progress_at == 0 then null else . end)}}'
 }
 
 status_event_json() {  # <id> <status-log>
@@ -225,6 +252,12 @@ status_event_json() {  # <id> <status-log>
   observed_signature=$(fm_reconcile_record_value "$record" status_signature)
   observed_raw=$(fm_reconcile_record_value "$record" last_status_event)
   observed_at=$(fm_reconcile_record_value "$record" observed_at)
+  if ! reconciled_matches_lifecycle "$id"; then
+    observed_sequence=0
+    observed_signature=
+    observed_raw=
+    observed_at=0
+  fi
   case "$observed_sequence" in ''|*[!0-9]*) observed_sequence=0 ;; esac
   case "$observed_at" in ''|*[!0-9]*) observed_at=0 ;; esac
   if [ "$observed_at" -eq 0 ]; then freshness=unobserved

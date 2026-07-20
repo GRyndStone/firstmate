@@ -73,6 +73,14 @@ case "$url" in
     ;;
   */connector/followup)
     [ -n "$ofile" ] && printf '%s' "${FAKE_FOLLOWUP_BODY:-${FAKE_ANSWER_BODY:-}}" > "$ofile"
+    [ -n "${FAKE_CURL_FOLLOWUP_STARTED:-}" ] && printf '%s\n' "$$" >> "$FAKE_CURL_FOLLOWUP_STARTED"
+    if [ -n "${FAKE_CURL_FOLLOWUP_RELEASE:-}" ]; then
+      attempts=0
+      while [ ! -f "$FAKE_CURL_FOLLOWUP_RELEASE" ] && [ "$attempts" -lt 500 ]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+      done
+    fi
     [ -n "${FAKE_CURL_TOUCH_AFTER_POST:-}" ] && : > "$FAKE_CURL_TOUCH_AFTER_POST"
     printf '%s' "${FAKE_FOLLOWUP_CODE:-${FAKE_ANSWER_CODE:-200}}"
     ;;
@@ -1631,6 +1639,78 @@ test_followup_post_increments_counter_keeps_link() {
   pass "fm-x-followup posts a follow-up, increments the counter, and keeps the link under the cap"
 }
 
+test_concurrent_followups_serialize_link_count() {
+  local home fakebin started release meta first_out second_out first_pid second_pid attempts
+  home="$TMP_ROOT/fu-post-concurrent"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  started="$home/followup-started"
+  release="$home/followup-release"
+  meta="$home/state/task-concurrent.meta"
+  printf 'FMX_PAIRING_TOKEN=tok-fu\n' > "$home/.env"
+  mk_linked_task "$home" task-concurrent req-concurrent 1700000000
+  first_out="$home/first.out"
+  second_out="$home/second.out"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_NOW_OVERRIDE=1700003600 FAKE_FOLLOWUP_CODE=200 \
+    FAKE_CURL_FOLLOWUP_STARTED="$started" FAKE_CURL_FOLLOWUP_RELEASE="$release" \
+    "$ROOT/bin/fm-x-followup.sh" task-concurrent - <<<"first update" >"$first_out" 2>/dev/null &
+  first_pid=$!
+  attempts=0
+  while [ ! -s "$started" ] && [ "$attempts" -lt 500 ]; do sleep 0.01; attempts=$((attempts + 1)); done
+  [ -s "$started" ] || { kill "$first_pid" 2>/dev/null || true; fail "first concurrent follow-up did not reach the relay"; }
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_NOW_OVERRIDE=1700003600 FAKE_FOLLOWUP_CODE=200 \
+    FAKE_CURL_FOLLOWUP_STARTED="$started" FAKE_CURL_FOLLOWUP_RELEASE="$release" \
+    "$ROOT/bin/fm-x-followup.sh" task-concurrent - <<<"second update" >"$second_out" 2>/dev/null &
+  second_pid=$!
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do sleep 0.01; attempts=$((attempts + 1)); done
+  [ "$(wc -l < "$started" | tr -d '[:space:]')" = 1 ] \
+    || { kill "$first_pid" "$second_pid" 2>/dev/null || true; fail "concurrent follow-ups posted from the same link count"; }
+  : > "$release"
+  wait "$first_pid" || fail "first serialized follow-up failed"
+  wait "$second_pid" || fail "second serialized follow-up failed"
+  assert_grep 'x_request=req-concurrent' "$meta" "serialized follow-ups must preserve the link below the cap"
+  assert_grep 'x_followups=2' "$meta" "serialized follow-ups must consume distinct link counts"
+  pass "concurrent follow-ups serialize the link count"
+}
+
+test_followup_and_relink_are_one_cas_boundary() {
+  local home fakebin started release meta followup_out relink_out followup_pid relink_pid attempts
+  home="$TMP_ROOT/fu-post-relink"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  started="$home/followup-started"
+  release="$home/followup-release"
+  meta="$home/state/task-relink.meta"
+  printf 'FMX_PAIRING_TOKEN=tok-fu\n' > "$home/.env"
+  mk_linked_task "$home" task-relink req-old 1700000000
+  followup_out="$home/followup.out"
+  relink_out="$home/relink.out"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_NOW_OVERRIDE=1700003600 FAKE_FOLLOWUP_CODE=200 \
+    FAKE_CURL_FOLLOWUP_STARTED="$started" FAKE_CURL_FOLLOWUP_RELEASE="$release" \
+    "$ROOT/bin/fm-x-followup.sh" task-relink - <<<"old link update" >"$followup_out" 2>/dev/null &
+  followup_pid=$!
+  attempts=0
+  while [ ! -s "$started" ] && [ "$attempts" -lt 500 ]; do sleep 0.01; attempts=$((attempts + 1)); done
+  [ -s "$started" ] || { kill "$followup_pid" 2>/dev/null || true; fail "follow-up did not reach the relay before relink"; }
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_NOW_OVERRIDE=1700007200 FAKE_REQCTX_CODE=404 \
+    "$ROOT/bin/fm-x-link.sh" task-relink req-new >"$relink_out" 2>/dev/null &
+  relink_pid=$!
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do sleep 0.01; attempts=$((attempts + 1)); done
+  assert_grep 'x_request=req-old' "$meta" "a same-generation relink must wait for the in-flight follow-up"
+  [ ! -s "$relink_out" ] \
+    || { kill "$followup_pid" "$relink_pid" 2>/dev/null || true; fail "relink completed inside the follow-up CAS boundary"; }
+  : > "$release"
+  wait "$followup_pid" || fail "follow-up before relink failed"
+  wait "$relink_pid" || fail "same-generation relink failed"
+  assert_grep 'x_request=req-new' "$meta" "relink must replace the old binding after its follow-up commits"
+  assert_grep 'x_followups=0' "$meta" "the old follow-up count must not mutate the replacement link"
+  pass "follow-up read, post, and write exclude same-generation relinks"
+}
+
 test_followup_post_final_clears_link_immediately() {
   local home fakebin out rc meta
   home="$TMP_ROOT/fu-post-final"; mkdir -p "$home/state"
@@ -1915,6 +1995,8 @@ test_followup_check_states
 test_followup_check_expired_prunes_link
 test_followup_check_cap_reached_prunes_link
 test_followup_post_increments_counter_keeps_link
+test_concurrent_followups_serialize_link_count
+test_followup_and_relink_are_one_cas_boundary
 test_followup_post_final_clears_link_immediately
 test_followup_post_cap_reached_clears_link
 test_followup_post_forwards_image_to_reply_client

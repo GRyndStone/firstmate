@@ -496,6 +496,24 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
 }
 
+test_create_task_reports_partial_workspace_after_cli_failure() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-task-partial"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-partial)
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  printf '1\n' > "$dir/responses/2.exit"
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  cmux_panes_response "$dir" 4 "cccccccc-2222-2222-2222-222222222222"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-partial /tmp/proj' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 2 ] || fail "create_task must distinguish a possibly-created cmux workspace (got $status)"
+  [ "$out" = $'partial\tbbbbbbbb-1111-1111-1111-111111111111\tcccccccc-2222-2222-2222-222222222222' ] \
+    || fail "create_task must return recovered partial cmux ids, got '$out'"
+  pass "fm_backend_cmux_create_task: reports recoverable partial workspace creation"
+}
+
 # --- target_ready / capture ---------------------------------------------------
 
 test_target_ready_fails_when_target_absent() {
@@ -1033,6 +1051,7 @@ test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
+test_create_task_reports_partial_workspace_after_cli_failure
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
