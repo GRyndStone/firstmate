@@ -37,6 +37,7 @@ start_watch() {  # <dir> <out>
     FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 \
+    FM_RECONCILE_TASK_TIMEOUT="${FM_CANARY_RECONCILE_TIMEOUT:-35}" \
     FM_STALE_ESCALATE_SECS="${FM_CANARY_STALE_ESCALATE:-999999}" \
     "$WATCH" > "$out" 2>&1 &
   CANARY_PID=$!
@@ -49,7 +50,7 @@ make_canary() {  # <name> <status-line>
   state="$dir/state"
   fakebin="$dir/fakebin"
   wt="$dir/worktree"
-  mkdir -p "$wt"
+  mkdir -p "$wt" "$dir/project"
   fm_write_meta "$state/task.meta" \
     'window=session:fm-task' \
     "worktree=$wt" \
@@ -376,6 +377,67 @@ SH
   pass "canary: fleet tasks reconcile concurrently under one bounded observation batch"
 }
 
+test_observer_crashes_and_timeouts_fail_loudly() {
+  local dir state out pid
+  dir=$(make_canary observer-failure 'working: observer failure fixture')
+  state="$dir/state"
+  out="$dir/watch.out"
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+exit 70
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "crashed observer was silently ignored: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'observer-failure' "crashed observer woke through the wrong path"
+  assert_contains "$(cat "$out")" 'status 70' "crashed observer status was not preserved"
+  assert_one_wake "$state" 'observer-failure'
+
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 10
+printf 'state: working · source: pane · harness busy\n'
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  : > "$out"
+  FM_CANARY_RECONCILE_TIMEOUT=1 start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "timed-out observer was silently ignored: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'observer-failure' "timed-out observer woke through the wrong path"
+  assert_contains "$(cat "$out")" 'timed out after 1s' "observer timeout budget was not reported"
+  assert_one_wake "$state" 'timed out after 1s'
+  pass "canary: observer crashes and timeouts emit durable failure wakes"
+}
+
+test_watcher_exit_reaps_reconciliation_workers() {
+  local dir state out pid observer_pid i=0 leftovers
+  dir=$(make_canary worker-cleanup 'working: watcher cleanup fixture')
+  state="$dir/state"
+  out="$dir/watch.out"
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$FM_WORKER_PID_FILE"
+sleep 30
+printf 'state: working · source: pane · harness busy\n'
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  export FM_WORKER_PID_FILE="$dir/observer.pid"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  while [ ! -s "$dir/observer.pid" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || fail "reconciliation worker did not start"
+  observer_pid=$(cat "$dir/observer.pid")
+  stop_watch "$pid"
+  i=0
+  while kill -0 "$observer_pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  kill -0 "$observer_pid" 2>/dev/null && fail "reconciliation worker survived watcher exit"
+  leftovers=$(find "$state" -maxdepth 1 -name '.reconcile-cycle.*' -print)
+  [ -z "$leftovers" ] || fail "watcher exit left reconciliation batch state behind: $leftovers"
+  unset FM_WORKER_PID_FILE
+  pass "canary: watcher exit reaps reconciliation workers and batch state"
+}
+
 test_active_review_parks_without_stale_cadence
 test_stopped_without_claimed_done_preserves_turn_end_evidence
 test_oauth_callback_completion_after_park
@@ -383,5 +445,7 @@ test_inflight_blocked_wait_without_observer_fails_loudly
 test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
+test_observer_crashes_and_timeouts_fail_loudly
+test_watcher_exit_reaps_reconciliation_workers
 
 echo "# fm-reconcile-watch-e2e.test.sh: all assertions passed"

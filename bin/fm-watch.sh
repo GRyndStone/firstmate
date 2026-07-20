@@ -119,8 +119,10 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
-RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-20}
-case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=20 ;; esac
+RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-35}
+case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=35 ;; esac
+RECONCILE_BATCH_DIR=
+RECONCILE_BATCH_PIDS=
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -559,6 +561,58 @@ scan_signals() {
   return 0
 }
 
+reconcile_terminate_descendants() {  # <pid>
+  local pid=$1 children descendant
+  children=$(pgrep -P "$pid" 2>/dev/null || true)
+  for descendant in $children; do
+    reconcile_terminate_descendants "$descendant"
+    kill -TERM "$descendant" 2>/dev/null || true
+  done
+}
+
+reconcile_worker() {  # <id>
+  local id=$1 child='' worker_rc
+  trap 'if [ -n "${child:-}" ]; then reconcile_terminate_descendants "$child"; kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; exit 143' TERM INT HUP
+  # shellcheck disable=SC2016
+  fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
+    export FM_RECONCILE_CREW_STATE_BIN=$1
+    export FM_EXTERNAL_WAIT_TIMEOUT=$2
+    . "$3"
+    fm_reconcile_observe "$4" "$5"
+  ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" \
+    "$SCRIPT_DIR/fm-reconcile-lib.sh" "$STATE" "$id" &
+  child=$!
+  if wait "$child"; then worker_rc=0; else worker_rc=$?; fi
+  child=
+  trap - TERM INT HUP
+  return "$worker_rc"
+}
+
+reconcile_batch_cleanup() {
+  local pid file batch_dir=$RECONCILE_BATCH_DIR
+  for pid in $RECONCILE_BATCH_PIDS; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $RECONCILE_BATCH_PIDS; do
+    wait "$pid" 2>/dev/null || true
+  done
+  RECONCILE_BATCH_PIDS=
+  case "$batch_dir" in
+    "$STATE"/.reconcile-cycle.*)
+      for file in "$batch_dir"/*.id "$batch_dir"/*.out "$batch_dir"/*.err "$batch_dir"/*.rc; do
+        [ -e "$file" ] && rm -f "$file"
+      done
+      rmdir "$batch_dir" 2>/dev/null || true
+      ;;
+  esac
+  RECONCILE_BATCH_DIR=
+}
+
+watch_cleanup() {
+  reconcile_batch_cleanup
+  fm_lock_release "$WATCH_LOCK"
+}
+
 # Observe every task's deterministic current state in one bounded parallel batch
 # and surface the first pending transition or external-wait action.
 # fm-reconcile-lib.sh persists each state and pending token before returning.
@@ -566,33 +620,56 @@ scan_signals() {
 # signatures; the daemon or queue drain acknowledges the token after durable
 # consumer handoff.
 reconcile_cycle() {
-  local meta id target out tag token evidence reason marker
+  local meta id target out tag token evidence reason marker worker_rc failure_evidence err_tail
   local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_evidence=''
+  local pending notified record_repository current_repository project queue_rc=0
   batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
+  RECONCILE_BATCH_DIR=$batch_dir
+  RECONCILE_BATCH_PIDS=
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     id=$(basename "$meta" .meta)
     index=$((index + 1))
     printf '%s\n' "$id" > "$batch_dir/$index.id" || exit 1
-    (
-      # shellcheck disable=SC2016
-      fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
-        export FM_RECONCILE_CREW_STATE_BIN=$1
-        export FM_EXTERNAL_WAIT_TIMEOUT=$2
-        . "$3"
-        fm_reconcile_observe "$4" "$5"
-      ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" \
-        "$SCRIPT_DIR/fm-reconcile-lib.sh" "$STATE" "$id"
-    ) > "$batch_dir/$index.out" 2>/dev/null &
+    reconcile_worker "$id" > "$batch_dir/$index.out" 2> "$batch_dir/$index.err" &
     pids="${pids:+$pids }$!"
+    RECONCILE_BATCH_PIDS=$pids
   done
+  index=1
   for pid in $pids; do
-    wait "$pid" || true
+    if wait "$pid"; then worker_rc=0; else worker_rc=$?; fi
+    printf '%s\n' "$worker_rc" > "$batch_dir/$index.rc" || exit 1
+    index=$((index + 1))
   done
+  RECONCILE_BATCH_PIDS=
   index=1
   while [ -f "$batch_dir/$index.id" ]; do
     id=$(cat "$batch_dir/$index.id")
     out=$(cat "$batch_dir/$index.out" 2>/dev/null || true)
+    worker_rc=$(cat "$batch_dir/$index.rc" 2>/dev/null || echo 125)
+    if [ "$worker_rc" -ne 0 ]; then
+      case "$worker_rc" in
+        124) failure_evidence="task state observer timed out after ${RECONCILE_TASK_TIMEOUT}s" ;;
+        125) failure_evidence='task state observer has no bounded runner' ;;
+        *) failure_evidence="task state observer exited with status $worker_rc" ;;
+      esac
+      err_tail=$(tail -1 "$batch_dir/$index.err" 2>/dev/null || true)
+      [ -z "$err_tail" ] || failure_evidence="$failure_evidence: $err_tail"
+      if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" "$failure_evidence"); then
+        reconcile_batch_cleanup
+        exit 1
+      fi
+    elif [ -n "$out" ]; then
+      IFS=$(printf '\t') read -r tag token evidence <<EOF
+$out
+EOF
+      if [ "$tag" != action ] || [ -z "$token" ]; then
+        if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" 'task state observer returned malformed output'); then
+          reconcile_batch_cleanup
+          exit 1
+        fi
+      fi
+    fi
     index=$((index + 1))
     [ -n "$out" ] || continue
     IFS=$(printf '\t') read -r tag token evidence <<EOF
@@ -604,20 +681,41 @@ EOF
     selected_evidence=$evidence
     break
   done
-  for pid in "$batch_dir"/*.id "$batch_dir"/*.out; do
-    [ -e "$pid" ] && rm -f "$pid"
-  done
-  rmdir "$batch_dir" 2>/dev/null || true
+  reconcile_batch_cleanup
   [ -n "$selected_id" ] || return 0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_reconcile_lock_acquire "$STATE" "$selected_id"
   meta="$STATE/$selected_id.meta"
+  if [ ! -f "$meta" ] || [ -e "$STATE/$selected_id.tearing-down" ]; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
+  notified=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_token)
+  record_repository=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" repository_identity)
+  project=$(fm_reconcile_meta_value "$meta" project)
+  current_repository=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
+  if [ "$pending" != "$selected_token" ] || [ "$notified" = "$selected_token" ] \
+    || [ -z "$record_repository" ] || [ "$record_repository" != "$current_repository" ]; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || target="fm-$selected_id"
   marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token")
   reason="stale: $target $selected_evidence $marker"
-  fm_wake_append stale "$target" "$reason" || exit 1
-
-  fm_reconcile_advance_seen "$STATE" "$selected_id" || exit 1
-  mark_surfaced "$STATE/$selected_id.status"
+  fm_wake_append_locked stale "$target" "$reason" || queue_rc=$?
+  if [ "$queue_rc" -eq 0 ]; then
+    fm_reconcile_advance_seen "$STATE" "$selected_id" || queue_rc=$?
+  fi
+  if [ "$queue_rc" -eq 0 ]; then
+    mark_surfaced "$STATE/$selected_id.status"
+  fi
+  fm_reconcile_lock_release "$STATE" "$selected_id"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  [ "$queue_rc" -eq 0 ] || exit "$queue_rc"
   wake "$reason"
 }
 
@@ -843,7 +941,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'fm_lock_release "$WATCH_LOCK"' EXIT
+trap watch_cleanup EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.

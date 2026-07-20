@@ -177,6 +177,39 @@ SH
   pass "registered OAuth predicate wakes on completion, dedupes, and fails loudly"
 }
 
+test_unchanged_terminal_wait_does_not_mask_live_transition() {
+  local dir state live predicate out token
+  dir=$(make_reconcile_case terminal-wait-transition)
+  state="$dir/state"
+  live="$dir/live"
+  predicate="$dir/predicate.sh"
+  printf 'working: foreground resumed after callback\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'callback already complete\n'
+exit 0
+SH
+  chmod +x "$predicate"
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=completed callback' \
+    "predicate=$predicate" \
+    'registered_at=1'
+
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'external-wait-complete' "completed wait fixture did not establish its terminal baseline"
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token" || fail "completed wait baseline could not be acknowledged"
+
+  printf 'state: idle · source: pane · resumed foreground turn ended\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'reconciled-transition (working -> idle' "unchanged terminal wait masked the later live transition"
+  case "$out" in *external-wait-complete*) fail "unchanged completed wait displaced the later live transition" ;; esac
+  pass "unchanged terminal waits do not mask later live transitions"
+}
+
 test_signaled_predicate_is_not_reported_complete() {
   local dir perl_bin rc
   dir=$(make_reconcile_case signaled-predicate)
@@ -280,6 +313,95 @@ test_unacknowledged_transition_is_not_replaced_by_newer_state() {
   pass "unacknowledged transition survives newer live truth without loss or replacement"
 }
 
+test_unacknowledged_transition_folds_newer_sparse_event() {
+  local dir state live first second token
+  dir=$(make_reconcile_case pending-event-race)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: implementation active\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+
+  printf 'state: idle · source: pane · foreground turn ended\n' > "$live"
+  first=$(observe "$state" "$live")
+  token=$(printf '%s' "$first" | cut -f2)
+  printf 'done: claimed after the pending transition\n' >> "$state/task.status"
+  second=$(observe "$state" "$live")
+  [ "$(printf '%s' "$second" | cut -f2)" = "$token" ] \
+    || fail "newer sparse event replaced the pending transition token"
+  assert_contains "$second" 'newer sparse event before delivery' \
+    "newer status append was not folded into the pending wake"
+  assert_contains "$second" 'done: claimed after the pending transition' \
+    "pending wake did not represent the newer status evidence"
+  pass "pending transitions retain newer sparse event evidence"
+}
+
+test_acknowledgement_race_preserves_notified_token() {
+  local dir state live first token observer_pid i=0
+  dir=$(make_reconcile_case acknowledgement-race)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: implementation active\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  printf 'state: idle · source: pane · foreground turn ended\n' > "$live"
+  first=$(observe "$state" "$live")
+  token=$(printf '%s' "$first" | cut -f2)
+
+  cat > "$dir/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_ACK_RACE_STARTED"
+while [ ! -e "$FM_ACK_RACE_RELEASE" ]; do sleep 0.02; done
+cat "$FM_FAKE_RECONCILED_STATE_FILE"
+SH
+  chmod +x "$dir/fm-crew-state.sh"
+  FM_RECONCILE_CREW_STATE_BIN="$dir/fm-crew-state.sh" \
+    FM_FAKE_RECONCILED_STATE_FILE="$live" \
+    FM_ACK_RACE_STARTED="$dir/observer-started" \
+    FM_ACK_RACE_RELEASE="$dir/observer-release" \
+    fm_reconcile_observe "$state" task > "$dir/observer.out" &
+  observer_pid=$!
+  while [ ! -e "$dir/observer-started" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || fail "acknowledgement-race observer did not start"
+  fm_reconcile_ack "$state" task "$token" || fail "concurrent acknowledgement failed"
+  touch "$dir/observer-release"
+  wait "$observer_pid" || fail "observer failed after concurrent acknowledgement"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" notified_action_token)" = "$token" ] \
+    || fail "later observation erased the concurrent acknowledgement"
+  pass "per-task serialization preserves concurrent acknowledgements"
+}
+
+test_teardown_tombstone_prevents_record_resurrection() {
+  local dir state live observer_pid i=0
+  dir=$(make_reconcile_case teardown-race)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: implementation active\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  cat > "$dir/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEARDOWN_RACE_STARTED"
+while [ ! -e "$FM_TEARDOWN_RACE_RELEASE" ]; do sleep 0.02; done
+cat "$FM_FAKE_RECONCILED_STATE_FILE"
+SH
+  chmod +x "$dir/fm-crew-state.sh"
+  FM_RECONCILE_CREW_STATE_BIN="$dir/fm-crew-state.sh" \
+    FM_FAKE_RECONCILED_STATE_FILE="$live" \
+    FM_TEARDOWN_RACE_STARTED="$dir/observer-started" \
+    FM_TEARDOWN_RACE_RELEASE="$dir/observer-release" \
+    fm_reconcile_observe "$state" task > "$dir/observer.out" &
+  observer_pid=$!
+  while [ ! -e "$dir/observer-started" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || fail "teardown-race observer did not start"
+  fm_reconcile_teardown_begin "$state" task || fail "teardown tombstone could not be serialized"
+  rm -f "$state/task.meta" "$state/task.reconciled" "$state/task.tearing-down"
+  touch "$dir/observer-release"
+  wait "$observer_pid" || fail "teardown-race observer failed"
+  [ ! -e "$state/task.reconciled" ] || fail "in-flight observer resurrected reconciliation state after teardown"
+  [ ! -s "$dir/observer.out" ] || fail "in-flight observer emitted a post-teardown action"
+  pass "teardown serialization prevents reconciliation-state resurrection"
+}
+
 test_delivery_race_preserves_later_status_and_turn_events() {
   local dir state live out token record observed_status observed_turn seen_status seen_turn
   dir=$(make_reconcile_case delivery-race)
@@ -344,10 +466,14 @@ test_stopped_endpoint_without_claimed_done_wakes_once
 test_same_repository_endpoint_replacement_preserves_working_baseline
 test_positive_working_source_loss_wakes_past_stale_working_event
 test_external_wait_completion_and_failures
+test_unchanged_terminal_wait_does_not_mask_live_transition
 test_signaled_predicate_is_not_reported_complete
 test_unobservable_pause_fails_loudly_and_busy_stays_quiet
 test_inflight_unregistered_blocked_wait_fails_loudly_once
 test_unacknowledged_transition_is_not_replaced_by_newer_state
+test_unacknowledged_transition_folds_newer_sparse_event
+test_acknowledgement_race_preserves_notified_token
+test_teardown_tombstone_prevents_record_resurrection
 test_delivery_race_preserves_later_status_and_turn_events
 test_restart_preserves_transition_dedup
 

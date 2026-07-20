@@ -673,7 +673,7 @@ PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_AB
 # deliberately has no project= field, so repository identity validation here
 # would break legitimate dead-endpoint recovery.
 if [ "$KIND" != secondmate ]; then
-  fm_task_identity_validate "$STATE" "$ID" "$PROJ_ABS_REAL" || exit 1
+  fm_task_identity_bind "$STATE" "$ID" "$PROJ_ABS_REAL" || exit 1
 fi
 
 real_path_or_raw() {  # <path>

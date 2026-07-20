@@ -318,7 +318,8 @@ test_handle_wake_escalates_reconciled_verdicts() {
     'reconciled-transition (working -> unknown)' \
     'external-wait-complete (OAuth callback)' \
     'external-wait-failed (predicate exited 3)' \
-    'external-wait-unobservable (no predicate registered)'; do
+    'external-wait-unobservable (no predicate registered)' \
+    'observer-failure (task state observer timed out)'; do
     reason="stale: $win $verdict"
     FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
     grep -qF "$verdict" "$state/.subsuper-escalations" \
@@ -543,11 +544,12 @@ test_normal_supervisor_self_handle_ack_preserves_unrelated_wake() {
 }
 
 test_normal_supervisor_replays_unaccepted_reconciled_wake() {
-  local dir state record reason count
+  local dir state record old_reason reason count
   dir=$(make_supercase reconcile-replay)
   state="$dir/state"
   record="$state/task.reconciled"
-  reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence) [fm-reconcile=task,transition:1]'
+  old_reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence) [fm-reconcile=task,transition:1]'
+  reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence); newer sparse event before delivery: done: final evidence [fm-reconcile=task,transition:1]'
   fm_write_meta "$record" \
     'schema=fm-reconciled.v1' \
     'task=task' \
@@ -556,6 +558,7 @@ test_normal_supervisor_replays_unaccepted_reconciled_wake() {
     'pending_action_token=transition:1' \
     'pending_action_reason=reconciled-transition (working -> idle from positive pane evidence)' \
     'notified_action_token='
+  append_wake "$state" stale session:fm-task "$old_reason"
   append_wake "$state" stale session:fm-task "$reason"
 
   FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal bash -c '
@@ -569,7 +572,9 @@ test_normal_supervisor_replays_unaccepted_reconciled_wake() {
     || fail "durable daemon replay did not acknowledge consumer handoff"
   count=$(wc -l < "$state/.subsuper-escalations" 2>/dev/null || echo 0)
   [ "$count" -eq 1 ] || fail "replayed reconciled action reached the durable consumer $count times"
-  pass "normal supervisor replays and accepts an unacknowledged queued reconciled action once"
+  grep -F 'newer sparse event before delivery' "$state/.subsuper-escalations" >/dev/null \
+    || fail "durable daemon replay consumed an older payload for the pending token"
+  pass "normal supervisor replays the latest pending-token evidence exactly once"
 }
 
 # A pause whose pane became busy again (the crew resumed) drops its marker without

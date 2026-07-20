@@ -1347,7 +1347,7 @@ handle_wake() {  # <reason> <state>
               verdict="${arg#* }"
               arg="${arg%% *}"
               case "$verdict" in
-                endpoint-gone\ \(*|agent-dead\ \(*|reconciled-transition\ \(*|external-wait-complete\ \(*|external-wait-failed\ \(*|external-wait-unobservable\ \(*)
+                endpoint-gone\ \(*|agent-dead\ \(*|reconciled-transition\ \(*|external-wait-complete\ \(*|external-wait-failed\ \(*|external-wait-unobservable\ \(*|observer-failure\ \(*)
                   # A confirmed death verdict (fm-watch.sh handle_gone_endpoint
                   # / handle_dead_agent), a durable reconciled transition, or an
                   # external-wait completion/registration failure is already an

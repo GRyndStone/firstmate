@@ -92,6 +92,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -999,7 +1001,10 @@ fi
 # (fm-watch.sh handle_gone_endpoint). Removed with the other state files below;
 # the watcher's absorb is age-bounded, so a crashed teardown cannot suppress a
 # real death past the bound.
-touch "$STATE/$ID.tearing-down"
+if [ "$KIND" != secondmate ]; then
+  fm_task_identity_bind "$STATE" "$ID" "$PROJ" || exit 1
+fi
+fm_reconcile_teardown_begin "$STATE" "$ID" || exit 1
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then

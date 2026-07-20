@@ -61,4 +61,17 @@ if fm_task_identity_validate "$state" missing "$repo" 2> "$err"; then
 fi
 pass "existing task metadata without a provable repository identity fails closed"
 
+fm_task_identity_bind "$state" task "$repo" \
+  || fail "existing task metadata could not bootstrap a durable repository binding"
+[ -f "$state/task.identity" ] || fail "repository binding was not persisted"
+rm -f "$state/task.meta"
+fm_task_identity_validate "$state" task "$same_wt" \
+  || fail "durable binding rejected same-repository reuse after metadata removal"
+if fm_task_identity_validate "$state" task "$other" 2> "$err"; then
+  fail "metadata removal erased the cross-repository task-id guard"
+fi
+grep -F "task id 'task' is already bound" "$err" >/dev/null \
+  || fail "durable cross-repository refusal lost the bound task id"
+pass "task identity remains repository-bound after volatile metadata removal"
+
 echo "# fm-task-identity.test.sh: all assertions passed"

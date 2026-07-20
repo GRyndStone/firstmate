@@ -46,6 +46,10 @@
 #   fm_reconcile_ack <state-dir> <id> <token>
 #     Acknowledge only the token already persisted in the record after consumer
 #     handoff.
+#   fm_reconcile_observer_failure <state-dir> <id> <evidence>
+#     Persist and emit one deduplicated observer-failure action.
+#   fm_reconcile_teardown_begin <state-dir> <id>
+#     Serialize and publish the teardown tombstone before destructive cleanup.
 #   fm_reconcile_action_marker <id> <token>
 #     Print the durable wake marker that binds a queue payload to its action.
 #   fm_reconcile_action_pending <state-dir> <reason>
@@ -166,7 +170,7 @@ fm_reconcile_bounded() {  # <seconds> <command...>
   elif command -v gtimeout >/dev/null 2>&1; then
     gtimeout -k 1 "$seconds" "$@"
   elif command -v perl >/dev/null 2>&1; then
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $s = $?; exit(($s & 127) ? 128 + ($s & 127) : ($s >> 8))' "$seconds" "$@"
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } my $stop = sub { my ($code) = @_; kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; waitpid $pid, 0; exit $code }; local $SIG{ALRM} = sub { $stop->(124) }; local $SIG{TERM} = sub { $stop->(143) }; local $SIG{INT} = sub { $stop->(130) }; local $SIG{HUP} = sub { $stop->(129) }; alarm $t; waitpid $pid, 0; my $s = $?; exit(($s & 127) ? 128 + ($s & 127) : ($s >> 8))' "$seconds" "$@"
   else
     return 125
   fi
@@ -451,32 +455,52 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
     printf 'pending_action_token=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_TOKEN")"
     printf 'pending_action_reason=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_REASON")"
     printf 'notified_action_token=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_NOTIFIED_TOKEN")"
+    printf 'observer_state=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_OBSERVER_STATE")"
+    printf 'observer_evidence=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_OBSERVER_EVIDENCE")"
+    printf 'observer_sequence=%s\n' "$FM_RECONCILE_WRITE_OBSERVER_SEQUENCE"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$record"
 }
 
-fm_reconcile_observe() {  # <state-dir> <id>
-  local state=$1 id=$2 meta record status_file project repository_identity endpoint raw now
+fm_reconcile_lock_path() {  # <state-dir> <id>
+  printf '%s/.reconcile-%s.lock\n' "$1" "$2"
+}
+
+fm_reconcile_lock_acquire() {  # <state-dir> <id>
+  fm_lock_acquire_wait "$(fm_reconcile_lock_path "$1" "$2")"
+}
+
+fm_reconcile_lock_release() {  # <state-dir> <id>
+  fm_lock_release "$(fm_reconcile_lock_path "$1" "$2")"
+}
+
+fm_reconcile_meta_matches() {  # <state-dir> <id> <signature>
+  local state=$1 id=$2 expected=$3 meta
+  meta="$state/$id.meta"
+  [ -f "$meta" ] || return 1
+  [ ! -e "$state/$id.tearing-down" ] || return 1
+  [ "$(fm_reconcile_file_signature "$meta")" = "$expected" ]
+}
+
+fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state>
+  local state=$1 id=$2 meta_signature=$3 raw=$4 meta record status_file project repository_identity endpoint now
   local old_repository_identity old_endpoint old_state old_source old_evidence old_observed old_transition_seq
   local old_prior_endpoint old_prior_state old_prior_source old_prior_evidence old_prior_observed
   local old_wait_kind old_wait_sig old_wait_state old_wait_seq old_pending old_reason old_notified
+  local old_status_signal old_turn_signal old_observer_seq
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
-  local wait_seq pending reason candidate_token='' candidate_reason=''
+  local wait_seq pending reason candidate_token='' candidate_reason='' event_note=''
   local pending_unacked=0 positive_working=0 current_positive_working=0
   local endpoint_changed=0 state_changed=0 source_changed=0 same_repository=0
 
   meta="$state/$id.meta"
-  [ -f "$meta" ] || return 0
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || return 0
   record="$state/$id.reconciled"
   status_file="$state/$id.status"
   project=$(fm_reconcile_meta_value "$meta" project)
   repository_identity=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
   endpoint=$(fm_reconcile_endpoint "$meta")
-  raw=$(
-    FM_CREW_STATE_LIVE_ONLY=1 FM_STATE_OVERRIDE="$state" "$FM_RECONCILE_CREW_STATE_BIN" "$id" 2>/dev/null || true
-  )
-  raw=$(printf '%s\n' "$raw" | head -1)
   fm_reconcile_parse_state_line "$raw"
   current_state=$FM_RECONCILE_CURRENT_STATE
   current_source=$FM_RECONCILE_CURRENT_SOURCE
@@ -514,8 +538,12 @@ fm_reconcile_observe() {  # <state-dir> <id>
   old_pending=$(fm_reconcile_record_value "$record" pending_action_token)
   old_reason=$(fm_reconcile_record_value "$record" pending_action_reason)
   old_notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  old_status_signal=$(fm_reconcile_record_value "$record" status_signal_signature)
+  old_turn_signal=$(fm_reconcile_record_value "$record" turn_signal_signature)
+  old_observer_seq=$(fm_reconcile_record_value "$record" observer_sequence)
   case "$old_transition_seq" in ''|*[!0-9]*) old_transition_seq=0 ;; esac
   case "$old_wait_seq" in ''|*[!0-9]*) old_wait_seq=0 ;; esac
+  case "$old_observer_seq" in ''|*[!0-9]*) old_observer_seq=0 ;; esac
 
   prior_endpoint=$old_prior_endpoint
   prior_state=$old_prior_state
@@ -561,9 +589,30 @@ fm_reconcile_observe() {  # <state-dir> <id>
     wait_seq=$((old_wait_seq + 1))
   fi
 
-  # External-wait completion/failure is more specific than the foreground
-  # state edge and therefore becomes the one pending action when both happen in
-  # the same cycle.
+  case "$current_state" in
+    paused|blocked)
+      if [ "$FM_RECONCILE_WAIT_PRESENT" -eq 0 ]; then
+        if [ "$old_wait_state" != unobservable ] || [ "$(fm_reconcile_record_value "$record" status_signature)" != "$status_sig" ]; then
+          wait_seq=$((old_wait_seq + 1))
+          candidate_token="wait:$wait_seq:unobservable"
+          candidate_reason="external-wait-unobservable ($current_state task has no state/$id.wait predicate/process registration or legacy check; blocked work requires immediate intervention unless an observable external wait is registered; last status event sequence $status_seq: ${last_status:-none})"
+        fi
+        FM_RECONCILE_WAIT_RESULT=unobservable
+        FM_RECONCILE_WAIT_EVIDENCE='no completion predicate or process signal registered'
+      elif [ "$positive_working" -eq 1 ]; then
+        candidate_token="transition:$transition_seq"
+        candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
+      fi
+      ;;
+    *)
+      if [ "$positive_working" -eq 1 ] \
+        && { [ "$current_state" != working ] || [ "$current_positive_working" -eq 0 ]; }; then
+        candidate_token="transition:$transition_seq"
+        candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
+      fi
+      ;;
+  esac
+
   case "$FM_RECONCILE_WAIT_RESULT" in
     complete)
       if [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] || [ "$old_wait_state" != complete ]; then
@@ -577,32 +626,14 @@ fm_reconcile_observe() {  # <state-dir> <id>
         candidate_reason="external-wait-failed ($FM_RECONCILE_WAIT_DESCRIPTION; $FM_RECONCILE_WAIT_EVIDENCE; last status event sequence $status_seq: ${last_status:-none})"
       fi
       ;;
-    *)
-      case "$current_state" in
-        paused|blocked)
-          if [ "$FM_RECONCILE_WAIT_PRESENT" -eq 0 ]; then
-            if [ "$old_wait_state" != unobservable ] || [ "$(fm_reconcile_record_value "$record" status_signature)" != "$status_sig" ]; then
-              wait_seq=$((old_wait_seq + 1))
-              candidate_token="wait:$wait_seq:unobservable"
-              candidate_reason="external-wait-unobservable ($current_state task has no state/$id.wait predicate/process registration or legacy check; blocked work requires immediate intervention unless an observable external wait is registered; last status event sequence $status_seq: ${last_status:-none})"
-            fi
-            FM_RECONCILE_WAIT_RESULT=unobservable
-            FM_RECONCILE_WAIT_EVIDENCE='no completion predicate or process signal registered'
-          elif [ "$positive_working" -eq 1 ]; then
-            candidate_token="transition:$transition_seq"
-            candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
-          fi
-          ;;
-        *)
-          if [ "$positive_working" -eq 1 ] \
-            && { [ "$current_state" != working ] || [ "$current_positive_working" -eq 0 ]; }; then
-            candidate_token="transition:$transition_seq"
-            candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
-          fi
-          ;;
-      esac
-      ;;
   esac
+
+  if [ "$old_status_signal" != "$status_signal_sig" ]; then
+    event_note="status event sequence $status_seq, last event: ${last_status:-none}"
+  fi
+  if [ "$old_turn_signal" != "$turn_signal_sig" ]; then
+    event_note="${event_note:+$event_note; }turn-end signal changed"
+  fi
 
   # Never replace an unacknowledged action with a newer observation.  The
   # watcher persists the action before enqueueing it, so replacement during a
@@ -613,7 +644,9 @@ fm_reconcile_observe() {  # <state-dir> <id>
     if [ -n "$candidate_token" ] && [ "$candidate_token" != "$old_pending" ]; then
       reason="$old_reason; newer observation before delivery: $candidate_reason"
     elif [ "$state_changed" -eq 1 ]; then
-      reason="$old_reason; current observation before delivery: $current_state from $current_source (${current_detail:-no detail})"
+      reason="$old_reason; current observation before delivery: $current_state from $current_source (${current_detail:-no detail})${event_note:+; $event_note}"
+    elif [ -n "$event_note" ]; then
+      reason="$old_reason; newer sparse event before delivery: $event_note"
     fi
   elif [ -n "$candidate_token" ]; then
     pending=$candidate_token
@@ -652,6 +685,10 @@ fm_reconcile_observe() {  # <state-dir> <id>
   FM_RECONCILE_WRITE_PENDING_TOKEN=$pending
   FM_RECONCILE_WRITE_PENDING_REASON=$reason
   FM_RECONCILE_WRITE_NOTIFIED_TOKEN=$old_notified
+  FM_RECONCILE_WRITE_OBSERVER_STATE=ok
+  FM_RECONCILE_WRITE_OBSERVER_EVIDENCE=
+  FM_RECONCILE_WRITE_OBSERVER_SEQUENCE=$old_observer_seq
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || return 0
   fm_reconcile_write_record "$record" || return 1
 
   if [ -n "$pending" ] && [ "$pending" != "$old_notified" ]; then
@@ -659,7 +696,140 @@ fm_reconcile_observe() {  # <state-dir> <id>
   fi
 }
 
-fm_reconcile_ack() {  # <state-dir> <id> <token>
+fm_reconcile_observe() {  # <state-dir> <id>
+  local state=$1 id=$2 meta meta_signature raw observe_rc
+  meta="$state/$id.meta"
+  [ -f "$meta" ] || return 0
+  [ ! -e "$state/$id.tearing-down" ] || return 0
+  meta_signature=$(fm_reconcile_file_signature "$meta")
+  raw=$(
+    FM_CREW_STATE_LIVE_ONLY=1 FM_STATE_OVERRIDE="$state" "$FM_RECONCILE_CREW_STATE_BIN" "$id" 2>/dev/null
+  ) || return $?
+  raw=$(printf '%s\n' "$raw" | head -1)
+  fm_reconcile_lock_acquire "$state" "$id"
+  if fm_reconcile_observe_locked "$state" "$id" "$meta_signature" "$raw"; then
+    observe_rc=0
+  else
+    observe_rc=$?
+  fi
+  fm_reconcile_lock_release "$state" "$id"
+  return "$observe_rc"
+}
+
+fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
+  local state=$1 id=$2 evidence=$3 meta meta_signature record input tmp project repository_identity endpoint now
+  local old_state old_evidence old_sequence old_pending old_reason old_notified pending reason token
+  meta="$state/$id.meta"
+  [ -f "$meta" ] || return 0
+  [ ! -e "$state/$id.tearing-down" ] || return 0
+  meta_signature=$(fm_reconcile_file_signature "$meta")
+  record="$state/$id.reconciled"
+  project=$(fm_reconcile_meta_value "$meta" project)
+  repository_identity=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
+  endpoint=$(fm_reconcile_endpoint "$meta")
+  old_state=$(fm_reconcile_record_value "$record" observer_state)
+  old_evidence=$(fm_reconcile_record_value "$record" observer_evidence)
+  old_sequence=$(fm_reconcile_record_value "$record" observer_sequence)
+  old_pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  old_reason=$(fm_reconcile_record_value "$record" pending_action_reason)
+  old_notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  case "$old_sequence" in ''|*[!0-9]*) old_sequence=0 ;; esac
+  evidence=$(fm_reconcile_clean_value "$evidence")
+  pending=$old_pending
+  reason=$old_reason
+  if [ "$old_state" != failed ] || [ "$old_evidence" != "$evidence" ]; then
+    old_sequence=$((old_sequence + 1))
+    token="observer:$old_sequence:failed"
+    if [ -n "$old_pending" ] && [ "$old_pending" != "$old_notified" ]; then
+      reason="$old_reason; newer observation before delivery: observer-failure ($evidence)"
+    else
+      pending=$token
+      reason="observer-failure ($evidence)"
+    fi
+  fi
+  now=$(date +%s)
+  tmp="$record.observer.${BASHPID:-$$}"
+  input=$record
+  [ -f "$input" ] || input=/dev/null
+  awk \
+    -v task="$id" \
+    -v repository_identity="$repository_identity" \
+    -v endpoint="$endpoint" \
+    -v now="$now" \
+    -v observer_evidence="$evidence" \
+    -v observer_sequence="$old_sequence" \
+    -v pending="$pending" \
+    -v reason="$reason" '
+    BEGIN {
+      defaults["schema"] = "fm-reconciled.v1"
+      defaults["task"] = task
+      defaults["repository_identity"] = repository_identity
+      defaults["endpoint"] = endpoint
+      defaults["state"] = "unknown"
+      defaults["source"] = "none"
+      defaults["evidence"] = "observer failure"
+      defaults["observed_at"] = now
+      defaults["notified_action_token"] = ""
+      updates["pending_action_token"] = pending
+      updates["pending_action_reason"] = reason
+      updates["observer_state"] = "failed"
+      updates["observer_evidence"] = observer_evidence
+      updates["observer_sequence"] = observer_sequence
+    }
+    {
+      split($0, parts, "=")
+      key = parts[1]
+      if (key in updates) {
+        print key "=" updates[key]
+      } else {
+        print
+      }
+      seen[key] = 1
+    }
+    END {
+      order[1] = "schema"
+      order[2] = "task"
+      order[3] = "repository_identity"
+      order[4] = "endpoint"
+      order[5] = "state"
+      order[6] = "source"
+      order[7] = "evidence"
+      order[8] = "observed_at"
+      order[9] = "pending_action_token"
+      order[10] = "pending_action_reason"
+      order[11] = "notified_action_token"
+      order[12] = "observer_state"
+      order[13] = "observer_evidence"
+      order[14] = "observer_sequence"
+      for (i = 1; i <= 14; i++) {
+        key = order[i]
+        if (!(key in seen)) {
+          if (key in updates) print key "=" updates[key]
+          else print key "=" defaults[key]
+        }
+      }
+    }
+  ' "$input" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || { rm -f "$tmp"; return 0; }
+  mv -f "$tmp" "$record" || return 1
+  if [ -n "$pending" ] && [ "$pending" != "$old_notified" ]; then
+    printf 'action\t%s\t%s\n' "$pending" "$reason"
+  fi
+}
+
+fm_reconcile_observer_failure() {  # <state-dir> <id> <evidence>
+  local state=$1 id=$2 evidence=$3 failure_rc
+  fm_reconcile_lock_acquire "$state" "$id"
+  if fm_reconcile_observer_failure_locked "$state" "$id" "$evidence"; then
+    failure_rc=0
+  else
+    failure_rc=$?
+  fi
+  fm_reconcile_lock_release "$state" "$id"
+  return "$failure_rc"
+}
+
+fm_reconcile_ack_locked() {  # <state-dir> <id> <token>
   local state=$1 id=$2 token=$3 record pending tmp
   record="$state/$id.reconciled"
   [ -f "$record" ] || return 1
@@ -673,6 +843,26 @@ fm_reconcile_ack() {  # <state-dir> <id> <token>
     END { if (!wrote) print "notified_action_token=" token }
   ' "$record" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$record"
+}
+
+fm_reconcile_ack() {  # <state-dir> <id> <token>
+  local state=$1 id=$2 token=$3 ack_rc
+  fm_reconcile_lock_acquire "$state" "$id"
+  if fm_reconcile_ack_locked "$state" "$id" "$token"; then
+    ack_rc=0
+  else
+    ack_rc=$?
+  fi
+  fm_reconcile_lock_release "$state" "$id"
+  return "$ack_rc"
+}
+
+fm_reconcile_teardown_begin() {  # <state-dir> <id>
+  local state=$1 id=$2 mark_rc=0
+  fm_reconcile_lock_acquire "$state" "$id"
+  touch "$state/$id.tearing-down" || mark_rc=$?
+  fm_reconcile_lock_release "$state" "$id"
+  return "$mark_rc"
 }
 
 fm_reconcile_action_marker() {  # <id> <token>

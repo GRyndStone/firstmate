@@ -7,6 +7,7 @@ The library header owns the exact `state/<id>.reconciled` and `state/<id>.wait` 
 ## Runtime contract
 
 Each cycle records repository identity, endpoint, current state, source evidence, observation time, status-event sequence and signature, preceding distinct state, external-wait result, pending action token, and consumer-acknowledged token.
+Observation and acknowledgement updates are serialized by a per-task portable lock, and teardown takes that lock before publishing its tombstone.
 The watcher writes an actionable wake to `state/.wake-queue` and advances sparse-event suppressors only to the exact status/turn-end signatures in that observation.
 The durable daemon replays any queued reconciled action not yet accepted into its persistent escalation buffer, while a direct queue drain acknowledges only after printing the wake, so a producer or supervisor restart cannot strand delivery.
 A prior positive `working` observation from a run-step, busy pane, or progressing task-owned command losing that positive source or changing to any non-working observation emits one `reconciled-transition` wake immediately.
@@ -42,13 +43,16 @@ The exact process exit or identity change remains an immediate model-free comple
 A `paused` or `blocked` task with no registration or legacy per-task check emits one `external-wait-unobservable` wake, including an existing task first observed after supervisor rollout, and a missing, non-executable, timed-out, or failed predicate emits one `external-wait-failed` wake.
 An unchanged pending registration stays quiet, and acknowledged completion or failure stays deduplicated across watcher and daemon restarts.
 An unacknowledged transition token cannot be replaced by a newer observation during crash recovery; the wake retains the original event evidence, folds in any newer actionable condition, and persists the newer live state separately as current truth.
+Newer status and turn-end evidence is folded into that pending wake before its exact suppressor signatures advance.
 An unchanged pane remains quiet at every stale threshold while the reconciled reader still reports positive run-step, busy-pane, or progressing owned-command evidence; the watcher revalidates that evidence instead of converting elapsed time alone into a possible-wedge alarm.
+Observer crashes, malformed results, and outer timeouts persist one `observer-failure` action, while watcher shutdown terminates and waits for every active batch worker before releasing singleton ownership.
 
 ## Task identity boundary
 
 `bin/fm-spawn.sh` validates an existing ship/scout task id before it creates a backend endpoint or worktree.
-`bin/fm-task-identity-lib.sh` accepts the same physical repository or another linked worktree with the same git common directory, preserving recovery and delivery flow.
+`bin/fm-task-identity-lib.sh` persists `state/<id>.identity` before endpoint creation and accepts the same physical repository or another linked worktree with the same git common directory, preserving recovery and delivery flow.
 It refuses an unrelated repository and directs the caller to create a new linked task instead of overwriting the existing identity.
+Successful teardown preserves that binding after volatile metadata and reconciliation state are removed.
 Persistent secondmates remain bound to their configured home through the existing home/registry validators and are intentionally outside this repository guard because their metadata has no `project=` identity.
 
 ## Regression evidence
