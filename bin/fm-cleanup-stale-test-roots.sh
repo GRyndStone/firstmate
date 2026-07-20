@@ -159,6 +159,7 @@ has_open_files() {
   if ! command -v lsof >/dev/null 2>&1; then
     return 0
   fi
+  # +D walks the tree; fail closed on any non-empty output or non-1 status.
   if output=$(lsof -nP +D "$p" 2>&1); then
     return 0
   else
@@ -191,6 +192,78 @@ has_live_process_ref() {
   return 1
 }
 
+# classify_path <raw-or-resolved-path>
+# Prints "OK|<resolved>|<bytes>" when every safety gate passes, or
+# "REFUSE|<path>|<reason>|<bytes>" when any gate fails. Shared by the initial
+# scan and the immediate pre-delete recheck so apply mode cannot TOCTOU-skip
+# owner/age/live/open-file gates.
+classify_path() {
+  local raw=$1 resolved base_name prefix_ok=0 ouid mtime birth age_m age_b bytes
+  local reason_csv="" r
+  local now
+  now=$(date +%s)
+
+  if [ ! -d "$raw" ]; then
+    printf 'REFUSE|%s|not-a-directory-anymore|0\n' "$raw"
+    return
+  fi
+  resolved=$(cd "$raw" && pwd -P) || {
+    printf 'REFUSE|%s|resolve-failed|0\n' "$raw"
+    return
+  }
+  case "$resolved" in
+    "$BASE"/*) : ;;
+    *)
+      printf 'REFUSE|%s|escaped-base-via-symlink-or-resolve|0\n' "$resolved"
+      return
+      ;;
+  esac
+  base_name=$(basename "$resolved")
+  for prefix in "${PREFIXES[@]}"; do
+    case "$base_name" in
+      "${prefix}".*) prefix_ok=1; break ;;
+    esac
+  done
+  if [ "$prefix_ok" -ne 1 ]; then
+    printf 'REFUSE|%s|basename-prefix-mismatch|0\n' "$resolved"
+    return
+  fi
+
+  bytes=$(path_bytes "$resolved")
+  ouid=$(owner_uid "$resolved")
+  if [ "$ouid" != "$ME_UID" ]; then
+    reason_csv="owner-uid-$ouid-ne-$ME_UID"
+  fi
+
+  mtime=$(path_mtime_epoch "$resolved")
+  birth=$(path_birth_epoch "$resolved")
+  age_m=$((now - mtime))
+  age_b=$((now - birth))
+  if [ "$age_m" -lt "$MIN_AGE_SECS" ]; then
+    r="mtime-too-fresh-${age_m}s"
+    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+  fi
+  if [ "$age_b" -lt "$MIN_AGE_SECS" ]; then
+    r="birth-too-fresh-${age_b}s"
+    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+  fi
+
+  if has_live_process_ref "$resolved"; then
+    r="live-process-command-or-cwd"
+    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+  fi
+  if has_open_files "$resolved"; then
+    r="open-files-cwd-root-or-lsof-unavailable"
+    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+  fi
+
+  if [ -n "$reason_csv" ]; then
+    printf 'REFUSE|%s|%s|%s\n' "$resolved" "$reason_csv" "$bytes"
+    return
+  fi
+  printf 'OK|%s|%s\n' "$resolved" "$bytes"
+}
+
 eligible=()
 eligible_bytes=()
 refused=()
@@ -211,73 +284,29 @@ printf '\n'
 
 for raw in "${candidates[@]:-}"; do
   [ -n "$raw" ] || continue
-  # Resolve and ensure still under BASE (no symlink escape).
-  if [ ! -d "$raw" ]; then
-    refused+=("$raw")
-    refused_reasons+=("not-a-directory-anymore")
-    continue
-  fi
-  resolved=$(cd "$raw" && pwd -P)
-  case "$resolved" in
-    "$BASE"/*) : ;;
-    *)
+  verdict=$(classify_path "$raw")
+  case "$verdict" in
+    OK\|*)
+      resolved=${verdict#OK|}
+      bytes=${resolved##*|}
+      resolved=${resolved%|*}
+      eligible+=("$resolved")
+      eligible_bytes+=("$bytes")
+      total_eligible_bytes=$((total_eligible_bytes + bytes))
+      total_scan_bytes=$((total_scan_bytes + bytes))
+      ;;
+    REFUSE\|*)
+      rest=${verdict#REFUSE|}
+      resolved=${rest%%|*}
+      rest=${rest#*|}
+      reason=${rest%%|*}
+      bytes=${rest#*|}
       refused+=("$resolved")
-      refused_reasons+=("escaped-base-via-symlink-or-resolve")
-      continue
+      refused_reasons+=("$reason")
+      total_refused_bytes=$((total_refused_bytes + bytes))
+      total_scan_bytes=$((total_scan_bytes + bytes))
       ;;
   esac
-  base_name=$(basename "$resolved")
-  prefix_ok=0
-  for prefix in "${PREFIXES[@]}"; do
-    case "$base_name" in
-      "${prefix}".*) prefix_ok=1; break ;;
-    esac
-  done
-  if [ "$prefix_ok" -ne 1 ]; then
-    refused+=("$resolved")
-    refused_reasons+=("basename-prefix-mismatch")
-    continue
-  fi
-
-  bytes=$(path_bytes "$resolved")
-  total_scan_bytes=$((total_scan_bytes + bytes))
-  reasons=()
-
-  ouid=$(owner_uid "$resolved")
-  if [ "$ouid" != "$ME_UID" ]; then
-    reasons+=("owner-uid-$ouid-ne-$ME_UID")
-  fi
-
-  mtime=$(path_mtime_epoch "$resolved")
-  birth=$(path_birth_epoch "$resolved")
-  age_m=$((NOW - mtime))
-  age_b=$((NOW - birth))
-  if [ "$age_m" -lt "$MIN_AGE_SECS" ]; then
-    reasons+=("mtime-too-fresh-${age_m}s")
-  fi
-  if [ "$age_b" -lt "$MIN_AGE_SECS" ]; then
-    reasons+=("birth-too-fresh-${age_b}s")
-  fi
-
-  if has_live_process_ref "$resolved"; then
-    reasons+=("live-process-command")
-  fi
-  if has_open_files "$resolved"; then
-    reasons+=("open-files-cwd-root-or-lsof-unavailable")
-  fi
-
-  if [ "${#reasons[@]}" -gt 0 ]; then
-    refused+=("$resolved")
-    refused_reasons+=("$(
-      IFS=,
-      printf '%s' "${reasons[*]}"
-    )")
-    total_refused_bytes=$((total_refused_bytes + bytes))
-  else
-    eligible+=("$resolved")
-    eligible_bytes+=("$bytes")
-    total_eligible_bytes=$((total_eligible_bytes + bytes))
-  fi
 done
 
 printf '=== DELETION MANIFEST (eligible) ===\n'
@@ -327,28 +356,35 @@ deleted_bytes=0
 failed=0
 for p in "${eligible[@]:-}"; do
   [ -n "$p" ] || continue
-  # Re-check existence and prefix immediately before rm.
-  base_name=$(basename "$p")
-  ok=0
-  for prefix in "${PREFIXES[@]}"; do
-    case "$base_name" in
-      "${prefix}".*) ok=1; break ;;
-    esac
-  done
-  if [ "$ok" -ne 1 ] || [ ! -d "$p" ]; then
-    printf 'skip-race: %s\n' "$p"
-    failed=$((failed + 1))
-    continue
-  fi
-  b=$(path_bytes "$p")
-  if rm -rf "$p"; then
-    deleted=$((deleted + 1))
-    deleted_bytes=$((deleted_bytes + b))
-    printf 'deleted: %s\t%s\n' "$b" "$p"
-  else
-    printf 'delete-failed: %s\n' "$p"
-    failed=$((failed + 1))
-  fi
+  # Immediate pre-delete recheck: every safety gate, not just basename/existence.
+  verdict=$(classify_path "$p")
+  case "$verdict" in
+    OK\|*)
+      resolved=${verdict#OK|}
+      bytes=${resolved##*|}
+      resolved=${resolved%|*}
+      if rm -rf "$resolved"; then
+        deleted=$((deleted + 1))
+        deleted_bytes=$((deleted_bytes + bytes))
+        printf 'deleted: %s\t%s\n' "$bytes" "$resolved"
+      else
+        printf 'delete-failed: %s\n' "$resolved"
+        failed=$((failed + 1))
+      fi
+      ;;
+    REFUSE\|*)
+      rest=${verdict#REFUSE|}
+      resolved=${rest%%|*}
+      rest=${rest#*|}
+      reason=${rest%%|*}
+      printf 'skip-recheck: reason=%s path=%s\n' "$reason" "$resolved"
+      failed=$((failed + 1))
+      ;;
+    *)
+      printf 'skip-recheck: reason=classify-error path=%s\n' "$p"
+      failed=$((failed + 1))
+      ;;
+  esac
 done
 
 # Remeasure remaining matching roots.

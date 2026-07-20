@@ -76,6 +76,50 @@ test_clear_recursive_probe_allows_candidate() {
   pass "cleanup helper: clear recursive probe preserves eligibility"
 }
 
+test_apply_rechecks_gates_before_delete() {
+  # Apply path must re-run full eligibility immediately before rm, not just
+  # basename/existence. Flip the lsof probe after scan so a once-eligible root
+  # is refused on the pre-delete recheck (TOCTOU regression for apply-eligibility).
+  local candidate fb log out state
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.recheck)
+  fb="$TMP_ROOT/recheck-fake/fakebin"
+  mkdir -p "$fb"
+  state="$TMP_ROOT/recheck-state"
+  printf 'clear\n' > "$state"
+  log="$TMP_ROOT/recheck-lsof.log"; : > "$log"
+  cat > "$fb/lsof" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> '$log'
+mode=\$(cat '$state')
+case "\$mode" in
+  clear)
+    printf 'open\n' > '$state'
+    exit 1
+    ;;
+  *)
+    case " \$* " in
+      *" +D "*)
+        printf 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n'
+        printf 'sleep 1 user 3r REG 1,1 0 1 %s/nested/open-file\n' "\${*: -1}"
+        exit 0
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+esac
+EOF
+  chmod +x "$fb/lsof"
+  out=$(PATH="$fb:$PATH" "$ROOT/bin/fm-cleanup-stale-test-roots.sh" \
+    --base "$TMP_ROOT" --min-age-hours 0 --apply-eligible)
+  assert_contains "$out" "eligible_count: 1" "initial scan should have allowed the candidate"
+  assert_contains "$out" "skip-recheck:" "apply did not recheck before delete"
+  assert_contains "$out" "open-files-cwd-root-or-lsof-unavailable" "recheck refusal lost its reason"
+  assert_present "$candidate" "apply deleted a path that failed the pre-delete recheck"
+  pass "cleanup helper: apply rechecks full gates before delete"
+}
+
 test_descendant_handles_refuse_candidate
 test_missing_lsof_refuses_candidate
 test_clear_recursive_probe_allows_candidate
+test_apply_rechecks_gates_before_delete
