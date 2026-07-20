@@ -124,6 +124,8 @@ RECONCILE_CREW_READ_TIMEOUT=${FM_RECONCILE_CREW_READ_TIMEOUT:-35}
 case "$RECONCILE_CREW_READ_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_CREW_READ_TIMEOUT=35 ;; esac
 RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT))}
 case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT)) ;; esac
+RECONCILE_MAX_WORKERS=${FM_RECONCILE_MAX_WORKERS:-8}
+case "$RECONCILE_MAX_WORKERS" in ''|*[!0-9]*|0) RECONCILE_MAX_WORKERS=8 ;; esac
 RECONCILE_BATCH_DIR=
 RECONCILE_BATCH_PIDS=
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
@@ -637,7 +639,7 @@ watch_cleanup() {
 # consumer handoff.
 reconcile_cycle() {
   local meta id target out tag token version evidence reason marker worker_rc failure_evidence err_tail expected_generation
-  local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_version='' selected_evidence=''
+  local batch_dir pids='' indexes='' pid worker_index active_count=0 index=0 selected_id='' selected_token='' selected_version='' selected_evidence=''
   local pending pending_version notified notified_version record_repository record_generation current_generation kind identity_failure_delivery queue_rc=0
   batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
   RECONCILE_BATCH_DIR=$batch_dir
@@ -652,13 +654,27 @@ reconcile_cycle() {
     reconcile_worker "$id" > "$batch_dir/$index.out" 2> "$batch_dir/$index.err" &
     pid=$!
     pids="${pids:+$pids }$pid"
+    indexes="${indexes:+$indexes }$index"
+    active_count=$((active_count + 1))
     RECONCILE_BATCH_PIDS=$pids
+    if [ "$active_count" -ge "$RECONCILE_MAX_WORKERS" ]; then
+      pid=${pids%% *}
+      worker_index=${indexes%% *}
+      if wait "$pid"; then worker_rc=0; else worker_rc=$?; fi
+      printf '%s\n' "$worker_rc" > "$batch_dir/$worker_index.rc" || exit 1
+      case "$pids" in *' '*) pids=${pids#* }; indexes=${indexes#* } ;; *) pids=; indexes= ;; esac
+      active_count=$((active_count - 1))
+      RECONCILE_BATCH_PIDS=$pids
+    fi
   done
-  index=1
-  for pid in $pids; do
+  while [ "$active_count" -gt 0 ]; do
+    pid=${pids%% *}
+    worker_index=${indexes%% *}
     if wait "$pid"; then worker_rc=0; else worker_rc=$?; fi
-    printf '%s\n' "$worker_rc" > "$batch_dir/$index.rc" || exit 1
-    index=$((index + 1))
+    printf '%s\n' "$worker_rc" > "$batch_dir/$worker_index.rc" || exit 1
+    case "$pids" in *' '*) pids=${pids#* }; indexes=${indexes#* } ;; *) pids=; indexes= ;; esac
+    active_count=$((active_count - 1))
+    RECONCILE_BATCH_PIDS=$pids
   done
   RECONCILE_BATCH_PIDS=
   index=1

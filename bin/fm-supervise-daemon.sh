@@ -710,6 +710,14 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
+escalation_sink_has_delivery() {  # <delivery-key>
+  local key=$1 target backend capture
+  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  backend="${FM_SUPERVISOR_BACKEND:-tmux}"
+  capture=$(fm_backend_capture "$backend" "$target" 2000 2>/dev/null) || return 1
+  printf '%s\n' "$capture" | grep -Fq -- "[fm-delivery=$key]"
+}
+
 escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
   local buf=$1 key=$2 total i=1 msg candidate
   total=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
@@ -730,7 +738,7 @@ escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf inflight n msg receipt delivery_key receipt_tmp claim_delivery_key retry_tmp receipt_key prefix_count
+  local state=$1 buf inflight n msg sink_msg receipt delivery_key receipt_tmp claim_delivery_key claim_delivery_state retry_tmp receipt_key prefix_count
   buf="$state/.subsuper-escalations"
   inflight="$state/.subsuper-escalations.inflight"
   receipt="$state/.subsuper-escalation-delivered"
@@ -756,8 +764,15 @@ escalate_flush() {  # <state>
       && command -v fm_wake_reconcile_claim_delivery_key >/dev/null 2>&1; then
       claim_delivery_key=$(fm_wake_reconcile_claim_delivery_key "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
     fi
-    if [ "$claim_delivery_key" = "$delivery_key" ] \
-      || [ "$(cat "$receipt" 2>/dev/null || true)" = "$delivery_key" ]; then
+    claim_delivery_state=
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      && command -v fm_wake_reconcile_claim_delivery_state >/dev/null 2>&1; then
+      claim_delivery_state=$(fm_wake_reconcile_claim_delivery_state "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
+    fi
+    receipt_key=$(cat "$receipt" 2>/dev/null || true)
+    if { [ "$claim_delivery_key" = "$delivery_key" ] && [ "$claim_delivery_state" = delivered ]; } \
+      || { { [ "$claim_delivery_key" = "$delivery_key" ] || [ "$receipt_key" = "$delivery_key" ]; } \
+        && escalation_sink_has_delivery "$delivery_key"; }; then
       if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
         && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
         fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1
@@ -770,10 +785,9 @@ escalate_flush() {  # <state>
       fi
       continue
     fi
-    receipt_key=$(cat "$receipt" 2>/dev/null || true)
     if [ -n "$receipt_key" ]; then
       prefix_count=$(escalation_prefix_count_for_key "$inflight" "$receipt_key" 2>/dev/null || true)
-      if [ -n "$prefix_count" ]; then
+      if [ -n "$prefix_count" ] && escalation_sink_has_delivery "$receipt_key"; then
         retry_tmp="$buf.retry.${BASHPID:-$$}"
         if ! { tail -n "+$((prefix_count + 1))" "$inflight"; cat "$buf"; } > "$retry_tmp"; then
           rm -f "$retry_tmp"
@@ -800,7 +814,8 @@ escalate_flush() {  # <state>
         return 1
       fi
     fi
-    if inject_msg "$msg" "$state"; then
+    sink_msg="$msg [fm-delivery=$delivery_key]"
+    if inject_msg "$sink_msg" "$state"; then
       if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
         && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
         fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1

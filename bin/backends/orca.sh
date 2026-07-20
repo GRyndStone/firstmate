@@ -129,18 +129,27 @@ fm_backend_orca_repo_ensure() {  # <project-path>
 }
 
 fm_backend_orca_worktree_create() {  # <project-path> <name>
-  local project=$1 name=$2 repo_id out wt_id wt_path terminal
+  local project=$1 name=$2 repo_id out wt_id wt_path terminal create_rc=0
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
-  wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id) || {
-    echo "error: orca worktree create did not return a worktree id for $name" >&2
-    return 1
-  }
+  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || create_rc=$?
+  wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id 2>/dev/null || true)
+  wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path 2>/dev/null || true)
   terminal=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-terminal-handle 2>/dev/null || true)
-  wt_path=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-path) || {
+  if [ "$create_rc" -ne 0 ]; then
+    printf '%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal"
+    return 2
+  fi
+  [ -n "$wt_id" ] || {
+    echo "error: orca worktree create did not return a worktree id for $name" >&2
+    printf '%s\t%s\t%s' "$wt_id" "$wt_path" "$terminal"
+    return 2
+  }
+  [ -n "$wt_path" ] || {
     echo "error: orca worktree create did not return a path for $name" >&2
     [ -z "$terminal" ] || fm_backend_orca_kill "$terminal" >/dev/null 2>&1 || true
-    if fm_backend_orca_remove_worktree "$wt_id" >/dev/null; then
+    fm_backend_orca_remove_worktree "$wt_id" >/dev/null 2>&1 || true
+    if { [ -z "$terminal" ] || fm_backend_orca_terminal_absent "$terminal"; } \
+      && fm_backend_orca_worktree_absent "$wt_id"; then
       return 1
     fi
     if [ -n "$terminal" ]; then
@@ -155,12 +164,18 @@ fm_backend_orca_worktree_create() {  # <project-path> <name>
 }
 
 fm_backend_orca_terminal_create() {  # <worktree-id> <title>
-  local worktree_id=$1 title=$2 out terminal
+  local worktree_id=$1 title=$2 out terminal create_rc=0
   fm_backend_orca_tool_check || return 1
-  out=$(orca terminal create --worktree "id:$worktree_id" --title "$title" --json) || return 1
-  terminal=$(printf '%s' "$out" | fm_backend_orca_json_get terminal-handle) || {
+  out=$(orca terminal create --worktree "id:$worktree_id" --title "$title" --json) || create_rc=$?
+  terminal=$(printf '%s' "$out" | fm_backend_orca_json_get terminal-handle 2>/dev/null || true)
+  if [ "$create_rc" -ne 0 ]; then
+    printf 'partial\t%s' "$terminal"
+    return 2
+  fi
+  [ -n "$terminal" ] || {
     echo "error: orca terminal create did not return a terminal handle for $title" >&2
-    return 1
+    printf 'partial\t'
+    return 2
   }
   printf '%s' "$terminal"
 }
@@ -194,6 +209,41 @@ fm_backend_orca_worktree_path() {
     return 1
   }
   printf '%s' "$path"
+}
+
+fm_backend_orca_absence_from_json() {  # <not-found-code>...
+  node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (_) {
+  process.exit(2);
+}
+const allowed = new Set(process.argv.slice(1));
+if (data && data.ok === false) {
+  const code = data.error && data.error.code;
+  process.exit(allowed.has(code) ? 0 : 2);
+}
+if (data && (data.ok === true || data.result)) process.exit(1);
+process.exit(2);
+' "$@"
+}
+
+fm_backend_orca_terminal_absent() {  # <terminal-id>
+  local terminal_id=${1:-} out
+  [ -n "$terminal_id" ] || return 2
+  fm_backend_orca_tool_check || return 2
+  out=$(orca terminal read --terminal "$terminal_id" --limit 1 --json 2>&1) || true
+  printf '%s' "$out" | fm_backend_orca_absence_from_json terminal_handle_stale terminal_not_found
+}
+
+fm_backend_orca_worktree_absent() {  # <worktree-id>
+  local worktree_id=${1:-} out
+  [ -n "$worktree_id" ] || return 2
+  fm_backend_orca_tool_check || return 2
+  out=$(orca worktree show --worktree "id:$worktree_id" --json 2>&1) || true
+  printf '%s' "$out" | fm_backend_orca_absence_from_json worktree_not_found worktree_id_not_found
 }
 
 fm_backend_orca_capture() {  # <terminal-id> <lines>
@@ -331,6 +381,6 @@ fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sl
 }
 
 fm_backend_orca_kill() {  # <terminal-id>
-  fm_backend_orca_tool_check || return 0
-  orca terminal close --terminal "$1" --json >/dev/null 2>&1 || true
+  fm_backend_orca_tool_check || return 1
+  orca terminal close --terminal "$1" --json >/dev/null 2>&1
 }

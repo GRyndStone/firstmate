@@ -836,7 +836,7 @@ fm_reconcile_legacy_check_register() {  # <state-dir> <id> <expected-generation>
 
 fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
   local state=$1 id=$2 generation=$3 claim tmp owner_pid owner_identity existing_pid existing_identity current_identity
-  local expected_signature expected_generation claim_rc=0
+  local expected_signature expected_generation rescue_pending claim_rc=0
   fm_reconcile_task_id_valid "$id" && fm_reconcile_generation_valid "$generation" && [ -d "$state" ] || return 2
   claim="$state/$id.spawn-claim"
   owner_pid=${BASHPID:-$$}
@@ -845,10 +845,13 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
   if fm_reconcile_tombstone_active "$state" "$id"; then
     claim_rc=3
   elif [ -f "$claim" ]; then
+    rescue_pending=$(fm_reconcile_record_value "$claim" rescue_pending)
     existing_pid=$(fm_reconcile_record_value "$claim" owner_pid)
     existing_identity=$(fm_reconcile_record_value "$claim" owner_identity)
     current_identity=$(fm_reconcile_process_identity "$existing_pid" 2>/dev/null || true)
-    if fm_reconcile_pid_alive "$existing_pid" \
+    if [ "$rescue_pending" = 1 ]; then
+      claim_rc=5
+    elif fm_reconcile_pid_alive "$existing_pid" \
       && { [ -z "$current_identity" ] || { [ -n "$existing_identity" ] && [ "$current_identity" = "$existing_identity" ]; }; }; then
       claim_rc=4
     else
@@ -872,6 +875,36 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
   fi
   fm_reconcile_lock_release "$state" "$id"
   return "$claim_rc"
+}
+
+fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation> <rescue-path>
+  local state=$1 id=$2 generation=$3 rescue_path=$4 claim tmp mark_rc=0
+  local owner_pid owner_identity expected_signature expected_generation
+  claim="$state/$id.spawn-claim"
+  fm_reconcile_lock_acquire "$state" "$id"
+  if ! fm_reconcile_spawn_claim_matches_locked "$state" "$id" "$generation"; then
+    mark_rc=3
+  else
+    owner_pid=$(fm_reconcile_record_value "$claim" owner_pid)
+    owner_identity=$(fm_reconcile_record_value "$claim" owner_identity)
+    expected_signature=$(fm_reconcile_record_value "$claim" expected_meta_signature)
+    expected_generation=$(fm_reconcile_record_value "$claim" expected_meta_generation)
+    tmp="$claim.tmp.${BASHPID:-$$}"
+    {
+      printf 'schema=fm-spawn-claim.v1\n'
+      printf 'generation=%s\n' "$generation"
+      printf 'owner_pid=%s\n' "$owner_pid"
+      printf 'owner_identity=%s\n' "$owner_identity"
+      printf 'expected_meta_signature=%s\n' "$expected_signature"
+      printf 'expected_meta_generation=%s\n' "$expected_generation"
+      printf 'rescue_pending=1\n'
+      printf 'rescue_path=%s\n' "$(fm_reconcile_clean_value "$rescue_path")"
+    } > "$tmp" || mark_rc=1
+    if [ "$mark_rc" -eq 0 ] && ! mv -f "$tmp" "$claim"; then mark_rc=1; fi
+    rm -f "$tmp"
+  fi
+  fm_reconcile_lock_release "$state" "$id"
+  return "$mark_rc"
 }
 
 fm_reconcile_spawn_claim_matches_locked() {  # <state-dir> <id> <generation>
@@ -1432,7 +1465,7 @@ fm_reconcile_ack() {  # <state-dir> <id> <token> <version>
 
 fm_reconcile_teardown_begin() {  # <state-dir> <id> [expected-generation]
   local state=$1 id=$2 expected_generation=${3:-} mark_rc=0 tombstone tmp owner_pid owner_identity current_generation
-  local claim claim_pid claim_identity current_identity
+  local claim claim_pid claim_identity current_identity rescue_pending
   tombstone="$state/$id.tearing-down"
   owner_pid=${BASHPID:-$$}
   owner_identity=$(fm_reconcile_process_identity "$owner_pid") || return 1
@@ -1444,10 +1477,13 @@ fm_reconcile_teardown_begin() {  # <state-dir> <id> [expected-generation]
     || fm_reconcile_tombstone_active "$state" "$id"; then
     mark_rc=3
   elif [ -f "$claim" ]; then
+    rescue_pending=$(fm_reconcile_record_value "$claim" rescue_pending)
     claim_pid=$(fm_reconcile_record_value "$claim" owner_pid)
     claim_identity=$(fm_reconcile_record_value "$claim" owner_identity)
     current_identity=$(fm_reconcile_process_identity "$claim_pid" 2>/dev/null || true)
-    if fm_reconcile_pid_alive "$claim_pid" \
+    if [ "$rescue_pending" = 1 ]; then
+      mark_rc=4
+    elif fm_reconcile_pid_alive "$claim_pid" \
       && { [ -z "$current_identity" ] || { [ -n "$claim_identity" ] && [ "$current_identity" = "$claim_identity" ]; }; }; then
       mark_rc=4
     elif ! rm -f "$claim"; then

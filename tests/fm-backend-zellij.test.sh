@@ -807,6 +807,35 @@ test_kill_is_noop_when_session_absent() {
   pass "fm_backend_zellij_kill: never fails when the target session no longer exists"
 }
 
+test_tab_absence_requires_parseable_inventory() {
+  local dir fb status
+  dir="$TMP_ROOT/tab-absence"; mkdir -p "$dir/responses"
+  printf '[{"tab_id":3,"name":"renamed-task"}]\n' > "$dir/responses/1.out"
+  printf '{}\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate 3 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "matching zellij task tab must be reported present"
+  set +e
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate 3 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed zellij inventory must remain unknown"
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate 3 fm-task' "$ROOT" \
+    || fail "empty parseable zellij inventory was not recognized as absent"
+  set +e
+  pass "zellij absence distinguishes empty inventories from failed reads"
+}
+
 test_teardown_passes_recorded_tab_id_to_zellij_kill() {
   local dir state data config project fb out status
   dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
@@ -821,6 +850,8 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "kind=scout"
   printf '[]\n' > "$dir/responses/1.out"
   printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/4.out"
+  printf '[]\n' > "$dir/responses/5.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -860,6 +891,12 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   zellij_pane_response "$dir" 1 7 4
   zellij_tab_response "$dir" 2 4 "$child_title"
   printf '[]\n' > "$dir/responses/3.out"
+  printf '[]\n' > "$dir/responses/4.out"
+  printf '[]\n' > "$dir/responses/5.out"
+  printf '[]\n' > "$dir/responses/6.out"
+  printf '[]\n' > "$dir/responses/7.out"
+  printf '[]\n' > "$dir/responses/8.out"
+  printf '[]\n' > "$dir/responses/9.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ROOT_OVERRIDE="$ROOT" \
@@ -1072,6 +1109,7 @@ test_kill_falls_back_to_close_pane_when_tab_lookup_empty
 test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
+test_tab_absence_requires_parseable_inventory
 test_teardown_passes_recorded_tab_id_to_zellij_kill
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
 test_send_text_submit_detects_landed_send

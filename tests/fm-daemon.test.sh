@@ -625,8 +625,8 @@ SH
   pass "reconciliation queue claims exclude drain and preserve post-claim evidence"
 }
 
-test_escalation_receipt_makes_post_submit_replay_idempotent() {
-  local dir state buf item n msg key unexpected
+test_prepared_escalation_receipt_does_not_claim_delivery() {
+  local dir state buf item n msg key delivered
   dir=$(make_supercase post-submit-receipt)
   state="$dir/state"
   buf="$state/.subsuper-escalations"
@@ -637,14 +637,32 @@ test_escalation_receipt_makes_post_submit_replay_idempotent() {
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
   key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
+  delivered="$dir/delivered"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$delivered"; }
+    fm_backend_capture() { return 1; }
+    escalate_flush "$state"
+  ) || fail "prepared escalation could not be retried"
+  assert_grep "[fm-delivery=$key]" "$delivered" "retried escalation did not carry its sink-verifiable delivery key"
+  [ ! -s "$buf" ] || fail "confirmed retry did not retire the delivered buffer"
+  pass "prepared local escalation receipts never masquerade as confirmed delivery"
+}
+
+test_sink_verified_escalation_is_not_replayed() {
+  local dir state key unexpected
+  dir=$(make_supercase sink-verified-receipt)
+  state="$dir/state"
+  escalate_add "$state" 'terminal outcome already submitted'
+  key=$(printf '%s' 'Supervisor escalate (1 event(s)): terminal outcome already submitted (pre-read; re-arm not needed — watcher daemon-managed)' | cksum | awk '{print $1 ":" $2}')
+  printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   unexpected="$dir/unexpected-inject"
   (
+    fm_backend_capture() { printf 'captured user turn [fm-delivery=%s]\n' "$key"; }
     inject_msg() { touch "$unexpected"; return 1; }
     escalate_flush "$state"
-  ) || fail "receipt-backed post-submit replay did not complete"
-  [ ! -e "$unexpected" ] || fail "post-submit replay injected the delivered digest again"
-  [ ! -s "$buf" ] || fail "post-submit receipt did not retire the delivered buffer"
-  pass "durable receipts make post-submit escalation replay idempotent"
+  ) || fail "sink-verified post-submit replay did not complete"
+  [ ! -e "$unexpected" ] || fail "sink-verified escalation was injected again"
+  pass "sink-visible delivery keys retire prepared escalations after restart"
 }
 
 test_escalation_receipt_precedes_external_submit() {
@@ -676,6 +694,7 @@ test_delivered_escalation_prefix_is_not_replayed() {
   printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
   escalate_add "$state" 'later B'
   (
+    fm_backend_capture() { printf 'captured user turn [fm-delivery=%s]\n' "$key"; }
     inject_msg() {
       printf '%s\n' "$1" >> "$delivered"
     }
@@ -2309,7 +2328,8 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale
 test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
-test_escalation_receipt_makes_post_submit_replay_idempotent
+test_prepared_escalation_receipt_does_not_claim_delivery
+test_sink_verified_escalation_is_not_replayed
 test_escalation_receipt_precedes_external_submit
 test_delivered_escalation_prefix_is_not_replayed
 test_drain_preserves_delivered_dead_owner_claim

@@ -1565,6 +1565,27 @@ mk_linked_task() { # <home> <id> <request_id> <link-epoch> [starting-count]
   fi
 }
 
+followup_payload_hash() {  # <generation> <request-id> <count> <final> <text-file> [image]
+  local generation=$1 rid=$2 count=$3 final=$4 text_file=$5 image=${6:-} text_size image_size=0 media_type=
+  text_size=$(wc -c < "$text_file" | tr -d '[:space:]')
+  if [ -n "$image" ]; then
+    image_size=$(wc -c < "$image" | tr -d '[:space:]')
+    case "$image" in *.png) media_type=image/png ;; *.jpg|*.jpeg) media_type=image/jpeg ;; *.gif) media_type=image/gif ;; esac
+  fi
+  {
+    printf 'schema=fm-x-followup-payload.v1\n'
+    printf 'generation=%s\n' "$generation"
+    printf 'request_id=%s\n' "$rid"
+    printf 'followup_count=%s\n' "$count"
+    printf 'final=%s\n' "$final"
+    printf 'text_bytes=%s\n' "$text_size"
+    cat "$text_file"
+    printf '\nimage_bytes=%s\n' "$image_size"
+    printf 'image_media_type=%s\n' "$media_type"
+    [ -z "$image" ] || cat "$image"
+  } | shasum -a 256 | awk '{print $1}'
+}
+
 test_followup_check_states() {
   local home out rc
   home="$TMP_ROOT/fu-check"; mkdir -p "$home/state"
@@ -1664,7 +1685,7 @@ test_followup_prepares_idempotency_before_post() {
 }
 
 test_delivered_followup_operation_recovers_without_repost() {
-  local home fakebin log meta op generation out rc
+  local home fakebin log meta op generation out rc text hash
   home="$TMP_ROOT/followup-delivered-recovery"; mkdir -p "$home/state"
   fakebin=$(make_fake_curl "$home")
   log="$home/curl.log"
@@ -1672,13 +1693,18 @@ test_delivered_followup_operation_recovers_without_repost() {
   meta="$home/state/task-delivered.meta"
   op="$home/state/task-delivered.x-followup-op"
   generation=$(bash -c '. "$1"; fm_reconcile_meta_generation "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$meta")
+  text="$home/delivered.txt"
+  printf 'must not repost' > "$text"
+  hash=$(followup_payload_hash "$generation" req-delivered 0 0 "$text")
   fm_write_meta "$op" \
-    'schema=fm-x-followup-operation.v1' \
+    'schema=fm-x-followup-operation.v2' \
     'state=delivered' \
     "generation=$generation" \
     'request_id=req-delivered' \
     'followup_count=0' \
-    'idempotency_key=delivered-operation-key'
+    "payload_digest=sha256:$hash" \
+    'final=0' \
+    "idempotency_key=fmx-$hash"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
     FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
     "$ROOT/bin/fm-x-followup.sh" task-delivered - <<<"must not repost")
@@ -1690,6 +1716,54 @@ test_delivered_followup_operation_recovers_without_repost() {
   assert_grep 'x_followups=1' "$meta" "delivered recovery did not commit its counter"
   [ ! -e "$op" ] || fail "delivered recovery retained its operation record"
   pass "delivered follow-up operations finalize locally without reposting"
+}
+
+test_followup_operation_rejects_payload_mutation() {
+  local home fakebin log op img rc posts
+  home="$TMP_ROOT/followup-payload-mutation"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  mk_linked_task "$home" task-payload req-payload 1700000000 0
+  set +e
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" FAKE_FOLLOWUP_CODE=500 \
+    "$ROOT/bin/fm-x-followup.sh" task-payload - <<<"original payload" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "initial ambiguous follow-up fixture unexpectedly succeeded"
+  op="$home/state/task-payload.x-followup-op"
+  assert_grep 'schema=fm-x-followup-operation.v2' "$op" "follow-up operation did not record the payload-bound schema"
+  assert_grep 'payload_digest=sha256:' "$op" "follow-up operation did not persist its payload digest"
+
+  set +e
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" FAKE_FOLLOWUP_CODE=200 \
+    "$ROOT/bin/fm-x-followup.sh" task-payload - <<<"changed text" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "changed follow-up text reused a prepared operation"
+
+  set +e
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" FAKE_FOLLOWUP_CODE=200 \
+    "$ROOT/bin/fm-x-followup.sh" task-payload --final - <<<"original payload" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "changed follow-up finality reused a prepared operation"
+
+  img="$home/payload.png"
+  make_sample_image "$img"
+  set +e
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" FAKE_FOLLOWUP_CODE=200 \
+    "$ROOT/bin/fm-x-followup.sh" task-payload --image "$img" - <<<"original payload" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "changed follow-up attachment reused a prepared operation"
+  posts=$(grep -cF 'url=https://relay.test/connector/followup' "$log" 2>/dev/null || true)
+  [ "$posts" -eq 1 ] || fail "payload mutation reached the relay $posts times"
+  set +e
+  pass "follow-up idempotency binds text, attachment bytes, and finality"
 }
 
 test_concurrent_followups_serialize_link_count() {
@@ -2052,6 +2126,7 @@ test_followup_check_cap_reached_prunes_link
 test_followup_post_increments_counter_keeps_link
 test_followup_prepares_idempotency_before_post
 test_delivered_followup_operation_recovers_without_repost
+test_followup_operation_rejects_payload_mutation
 test_concurrent_followups_serialize_link_count
 test_followup_and_relink_are_one_cas_boundary
 test_followup_post_final_clears_link_immediately

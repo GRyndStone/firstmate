@@ -587,6 +587,12 @@ fm_wake_reconcile_claim_delivery_key() {  # <payload>
   fm_wake_reconcile_claim_value "$claim" delivery_key
 }
 
+fm_wake_reconcile_claim_delivery_state() {  # <payload>
+  local payload=$1 claim="$STATE/.wake-queue.reconcile-claim"
+  [ "$(fm_wake_reconcile_claim_value "$claim" payload)" = "$payload" ] || return 1
+  fm_wake_reconcile_claim_value "$claim" delivery_state
+}
+
 fm_wake_reconcile_claim_mark_delivered() {  # <payload> <delivery-key> [prepared|delivered]
   local payload=$1 delivery_key=$2 delivery_state=${3:-delivered} claim="$STATE/.wake-queue.reconcile-claim" tmp marker queue_sequence owner_pid owner_identity status=0
   case "$delivery_state" in prepared|delivered) ;; *) return 2 ;; esac

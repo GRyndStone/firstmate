@@ -7,7 +7,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 RECONCILE="$ROOT/bin/fm-reconcile-lib.sh"
-TMP_ROOT=$(fm_test_tmproot fm-reconcile-lib)
+fm_test_tmproot TMP_ROOT fm-reconcile-lib
 
 [ -f "$RECONCILE" ] || fail "missing durable reconciliation owner: $RECONCILE"
 # shellcheck source=bin/fm-reconcile-lib.sh
@@ -982,6 +982,34 @@ test_teardown_refuses_active_spawn_claim() {
   pass "teardown serializes against active spawn claims"
 }
 
+test_partial_spawn_rescue_claim_survives_owner_exit() {
+  local dir state claim rescue generation
+  dir="$TMP_ROOT/spawn-rescue-claim"
+  state="$dir/state"
+  mkdir -p "$state"
+  generation=lifecycle-one
+  fm_write_meta "$state/task.meta" "generation=$generation" 'window=session:fm-task' 'kind=scout'
+  fm_reconcile_spawn_claim "$state" task spawn-rescue || fail "rescue spawn claim setup failed"
+  rescue="$state/task.meta.rescue.test"
+  fm_reconcile_spawn_claim_mark_rescue_pending "$state" task spawn-rescue "$rescue" \
+    || fail "spawn claim could not enter rescue-pending state"
+  claim="$state/task.spawn-claim"
+  if fm_reconcile_spawn_publish "$state" task spawn-rescue "$rescue"; then
+    fail "missing rescue metadata unexpectedly published"
+  fi
+  assert_grep 'rescue_pending=1' "$claim" "failed rescue publication released spawn ownership"
+  sed 's/^owner_pid=.*/owner_pid=999999/' "$claim" > "$claim.tmp"
+  mv "$claim.tmp" "$claim"
+  if fm_reconcile_spawn_claim "$state" task replacement; then
+    fail "replacement spawn stole a dead-owner rescue-pending claim"
+  fi
+  if fm_reconcile_teardown_begin "$state" task "$generation"; then
+    fail "teardown discarded a rescue-pending spawn claim"
+  fi
+  assert_grep 'rescue_pending=1' "$claim" "rescue-pending ownership marker was lost"
+  pass "partial spawn ownership survives until rescue metadata is published"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -1015,5 +1043,6 @@ test_owned_command_cannot_mask_newer_terminal_state
 test_generation_cas_and_spawn_claim_revalidate_lifecycle
 test_teardown_claim_is_live_and_generation_bound
 test_teardown_refuses_active_spawn_claim
+test_partial_spawn_rescue_claim_survives_owner_exit
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

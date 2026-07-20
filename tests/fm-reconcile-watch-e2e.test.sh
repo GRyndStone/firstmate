@@ -12,7 +12,7 @@ set -u
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
-TMP_ROOT=$(fm_test_tmproot fm-reconcile-watch-e2e)
+fm_test_tmproot TMP_ROOT fm-reconcile-watch-e2e
 ACTIVE_PIDS=()
 
 cleanup_canary() {
@@ -378,6 +378,59 @@ SH
   pass "canary: fleet tasks reconcile concurrently under one bounded observation batch"
 }
 
+test_fleet_reconciliation_respects_worker_cap() {
+  local dir state out pid task i count
+  dir=$(make_canary bounded-pool 'working: bounded pool baseline')
+  state="$dir/state"
+  out="$dir/watch.out"
+  rm -f "$state/task.meta" "$state/task.status" "$state/task.turn-ended"
+  mkdir -p "$dir/started"
+  for task in task-a task-b task-c task-d; do
+    mkdir -p "$dir/project-$task" "$dir/worktree-$task"
+    fm_write_meta "$state/$task.meta" \
+      "window=session:fm-$task" \
+      "worktree=$dir/worktree-$task" \
+      "project=$dir/project-$task" \
+      'kind=ship'
+    printf 'working: %s baseline\n' "$task" > "$state/$task.status"
+  done
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_POOL_STARTED/$1"
+while [ ! -e "$FM_POOL_RELEASE" ]; do sleep 0.02; done
+printf 'state: working · source: pane · harness busy\n'
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  export FM_POOL_STARTED="$dir/started"
+  export FM_POOL_RELEASE="$dir/release"
+  export FM_RECONCILE_MAX_WORKERS=2
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  i=0
+  while [ "$i" -lt 100 ]; do
+    count=$(find "$dir/started" -type f | wc -l | tr -d '[:space:]')
+    [ "$count" -ge 2 ] && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$count" -eq 2 ] || fail "bounded pool did not start its first two workers"
+  sleep 0.3
+  count=$(find "$dir/started" -type f | wc -l | tr -d '[:space:]')
+  [ "$count" -eq 2 ] || fail "worker pool exceeded its configured cap before release: $count"
+  : > "$dir/release"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    count=$(find "$dir/started" -type f | wc -l | tr -d '[:space:]')
+    [ "$count" -eq 4 ] && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$count" -eq 4 ] || fail "bounded pool did not eventually observe every task"
+  stop_watch "$pid"
+  unset FM_POOL_STARTED FM_POOL_RELEASE FM_RECONCILE_MAX_WORKERS
+  pass "canary: fleet reconciliation honors the configured worker cap"
+}
+
 test_observer_crashes_and_timeouts_fail_loudly() {
   local dir state out pid
   dir=$(make_canary observer-failure 'working: observer failure fixture')
@@ -535,6 +588,7 @@ test_inflight_blocked_wait_without_observer_fails_loudly
 test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
+test_fleet_reconciliation_respects_worker_cap
 test_observer_crashes_and_timeouts_fail_loudly
 test_observer_budget_includes_configured_check_timeout
 test_later_worker_failure_is_recorded_after_first_action_selection

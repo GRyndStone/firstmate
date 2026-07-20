@@ -334,6 +334,26 @@ fm_backend_cmux_workspace_id_for_label() {  # <label>
     | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
 }
 
+fm_backend_cmux_workspace_absent() {  # <workspace-id> [expected-label]
+  local wsid=${1:-} expected_label=${2:-} title workspaces
+  workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 2
+  printf '%s' "$workspaces" | jq -e '(.workspaces | type) == "array"' >/dev/null 2>&1 || return 2
+  if [ -n "$wsid" ] && printf '%s' "$workspaces" | jq -e --arg id "$wsid" \
+    '[.workspaces[]? | select(.id == $id)] | length > 0' >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ -n "$expected_label" ]; then
+    title=$(fm_backend_cmux_scoped_title "$expected_label")
+    if printf '%s' "$workspaces" | jq -e --arg title "$title" \
+      '[.workspaces[]? | select(.title == $title)] | length > 0' >/dev/null 2>&1; then
+      return 1
+    fi
+    return 0
+  fi
+  [ -n "$wsid" ] || return 2
+  return 0
+}
+
 fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
   local wsid=$1
   fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null \

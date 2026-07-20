@@ -553,6 +553,45 @@ fm_backend_remove_worktree() {  # <backend> <worktree-id>
   esac
 }
 
+fm_backend_target_absent() {  # <backend> <target> [resource-id] [expected-label]
+  local backend=$1 target=$2 resource_id=${3:-} expected_label=${4:-} session pane workspace
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    tmux)
+      [ -n "$target" ] || return 2
+      fm_backend_tmux_target_exists "$target" "$expected_label" && return 1
+      return 0
+      ;;
+    herdr)
+      session=${target%%:*}
+      pane=${target#*:}
+      fm_backend_herdr_pane_absent "$session" "$pane"
+      ;;
+    zellij)
+      fm_backend_zellij_parse_target "$target" || return 2
+      fm_backend_zellij_tab_absent "$FM_BACKEND_ZELLIJ_SESSION" "$resource_id" "$expected_label" "$FM_BACKEND_ZELLIJ_PANE"
+      ;;
+    orca)
+      fm_backend_orca_terminal_absent "$target"
+      ;;
+    cmux)
+      workspace=${target%%:*}
+      fm_backend_cmux_workspace_absent "$workspace" "$expected_label"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+fm_backend_worktree_absent() {  # <backend> <worktree-id>
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    orca) fm_backend_orca_worktree_absent "$@" ;;
+    *) return 2 ;;
+  esac
+}
+
 fm_backend_worktree_path() {  # <backend> <worktree-id>
   local backend=$1
   shift

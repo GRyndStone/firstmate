@@ -104,6 +104,7 @@ case "${1:-}" in
 esac
 
 FINAL=0
+IMAGE_PATH=
 if [ "${1:-}" = --check ]; then
   MODE=check
   ID=${2:-}
@@ -119,14 +120,13 @@ else
         FINAL=1
         ;;
       --image)
-        TS_ARGS+=("$1")
         shift
         if [ "$#" -lt 1 ] || [ -z "$1" ]; then
           echo "fm-x-followup: missing --image path" >&2
           usage
           exit 2
         fi
-        TS_ARGS+=("$1")
+        IMAGE_PATH=$1
         ;;
       *) TS_ARGS+=("$1") ;;
     esac
@@ -141,8 +141,12 @@ esac
 
 META="$STATE/$ID.meta"
 FOLLOWUP_LOCK_HELD=0
+PAYLOAD_TEXT=
+PAYLOAD_IMAGE=
 # shellcheck disable=SC2329
 followup_lock_release() {
+  [ -z "$PAYLOAD_TEXT" ] || rm -f "$PAYLOAD_TEXT"
+  [ -z "$PAYLOAD_IMAGE" ] || rm -f "$PAYLOAD_IMAGE"
   if [ "$FOLLOWUP_LOCK_HELD" -eq 1 ]; then
     fm_reconcile_lock_release "$STATE" "$ID"
     FOLLOWUP_LOCK_HELD=0
@@ -208,6 +212,74 @@ if [ "$MODE" = check ]; then
   exit 0
 fi
 
+case "${TS_ARGS[0]:-}" in
+  --text-file)
+    if [ "${#TS_ARGS[@]}" -lt 2 ]; then usage; exit 2; fi
+    TEXT=$(cat -- "${TS_ARGS[1]}") || { echo "fm-x-followup: cannot read text file: ${TS_ARGS[1]}" >&2; exit 1; }
+    ;;
+  -) TEXT=$(cat) ;;
+  *) TEXT=${TS_ARGS[0]:-} ;;
+esac
+if [ -z "$TEXT" ]; then
+  echo "fm-x-followup: empty follow-up text" >&2
+  exit 2
+fi
+PAYLOAD_TEXT="$STATE/.$ID.x-followup-text.${BASHPID:-$$}"
+printf '%s' "$TEXT" > "$PAYLOAD_TEXT" || exit 1
+if [ -n "$IMAGE_PATH" ] && { [ ! -f "$IMAGE_PATH" ] || [ ! -r "$IMAGE_PATH" ]; }; then
+  echo "fm-x-followup: cannot read image file: $IMAGE_PATH" >&2
+  exit 1
+fi
+IMAGE_MEDIA_TYPE=
+if [ -n "$IMAGE_PATH" ]; then
+  IMAGE_MEDIA_TYPE=$(fmx_image_media_type_from_path "$IMAGE_PATH") || {
+    echo "fm-x-followup: unsupported image media type for: $IMAGE_PATH" >&2
+    exit 1
+  }
+  case "$IMAGE_MEDIA_TYPE" in
+    image/png) IMAGE_SUFFIX=.png ;;
+    image/jpeg|image/pjpeg) IMAGE_SUFFIX=.jpg ;;
+    image/gif) IMAGE_SUFFIX=.gif ;;
+    image/webp) IMAGE_SUFFIX=.webp ;;
+    image/bmp) IMAGE_SUFFIX=.bmp ;;
+    image/tiff) IMAGE_SUFFIX=.tiff ;;
+    *) exit 1 ;;
+  esac
+  PAYLOAD_IMAGE="$STATE/.$ID.x-followup-image.${BASHPID:-$$}$IMAGE_SUFFIX"
+  cp "$IMAGE_PATH" "$PAYLOAD_IMAGE" || exit 1
+fi
+
+followup_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+TEXT_SIZE=$(wc -c < "$PAYLOAD_TEXT" | tr -d '[:space:]') || exit 1
+IMAGE_SIZE=0
+[ -z "$PAYLOAD_IMAGE" ] || IMAGE_SIZE=$(wc -c < "$PAYLOAD_IMAGE" | tr -d '[:space:]') || exit 1
+PAYLOAD_HASH=$({
+  printf 'schema=fm-x-followup-payload.v1\n'
+  printf 'generation=%s\n' "$META_GENERATION"
+  printf 'request_id=%s\n' "$RID"
+  printf 'followup_count=%s\n' "$COUNT"
+  printf 'final=%s\n' "$FINAL"
+  printf 'text_bytes=%s\n' "$TEXT_SIZE"
+  cat "$PAYLOAD_TEXT"
+  printf '\nimage_bytes=%s\n' "$IMAGE_SIZE"
+  printf 'image_media_type=%s\n' "$IMAGE_MEDIA_TYPE"
+  [ -z "$PAYLOAD_IMAGE" ] || cat "$PAYLOAD_IMAGE"
+} | followup_sha256) || {
+  echo "fm-x-followup: no SHA-256 implementation available for payload idempotency" >&2
+  exit 1
+}
+PAYLOAD_DIGEST="sha256:$PAYLOAD_HASH"
+EXPECTED_OP_KEY="fmx-$PAYLOAD_HASH"
+
 FOLLOWUP_OP="$STATE/$ID.x-followup-op"
 
 followup_operation_value() {  # <key>
@@ -218,11 +290,13 @@ followup_operation_write() {  # <prepared|delivered> <key>
   local state=$1 key=$2 tmp
   tmp="$FOLLOWUP_OP.tmp.${BASHPID:-$$}"
   {
-    printf 'schema=fm-x-followup-operation.v1\n'
+    printf 'schema=fm-x-followup-operation.v2\n'
     printf 'state=%s\n' "$state"
     printf 'generation=%s\n' "$META_GENERATION"
     printf 'request_id=%s\n' "$RID"
     printf 'followup_count=%s\n' "$COUNT"
+    printf 'payload_digest=%s\n' "$PAYLOAD_DIGEST"
+    printf 'final=%s\n' "$FINAL"
     printf 'idempotency_key=%s\n' "$key"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$FOLLOWUP_OP" || { rm -f "$tmp"; return 1; }
@@ -234,8 +308,15 @@ if [ -f "$FOLLOWUP_OP" ] \
   && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
   && [ "$(followup_operation_value request_id)" = "$RID" ] \
   && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
+  if [ "$(followup_operation_value schema)" != fm-x-followup-operation.v2 ] \
+    || [ "$(followup_operation_value payload_digest)" != "$PAYLOAD_DIGEST" ] \
+    || [ "$(followup_operation_value final)" != "$FINAL" ] \
+    || [ "$(followup_operation_value idempotency_key)" != "$EXPECTED_OP_KEY" ]; then
+    echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original text, attachment, and finality" >&2
+    exit 1
+  fi
   OP_STATE=$(followup_operation_value state)
-  OP_KEY=$(followup_operation_value idempotency_key)
+  OP_KEY=$EXPECTED_OP_KEY
 fi
 case "$OP_STATE:$OP_KEY" in
   prepared:*|delivered:*)
@@ -245,7 +326,7 @@ case "$OP_STATE:$OP_KEY" in
 esac
 if [ -z "$OP_KEY" ]; then
   rm -f "$FOLLOWUP_OP"
-  OP_KEY=$(fm_task_identity_new_token) || exit 1
+  OP_KEY=$EXPECTED_OP_KEY
   followup_operation_write prepared "$OP_KEY" || {
     echo "fm-x-followup: could not prepare durable follow-up operation for $ID" >&2
     exit 1
@@ -257,6 +338,8 @@ fi
 # endpoint, and the never-inline safety; we only pass the text source and any
 # recorded reply-platform context through.
 declare -a REPLY_ENV=()
+declare -a REPLY_ARGS=(--text-file "$PAYLOAD_TEXT")
+[ -z "$PAYLOAD_IMAGE" ] || REPLY_ARGS=(--image "$PAYLOAD_IMAGE" "${REPLY_ARGS[@]}")
 REPLY_ENV+=("FMX_IDEMPOTENCY_KEY=$OP_KEY")
 case "$REQ_PLATFORM" in
   discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$REQ_PLATFORM") ;;
@@ -269,12 +352,12 @@ if [ "$OP_STATE" = delivered ]; then
   post_rc=0
 elif [ "${#REPLY_ENV[@]}" -gt 0 ]; then
   set +e
-  env "${REPLY_ENV[@]}" "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+  env "${REPLY_ENV[@]}" "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${REPLY_ARGS[@]}" >/dev/null
   post_rc=$?
   set -e
 else
   set +e
-  "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+  "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${REPLY_ARGS[@]}" >/dev/null
   post_rc=$?
   set -e
 fi

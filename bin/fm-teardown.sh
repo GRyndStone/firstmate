@@ -180,14 +180,18 @@ remove_grok_turnend_auth() {
 }
 
 cleanup_recorded_partial_herdr() {  # <meta>
-  local meta=$1 session workspace tab
+  local meta=$1 session workspace tab label
   [ "$(meta_value "$meta" spawn_partial)" = 1 ] || return 0
   [ "$(fm_backend_of_meta "$meta")" = herdr ] || return 0
   fm_backend_source herdr || return 1
   tab=$(meta_value "$meta" herdr_tab_id)
-  [ -n "$tab" ] || return 0
   session=$(meta_value "$meta" herdr_session)
   workspace=$(meta_value "$meta" herdr_workspace_id)
+  label=$(meta_value "$meta" spawn_backend_label)
+  if [ -z "$tab" ]; then
+    echo "error: recorded partial herdr resource ${label:-in $workspace} has no tab id whose cleanup can be verified; preserving $meta" >&2
+    return 1
+  fi
   if [ -z "$session" ]; then
     session=$(fm_backend_target_of_meta "$meta")
     session=${session%%:*}
@@ -198,6 +202,46 @@ cleanup_recorded_partial_herdr() {  # <meta>
     echo "error: could not verify cleanup of recorded partial herdr tab $tab in session $session; preserving $meta" >&2
     return 1
   fi
+}
+
+verify_recorded_endpoint_absent() {  # <meta> <task-id>
+  local meta=$1 task_id=$2 backend target tab session workspace pane
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  case "$backend" in
+    herdr)
+      if [ "$(meta_value "$meta" spawn_partial)" = 1 ]; then
+        tab=$(meta_value "$meta" herdr_tab_id)
+        session=$(meta_value "$meta" herdr_session)
+        workspace=$(meta_value "$meta" herdr_workspace_id)
+        [ -n "$tab" ] && [ -n "$session" ] && [ -n "$workspace" ] || return 2
+        fm_backend_herdr_tab_absent "$session" "$workspace" "$tab"
+        return
+      fi
+      pane=$(meta_value "$meta" herdr_pane_id)
+      [ -n "$pane" ] || pane=${target#*:}
+      session=$(meta_value "$meta" herdr_session)
+      [ -n "$session" ] || session=${target%%:*}
+      fm_backend_herdr_pane_absent "$session" "$pane"
+      ;;
+    zellij)
+      fm_backend_target_absent zellij "$target" "$(meta_value "$meta" zellij_tab_id)" "fm-$task_id"
+      ;;
+    orca)
+      target=$(meta_value "$meta" terminal)
+      if [ -z "$target" ]; then
+        [ "$(meta_value "$meta" spawn_endpoint_uncertain)" = 0 ] || return 2
+        return 0
+      fi
+      fm_backend_target_absent orca "$target"
+      ;;
+    cmux)
+      fm_backend_target_absent cmux "$target" '' "fm-$task_id"
+      ;;
+    *)
+      fm_backend_target_absent "$backend" "$target" '' "fm-$task_id"
+      ;;
+  esac
 }
 
 # Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
@@ -907,6 +951,33 @@ cleanup_firstmate_home_children() {
       fi
     fi
     fm_reconcile_teardown_begin "$sub_state" "$child_id" "$child_generation" || return 1
+    [ -f "$child_meta" ] || return 1
+    child_generation=$(fm_reconcile_meta_generation "$child_meta") || return 1
+    [ "$(fm_reconcile_record_value "$sub_state/$child_id.tearing-down" lifecycle_generation)" = "$child_generation" ] || return 1
+    child_wt=$(meta_value "$child_meta" worktree)
+    child_proj=$(meta_value "$child_meta" project)
+    child_kind=$(meta_value "$child_meta" kind)
+    [ -n "$child_kind" ] || child_kind=ship
+    child_backend=$(fm_backend_of_meta "$child_meta")
+    if [ "$child_backend" = orca ]; then
+      child_t=$(meta_value "$child_meta" terminal)
+    else
+      child_t=$(fm_backend_target_of_meta "$child_meta")
+    fi
+    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
+      child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
+      if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+        require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" || return 1
+      fi
+    elif [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
+      validate_firstmate_home_children_removal "$child_home" || return 1
+    elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+      validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+    fi
     cleanup_recorded_partial_herdr "$child_meta" || return 1
     if [ -n "$child_t" ]; then
       # Tombstone for the child home's own watcher, same contract as the main
@@ -919,19 +990,33 @@ cleanup_firstmate_home_children() {
         fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
       fi
     fi
+    if [ "$child_backend" != orca ]; then
+      if [ "$child_backend" = zellij ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home verify_recorded_endpoint_absent "$child_meta" "$child_id" ) \
+          || { echo "error: could not verify cleanup of child $child_id $child_backend endpoint; preserving $child_meta" >&2; return 1; }
+      elif ! verify_recorded_endpoint_absent "$child_meta" "$child_id"; then
+        echo "error: could not verify cleanup of child $child_id $child_backend endpoint; preserving $child_meta" >&2
+        return 1
+      fi
+    fi
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home"
-        remove_firstmate_home "$child_home" "child firstmate home" "$child_id"
+        cleanup_firstmate_home_children "$child_home" || return 1
+        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return 1
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
       fi
-      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" || return 1
+      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" >/dev/null 2>&1 || true
+      if ! fm_backend_worktree_absent "$child_backend" "$child_orca_worktree_id" \
+        || ! verify_recorded_endpoint_absent "$child_meta" "$child_id"; then
+        echo "error: could not verify cleanup of child $child_id Orca resources; preserving $child_meta" >&2
+        return 1
+      fi
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
@@ -943,10 +1028,10 @@ cleanup_firstmate_home_children() {
           if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
             return "$child_return_rc"
           fi
-          safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+          safe_rm_rf_child_worktree "$child_wt" "$child_proj" || return 1
         fi
       else
-        safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+        safe_rm_rf_child_worktree "$child_wt" "$child_proj" || return 1
       fi
     fi
     fm_reconcile_lock_acquire "$sub_state" "$child_id"
@@ -1049,7 +1134,7 @@ if [ "$KIND" != secondmate ]; then
   fm_task_identity_bind "$STATE" "$ID" "$PROJ" || exit 1
 fi
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH"
+  cleanup_firstmate_home_children "$HOME_PATH" || exit 1
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
@@ -1068,7 +1153,12 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
+  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID" >/dev/null 2>&1 || true
+  if ! fm_backend_worktree_absent "$BACKEND" "$ORCA_WORKTREE_ID" \
+    || ! verify_recorded_endpoint_absent "$META" "$ID"; then
+    echo "error: could not verify cleanup of task $ID Orca resources; preserving $META" >&2
+    exit 1
+  fi
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
@@ -1095,11 +1185,15 @@ fi
 if [ "$BACKEND" != orca ]; then
   cleanup_recorded_partial_herdr "$META" || exit 1
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if ! verify_recorded_endpoint_absent "$META" "$ID"; then
+    echo "error: could not verify cleanup of task $ID $BACKEND endpoint; preserving $META" >&2
+    exit 1
+  fi
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
-  remove_secondmate_registry_entry "$ID"
+  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit 1
+  remove_secondmate_registry_entry "$ID" || exit 1
 fi
 fm_reconcile_lock_acquire "$STATE" "$ID"
 remove_rc=0

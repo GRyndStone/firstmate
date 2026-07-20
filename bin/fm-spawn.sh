@@ -214,17 +214,37 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? cleanup_failed=0 rescue token remaining
+  local status=$? cleanup_failed=0 rescue token
   [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
-  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" = orca ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
-    fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
-    SPAWN_ENDPOINT_CREATED=0
-  fi
-  if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
-    if [ "${BACKEND:-}" = orca ]; then
-      fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || cleanup_failed=1
-    elif [ "${KIND:-}" != secondmate ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ]; then
-      (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1 || cleanup_failed=1
+  if [ "${BACKEND:-}" = orca ]; then
+    if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
+      fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ]; then
+      if [ -n "${T:-${ORCA_TERMINAL:-}}" ] \
+        && fm_backend_target_absent orca "${T:-$ORCA_TERMINAL}"; then
+        SPAWN_ENDPOINT_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
+      if [ -n "${ORCA_WORKTREE_ID:-}" ] \
+        && fm_backend_worktree_absent orca "$ORCA_WORKTREE_ID"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+  elif [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] \
+    && [ "${KIND:-}" != secondmate ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ]; then
+    if (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1; then
+      SPAWN_WORKTREE_CREATED=0
+    else
+      cleanup_failed=1
     fi
   fi
   if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" != orca ]; then
@@ -236,7 +256,8 @@ spawn_abort_cleanup() {
             || cleanup_failed=1
         elif [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
           fm_backend_kill herdr "$HERDR_SES:$HERDR_PANE_ID" 2>/dev/null || true
-          fm_backend_herdr_pane_absent "$HERDR_SES" "$HERDR_PANE_ID" || cleanup_failed=1
+          fm_backend_herdr_pane_absent "$HERDR_SES" "$HERDR_PANE_ID" || true
+          cleanup_failed=1
         else
           cleanup_failed=1
         fi
@@ -244,8 +265,8 @@ spawn_abort_cleanup() {
       zellij)
         if [ -n "${ZELLIJ_SES:-}" ] && { [ -n "${ZELLIJ_TAB_ID:-}" ] || [ -n "${ZELLIJ_PANE_ID:-}" ]; }; then
           fm_backend_kill zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
-          if [ -n "${ZELLIJ_TAB_ID:-}" ] \
-            && fm_backend_zellij_tab_matches_label "$ZELLIJ_SES" "$ZELLIJ_TAB_ID" "${W:-fm-${ID:-}}"; then
+          if ! fm_backend_target_absent zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" \
+            "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}"; then
             cleanup_failed=1
           fi
         else
@@ -253,10 +274,10 @@ spawn_abort_cleanup() {
         fi
         ;;
       cmux)
-        if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
-          fm_backend_kill cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" 2>/dev/null || true
-          remaining=$(fm_backend_cmux_workspace_id_for_label "$(fm_backend_cmux_scoped_title "${W:-fm-${ID:-}}")")
-          [ "$remaining" != "$CMUX_WORKSPACE_ID" ] || cleanup_failed=1
+        if [ -n "${CMUX_WORKSPACE_ID:-}" ] || [ "$SPAWN_PARTIAL_ENDPOINT" -eq 1 ]; then
+          fm_backend_kill cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" '' "${W:-fm-${ID:-}}" 2>/dev/null || true
+          fm_backend_target_absent cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" \
+            '' "${W:-fm-${ID:-}}" || cleanup_failed=1
         else
           cleanup_failed=1
         fi
@@ -264,7 +285,7 @@ spawn_abort_cleanup() {
       *)
         if [ -n "${T:-}" ]; then
           fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
-          fm_backend_target_exists "${BACKEND:-tmux}" "$T" "${W:-fm-${ID:-}}" && cleanup_failed=1
+          fm_backend_target_absent "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" || cleanup_failed=1
         else
           cleanup_failed=1
         fi
@@ -283,7 +304,8 @@ spawn_abort_cleanup() {
   fi
   if [ "$cleanup_failed" -eq 1 ] && [ "$SPAWN_CLAIMED" -eq 1 ]; then
     rescue="$STATE/$ID.meta.rescue.${BASHPID:-$$}"
-    {
+    fm_reconcile_spawn_claim_mark_rescue_pending "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue" 2>/dev/null || true
+    if {
       if [ "${BACKEND:-tmux}" = orca ]; then echo "window=${W:-fm-$ID}"; else echo "window=${T:-${W:-fm-$ID}}"; fi
       echo "generation=$LIFECYCLE_GENERATION"
       echo "worktree=${WT:-}"
@@ -296,6 +318,8 @@ spawn_abort_cleanup() {
       echo "model=${MODEL:-default}"
       echo "effort=${EFFORT:-default}"
       echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
+      echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
+      echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
       echo "spawn_backend_label=${W:-fm-$ID}"
       [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
       [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
@@ -309,14 +333,15 @@ spawn_abort_cleanup() {
       [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
       [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
       [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
-    } > "$rescue" 2>/dev/null || true
-    if [ -f "$rescue" ] && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
+    } > "$rescue" 2>/dev/null \
+      && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
       SPAWN_META_PUBLISHED=1
       SPAWN_CLAIMED=0
+    else
+      echo "error: cleanup of partial $BACKEND spawn $ID could not be verified and rescue metadata was not published; retained spawn ownership" >&2
     fi
-    rm -f "$rescue"
   fi
-  if [ "$SPAWN_CLAIMED" -eq 1 ]; then
+  if [ "$SPAWN_CLAIMED" -eq 1 ] && [ "$cleanup_failed" -eq 0 ]; then
     fm_reconcile_spawn_claim_release "$STATE" "$ID" "$LIFECYCLE_GENERATION" 2>/dev/null || true
     SPAWN_CLAIMED=0
   fi
@@ -952,9 +977,10 @@ EOF
     ORCA_WT_STATUS=$?
     set -e
     if [ "$ORCA_WT_STATUS" -ne 0 ]; then
-      if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
-        if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-          SPAWN_WORKTREE_CREATED=1
+      if [ "$ORCA_WT_STATUS" -eq 2 ]; then
+        SPAWN_WORKTREE_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+        if [ -n "$ORCA_WT_RAW" ] && parse_orca_worktree_result "$ORCA_WT_RAW"; then
           [ -z "$ORCA_TERMINAL" ] || SPAWN_ENDPOINT_CREATED=1
         fi
       fi
@@ -969,7 +995,21 @@ EOF
     fi
     validate_spawn_worktree "orca worktree create" "$W"
     if [ -z "$ORCA_TERMINAL" ]; then
-      ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+      set +e
+      ORCA_TERMINAL_RAW=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W")
+      ORCA_TERMINAL_STATUS=$?
+      set -e
+      if [ "$ORCA_TERMINAL_STATUS" -ne 0 ]; then
+        if [ "$ORCA_TERMINAL_STATUS" -eq 2 ]; then
+          SPAWN_ENDPOINT_CREATED=1
+          SPAWN_PARTIAL_ENDPOINT=1
+          case "$ORCA_TERMINAL_RAW" in
+            partial$'\t'*) ORCA_TERMINAL=${ORCA_TERMINAL_RAW#partial$'\t'} ;;
+          esac
+        fi
+        exit 1
+      fi
+      ORCA_TERMINAL=$ORCA_TERMINAL_RAW
     fi
     T="$ORCA_TERMINAL"
     SPAWN_ENDPOINT_CREATED=1

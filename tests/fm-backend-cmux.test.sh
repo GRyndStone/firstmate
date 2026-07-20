@@ -959,6 +959,40 @@ test_kill_is_best_effort_when_close_workspace_fails() {
   pass "fm_backend_cmux_kill: never fails even when close-workspace fails"
 }
 
+test_workspace_absence_requires_parseable_inventory() {
+  local dir fb title status
+  dir="$TMP_ROOT/workspace-absence"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-task)
+  cmux_workspace_list_response "$dir" 1 aaaaaaaa-0000-0000-0000-000000000000 renamed-task
+  cmux_workspace_list_response "$dir" 2 bbbbbbbb-0000-0000-0000-000000000000 "$title"
+  printf '{}\n' > "$dir/responses/3.out"
+  cmux_workspace_list_response "$dir" 4
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "recorded cmux workspace id must be reported present after a rename"
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "matching cmux task label must be reported present under a replacement id"
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed cmux inventory must remain unknown"
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT" \
+    || fail "empty parseable cmux inventory was not recognized as absent"
+  set +e
+  pass "cmux absence distinguishes empty inventories from failed reads"
+}
+
 test_kill_recovers_stale_target_by_label() {
   local dir fb title
   dir="$TMP_ROOT/kill-stale-target"; mkdir -p "$dir/responses"
@@ -1077,6 +1111,7 @@ test_window_of_workspace_empty_when_not_found
 test_kill_closes_workspace_directly_when_not_last
 test_kill_adds_sibling_when_last_in_window
 test_kill_is_best_effort_when_close_workspace_fails
+test_workspace_absence_requires_parseable_inventory
 test_kill_recovers_stale_target_by_label
 test_list_live_filters_by_title_prefix
 test_secondmate_spawn_refuses_cmux_backend
