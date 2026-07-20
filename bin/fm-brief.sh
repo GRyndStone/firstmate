@@ -125,6 +125,8 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+WAIT_STATE_DIR=$(shell_quote "$STATE")
+WAIT_HELPER=$(shell_quote "$FM_ROOT/bin/fm-external-wait.sh")
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -183,6 +185,8 @@ Report only true captain-relevant outcomes or a declared external wait by append
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
+Before parking on a machine-observable wait, register its model-free completion observer with \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\` or \`register-process\`; an unobservable parked task wakes as a runtime failure.
+When a task-owned command will keep working after the foreground harness turn ends, register its exact pid with the same helper's \`register-command\` form before yielding; this makes fresh descendant progress positive working evidence and its exit an immediate completion signal.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
 This is also how you return the answer to a marked from-firstmate request above.
 When a decision you escalated is answered or a blocker clears and your domain resumes, append \`resolved: {how it was decided or unblocked}\` (keyed with \`[key=<slug>]\` if you opened it with one) so it is durably closed instead of resurfacing behind later unrelated events.
@@ -266,6 +270,10 @@ The report is the only thing that survives, so anything worth keeping must be in
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset):
    firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
    treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   Before parking on a machine-observable wait, register its predicate or tracked process with
+   \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
+   or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
+   If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
@@ -343,6 +351,10 @@ When firstmate replies, feed the decision to GSD; when it replies or a blocker c
    \`$PAUSED_VERB: driving GSD {milestone}, next check {when}\` as the LAST status line, re-appended each
    time you return to waiting, so firstmate treats your quiet pane as a declared external wait, not a
    wedge. Use \`blocked: {why}\` when you are stuck and need firstmate to act.
+   Before that wait, register its predicate or tracked process with
+   \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
+   or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
+   If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
 5. Keep your own context lean: do not read large project artifacts into context - sample heads only;
    GSD's units hold the detail. If your context passes ~85% used, finish the current supervision step,
    write a handoff note to \`$DATA/$ID/handoff.md\` (GSD state, running units, next action, any open
@@ -447,6 +459,10 @@ $RULE1
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
    a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
    cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   Before parking on a machine-observable wait, register its predicate or tracked process with
+   \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
+   or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
+   If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.

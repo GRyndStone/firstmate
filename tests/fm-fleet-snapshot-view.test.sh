@@ -414,6 +414,84 @@ test_view_renders_dead_secondmate_agent_status() {
   pass "fleet view renders secondmate agent liveness"
 }
 
+test_snapshot_separates_reconciled_truth_event_history_and_wait() {
+  local home fakebin now out view bearings
+  home=$(make_home reconciled-separation)
+  mkdir -p "$home/projects/reconciled-wt"
+  fm_write_meta "$home/state/reconciled-task.meta" \
+    'window=firstmate:fm-reconciled-task' \
+    "worktree=$home/projects/reconciled-wt" \
+    'project=alpha' \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship'
+  printf 'paused: stale OAuth label from before callback completion\n' > "$home/state/reconciled-task.status"
+  fm_write_meta "$home/state/reconciled-task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=xAI OAuth callback' \
+    'predicate=/tmp/oauth-completion-predicate' \
+    'registered_at=1'
+  now=$(date +%s)
+  fm_write_meta "$home/state/reconciled-task.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=reconciled-task' \
+    'endpoint=firstmate:fm-reconciled-task' \
+    'state=done' \
+    'source=run-step' \
+    'detail=checks green: PR ready for review' \
+    'evidence=state: done · source: run-step · checks green: PR ready for review' \
+    "observed_at=$now" \
+    'status_sequence=1' \
+    'status_signature=old-event-signature' \
+    'last_status_event=paused: stale OAuth label from before callback completion' \
+    'prior_endpoint=firstmate:fm-reconciled-task' \
+    'prior_state=working' \
+    'prior_source=run-step' \
+    'prior_evidence=state: working · source: run-step · validating' \
+    "prior_observed_at=$((now - 1))" \
+    'transition_sequence=2' \
+    'wait_kind=predicate' \
+    'wait_description=xAI OAuth callback' \
+    'wait_target=/tmp/oauth-completion-predicate' \
+    'wait_signature=old-wait-signature' \
+    'wait_state=complete' \
+    'wait_evidence=OAuth credential stored' \
+    "wait_checked_at=$now" \
+    'wait_sequence=2' \
+    'pending_action_token=wait:2:complete' \
+    'pending_action_reason=external-wait-complete' \
+    'notified_action_token=wait:2:complete'
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "reconciled-task")
+    | .current_state.state == "done"
+      and .current_state.source == "run-step"
+      and .current_state.persisted == true
+      and .current_state.freshness == "fresh"
+      and .prior_observed_state.state == "working"
+      and .last_status_event.sequence == 1
+      and .last_status_event.event.raw == "paused: stale OAuth label from before callback completion"
+      and .last_status_event.supervisor_observation.sequence == 1
+      and .last_status_event.supervisor_observation.event.raw == "paused: stale OAuth label from before callback completion"
+      and .last_status_event.supervisor_observation.freshness == "advanced_or_changed"
+      and .external_wait.registered == true
+      and .external_wait.kind == "predicate"
+      and .external_wait.observation.state == "complete"
+  ' >/dev/null || fail "snapshot did not separate reconciled truth, prior state, event history, and wait registration: $out"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" '| done / run-step |' "fleet view did not render reconciled state as current truth"
+  assert_contains "$view" '| working / run-step | #1 paused: stale OAuth label' "fleet view did not separate prior state from last event"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bearings-snapshot.sh" --json)
+  printf '%s' "$bearings" | jq -e '
+    .in_flight[] | select(.id == "reconciled-task")
+    | .state == "done" and (.doing | contains("checks green"))
+  ' >/dev/null || fail "captain-facing bearings did not consume reconciled snapshot truth"
+  assert_not_contains "$bearings" 'stale OAuth label' "bearings presented the last event prose as current truth"
+  pass "snapshot and captain-facing views separate reconciled truth from stale event history"
+}
+
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
 # append-only stream. This is the fmdev masking bug: last-event-wins read the trailing
 # `done` and reported pending_decision=false while a needs-decision was still open. The
@@ -574,3 +652,4 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_snapshot_separates_reconciled_truth_event_history_and_wait

@@ -14,9 +14,10 @@
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
 #                          is not provably working, unless afk is active
-#   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
-#                          timer) regardless of what the status log says - an active
-#                          run-step or busy pane outranks even a captain-relevant log
+#   stale: <window>        a provably-working stale is ALWAYS absorbed regardless
+#                          of what the status log says - an active
+#                          run-step, busy pane, or progressing owned command
+#                          outranks even a captain-relevant log
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
@@ -28,14 +29,15 @@
 #                          that decision). Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
-#                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
-#                          consecutive escalations on the SAME pane, the reason
-#                          also carries a "demand-deep-inspection" marker so the
-#                          wake payload itself, not just repetition, forces a
-#                          closer look instead of another routine supervision
-#                          resume. Unless afk is active. A stale reason carrying
+#                          both surfaced at once. A previously working stale whose
+#                          positive run-step/pane/owned-command evidence disappears at the wedge
+#                          threshold surfaces with an "escalation N" count; at
+#                          FM_WEDGE_DEMAND_INSPECT_COUNT consecutive escalations on
+#                          the SAME pane, the reason also carries a
+#                          "demand-deep-inspection" marker. Current positive busy
+#                          evidence always resets the timer and stays quiet, even
+#                          when the pane hash is unchanged. Unless afk is active.
+#                          A stale reason carrying
 #                          "endpoint-gone" (the recorded endpoint no longer
 #                          exists) or "agent-dead" (the endpoint exists but the
 #                          agent process is confidently dead) means the crew
@@ -80,6 +82,12 @@ mkdir -p "$STATE"
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
 # shellcheck source=bin/fm-transition-lib.sh
 . "$SCRIPT_DIR/fm-transition-lib.sh"
+# Durable reconciled task/endpoint observations.  This is evaluated once for
+# every recorded task at the start of every classification cycle, before sparse
+# status/turn-end events are triaged, so an old status event can never mask a
+# newer positive working -> stopped/parked/terminal transition.
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -127,18 +135,20 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
 # while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
+# no-mistakes step, a busy pane, or a progressing task-owned command, via
+# crew_is_provably_working over
 # fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
 # busy pane is SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
 # signal, a no-verb signal whose crew is not provably working, any check, a stale
-# pane whose crew is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
+# pane whose crew is not provably working, a stale whose positive working evidence
+# disappeared at its recheck threshold, or anything unknown) is written to the
+# durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
-STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a stale hash revalidates positive working evidence
 # A crew that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
@@ -277,10 +287,9 @@ window_key() {  # <target>
 }
 
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
-# (default 3): a pane that keeps re-wedging on the SAME stale hash - each
-# escalation gets absorbed again as "still validating" one poll later, since the
-# hash never changes - can otherwise repeat forever with no signal that this is
-# no longer a one-off. At the threshold, wedge_timer_check appends a
+# (default 3) after its positive working evidence has disappeared. A pane that
+# keeps re-wedging on the SAME stale hash can otherwise repeat forever with no
+# signal that this is no longer a one-off. At the threshold, wedge_timer_check appends a
 # "demand-deep-inspection" marker to the wake payload so the wake reason itself
 # (not just repetition the supervisor has to notice on its own) forces a closer
 # look instead of another routine supervision resume. Reset wherever a window's
@@ -288,16 +297,16 @@ window_key() {  # <target>
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
-# Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
-# absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
-# watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
-# state (the costly check already ran once, at classification time). Shared by
+# Repeat-poll stale-timer bookkeeping for an already-classified hash absorbed as
+# provably-working. It repairs a missing/corrupt timer, then revalidates current
+# working evidence once STALE_ESCALATE_SECS has elapsed. Positive evidence resets
+# the timer and remains quiet even when pane content is unchanged; only loss of
+# that evidence can escalate. Shared by
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
-# line that an active run/busy pane outranked).
+# line that an active run/busy pane/owned command outranked).
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason task
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -307,15 +316,22 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
-        echo "$n" > "$escalation_file"
-        reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
-        if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
-          reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+        task=$(window_to_task "$win" "$STATE")
+        if crew_is_provably_working "$task"; then
+          date +%s > "$since_file"
+          rm -f "$escalation_file"
+          triage_log "absorbed $label after threshold (positive working evidence still current): $win"
+        else
+          n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > "$escalation_file"
+          reason="stale: $win (idle ${age}s, positive working evidence disappeared, possible wedge, escalation $n)"
+          if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+            reason="stale: $win (idle ${age}s, positive working evidence disappeared, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row)"
+          fi
+          fm_wake_append stale "$win" "$reason" || exit 1
+          rm -f "$since_file"
+          wake "$reason"
         fi
-        fm_wake_append stale "$win" "$reason" || exit 1
-        rm -f "$since_file"
-        wake "$reason"
       fi
       ;;
   esac
@@ -539,6 +555,39 @@ scan_signals() {
     fi
   done
   return 0
+}
+
+# Observe every task's deterministic current state and surface the first pending
+# transition or external-wait action.  fm-reconcile-lib.sh persists the state and
+# pending token before returning.  This function preserves the queue safety
+# ordering: append the wake first, advance sparse event-file suppressors only to
+# the observed signatures, then acknowledge the token, then exit.  A crash
+# anywhere before the ack
+# leaves the token pending for the restarted watcher.
+reconcile_cycle() {
+  local meta id target out tag token evidence reason
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    out=$(fm_reconcile_observe "$STATE" "$id") || continue
+    [ -n "$out" ] || continue
+    IFS=$(printf '\t') read -r tag token evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || continue
+    target=$(fm_backend_target_of_meta "$meta")
+    [ -n "$target" ] || target="fm-$id"
+    reason="stale: $target $evidence"
+    fm_wake_append stale "$target" "$reason" || exit 1
+
+    # The reconciled wake subsumes only the status/turn-end versions persisted
+    # by its observation.  The library advances suppressors to those exact
+    # signatures, never a newer append/touch that raced enqueue/ack delivery.
+    fm_reconcile_advance_seen "$STATE" "$id" || exit 1
+    fm_reconcile_ack "$STATE" "$id" "$token" || exit 1
+    mark_surfaced "$STATE/$id.status"
+    wake "$reason"
+  done
 }
 
 run_check() {
@@ -799,6 +848,11 @@ while :; do
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   touch "$STATE/.last-watcher-beat"
 
+  # Authoritative durable task-state transition classification.  This precedes
+  # check/status/stale cadence paths and therefore does not depend on a heartbeat,
+  # pane hash becoming stale, or a fresh status append.
+  reconcile_cycle
+
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed
@@ -923,7 +977,15 @@ EOF
       if [ "$n" -ge 2 ] && ! window_is_busy "$w" "$tail40"; then
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
-        if [ "$kind" = secondmate ]; then
+        if [ "$kind" != secondmate ] && fm_reconcile_is_quiet_notified "$STATE" "$task" "$w"; then
+          # Durable reconciliation already surfaced and acknowledged this exact
+          # task/endpoint's current non-working state.  Pane staleness is
+          # downstream evidence for the same transition, not a second wake.
+          # A later positive working observation removes this exemption.
+          printf '%s' "$h" > "$sf"
+          rm -f "$ssf" "$ewf"
+          triage_log "absorbed stale (reconciled transition already notified): $w"
+        elif [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
             *)      clear_pause_tracking "$w" ;;
@@ -966,7 +1028,7 @@ EOF
           # poll. Root cause of the 2026-07 herdr false-surface incidents: a
           # validating crew was surfaced as stale every few minutes despite an
           # actively-running pipeline, purely because of this stale leftover
-          # line. On a NEW hash, give an active run/busy pane (the same
+          # line. On a NEW hash, give an active run/busy pane/owned command (the same
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
@@ -997,8 +1059,8 @@ EOF
           # on first sight, never every poll) via crew_absorb_class, which returns
           # BOTH absorb reasons from one fm-crew-state.sh read:
           #   - working: an actively-running pipeline legitimately sits on a static
-          #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
-          #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
+          #     pane (e.g. waiting on CI), so absorb and start the bounded revalidation
+          #     timer; unchanged positive evidence remains quiet at every recheck;
           #   - paused: the crew DECLARED an external wait (paused:), or its run
           #     finished green with park-anchor evidence (a declared pause or an
           #     armed check; crew_absorb_class), so absorb on the long

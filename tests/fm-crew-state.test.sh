@@ -32,6 +32,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$ROOT/bin/fm-reconcile-lib.sh"
 
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
 fm_test_tmproot TMP_ROOT fm-crew-state
@@ -885,6 +887,49 @@ test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle() {
   pass "herdr native idle state supersedes stale working status history"
 }
 
+# A foreground Grok/Herdr turn may be idle while a shell it launched continues
+# the task's full suite.  Only an explicit task-scoped command registration with
+# fresh exact-pid descendant progress can override native harness idle.
+test_idle_herdr_with_progressing_owned_command_is_working() {
+  command -v jq >/dev/null 2>&1 || { pass "owned-command Herdr case skipped without jq"; return; }
+  reset_fakes
+  local d pid out cwd physical_wt i=0
+  d=$(new_case herdr-idle-owned-command)
+  make_repo_on_branch "$d/wt" fm/feat-owned-command
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-owned-command.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: full suite is still advancing in the task worktree\n' > "$d/state/feat-owned-command.status"
+  physical_wt=$(cd "$d/wt" && pwd -P)
+  sh -c 'cd "$1" || exit 1; end=$(( $(date +%s) + 30 )); while [ "$(date +%s)" -lt "$end" ]; do sleep 0.1; done' _ "$d/wt" &
+  pid=$!
+  while [ "$i" -lt 100 ]; do
+    cwd=$(fm_reconcile_process_cwd "$pid" 2>/dev/null || true)
+    fm_reconcile_path_is_within "$cwd" "$physical_wt" && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$i" -lt 100 ] || { kill "$pid" 2>/dev/null || true; fail "owned command did not enter the task worktree"; }
+  FM_OWNED_COMMAND_PROGRESS_GRACE=2 FM_STATE_OVERRIDE="$d/state" \
+    "$ROOT/bin/fm-external-wait.sh" register-command feat-owned-command "$pid" 'background full suite' >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "could not register task-owned full suite"; }
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_TMUX_MISSING=1
+  FM_FAKE_HERDR_AGENT_STATUS=idle
+  FM_FAKE_HERDR_BUSY=0
+  out=$(run_crew_state "$d" feat-owned-command)
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" 'state: working' "progressing task-owned command did not override idle harness"
+  assert_contains "$out" 'source: owned-command' "owned command was not exposed as a distinct current-state source"
+  assert_contains "$out" 'descendant progress observed' "owned command current state omitted progress freshness"
+  pass "idle Herdr harness plus progressing identity-bound task command remains positive working evidence"
+}
+
 # (g) no run + idle pane -> the status-log verb, as-is
 test_no_run_idle_pane_uses_log() {
   reset_fakes
@@ -1160,6 +1205,7 @@ test_no_run_busy_pane
 test_no_run_herdr_unknown_uses_backend_capture
 test_no_run_herdr_idle_agent_status_overrides_busy_pane
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle
+test_idle_herdr_with_progressing_owned_command_is_working
 test_no_run_idle_pane_uses_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused

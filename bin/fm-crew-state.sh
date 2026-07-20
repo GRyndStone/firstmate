@@ -11,12 +11,15 @@
 # full no-mistakes run-step attributed to this crew's branch and current HEAD,
 # or the existing coarse cross-branch status, else a hard-bounded backend read)
 # and reconciles the possibly-stale log against it.
+# Normal readers first consume a fresh endpoint-matched observation persisted
+# by that watcher cycle; the watcher uses a live-only mode to avoid feedback.
 #
-# The determinism lives entirely here - only run-step / pane / log reads plus
-# fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
+# The determinism lives entirely here - only run-step / registered-command /
+# pane / log reads plus fixed mapping logic, no heuristics and no LLM.
+# Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <run-step|owned-command|pane|status-log|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -38,9 +41,12 @@
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): read the recorded
-#      backend within a hard bound. Native Herdr busy|idle is authoritative, so
-#      live idle supersedes stale working history; an unproved state fails
-#      closed to unknown. Other backends retain the pane-busy/status-log fallback.
+#      task-owned command registration first, then the backend within a hard
+#      bound. An exact registered pid is working only while its task-scoped
+#      descendant tree is observably advancing. Native Herdr busy|idle remains
+#      authoritative when no owned command is active, so live idle supersedes
+#      stale working history; an unproved state fails closed to unknown. Other
+#      backends retain the pane-busy/status-log fallback.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -60,6 +66,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 ID=${1:-}
 [ -n "$ID" ] || { echo "usage: fm-crew-state.sh <id>" >&2; exit 2; }
@@ -160,6 +168,37 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
+
+# Normal point-in-time readers consume the durable watcher's fresh reconciled
+# observation, which includes the live source that superseded a stale event log.
+# The watcher itself sets FM_CREW_STATE_LIVE_ONLY=1 through fm-reconcile-lib.sh
+# so its classification cycle always reads the underlying run-step/backend and
+# can discover the next transition instead of feeding the persisted state back
+# into itself.
+if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
+  RECONCILED="$STATE/$ID.reconciled"
+  if [ -f "$RECONCILED" ]; then
+    reconciled_endpoint=$(fm_reconcile_record_value "$RECONCILED" endpoint)
+    reconciled_state=$(fm_reconcile_record_value "$RECONCILED" state)
+    reconciled_source=$(fm_reconcile_record_value "$RECONCILED" source)
+    reconciled_detail=$(fm_reconcile_record_value "$RECONCILED" detail)
+    reconciled_observed=$(fm_reconcile_record_value "$RECONCILED" observed_at)
+    case "$reconciled_observed" in ''|*[!0-9]*) reconciled_observed=0 ;; esac
+    reconciled_age=$(( $(date +%s) - reconciled_observed ))
+    [ "$reconciled_age" -ge 0 ] || reconciled_age=0
+    reconciled_fresh_secs=${FM_RECONCILE_FRESH_SECS:-60}
+    case "$reconciled_fresh_secs" in ''|*[!0-9]*|0) reconciled_fresh_secs=60 ;; esac
+    if [ -n "$BACKEND_TARGET" ] \
+      && [ "$reconciled_endpoint" = "$BACKEND_TARGET" ] \
+      && [ -n "$reconciled_state" ] \
+      && [ "$reconciled_observed" -gt 0 ] \
+      && [ "$reconciled_age" -le "$reconciled_fresh_secs" ]; then
+      emit "$reconciled_state" "${reconciled_source:-none}" \
+        "${reconciled_detail:-reconciled live observation}${SEP}reconciled ${reconciled_age}s ago"
+    fi
+  fi
+fi
+
 backend_busy_state_bounded() {
   # shellcheck disable=SC2016 # Positional parameters expand inside the child bash.
   bounded_run "$BACKEND_TIMEOUT" bash -c \
@@ -589,8 +628,14 @@ fi
 # --- fallback: no run attributed to this crew ------------------------------
 # The run-step path above already handled any crew with a run, regardless of pane
 # liveness, so a finished-but-pane-closed crew never reaches here. Down here there
-# is no run to consult, so a dead/unreadable target means the crew is gone: report
-# unknown rather than trusting a possibly-stale status log as the current state.
+# is no run to consult.  A validated task-owned background command can outlive
+# an idle foreground harness and remains positive working evidence only while
+# its exact pid/descendant progress is fresh.  Without that evidence, a dead or
+# unreadable target means the crew is gone: report unknown rather than trusting
+# a possibly-stale status log as the current state.
+owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+[ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
+
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
 if [ "$TASK_BACKEND" = herdr ]; then
   herdr_pane_state

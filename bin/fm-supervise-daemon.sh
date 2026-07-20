@@ -1340,11 +1340,12 @@ handle_wake() {  # <reason> <state>
               verdict="${arg#* }"
               arg="${arg%% *}"
               case "$verdict" in
-                endpoint-gone\ \(*|agent-dead\ \(*)
+                endpoint-gone\ \(*|agent-dead\ \(*|reconciled-transition\ \(*|external-wait-complete\ \(*|external-wait-failed\ \(*|external-wait-unobservable\ \(*)
                   # A confirmed death verdict (fm-watch.sh handle_gone_endpoint
-                  # / handle_dead_agent): the crew is dead, not idle, whatever
-                  # its status log says - escalate directly, never re-absorb it
-                  # as a declared pause or age it as a transient wedge.
+                  # / handle_dead_agent), a durable reconciled transition, or an
+                  # external-wait completion/registration failure is already an
+                  # authoritative watcher verdict.  Escalate it directly, never
+                  # re-absorb it through a stale paused/blocked status event.
                   decision="escalate|${reason#stale: }" ;;
                 *)
                   decision=$(classify_stale "$arg" "$state") ;;

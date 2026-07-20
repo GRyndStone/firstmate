@@ -271,6 +271,11 @@ The 2026-07-18 supervision incident established the opposite fail-closed rule fo
 The backend read and capture are hard-bounded; timeout or unreadable state returns `unknown` instead of hanging supervision or trusting status history.
 This current-state rule is specific to `bin/fm-crew-state.sh`; injection safety and other callers retain their documented backend-specific corroboration policies.
 
+The 2026-07-20 `default:w0:p1F` incident established a distinct signal that does not weaken that native-state rule: Grok's foreground turn was truly idle while an explicitly task-owned full-suite shell continued advancing in the task worktree.
+Such work must be registered with `bin/fm-external-wait.sh register-command` against its exact pid.
+The registration boundary verifies the process cwd against that task's recorded physical worktree/tasktmp, and reconciliation follows only that pid's descendants without process-name matching or cross-home discovery.
+Fresh descendant lifecycle/CPU progress becomes the separate `owned-command` working source; unchanged progress ages out after the registered grace, and exact process completion wakes immediately.
+
 ## Slash/`$` autocomplete popup hazard (confirmed, same mitigation as tmux)
 
 Typing `/mem` into a live `claude` composer inside a herdr pane and reading the pane back within 0.1 seconds already shows the full autocomplete popup.

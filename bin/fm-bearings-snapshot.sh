@@ -265,7 +265,9 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         id, kind,
         state: .current_state.state,
         doing: ((.current_state.detail // "") as $d
-                | (if $d != "" then $d else (.hints.last_event_text // "") end) | trunc(90))
+                | (if $d != "" then $d
+                   elif .external_wait.registered then .external_wait.description
+                   else "no reconciled detail" end) | trunc(90))
       } ]) as $in_flight_all
   | ([ .tasks[] as $t | ($t.hints.open_decisions // [])[]
        | {id:$t.id, key, verb, summary:(.summary | trunc(90))} ]) as $decisions_all

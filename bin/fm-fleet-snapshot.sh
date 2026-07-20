@@ -15,10 +15,13 @@
 #     Canonical tasks-axi rows are structured; free-form non-empty lines in
 #     those sections are preserved as unstructured records.
 #   tasks[]: one row per state/<id>.meta, sorted by id.
-#     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
-#     state, source, detail, and raw line separately.
-#     paths.status_log.last_event is historical wake-event data only, never
-#     current state.
+#     current_state prefers the matching persisted watcher observation and
+#     preserves state, source, evidence, observation time, age, and freshness.
+#     prior_observed_state retains the preceding distinct task/endpoint state.
+#     last_status_event is historical append-only evidence with its observed
+#     sequence and signature, never current state.
+#     external_wait separates the registered completion observer from its last
+#     model-free result and freshness.
 #     hints.open_decisions is the keyed open-decision set returned by
 #     fm-classify-lib.sh's authoritative status_open_decisions fold and reconciled
 #     against current_state; hints.pending_decision and hints.blocked_event are
@@ -48,6 +51,9 @@ BACKLOG="$DATA/backlog.md"
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 usage() {
   cat <<'EOF'
@@ -86,8 +92,8 @@ last_nonempty_line() {  # <file>
   grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -1
 }
 
-crew_state_json() {  # <id>
-  local id=$1 raw rest state source detail sep
+live_crew_state_json() {  # <id>
+  local id=$1 raw rest state source detail sep now
   raw=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -113,25 +119,132 @@ crew_state_json() {  # <id>
       esac
       ;;
   esac
-  jq -n --arg raw "$raw" --arg state "$state" --arg source "$source" --arg detail "$detail" \
-    '{state:$state,source:$source,detail:$detail,raw:$raw}'
+  now=$(date +%s)
+  jq -n --arg raw "$raw" --arg state "$state" --arg source "$source" --arg detail "$detail" --argjson now "$now" \
+    '{state:$state,source:$source,detail:$detail,raw:$raw,evidence:$raw,observed_at:$now,age_seconds:0,freshness:"unpersisted",persisted:false}'
 }
 
-status_event_json() {  # <status-log>
-  local log=$1 present=0 raw='' verb='' note=''
+crew_state_json() {  # <id>
+  local id=$1 record meta target recorded_target state source detail evidence observed now age freshness fresh_secs
+  record="$STATE/$id.reconciled"
+  meta="$STATE/$id.meta"
+  [ -f "$record" ] || { live_crew_state_json "$id"; return; }
+  target=$(fm_backend_target_of_meta "$meta")
+  recorded_target=$(fm_reconcile_record_value "$record" endpoint)
+  [ -n "$target" ] && [ "$target" = "$recorded_target" ] || { live_crew_state_json "$id"; return; }
+  state=$(fm_reconcile_record_value "$record" state)
+  source=$(fm_reconcile_record_value "$record" source)
+  detail=$(fm_reconcile_record_value "$record" detail)
+  evidence=$(fm_reconcile_record_value "$record" evidence)
+  observed=$(fm_reconcile_record_value "$record" observed_at)
+  case "$observed" in ''|*[!0-9]*) observed=0 ;; esac
+  now=$(date +%s)
+  age=$((now - observed))
+  [ "$age" -ge 0 ] || age=0
+  fresh_secs=${FM_RECONCILE_FRESH_SECS:-60}
+  case "$fresh_secs" in ''|*[!0-9]*|0) fresh_secs=60 ;; esac
+  if [ "$observed" -eq 0 ]; then freshness=unknown
+  elif [ "$age" -le "$fresh_secs" ]; then freshness=fresh
+  else freshness=stale
+  fi
+  jq -n \
+    --arg raw "$evidence" \
+    --arg evidence "$evidence" \
+    --arg state "$state" \
+    --arg source "$source" \
+    --arg detail "$detail" \
+    --arg freshness "$freshness" \
+    --argjson observed_at "$observed" \
+    --argjson age_seconds "$age" \
+    '{state:$state,source:$source,detail:$detail,raw:$raw,evidence:$evidence,observed_at:$observed_at,age_seconds:$age_seconds,freshness:$freshness,persisted:true}'
+}
+
+prior_observed_json() {  # <id>
+  local record state source evidence endpoint observed
+  record="$STATE/$1.reconciled"
+  state=$(fm_reconcile_record_value "$record" prior_state)
+  source=$(fm_reconcile_record_value "$record" prior_source)
+  evidence=$(fm_reconcile_record_value "$record" prior_evidence)
+  endpoint=$(fm_reconcile_record_value "$record" prior_endpoint)
+  observed=$(fm_reconcile_record_value "$record" prior_observed_at)
+  case "$observed" in ''|*[!0-9]*) observed=0 ;; esac
+  jq -n \
+    --arg state "$state" \
+    --arg source "$source" \
+    --arg evidence "$evidence" \
+    --arg endpoint "$endpoint" \
+    --argjson observed_at "$observed" \
+    '{state:($state | if . == "" then null else . end),source:($source | if . == "" then null else . end),evidence:($evidence | if . == "" then null else . end),endpoint:($endpoint | if . == "" then null else . end),observed_at:($observed_at | if . == 0 then null else . end)}'
+}
+
+external_wait_json() {  # <id>
+  local id=$1 record observed_sig observed_state observed_evidence observed_at freshness registration current_sig
+  local progress_sig progress_at progress_age
+  record="$STATE/$id.reconciled"
+  registration=$(fm_reconcile_wait_registration "$STATE" "$id")
+  observed_sig=$(fm_reconcile_record_value "$record" wait_signature)
+  observed_state=$(fm_reconcile_record_value "$record" wait_state)
+  observed_evidence=$(fm_reconcile_record_value "$record" wait_evidence)
+  observed_at=$(fm_reconcile_record_value "$record" wait_checked_at)
+  progress_sig=$(fm_reconcile_record_value "$record" wait_progress_signature)
+  progress_at=$(fm_reconcile_record_value "$record" wait_progress_at)
+  case "$observed_at" in ''|*[!0-9]*) observed_at=0 ;; esac
+  case "$progress_at" in ''|*[!0-9]*) progress_at=0 ;; esac
+  progress_age=$(( $(date +%s) - progress_at ))
+  [ "$progress_age" -ge 0 ] || progress_age=0
+  current_sig=$(printf '%s' "$registration" | jq -r '.signature')
+  if [ "$observed_at" -eq 0 ]; then freshness=unobserved
+  elif [ "$observed_sig" = "$current_sig" ]; then freshness=current
+  else freshness=registration_changed
+  fi
+  jq -n \
+    --argjson registration "$registration" \
+    --arg state "$observed_state" \
+    --arg evidence "$observed_evidence" \
+    --arg freshness "$freshness" \
+    --arg progress_signature "$progress_sig" \
+    --argjson checked_at "$observed_at" \
+    --argjson progress_at "$progress_at" \
+    --argjson progress_age "$progress_age" \
+    '$registration + {observation:{state:($state | if . == "" then "unobserved" else . end),evidence:$evidence,checked_at:($checked_at | if . == 0 then null else . end),freshness:$freshness,progress_signature:($progress_signature | if . == "" then null else . end),progress_at:($progress_at | if . == 0 then null else . end),progress_age_seconds:($progress_age | if $progress_at == 0 then null else . end)}}'
+}
+
+status_event_json() {  # <id> <status-log>
+  local id=$1 log=$2 record present=0 raw='' verb='' note='' sequence signature
+  local observed_sequence observed_signature observed_raw observed_at freshness
+  record="$STATE/$id.reconciled"
   if [ -f "$log" ]; then
     present=1
     raw=$(last_nonempty_line "$log" || true)
     verb=$(status_line_verb "$raw")
     note=$(status_line_note "$raw")
   fi
+  sequence=$(fm_reconcile_status_sequence "$log")
+  signature=$(fm_reconcile_file_signature "$log")
+  observed_sequence=$(fm_reconcile_record_value "$record" status_sequence)
+  observed_signature=$(fm_reconcile_record_value "$record" status_signature)
+  observed_raw=$(fm_reconcile_record_value "$record" last_status_event)
+  observed_at=$(fm_reconcile_record_value "$record" observed_at)
+  case "$observed_sequence" in ''|*[!0-9]*) observed_sequence=0 ;; esac
+  case "$observed_at" in ''|*[!0-9]*) observed_at=0 ;; esac
+  if [ "$observed_at" -eq 0 ]; then freshness=unobserved
+  elif [ "$sequence" -eq "$observed_sequence" ] && [ "$signature" = "$observed_signature" ]; then freshness=current
+  else freshness=advanced_or_changed
+  fi
   jq -n \
     --arg path "$log" \
     --arg raw "$raw" \
     --arg verb "$verb" \
     --arg note "$note" \
+    --arg signature "$signature" \
+    --arg observed_raw "$observed_raw" \
+    --arg observed_signature "$observed_signature" \
+    --arg freshness "$freshness" \
+    --argjson sequence "$sequence" \
+    --argjson observed_sequence "$observed_sequence" \
+    --argjson observed_at "$observed_at" \
     --argjson present "$(bool_json "$present")" \
-    '{path:$path,present:$present,kind:"event_history",last_event:{state:$verb,note:$note,raw:$raw}}'
+    '{path:$path,present:$present,kind:"event_history",sequence:$sequence,signature:$signature,last_event:{state:$verb,note:$note,raw:$raw},supervisor_observation:{sequence:($observed_sequence | if $observed_at == 0 then null else . end),signature:($observed_signature | if . == "" then null else . end),event:{raw:($observed_raw | if . == "" then null else . end)},observed_at:($observed_at | if . == 0 then null else . end),freshness:$freshness}}'
 }
 
 first_pr_url_in_file() {  # <file>
@@ -262,7 +375,7 @@ backlog_json() {
 
 task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
-  local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
+  local pr pr_source event_json current_json prior_json wait_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json reconciled_json wait_path_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
@@ -294,7 +407,9 @@ task_json_lines() {
     fi
 
     current_json=$(crew_state_json "$id")
-    event_json=$(status_event_json "$status_log")
+    prior_json=$(prior_observed_json "$id")
+    wait_json=$(external_wait_json "$id")
+    event_json=$(status_event_json "$id" "$status_log")
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
     current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
     current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
@@ -306,7 +421,8 @@ task_json_lines() {
     # reconciled against the crew LIFECYCLE, which only clears a stale decision the
     # crew has provably moved past. Two lifecycle signals clear it, neither of which
     # reads any report content:
-    #   - a live activity read (run-step or busy pane) that is working/done, so a
+#   - a live activity read (run-step, busy pane, or owned command) that is
+#     working/done, so a
     #     crew that resumed past a gate is not still reported as parked; and
     #   - a TERMINAL done/failed state on a single-owner task (scout or ship), whose
     #     deliverable is its report or PR, so a COMPLETED scout surfaces only as a
@@ -318,7 +434,7 @@ task_json_lines() {
     # open decision surfacing.
     open_decisions_tsv=$(status_open_decisions "$status_log")
     if [ "$kind" != secondmate ] && \
-       { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ]; } \
+       { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ] || [ "$current_source" = owned-command ]; } \
            && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
          || { [ "$current_state" = "done" ] || [ "$current_state" = "failed" ]; }; }; then
       open_decisions_tsv=""
@@ -345,6 +461,8 @@ task_json_lines() {
 
     [ -f "$report_path" ] && report_present=1 || report_present=0
     meta_json=$(path_present_json "$meta")
+    reconciled_json=$(path_present_json "$STATE/$id.reconciled")
+    wait_path_json=$(path_present_json "$STATE/$id.wait")
     status_json=$event_json
     report_json=$(path_present_json "$report_path")
     if [ -n "$worktree" ]; then worktree_json=$(path_present_json "$worktree"); else worktree_json=$(jq -n '{path:null,present:false}'); fi
@@ -367,7 +485,11 @@ task_json_lines() {
       --arg agent_alive "$agent_alive" \
       --arg last_event_raw "$last_event_raw" \
       --argjson current_state "$current_json" \
+      --argjson prior_observed_state "$prior_json" \
+      --argjson external_wait "$wait_json" \
       --argjson meta_path "$meta_json" \
+      --argjson reconciled_path "$reconciled_json" \
+      --argjson wait_path "$wait_path_json" \
       --argjson status_log "$status_json" \
       --argjson report "$report_json" \
       --argjson worktree_path "$worktree_json" \
@@ -387,6 +509,8 @@ task_json_lines() {
         backend:$backend,
         paths:{
           meta:$meta_path,
+          reconciled:$reconciled_path,
+          external_wait:$wait_path,
           status_log:$status_log,
           worktree:$worktree_path,
           home:$home_path,
@@ -394,6 +518,9 @@ task_json_lines() {
         },
         secondmate_projects:($projects | if . == "" then [] else split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(. != "")) end),
         current_state:$current_state,
+        prior_observed_state:$prior_observed_state,
+        last_status_event:($status_log | {sequence,signature,event:.last_event,supervisor_observation}),
+        external_wait:$external_wait,
         endpoint:{target:($target | if . == "" then null else . end),exists:$endpoint_exists,agent_alive:$agent_alive},
         pr:{url:($pr | if . == "" then null else . end),source:$pr_source},
         hints:{

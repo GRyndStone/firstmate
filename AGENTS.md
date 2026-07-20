@@ -552,10 +552,10 @@ Whenever at least one task is in flight, keep exactly one live supervision owner
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when provably working).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait or a checks-green finished crew parked behind that pause or an armed merge poll until its bounded recheck cadence, and no-change heartbeats.
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, a busy pane, or a progressing identity-bound task command registered with `bin/fm-external-wait.sh register-command`, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait or a checks-green finished crew parked behind that pause or an armed merge poll until its bounded recheck cadence, and no-change heartbeats.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
-Repeated provably-working stale escalations on one unchanged pane eventually add `demand-deep-inspection` to the wake reason so it is not mistaken for another routine validation wait.
+An unchanged pane with current positive run-step, busy-pane, or progressing task-owned-command evidence remains quiet at every stale threshold; only disappearance of that positive evidence can produce a possible-wedge escalation, with repeated fallback escalations eventually adding `demand-deep-inspection`.
 `docs/architecture.md` ("Event-driven supervision") owns the full classification mechanism, its thresholds, and the shared classifier library; while `state/.afk` exists the daemon owns triage and the watcher surfaces every wake to it.
 At the start of every wake-handling turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 Session-start recovery is the exception: `bin/fm-session-start.sh` already drained the queue when locked, or deliberately skipped the drain when read-only because another session owns it.
@@ -583,7 +583,7 @@ bin/fm-supervisor-start.sh          # durable normal-mode local supervisor for C
 bin/fm-watch-checkpoint.sh          # bounded foreground watcher diagnostic checkpoint
 bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat
 bin/fm-wake-drain.sh                # drain queued wake records at turn start; asserts guard after draining
-bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, pane, and status log
+bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, registered owned command, pane, and status log
 bin/fm-fleet-view.sh                # read-only Markdown whole-fleet view rendered from the structured snapshot
 ```
 
@@ -630,7 +630,7 @@ Do not assume one primary harness can use another harness's foreground or backgr
 For example, Claude uses a background-notify cycle, while Codex uses the identity-bound local supervisor daemon described in `docs/turnend-guard.md`.
 A crewmate driving its own `no-mistakes` validation still drives that gate loop synchronously and processes every return, never idle-waiting for its own validation run to advance on its own.
 
-Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
+Token discipline: for a crewmate's current state prefer `bin/fm-crew-state.sh <id>`, which looks for a branch-matched run-step and a progressing registered owned command before checking pane liveness, then falls back to the pane and log in that cheap-first order and treats the status log's last line as a wake event rather than the current state; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
 The context-% shown in a peek is not actionable as crew health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
 
 ### Away-mode stub

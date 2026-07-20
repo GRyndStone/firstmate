@@ -108,6 +108,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-task-identity-lib.sh
+. "$SCRIPT_DIR/fm-task-identity-lib.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -661,6 +663,18 @@ fi
 # once here so every downstream comparison uses the same physical form
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
+
+# Ship/scout task identity is repository-scoped at the spawn/respawn lifecycle
+# boundary.  Validate before any backend endpoint or worktree creation so a
+# follow-up can never silently overwrite an existing id's metadata with an
+# unrelated project.  Same-repository recovery (including another linked
+# worktree) remains valid.  A secondmate is instead bound to its configured
+# persistent home through the existing home/registry validators above; its meta
+# deliberately has no project= field, so repository identity validation here
+# would break legitimate dead-endpoint recovery.
+if [ "$KIND" != secondmate ]; then
+  fm_task_identity_validate "$STATE" "$ID" "$PROJ_ABS_REAL" || exit 1
+fi
 
 real_path_or_raw() {  # <path>
   local path=$1 real

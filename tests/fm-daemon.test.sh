@@ -94,6 +94,24 @@ test_normal_start_reuses_one_identity_bound_daemon_per_home() {
   pass "normal start reuses one identity-bound daemon per FM_HOME without entering afk"
 }
 
+test_normal_start_restart_signals_only_identity_bound_daemon() {
+  local dir state lock pid identity out status
+  dir=$(make_supercase normal-start-restart)
+  state="$dir/state"; lock="$state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  sleep 60 & pid=$!
+  identity=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//')
+  printf '%s\n' "$pid" > "$lock/pid"
+  printf '%s\n' "$identity" > "$lock/pid-identity"
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$SUPERVISOR_START" --restart 2>&1); status=$?
+  wait "$pid" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "restart test's unsupported replacement daemon unexpectedly started"
+  assert_contains "$out" "stopping identity-matched daemon pid=$pid" "restart did not identify the exact daemon it stopped"
+  assert_contains "$out" "starting normal daemon" "restart did not advance to the current daemon entrypoint"
+  assert_contains "$out" "does not support supervisor backend 'unsupported'" "replacement daemon was not actually executed"
+  pass "normal supervisor restart stops only the identity-bound owner before executing current code"
+}
+
 test_daemon_state_root_uses_fm_home() {
   local dir home override out
   dir=$(make_supercase daemon-fm-home)
@@ -287,6 +305,26 @@ test_handle_wake_escalates_decorated_agent_dead() {
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "agent-dead was re-absorbed as the crew's declared pause"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "agent-dead escalation left the real window's stale persistence marker to re-escalate as a false wedge"
   pass "handle_wake escalates a decorated agent-dead verdict against the real window"
+}
+
+test_handle_wake_escalates_reconciled_verdicts() {
+  local dir state win verdict reason
+  dir=$(make_supercase handle-reconciled-verdicts)
+  state="$dir/state"
+  win="sess:fm-reconciled-w13"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/reconciled-w13.meta"
+  printf 'paused: stale event that must not absorb reconciled truth\n' > "$state/reconciled-w13.status"
+  for verdict in \
+    'reconciled-transition (working -> unknown)' \
+    'external-wait-complete (OAuth callback)' \
+    'external-wait-failed (predicate exited 3)' \
+    'external-wait-unobservable (no predicate registered)'; do
+    reason="stale: $win $verdict"
+    FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+    grep -qF "$verdict" "$state/.subsuper-escalations" \
+      || fail "daemon absorbed actionable reconciled verdict behind stale paused status: $verdict"
+  done
+  pass "handle_wake directly escalates every durable reconciled verdict past stale status prose"
 }
 
 # Decorated NON-death stale reasons (the watcher's wedge and pause-recheck wakes)
@@ -1894,6 +1932,7 @@ test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_normal_start_reuses_one_identity_bound_daemon_per_home
+test_normal_start_restart_signals_only_identity_bound_daemon
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
@@ -1906,6 +1945,7 @@ test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
 test_handle_wake_escalates_decorated_endpoint_gone
 test_handle_wake_escalates_decorated_agent_dead
+test_handle_wake_escalates_reconciled_verdicts
 test_handle_wake_decorated_wedge_resolves_window
 test_housekeeping_migrates_watcher_pause_marker
 test_housekeeping_migrates_watcher_unpaused_marker_to_clear

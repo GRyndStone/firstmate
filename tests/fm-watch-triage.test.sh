@@ -7,7 +7,7 @@
 # a real fm-watch.sh subprocess to assert the behavioral contract:
 # provably-working no-verb wakes absorbed (no exit, no queue entry, suppressor
 # advanced, beacon fresh), stopped-crew no-verb wakes surfaced (queue + exit),
-# provably-working stale panes absorbed-then-escalated past the threshold,
+# provably-working stale panes quiet across a threshold revalidation,
 # terminal-looking stale status lines overridden by an active run, the heartbeat
 # backstop fail-safe, and afk coherence (no double-triage while the away-mode
 # daemon owns supervision).
@@ -74,6 +74,21 @@ file_mtime() {
 # fire on a pre-existing status (mirrors fm-watch.sh's stat_sig exactly).
 seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
+}
+
+register_pending_wait() {  # <state> <id>
+  local state=$1 id=$2 predicate="$1/$2.wait-pending.sh"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$predicate"
+  fm_write_meta "$state/$id.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=test pending external wait' \
+    "predicate=$predicate" \
+    'registered_at=1'
 }
 
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
@@ -209,6 +224,8 @@ test_crew_absorb_class_classifier() {
   [ "$(crew_absorb_class a)" = working ] || fail "active run-step not classed working"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   [ "$(crew_absorb_class a)" = working ] || fail "busy pane not classed working"
+  FM_FAKE_CREW_STATE='state: working · source: owned-command · registered task command 123 is live; descendant progress observed 0s ago'
+  [ "$(crew_absorb_class a)" = working ] || fail "progressing owned command not classed working"
   FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting upstream'
   [ "$(crew_absorb_class a)" = paused ] || fail "declared pause not classed paused"
   crew_is_paused a || fail "crew_is_paused did not recognize a paused verdict"
@@ -416,10 +433,10 @@ test_terminal_stale_surfaced() {
 # immediately surfacing a crew that is actively validating. crew_is_provably_working
 # must get a chance to override a captain-relevant-but-stale status line, exactly
 # as it already does for a plain non-terminal one.
-test_stale_terminal_status_overridden_by_active_run() {
-  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+test_stale_terminal_status_overridden_while_active_run_stays_quiet() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case terminal-stale-overridden); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-validating"
   printf 'no-mistakes axi run: validating...' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/validating.meta"
@@ -450,30 +467,36 @@ test_stale_terminal_status_overridden_by_active_run() {
   [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
   reap "$pid"
 
-  # Phase B: backdate the idle timer past the threshold; the run genuinely
-  # wedges and the next poll escalates exactly like the non-terminal case.
+  # Phase B: backdate the idle timer past the threshold. The unchanged pane is
+  # still backed by current positive run-step evidence, so the watcher must
+  # revalidate and remain quiet instead of emitting a possible-wedge alarm.
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not escalate an overridden stale terminal status past the threshold"
-  grep -F "stale: $window" "$out" >/dev/null || fail "escalation did not print a stale wake"
-  grep -F "possible wedge" "$out" >/dev/null || fail "escalation did not flag a possible wedge"
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher surfaced an unchanged pane despite current positive run-step evidence: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "positive run-step revalidation printed a stale wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "positive run-step revalidation queued a stale wake"
+  [ "$(file_mtime "$state/.stale-since-$key")" -ge $(( $(date +%s) - 5 )) ] \
+    || fail "positive run-step revalidation did not refresh the stale timer"
+  reap "$pid"
   unset FM_FAKE_CREW_STATE
-  pass "a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated"
+  pass "a stale terminal-looking status stays quiet past the threshold while positive run-step evidence remains current"
 }
 
-# --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
+# --- non-terminal stale, crew provably working: quiet across revalidation ----
 # A provably-working crew (an actively-running pipeline) legitimately sits on a
-# static pane (e.g. waiting on CI), so a non-terminal stale is absorbed and only
-# the wedge timer eventually escalates it - the low-churn behavior preserved.
+# static pane (e.g. waiting on CI), so a non-terminal stale is absorbed and the
+# bounded recheck remains quiet while the positive evidence is still current.
 
-test_nonterminal_stale_provably_working_absorbed_then_escalated() {
-  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+test_nonterminal_stale_positive_busy_stays_quiet_past_threshold() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case nonterminal-stale-working); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-quiet"
   printf 'idle building output' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet.meta"
@@ -502,21 +525,25 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
   reap "$pid"
 
-  # Phase B: backdate the idle timer past the threshold; the next run escalates.
-  # (The subsequent-sight timer path does not re-read the crew state.)
+  # Phase B: backdate the idle timer past the threshold. The pane hash remains
+  # unchanged, but current positive working evidence must suppress the alarm.
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not escalate a provably-working non-terminal stale past the threshold"
-  grep -F "stale: $window" "$out" >/dev/null || fail "escalation did not print a stale wake"
-  grep -F "possible wedge" "$out" >/dev/null || fail "escalation did not flag a possible wedge"
-  [ ! -e "$state/.stale-since-$key" ] || fail "stale-since timer was not cleared after escalation"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the wedge escalation failed"
-  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "wedge escalation was not queued"
-  pass "provably-working non-terminal stale is absorbed on first sight, then wedge-escalated past the threshold"
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher emitted a stale alarm despite current positive busy evidence: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "positive busy revalidation printed a stale wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "positive busy revalidation queued a stale wake"
+  [ "$(file_mtime "$state/.stale-since-$key")" -ge $(( $(date +%s) - 5 )) ] \
+    || fail "positive busy revalidation did not refresh the stale timer"
+  [ ! -e "$state/.wedge-escalations-$key" ] || fail "positive busy evidence retained a wedge escalation count"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "unchanged pane content stays quiet past the stale threshold under current positive busy evidence"
 }
 
 # --- non-terminal stale, crew NOT provably working: surfaced immediately ------
@@ -577,6 +604,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   # A DECLARED pause (not captain-relevant), .seen-* primed so the signal scan does
   # not pre-empt the stale path.
   printf 'paused: holding for the upstream tool release\n' > "$statusf"
+  register_pending_wait "$state" held
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle, holding for upstream")
@@ -818,6 +846,7 @@ test_secondmate_paused_resurfaces_in_normal_mode() {
   printf 'idle awaiting external\n' > "$capture_file"
   printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-held.meta"
   printf 'paused: awaiting the upstream release\n' > "$statusf"
+  register_pending_wait "$state" secondmate-held
   back=$(( $(date +%s) - 500 ))
   if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
   else touch -m -d "@$back" "$statusf"; fi
@@ -898,6 +927,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
   printf 'idle awaiting external\n' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/transition.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/transition.status"
+  register_pending_wait "$state" transition
   sig=$(seen_sig "$state/transition.status"); printf '%s' "$sig" > "$state/.seen-transition_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle awaiting external")
@@ -946,6 +976,7 @@ test_paused_recheck_surfaces_failed_run() {
   printf 'idle awaiting external\n' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/pause-recheck.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/pause-recheck.status"
+  register_pending_wait "$state" pause-recheck
   sig=$(seen_sig "$state/pause-recheck.status"); printf '%s' "$sig" > "$state/.seen-pause-recheck_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle awaiting external")
@@ -1077,7 +1108,9 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # Prime the stale hash from a working observation, then reset the reconciled
+  # baseline and remove positive evidence so this test exercises only the
+  # fallback wedge escalation counter rather than the working-transition wake.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Priming round: first sighting of this stale hash classifies and absorbs it
@@ -1091,12 +1124,13 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
   fi
   reap "$pid"
+  rm -f "$state/wedged.reconciled"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current working evidence'
 
   n=1
   while [ "$n" -le 3 ]; do
     # Backdate the wedge timer past the threshold before each round, mirroring
-    # the existing wedge-escalation tests' Phase B (the subsequent-sight timer
-    # path does not re-read the crew state).
+    # the fallback wedge path after positive evidence has disappeared.
     echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -1341,6 +1375,7 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-held.meta"
   statusf="$state/afk-held.status"
   printf 'paused: awaiting the upstream tool release\n' > "$statusf"
+  register_pending_wait "$state" afk-held
   back=$(( $(date +%s) - 500 ))
   if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
   else touch -m -d "@$back" "$statusf"; fi
@@ -1384,6 +1419,7 @@ test_paused_crew_gone_endpoint_surfaced_immediately() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/gone.meta"
   # The incident shape: the last status line is a legitimate declared pause.
   printf 'paused: supervising - monitor armed\n' > "$state/gone.status"
+  register_pending_wait "$state" gone
   sig=$(seen_sig "$state/gone.status"); printf '%s' "$sig" > "$state/.seen-gone_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   # Even with every absorb cadence effectively infinite, death surfaces at once.
@@ -1419,6 +1455,7 @@ test_paused_crew_alive_quiet_endpoint_absorbed() {
   printf 'idle, holding for upstream' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/held-alive.meta"
   printf 'paused: holding for the upstream release\n' > "$state/held-alive.status"
+  register_pending_wait "$state" held-alive
   sig=$(seen_sig "$state/held-alive.status"); printf '%s' "$sig" > "$state/.seen-held-alive_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle, holding for upstream")
@@ -1451,6 +1488,7 @@ test_paused_crew_confident_dead_agent_surfaced() {
   printf 'bare shell prompt after the agent exited' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-agent.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/dead-agent.status"
+  register_pending_wait "$state" dead-agent
   sig=$(seen_sig "$state/dead-agent.status"); printf '%s' "$sig" > "$state/.seen-dead-agent_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "bare shell prompt after the agent exited")
@@ -1495,6 +1533,7 @@ test_paused_crew_ambiguous_agent_liveness_absorbed() {
   printf 'idle, holding for upstream' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/ambiguous.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/ambiguous.status"
+  register_pending_wait "$state" ambiguous
   sig=$(seen_sig "$state/ambiguous.status"); printf '%s' "$sig" > "$state/.seen-ambiguous_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle, holding for upstream")
@@ -1550,6 +1589,7 @@ test_secondmate_dead_agent_not_probed() {
   printf 'idle awaiting external' > "$capture_file"
   printf 'window=%s\nkind=secondmate\n' "$window" > "$state/2nd-shell.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/2nd-shell.status"
+  register_pending_wait "$state" 2nd-shell
   sig=$(seen_sig "$state/2nd-shell.status"); printf '%s' "$sig" > "$state/.seen-2nd-shell_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle awaiting external")
@@ -1637,6 +1677,7 @@ test_dead_agent_marker_survives_pane_redraw() {
   printf 'bare shell prompt after the agent exited' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-redraw.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/dead-redraw.status"
+  register_pending_wait "$state" dead-redraw
   sig=$(seen_sig "$state/dead-redraw.status"); printf '%s' "$sig" > "$state/.seen-dead-redraw_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "bare shell prompt after the agent exited")
@@ -1681,6 +1722,7 @@ test_afk_paused_dead_agent_surfaced_once() {
   printf 'bare shell prompt after the agent exited' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-dead.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/afk-dead.status"
+  register_pending_wait "$state" afk-dead
   sig=$(seen_sig "$state/afk-dead.status"); printf '%s' "$sig" > "$state/.seen-afk-dead_status"
   date '+%s' > "$state/.afk"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1722,6 +1764,7 @@ test_afk_paused_ambiguous_agent_hands_off_plain_stale() {
   printf 'idle, holding for upstream' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-ambiguous.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/afk-ambiguous.status"
+  register_pending_wait "$state" afk-ambiguous
   sig=$(seen_sig "$state/afk-ambiguous.status"); printf '%s' "$sig" > "$state/.seen-afk-ambiguous_status"
   date '+%s' > "$state/.afk"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1759,8 +1802,8 @@ test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
-test_stale_terminal_status_overridden_by_active_run
-test_nonterminal_stale_provably_working_absorbed_then_escalated
+test_stale_terminal_status_overridden_while_active_run_stays_quiet
+test_nonterminal_stale_positive_busy_stays_quiet_past_threshold
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced

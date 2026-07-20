@@ -269,8 +269,9 @@ task_has_park_anchor() {  # <id> [<state-dir>]
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Run-step
 # precedence still holds for every NON-absorbable verdict: a crew whose run
 # failed or gate-parked behind a stale paused: line reads none and surfaces.
-# Only a working pane-busy verdict keeps outranking a declared pause (a busy
-# pane contradicts "expected to idle"), and an armed check alone never
+# Only a working pane-busy or identity-bound owned-command verdict keeps
+# outranking a declared pause (positive work contradicts "expected to idle"),
+# and an armed check alone never
 # reclassifies an active run - the composition needs the declared pause itself.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
@@ -294,7 +295,7 @@ crew_absorb_class() {  # <id>
         printf 'working'
         return
         ;;
-      pane) printf 'working'; return ;;
+      pane|owned-command) printf 'working'; return ;;
     esac
   fi
   if [ "$state" = "done" ] && [ "$src" = run-step ] && task_has_park_anchor "$id"; then

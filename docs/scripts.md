@@ -26,6 +26,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend |
+| `fm-task-identity-lib.sh` | Refuse existing task-id reuse across unrelated repositories at the spawn lifecycle boundary |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile, owning `quota-balanced` selection |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
@@ -42,8 +43,10 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-marker-lib.sh`       | Shared from-firstmate request marker and detector                                    |
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher diagnostic checkpoint                             |
-| `fm-supervisor-start.sh` | Start the durable normal-mode local supervisor for Codex                              |
+| `fm-supervisor-start.sh` | Start or identity-safely restart the durable normal-mode local supervisor for Codex   |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
+| `fm-reconcile-lib.sh`    | Persist and deduplicate per-cycle task-state and external-wait observations           |
+| `fm-external-wait.sh`    | Register a model-free predicate, process completion observer, or task-owned working command     |
 | `fm-afk-start.sh`        | Enter away mode and run the sub-supervisor daemon as a tracked foreground process    |
 | `fm-supervise-daemon.sh` | Identity-bound normal/away local supervisor: self-handle routine wakes, escalate batched digests, alert on failed delivery |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
