@@ -57,7 +57,7 @@ fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
-TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
+fm_test_tmproot TMP_ROOT fm-teardown-tests
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
 

@@ -71,3 +71,4 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-x-dismiss.sh`        | Dismiss a skipped X-mode mention at the relay without replying                       |
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
+| `fm-cleanup-stale-test-roots.sh` | Guarded dry-run-first cleanup of leaked test fixture roots under TMPDIR (safety gates + manifest) |

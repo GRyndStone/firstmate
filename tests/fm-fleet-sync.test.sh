@@ -28,7 +28,7 @@ set -u
 
 fm_git_identity fmtest fmtest@example.invalid
 
-TMP_ROOT=$(fm_test_tmproot fm-fleet-sync-tests)
+fm_test_tmproot TMP_ROOT fm-fleet-sync-tests
 HOME_N=0
 
 # --- fixtures ---------------------------------------------------------------

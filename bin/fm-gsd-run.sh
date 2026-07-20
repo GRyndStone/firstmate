@@ -125,23 +125,9 @@ gsd_run_server_identity() {
 
 RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
-if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
-  mkdir -p "$FM_GSD_RUN_STATE_DIR"
-  RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
-else
-  RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX")
-fi
-EXIT_FILE="$RUN_DIR/$LABEL.exit"
 
-# The pane command: run the gsd invocation through `env` (so quoted leading
-# NAME=value assignments still apply as environment), then record its exit
-# code. `env` resolves gsd against any PATH assignment passed this way.
-PANE_CMD="cd $(shell_quote "$GSD_DIR_ABS") && env"
-for w in "$@"; do
-  PANE_CMD="$PANE_CMD $(shell_quote "$w")"
-done
-PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
-
+# Container ensure + create_task first so preflight failures (missing herdr,
+# refused container, etc.) never leave an unused mktemp root behind.
 # Container ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>";
 # the seeded tab id threads through to create_task untouched, which is the
 # only function allowed to prune it (see bin/backends/herdr.sh).
@@ -159,9 +145,34 @@ if [ -z "$TAB_ID" ] || [ -z "$PANE_ID" ]; then
 fi
 TARGET="$SES:$PANE_ID"
 
+# Exit-file dir only after the run tab exists. Default is a fresh mktemp root
+# per run (override with FM_GSD_RUN_STATE_DIR); owned roots are removed if
+# the pane command fails to start before any exit code can be written.
+OWNED_RUN_DIR=0
+if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
+  mkdir -p "$FM_GSD_RUN_STATE_DIR"
+  RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
+else
+  RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX")
+  OWNED_RUN_DIR=1
+fi
+EXIT_FILE="$RUN_DIR/$LABEL.exit"
+
+# The pane command: run the gsd invocation through `env` (so quoted leading
+# NAME=value assignments still apply as environment), then record its exit
+# code. `env` resolves gsd against any PATH assignment passed this way.
+PANE_CMD="cd $(shell_quote "$GSD_DIR_ABS") && env"
+for w in "$@"; do
+  PANE_CMD="$PANE_CMD $(shell_quote "$w")"
+done
+PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
+
 SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
 
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
+  if [ "$OWNED_RUN_DIR" -eq 1 ]; then
+    rm -rf "$RUN_DIR"
+  fi
   echo "error: failed to start the run in herdr tab $LABEL (target $TARGET)" >&2
   exit 1
 }

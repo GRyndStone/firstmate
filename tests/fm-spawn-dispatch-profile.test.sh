@@ -11,7 +11,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
-TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
+fm_test_tmproot TMP_ROOT fm-spawn-dispatch-profile
 
 make_spawn_fakebin() {
   local dir=$1 fakebin

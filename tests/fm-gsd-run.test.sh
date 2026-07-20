@@ -21,7 +21,7 @@ set -u
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
 
-TMP_ROOT=$(fm_test_tmproot fm-gsd-run)
+fm_test_tmproot TMP_ROOT fm-gsd-run
 mkdir -p "$TMP_ROOT"
 
 # make_gsd_fake_herdr: a stateless fake `herdr` answering exactly the calls
@@ -136,10 +136,19 @@ test_env_assignments_allowed_before_gsd() {
 # Without herdr on PATH the helper fails loudly instead of running the
 # command invisibly - the caller reports blocked rather than driving raw.
 test_missing_herdr_fails_closed() {
-  local out status
-  out=$( PATH="/usr/bin:/bin" "$ROOT/bin/fm-gsd-run.sh" task-h1 "$TMP_ROOT" gsd headless auto 2>&1 ) && status=0 || status=$?
+  local out status state before after
+  # Keep any accidental state under the suite root, and prove preflight failure
+  # leaves no default fm-gsd-run-* mktemp in TMPDIR (regression for the
+  # storage-leak Phase 0 inventory).
+  state="$TMP_ROOT/missing-herdr-state"
+  mkdir -p "$state"
+  before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' 2>/dev/null | wc -l | tr -d ' ')
+  out=$( PATH="/usr/bin:/bin" FM_GSD_RUN_STATE_DIR="$state" \
+    "$ROOT/bin/fm-gsd-run.sh" task-h1 "$TMP_ROOT" gsd headless auto 2>&1 ) && status=0 || status=$?
   [ "$status" -ne 0 ] || fail "missing herdr must fail, not run invisibly"
   assert_contains "$out" "herdr" "missing-herdr failure does not name herdr"
+  after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' 2>/dev/null | wc -l | tr -d ' ')
+  [ "$after" = "$before" ] || fail "missing-herdr preflight left fm-gsd-run-task-h1.* under TMPDIR (before=$before after=$after)"
   pass "fm-gsd-run.sh: missing herdr fails closed"
 }
 

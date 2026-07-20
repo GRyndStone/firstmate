@@ -39,7 +39,7 @@ set -u
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-harness)
+fm_test_tmproot TMP_ROOT fm-secondmate-harness
 export FM_BACKEND=tmux
 
 # ===========================================================================

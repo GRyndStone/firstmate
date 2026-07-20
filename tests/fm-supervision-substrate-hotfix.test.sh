@@ -25,7 +25,7 @@ if [ "${FM_SUPERVISION_HOTFIX_TEST_INNER:-0}" != 1 ]; then
 fi
 
 HERDR_LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
-TMP_ROOT=$(fm_test_tmproot fm-supervision-substrate-hotfix)
+fm_test_tmproot TMP_ROOT fm-supervision-substrate-hotfix
 PRIMARY="$TMP_ROOT/primary"
 CREW_WT="$TMP_ROOT/crew-worktree"
 FAKEBIN="$TMP_ROOT/fakebin"

@@ -21,7 +21,7 @@ set -u
 # shellcheck source=bin/fm-tangle-lib.sh
 . "$ROOT/bin/fm-tangle-lib.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-tangle-guard)
+fm_test_tmproot TMP_ROOT fm-tangle-guard
 fm_git_identity fmtest fmtest@example.invalid
 
 # A fresh git repo on `main` with one commit. Echoes its path.

@@ -6,7 +6,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
-TMP_ROOT=$(fm_test_tmproot fm-watch-checkpoint)
+fm_test_tmproot TMP_ROOT fm-watch-checkpoint
 
 make_home() {
   local name=$1 home
