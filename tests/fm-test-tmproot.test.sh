@@ -148,17 +148,16 @@ test_custom_exit_trap_composition() {
 test_command_substitution_is_unsafe_and_static_rejected() {
   # Historical defect: command-substitution of the old echo-path helper left the
   # parent with no array entry and no trap; recreating the path leaked. The new
-  # API rejects a hyphenated "prefix-as-only-arg" used as the varname.
+  # API requires the caller-assignment variable and prefix as separate args.
   local rc=0 err hits
   err=$(bash -c '
     set -u
     . "$1/tests/lib.sh"
     export TMPDIR="$2"
-    # Old call shape: prefix only (hyphenated) - must fail varname validation.
-    fm_test_tmproot fm-old-shape 2>&1
+    fm_test_tmproot tmp 2>&1
   ' _ "$REPO_ROOT" "$TMPDIR") || rc=$?
-  [ "$rc" -ne 0 ] || fail "hyphenated prefix-as-varname should fail"
-  assert_contains "$err" "valid variable name" "old shape error message"
+  [ "$rc" -ne 0 ] || fail "one-argument fm_test_tmproot call should fail"
+  assert_contains "$err" "fm_test_tmproot VAR prefix" "old shape error message"
 
   # Static rejection: non-comment command substitution of fm_test_tmproot.
   # Comments in lib.sh may document the forbidden form; executable code must not.

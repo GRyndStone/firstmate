@@ -43,7 +43,7 @@ pass() {
 
 # --- self-cleaning temp root ------------------------------------------------
 #
-# fm_test_tmproot <varname> [prefix]
+# fm_test_tmproot <varname> <prefix>
 #   Creates a fresh temp dir under TMPDIR, assigns its path to <varname> in the
 #   caller's shell (via printf -v; works with caller-local variables), and
 #   registers it for removal on EXIT. The first registration installs
@@ -72,17 +72,17 @@ fm_test_cleanup() {
 }
 
 fm_test_tmproot() {
-  local __varname=$1
-  local __prefix=${2:-fm-test}
-  local __root
+  local __varname __prefix __root
+  if [ "$#" -ne 2 ]; then
+    printf 'fm_test_tmproot: usage: fm_test_tmproot VAR prefix\n' >&2
+    return 1
+  fi
+  __varname=$1
+  __prefix=$2
   if [ -z "${__varname:-}" ] || [[ ! "$__varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
     printf 'fm_test_tmproot: need a valid variable name as arg1 (got %q)\n' "${__varname:-}" >&2
     return 1
   fi
-  # Refuse the obsolete echo-path API so `$(fm_test_tmproot prefix)` fails loudly
-  # instead of silently leaking (prefix alone looks like a varname, but a missing
-  # second arg with a non-assignment intent is the old shape when used as $(...)).
-  # Callers must pass the variable name first; prefix is optional second.
   __root=$(mktemp -d "${TMPDIR:-/tmp}/${__prefix}.XXXXXX") || return 1
   if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
     trap fm_test_cleanup EXIT

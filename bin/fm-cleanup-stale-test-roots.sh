@@ -155,41 +155,38 @@ owner_uid() {
 }
 
 has_open_files() {
-  local p=$1
+  local p=$1 output status
   if ! command -v lsof >/dev/null 2>&1; then
-    # Without lsof we cannot prove no open files; refuse.
     return 0
   fi
-  # Bound lsof to this path only. Avoid system-wide lsof and avoid +D tree
-  # walks on multi-GiB fixture roots. macOS lsof accepts the path operand.
-  if lsof -nP "$p" 2>/dev/null | awk 'NR>1 { found=1 } END { exit !found }'; then
+  if output=$(lsof -nP +D "$p" 2>&1); then
     return 0
+  else
+    status=$?
   fi
-  return 1
+  if [ "$status" -eq 1 ] && [ -z "$output" ]; then
+    return 1
+  fi
+  return 0
 }
 
 has_live_process_ref() {
-  local p=$1
-  # Command-line mention (best effort; false positives refuse cleanup).
-  # Exclude this cleanup script's own process tree from matching its scan path
-  # only when the path appears solely as our argument noise: still fail closed
-  # if any other process references the path.
-  if command -v pgrep >/dev/null 2>&1; then
-    # List PIDs matching the path, drop our own PID and parent.
-    if pgrep -f "$p" 2>/dev/null | awk -v me="$$" -v pp="$PPID" '
-        $1 != me && $1 != pp { found=1 }
-        END { exit !found }
-      '; then
-      return 0
-    fi
-  else
-    if ps -ax -o pid= -o command= 2>/dev/null | awk -v root="$p" -v me="$$" -v pp="$PPID" '
-        $1 == me || $1 == pp { next }
-        index($0, root) > 0 { found=1; exit }
-        END { exit !found }
-      '; then
-      return 0
-    fi
+  local p=$1 output
+  local FM_CLEANUP_PROBE_PATH=$p
+  export FM_CLEANUP_PROBE_PATH
+  if ! command -v ps >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! output=$(ps -ax -o pid= -o command= 2>/dev/null); then
+    return 0
+  fi
+  if printf '%s\n' "$output" | awk -v me="$$" -v pp="$PPID" '
+      BEGIN { root=ENVIRON["FM_CLEANUP_PROBE_PATH"] }
+      $1 == me || $1 == pp { next }
+      index($0, root) > 0 { found=1; exit }
+      END { exit !found }
+    '; then
+    return 0
   fi
   return 1
 }
@@ -263,10 +260,10 @@ for raw in "${candidates[@]:-}"; do
   fi
 
   if has_live_process_ref "$resolved"; then
-    reasons+=("live-process-or-lsof-reference")
+    reasons+=("live-process-command")
   fi
   if has_open_files "$resolved"; then
-    reasons+=("open-files")
+    reasons+=("open-files-cwd-root-or-lsof-unavailable")
   fi
 
   if [ "${#reasons[@]}" -gt 0 ]; then

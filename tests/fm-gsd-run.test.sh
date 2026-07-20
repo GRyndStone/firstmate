@@ -136,20 +136,31 @@ test_env_assignments_allowed_before_gsd() {
 # Without herdr on PATH the helper fails loudly instead of running the
 # command invisibly - the caller reports blocked rather than driving raw.
 test_missing_herdr_fails_closed() {
-  local out status state before after
-  # Keep any accidental state under the suite root, and prove preflight failure
-  # leaves no default fm-gsd-run-* mktemp in TMPDIR (regression for the
-  # storage-leak Phase 0 inventory).
-  state="$TMP_ROOT/missing-herdr-state"
-  mkdir -p "$state"
-  before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' 2>/dev/null | wc -l | tr -d ' ')
-  out=$( PATH="/usr/bin:/bin" FM_GSD_RUN_STATE_DIR="$state" \
+  local out status tmpdir
+  tmpdir="$TMP_ROOT/missing-herdr-tmp"
+  mkdir -p "$tmpdir"
+  out=$( /usr/bin/env -u FM_GSD_RUN_STATE_DIR PATH="/usr/bin:/bin" TMPDIR="$tmpdir" \
     "$ROOT/bin/fm-gsd-run.sh" task-h1 "$TMP_ROOT" gsd headless auto 2>&1 ) && status=0 || status=$?
   [ "$status" -ne 0 ] || fail "missing herdr must fail, not run invisibly"
   assert_contains "$out" "herdr" "missing-herdr failure does not name herdr"
-  after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' 2>/dev/null | wc -l | tr -d ' ')
-  [ "$after" = "$before" ] || fail "missing-herdr preflight left fm-gsd-run-task-h1.* under TMPDIR (before=$before after=$after)"
+  [ -z "$(find "$tmpdir" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' -print -quit)" ] \
+    || fail "missing-herdr preflight left fm-gsd-run-task-h1.* under isolated TMPDIR"
   pass "fm-gsd-run.sh: missing herdr fails closed"
+}
+
+test_state_setup_failure_closes_created_tab() {
+  local dir fb log proj state_file out status
+  dir="$TMP_ROOT/state-failure"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_file="$dir/not-a-directory"; : > "$state_file"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$state_file" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-f1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "state-directory setup failure must fail the launch"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
+    "state-directory setup failure left the created herdr tab open"
+  pass "fm-gsd-run.sh: state setup failure closes the created run tab"
 }
 
 test_no_wait_launches_visible_tab() {
@@ -330,6 +341,7 @@ test_script_parses_and_help
 test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
+test_state_setup_failure_closes_created_tab
 test_no_wait_launches_visible_tab
 test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code

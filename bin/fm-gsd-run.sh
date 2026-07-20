@@ -147,8 +147,16 @@ TARGET="$SES:$PANE_ID"
 
 # Exit-file dir only after the run tab exists. Default is a fresh mktemp root
 # per run (override with FM_GSD_RUN_STATE_DIR); owned roots are removed if
-# the pane command fails to start before any exit code can be written.
+# setup fails before the pane command starts.
 OWNED_RUN_DIR=0
+RUN_DIR=
+cleanup_unstarted_run() {
+  if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "$RUN_DIR" ]; then
+    rm -rf "$RUN_DIR"
+  fi
+  fm_backend_herdr_cli "$SES" tab close "$TAB_ID" >/dev/null 2>&1 || true
+}
+trap cleanup_unstarted_run EXIT
 if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
   mkdir -p "$FM_GSD_RUN_STATE_DIR"
   RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
@@ -170,12 +178,10 @@ PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
 SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
 
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
-  if [ "$OWNED_RUN_DIR" -eq 1 ]; then
-    rm -rf "$RUN_DIR"
-  fi
   echo "error: failed to start the run in herdr tab $LABEL (target $TARGET)" >&2
   exit 1
 }
+trap - EXIT
 echo "run: tab=$LABEL target=$TARGET exit_file=$EXIT_FILE"
 
 if [ "$NO_WAIT" -eq 1 ]; then
