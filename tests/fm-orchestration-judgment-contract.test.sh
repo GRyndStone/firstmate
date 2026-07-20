@@ -20,6 +20,7 @@ assert_contains "$SECTION_ONE" 'decide the real implication and recommended acti
   "AGENTS.md does not require independent implication analysis and recommendation"
 assert_contains "$SECTION_ONE" 'Never adopt or forward a conclusion merely because' \
   "AGENTS.md does not prohibit adopting delegated or tool conclusions on assertion alone"
+# shellcheck disable=SC2016 # Single-quoted contract text intentionally preserves literal Markdown backticks.
 assert_contains "$SECTION_ONE" 'use this response shape: `Question (verbatim): <full original question>` followed by `Firstmate analysis: <independent implication analysis>` and `Recommendation: <recommended captain action>`' \
   "AGENTS.md does not require the verbatim question alongside independent analysis and recommendation"
 assert_contains "$SECTION_ONE" 'Never omit, paraphrase, merge into analysis, or answer the quoted question for the captain' \
