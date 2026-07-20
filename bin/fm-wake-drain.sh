@@ -5,6 +5,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
@@ -55,6 +57,10 @@ mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+while IFS=$(printf '\t') read -r _epoch _seq _kind _key payload; do
+  [ -n "${payload:-}" ] || continue
+  fm_reconcile_consumer_ack_reason "$STATE" "$payload" || exit 1
+done < "$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness

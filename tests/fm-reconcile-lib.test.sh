@@ -19,7 +19,7 @@ make_reconcile_case() {
   state="$dir/state"
   wt="$dir/worktree"
   fake="$dir/fm-crew-state.sh"
-  mkdir -p "$state" "$wt"
+  mkdir -p "$state" "$wt" "$dir/project"
   fm_write_meta "$state/task.meta" \
     "window=session:fm-task" \
     "worktree=$wt" \
@@ -89,6 +89,51 @@ test_stopped_endpoint_without_claimed_done_wakes_once() {
   pass "working -> stopped endpoint wakes once when the claimed done event is absent"
 }
 
+test_same_repository_endpoint_replacement_preserves_working_baseline() {
+  local dir state live out token record
+  dir=$(make_reconcile_case endpoint-replacement)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: implementation active\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  record="$state/task.reconciled"
+  [ -n "$(fm_reconcile_record_value "$record" repository_identity)" ] \
+    || fail "working baseline omitted its repository identity"
+
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task-recovered' \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    'kind=ship'
+  printf 'state: idle · source: pane · recovered endpoint is idle\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'working -> idle' "same-repository endpoint replacement lost its working baseline"
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token"
+  [ -z "$(observe "$state" "$live")" ] || fail "recovered endpoint transition duplicated after acknowledgement"
+  pass "same-repository endpoint replacement preserves and reconciles the working baseline"
+}
+
+test_positive_working_source_loss_wakes_past_stale_working_event() {
+  local dir state live out token
+  dir=$(make_reconcile_case stale-working-source)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: historical build event\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+
+  printf 'state: working · source: status-log · working: historical build event\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'from positive pane evidence' "stale working event masked loss of positive pane evidence"
+  assert_contains "$out" 'source now status-log' "source-loss wake did not expose the stale status-log fallback"
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token"
+  [ -z "$(observe "$state" "$live")" ] || fail "acknowledged positive-source loss emitted a duplicate"
+  pass "loss of positive working evidence wakes even when stale status prose still says working"
+}
+
 test_external_wait_completion_and_failures() {
   local dir state live predicate out token
   dir=$(make_reconcile_case external-wait)
@@ -130,6 +175,22 @@ SH
   out=$(FM_WAIT_TEST_STATE="$dir/wait-state" observe "$state" "$live")
   assert_contains "$out" 'external-wait-failed' "failed predicate did not fail loudly"
   pass "registered OAuth predicate wakes on completion, dedupes, and fails loudly"
+}
+
+test_signaled_predicate_is_not_reported_complete() {
+  local dir perl_bin rc
+  dir=$(make_reconcile_case signaled-predicate)
+  perl_bin=$(command -v perl 2>/dev/null || true)
+  if [ -z "$perl_bin" ]; then
+    pass "signaled predicate fallback skipped without perl"
+    return
+  fi
+  mkdir -p "$dir/perl-only"
+  ln -s "$perl_bin" "$dir/perl-only/perl"
+  PATH="$dir/perl-only" fm_reconcile_bounded 2 /bin/sh -c 'kill -TERM $$'
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "signaled predicate fallback was reported as successful completion"
+  pass "signaled predicate fallback preserves a nonzero failure status"
 }
 
 test_unobservable_pause_fails_loudly_and_busy_stays_quiet() {
@@ -280,7 +341,10 @@ test_restart_preserves_transition_dedup() {
 
 test_active_review_parks_once_past_stale_pause
 test_stopped_endpoint_without_claimed_done_wakes_once
+test_same_repository_endpoint_replacement_preserves_working_baseline
+test_positive_working_source_loss_wakes_past_stale_working_event
 test_external_wait_completion_and_failures
+test_signaled_predicate_is_not_reported_complete
 test_unobservable_pause_fails_loudly_and_busy_stays_quiet
 test_inflight_unregistered_blocked_wait_fails_loudly_once
 test_unacknowledged_transition_is_not_replaced_by_newer_state

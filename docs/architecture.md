@@ -9,7 +9,7 @@ firstmate's full operating manual for the orchestrator agent itself is [`AGENTS.
 ## Event-driven supervision
 
 A zero-token bash watcher (`bin/fm-watch.sh`) sleeps on the fleet, classifies detected wakes in bash, and wakes the first mate only when something is actionable.
-Before it classifies sparse status or turn-end signals, the watcher reconciles every recorded task against deterministic run-step and backend evidence and persists that observation through `bin/fm-reconcile-lib.sh`.
+Before it classifies sparse status or turn-end signals, the watcher reconciles every recorded task in one bounded parallel batch against deterministic run-step and backend evidence and persists that observation through `bin/fm-reconcile-lib.sh`.
 This makes an append-only status event historical evidence rather than a current-state override, and a positively observed `working` task that becomes idle, parked, terminal, or stopped produces one queued transition wake even when the last event still says `paused:` or `blocked:`.
 The durable reconciliation record, external-wait observer, snapshot surfaces, regression evidence, and rollout canary are documented in [state-reconciliation.md](state-reconciliation.md).
 Actionable wakes include captain-relevant status signals, no-verb signals whose crew is not provably working, check-script output such as PR merge polling or an X-mode mention, stale panes whose crew is neither provably working nor in an absorbable park whether their status log looks terminal or non-terminal, stale panes whose previously positive working evidence disappears at a bounded recheck, absorbable parks that remain idle past `FM_PAUSE_RESURFACE_SECS`, gone or confidently-dead crew endpoints, and heartbeat backstop hits.

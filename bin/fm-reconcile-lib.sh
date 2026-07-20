@@ -9,10 +9,9 @@
 # fm-watch.sh calls fm_reconcile_observe for every recorded task.  The function
 # compares deterministic live evidence from fm-crew-state.sh with the last
 # positively observed task/endpoint state and persists the result atomically.
-# A positive working observation changing to any non-working state leaves a
-# pending actionable token until the watcher durably queues and acknowledges it.
-# That enqueue-before-ack ordering makes both the observation and dedup state
-# survive watcher or supervisor restarts without losing a wake.
+# A positive working observation losing that source or changing to any
+# non-working state leaves a pending actionable token until a durable consumer
+# accepts it from the wake queue.
 #
 # The same record also owns external-wait observation state.  A registered
 # state/<id>.wait file has schema fm-external-wait.v1 and one of these forms:
@@ -45,7 +44,14 @@
 #     Persist one observation.  Print nothing when quiet, or one TAB-separated
 #     "action<TAB>token<TAB>reason" record while an action is unacknowledged.
 #   fm_reconcile_ack <state-dir> <id> <token>
-#     Acknowledge only the token already persisted in the record.
+#     Acknowledge only the token already persisted in the record after consumer
+#     handoff.
+#   fm_reconcile_action_marker <id> <token>
+#     Print the durable wake marker that binds a queue payload to its action.
+#   fm_reconcile_action_pending <state-dir> <reason>
+#     True when a marked queue payload still needs consumer handoff.
+#   fm_reconcile_consumer_ack_reason <state-dir> <reason>
+#     Acknowledge a marked payload after durable consumer handoff.
 #   fm_reconcile_advance_seen <state-dir> <id>
 #     Advance watcher event suppressors only to the exact status/turn signatures
 #     persisted by the observation, never to a newer event that raced delivery.
@@ -60,6 +66,8 @@
 #     is live, task-scoped, and within its persisted progress grace.
 
 _FM_RECONCILE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_RECONCILE_LIB_DIR="."
+# shellcheck source=bin/fm-task-identity-lib.sh
+. "$_FM_RECONCILE_LIB_DIR/fm-task-identity-lib.sh"
 FM_RECONCILE_CREW_STATE_BIN="${FM_RECONCILE_CREW_STATE_BIN:-${FM_CREW_STATE_BIN:-$_FM_RECONCILE_LIB_DIR/fm-crew-state.sh}}"
 FM_EXTERNAL_WAIT_TIMEOUT=${FM_EXTERNAL_WAIT_TIMEOUT:-5}
 case "$FM_EXTERNAL_WAIT_TIMEOUT" in ''|*[!0-9]*|0) FM_EXTERNAL_WAIT_TIMEOUT=5 ;; esac
@@ -158,7 +166,7 @@ fm_reconcile_bounded() {  # <seconds> <command...>
   elif command -v gtimeout >/dev/null 2>&1; then
     gtimeout -k 1 "$seconds" "$@"
   elif command -v perl >/dev/null 2>&1; then
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$seconds" "$@"
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $s = $?; exit(($s & 127) ? 128 + ($s & 127) : ($s >> 8))' "$seconds" "$@"
   else
     return 125
   fi
@@ -412,6 +420,7 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
   {
     printf 'schema=fm-reconciled.v1\n'
     printf 'task=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_ID")"
+    printf 'repository_identity=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_REPOSITORY_IDENTITY")"
     printf 'endpoint=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_ENDPOINT")"
     printf 'state=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_STATE")"
     printf 'source=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_SOURCE")"
@@ -447,19 +456,22 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
 }
 
 fm_reconcile_observe() {  # <state-dir> <id>
-  local state=$1 id=$2 meta record status_file endpoint raw now
-  local old_endpoint old_state old_source old_evidence old_observed old_transition_seq
+  local state=$1 id=$2 meta record status_file project repository_identity endpoint raw now
+  local old_repository_identity old_endpoint old_state old_source old_evidence old_observed old_transition_seq
   local old_prior_endpoint old_prior_state old_prior_source old_prior_evidence old_prior_observed
   local old_wait_kind old_wait_sig old_wait_state old_wait_seq old_pending old_reason old_notified
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
   local wait_seq pending reason candidate_token='' candidate_reason=''
-  local pending_unacked=0 positive_working=0 endpoint_changed=0 state_changed=0
+  local pending_unacked=0 positive_working=0 current_positive_working=0
+  local endpoint_changed=0 state_changed=0 source_changed=0 same_repository=0
 
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
   record="$state/$id.reconciled"
   status_file="$state/$id.status"
+  project=$(fm_reconcile_meta_value "$meta" project)
+  repository_identity=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
   endpoint=$(fm_reconcile_endpoint "$meta")
   raw=$(
     FM_CREW_STATE_LIVE_ONLY=1 FM_STATE_OVERRIDE="$state" "$FM_RECONCILE_CREW_STATE_BIN" "$id" 2>/dev/null || true
@@ -483,6 +495,7 @@ fm_reconcile_observe() {  # <state-dir> <id>
   fi
   turn_signal_sig=$(fm_reconcile_signal_signature "$state/$id.turn-ended")
 
+  old_repository_identity=$(fm_reconcile_record_value "$record" repository_identity)
   old_endpoint=$(fm_reconcile_record_value "$record" endpoint)
   old_state=$(fm_reconcile_record_value "$record" state)
   old_source=$(fm_reconcile_record_value "$record" source)
@@ -519,7 +532,11 @@ fm_reconcile_observe() {  # <state-dir> <id>
   if [ -n "$old_state" ]; then
     [ "$old_endpoint" = "$endpoint" ] || endpoint_changed=1
     [ "$old_state" = "$current_state" ] || state_changed=1
-    if [ "$endpoint_changed" -eq 1 ] || [ "$state_changed" -eq 1 ]; then
+    [ "$old_source" = "$current_source" ] || source_changed=1
+    if [ -n "$old_repository_identity" ] && [ "$old_repository_identity" = "$repository_identity" ]; then
+      same_repository=1
+    fi
+    if [ "$endpoint_changed" -eq 1 ] || [ "$state_changed" -eq 1 ] || [ "$source_changed" -eq 1 ]; then
       prior_endpoint=$old_endpoint
       prior_state=$old_state
       prior_source=$old_source
@@ -527,9 +544,12 @@ fm_reconcile_observe() {  # <state-dir> <id>
       prior_observed=$old_observed
       transition_seq=$((old_transition_seq + 1))
     fi
-    if [ "$old_endpoint" = "$endpoint" ] && [ "$old_state" = working ]; then
+    if { [ "$old_endpoint" = "$endpoint" ] || [ "$same_repository" -eq 1 ]; } && [ "$old_state" = working ]; then
       case "$old_source" in run-step|pane|owned-command) positive_working=1 ;; esac
     fi
+  fi
+  if [ "$current_state" = working ]; then
+    case "$current_source" in run-step|pane|owned-command) current_positive_working=1 ;; esac
   fi
 
   fm_reconcile_wait_load "$state" "$id"
@@ -574,7 +594,8 @@ fm_reconcile_observe() {  # <state-dir> <id>
           fi
           ;;
         *)
-          if [ "$positive_working" -eq 1 ] && [ "$current_state" != working ]; then
+          if [ "$positive_working" -eq 1 ] \
+            && { [ "$current_state" != working ] || [ "$current_positive_working" -eq 0 ]; }; then
             candidate_token="transition:$transition_seq"
             candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
           fi
@@ -600,6 +621,7 @@ fm_reconcile_observe() {  # <state-dir> <id>
   fi
 
   FM_RECONCILE_WRITE_ID=$id
+  FM_RECONCILE_WRITE_REPOSITORY_IDENTITY=$repository_identity
   FM_RECONCILE_WRITE_ENDPOINT=$endpoint
   FM_RECONCILE_WRITE_STATE=$current_state
   FM_RECONCILE_WRITE_SOURCE=$current_source
@@ -651,6 +673,46 @@ fm_reconcile_ack() {  # <state-dir> <id> <token>
     END { if (!wrote) print "notified_action_token=" token }
   ' "$record" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$record"
+}
+
+fm_reconcile_action_marker() {  # <id> <token>
+  printf '[fm-reconcile=%s,%s]' "$(fm_reconcile_clean_value "$1")" "$(fm_reconcile_clean_value "$2")"
+}
+
+fm_reconcile_action_parse() {  # <reason>; populates FM_RECONCILE_ACTION_ID/TOKEN
+  local reason=$1 marker
+  FM_RECONCILE_ACTION_ID=
+  FM_RECONCILE_ACTION_TOKEN=
+  case "$reason" in *'[fm-reconcile='*']'*) ;; *) return 1 ;; esac
+  marker=${reason##*'[fm-reconcile='}
+  marker=${marker%%']'*}
+  case "$marker" in *,*) ;; *) return 1 ;; esac
+  FM_RECONCILE_ACTION_ID=${marker%%,*}
+  FM_RECONCILE_ACTION_TOKEN=${marker#*,}
+  case "$FM_RECONCILE_ACTION_ID" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$FM_RECONCILE_ACTION_TOKEN" in ''|*[!A-Za-z0-9:._-]*) return 1 ;; esac
+}
+
+fm_reconcile_action_pending() {  # <state-dir> <reason>
+  local state=$1 reason=$2 record pending notified
+  fm_reconcile_action_parse "$reason" || return 1
+  record="$state/$FM_RECONCILE_ACTION_ID.reconciled"
+  [ -f "$record" ] || return 1
+  pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  [ "$pending" = "$FM_RECONCILE_ACTION_TOKEN" ] && [ "$notified" != "$FM_RECONCILE_ACTION_TOKEN" ]
+}
+
+fm_reconcile_consumer_ack_reason() {  # <state-dir> <reason>
+  local state=$1 reason=$2 record pending notified
+  fm_reconcile_action_parse "$reason" || return 0
+  record="$state/$FM_RECONCILE_ACTION_ID.reconciled"
+  [ -f "$record" ] || return 0
+  pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  [ "$notified" != "$FM_RECONCILE_ACTION_TOKEN" ] || return 0
+  [ "$pending" = "$FM_RECONCILE_ACTION_TOKEN" ] || return 0
+  fm_reconcile_ack "$state" "$FM_RECONCILE_ACTION_ID" "$FM_RECONCILE_ACTION_TOKEN"
 }
 
 fm_reconcile_advance_seen() {  # <state-dir> <id>

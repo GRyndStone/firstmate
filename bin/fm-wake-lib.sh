@@ -450,6 +450,16 @@ fm_wake_append() {
   return "$status"
 }
 
+fm_wake_reconcile_payloads() {
+  local status=0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ -s "$FM_WAKE_QUEUE" ]; then
+    awk -F '\t' 'NF >= 5 && index($5, "[fm-reconcile=") && !seen[$5]++ { print $5 }' "$FM_WAKE_QUEUE" || status=$?
+  fi
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
 # Remove every queued record whose payload exactly matches a wake the durable
 # normal-mode supervisor has conclusively self-handled in shell.
 # Concurrent appends are serialized by the existing queue lock, unrelated and

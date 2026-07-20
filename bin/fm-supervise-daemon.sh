@@ -161,6 +161,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # classification predicates have exactly one definition.
 # shellcheck source=bin/fm-classify-lib.sh
 . "$FM_DAEMON_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$FM_DAEMON_DIR/fm-reconcile-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
 FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
@@ -1325,9 +1327,14 @@ is_wake_reason() {  # <reason>
 handle_wake() {  # <reason> <state>
   local reason=$1 state=$2 decision action distilled task last verdict
   local kind="" arg=""
+  if fm_reconcile_action_parse "$reason" && ! fm_reconcile_action_pending "$state" "$reason"; then
+    log "wake already accepted by durable consumer: $reason"
+    return 0
+  fi
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
-    return
+    fm_reconcile_consumer_ack_reason "$state" "$reason"
+    return $?
   fi
   case "$reason" in
     signal:*) kind=signal; arg="${reason#signal: }"
@@ -1360,7 +1367,7 @@ handle_wake() {  # <reason> <state>
   case "$action" in
     escalate)
       log "escalate: $reason -> $distilled"
-      escalate_add "$state" "$distilled"
+      escalate_add "$state" "$distilled" || return 1
       # A terminal-stale escalate must not leave a persistence marker behind, or
       # housekeeping re-escalates the same pane as a false wedge later.
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
@@ -1401,8 +1408,23 @@ handle_wake() {  # <reason> <state>
     if ! fm_wake_ack_payload "$reason"; then
       log "ERROR: normal supervisor could not acknowledge self-handled wake: $reason"
       escalate_add "$state" "supervisor queue acknowledgement failed; drain wakes before continuing"
+      return 1
     fi
   fi
+  if ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
+    log "ERROR: normal supervisor could not acknowledge reconciled action: $reason"
+    return 1
+  fi
+}
+
+replay_reconciled_queue() {  # <state>
+  local state=$1 reason
+  while IFS= read -r reason; do
+    [ -n "$reason" ] || continue
+    fm_reconcile_action_pending "$state" "$reason" || continue
+    log "replay queued reconciled action: $reason"
+    handle_wake "$reason" "$state" || return 1
+  done < <(fm_wake_reconcile_payloads)
 }
 
 # --- log --------------------------------------------------------------------
@@ -1597,6 +1619,11 @@ fm_super_main() {
 
   local rc reason
   while true; do
+    if ! replay_reconciled_queue "$STATE"; then
+      log "ERROR: queued reconciled action could not reach durable consumer state; retrying"
+      sleep "$CRASH_NORMAL_SLEEP"
+      continue
+    fi
     # --- pane-gone guard (preserved) ---------------------------------------
     # With the #29 watcher's enqueue-before-suppress, a wake is no longer
     # swallowed by running the watcher with no injection target. We still back

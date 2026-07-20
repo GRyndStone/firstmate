@@ -1,14 +1,16 @@
 # Durable orchestration-state reconciliation
 
 `state/<id>.status` is append-only event evidence and is never the authoritative current state.
-The runtime owner is `bin/fm-watch.sh`, which invokes `fm_reconcile_observe` from `bin/fm-reconcile-lib.sh` for every task at the start of every classification cycle.
+The runtime owner is `bin/fm-watch.sh`, which invokes `fm_reconcile_observe` from `bin/fm-reconcile-lib.sh` for every task in one bounded parallel batch at the start of every classification cycle.
 The library header owns the exact `state/<id>.reconciled` and `state/<id>.wait` schemas and transition mechanics.
 
 ## Runtime contract
 
-Each cycle records the endpoint, current state, source evidence, observation time, status-event sequence and signature, preceding distinct state, external-wait result, pending action token, and acknowledged token.
-The watcher writes an actionable wake to `state/.wake-queue`, advances sparse-event suppressors only to the exact status/turn-end signatures in that observation, and then acknowledges the matching token, so a crash between those operations replays safely and a completed acknowledgement survives supervisor restart.
-A prior positive `working` observation from a run-step, busy pane, or progressing task-owned command changing to any non-working observation emits one `reconciled-transition` wake immediately.
+Each cycle records repository identity, endpoint, current state, source evidence, observation time, status-event sequence and signature, preceding distinct state, external-wait result, pending action token, and consumer-acknowledged token.
+The watcher writes an actionable wake to `state/.wake-queue` and advances sparse-event suppressors only to the exact status/turn-end signatures in that observation.
+The durable daemon replays any queued reconciled action not yet accepted into its persistent escalation buffer, while a direct queue drain acknowledges only after printing the wake, so a producer or supervisor restart cannot strand delivery.
+A prior positive `working` observation from a run-step, busy pane, or progressing task-owned command losing that positive source or changing to any non-working observation emits one `reconciled-transition` wake immediately.
+That positive baseline crosses an endpoint replacement only when the persisted repository identity still matches the task metadata.
 The wake reason includes the observed status-event sequence and last event, so a claimed append that never happened remains mechanically visible when the endpoint stops.
 The watcher advances only the exact status and turn-end signatures already represented by that reconciled wake, preserving later turn-end delivery while preventing a second wake for the same transition.
 The durable daemon escalates reconciled transition, external-wait completion, and observer-failure verdicts directly instead of sending them back through stale status prose.
@@ -54,12 +56,12 @@ Persistent secondmates remain bound to their configured home through the existin
 Before this repair, no durable per-cycle observation owner existed, and the no-run fallback could repeat a stale `paused:` or `blocked:` event after a newer live transition.
 The pre-fix baseline has no `bin/fm-reconcile-lib.sh`, and the new regression suite requires that owner before running any scenario.
 
-- `tests/fm-reconcile-lib.test.sh` covers working-to-parked review, stopped-without-`done`, OAuth completion, failed and absent observers, busy absorption, acknowledgement, and restart recovery.
-- `tests/fm-reconcile-watch-e2e.test.sh` runs the real durable watcher with heartbeat and stale cadences disabled, proves each of the three production failures wakes within the classification poll, drains exactly one queued wake, and restarts quietly.
+- `tests/fm-reconcile-lib.test.sh` covers working-to-parked review, same-repository endpoint replacement, positive-source loss behind stale working prose, stopped-without-`done`, OAuth completion, signaled predicates, failed and absent observers, busy absorption, acknowledgement, and restart recovery.
+- `tests/fm-reconcile-watch-e2e.test.sh` runs the real durable watcher with heartbeat and stale cadences disabled, proves each production failure wakes within the classification poll, drains exactly one queued wake, restarts quietly, and observes a fleet in one bounded parallel batch.
 - The stopped-endpoint canary touches the existing turn-end file without appending `done`, then asserts the wake reports status-event sequence 1 and the old pause as historical evidence rather than current truth.
 - `tests/fm-crew-state-reconciled.test.sh` proves wake-time readers consume the fresh stopped state while the watcher retains a live-only evidence path.
 - `tests/fm-external-wait.test.sh` covers predicate disappearance, tracked-process completion, task-scope refusal, and owned-command progress/completion.
-- `tests/fm-daemon.test.sh` proves the durable daemon cannot re-absorb reconciled verdicts behind stale pause prose and that restart signals only the identity-matched daemon.
+- `tests/fm-daemon.test.sh` proves the durable daemon cannot re-absorb reconciled verdicts behind stale pause prose, replays an unaccepted queue handoff exactly once, and signals only the identity-matched daemon during restart.
 - `tests/fm-fleet-snapshot-view.test.sh` proves snapshot, fleet view, and bearings keep reconciled truth, prior state, status event, and observer separate.
 - `tests/fm-task-identity.test.sh` proves same-repository recovery and cross-repository refusal.
 

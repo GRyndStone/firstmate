@@ -119,6 +119,8 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-20}
+case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=20 ;; esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -557,37 +559,66 @@ scan_signals() {
   return 0
 }
 
-# Observe every task's deterministic current state and surface the first pending
-# transition or external-wait action.  fm-reconcile-lib.sh persists the state and
-# pending token before returning.  This function preserves the queue safety
-# ordering: append the wake first, advance sparse event-file suppressors only to
-# the observed signatures, then acknowledge the token, then exit.  A crash
-# anywhere before the ack
-# leaves the token pending for the restarted watcher.
+# Observe every task's deterministic current state in one bounded parallel batch
+# and surface the first pending transition or external-wait action.
+# fm-reconcile-lib.sh persists each state and pending token before returning.
+# The watcher appends the wake and advances only the represented sparse event
+# signatures; the daemon or queue drain acknowledges the token after durable
+# consumer handoff.
 reconcile_cycle() {
-  local meta id target out tag token evidence reason
+  local meta id target out tag token evidence reason marker
+  local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_evidence=''
+  batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     id=$(basename "$meta" .meta)
-    out=$(fm_reconcile_observe "$STATE" "$id") || continue
+    index=$((index + 1))
+    printf '%s\n' "$id" > "$batch_dir/$index.id" || exit 1
+    (
+      # shellcheck disable=SC2016
+      fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
+        export FM_RECONCILE_CREW_STATE_BIN=$1
+        export FM_EXTERNAL_WAIT_TIMEOUT=$2
+        . "$3"
+        fm_reconcile_observe "$4" "$5"
+      ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" \
+        "$SCRIPT_DIR/fm-reconcile-lib.sh" "$STATE" "$id"
+    ) > "$batch_dir/$index.out" 2>/dev/null &
+    pids="${pids:+$pids }$!"
+  done
+  for pid in $pids; do
+    wait "$pid" || true
+  done
+  index=1
+  while [ -f "$batch_dir/$index.id" ]; do
+    id=$(cat "$batch_dir/$index.id")
+    out=$(cat "$batch_dir/$index.out" 2>/dev/null || true)
+    index=$((index + 1))
     [ -n "$out" ] || continue
     IFS=$(printf '\t') read -r tag token evidence <<EOF
 $out
 EOF
     [ "$tag" = action ] && [ -n "$token" ] || continue
-    target=$(fm_backend_target_of_meta "$meta")
-    [ -n "$target" ] || target="fm-$id"
-    reason="stale: $target $evidence"
-    fm_wake_append stale "$target" "$reason" || exit 1
-
-    # The reconciled wake subsumes only the status/turn-end versions persisted
-    # by its observation.  The library advances suppressors to those exact
-    # signatures, never a newer append/touch that raced enqueue/ack delivery.
-    fm_reconcile_advance_seen "$STATE" "$id" || exit 1
-    fm_reconcile_ack "$STATE" "$id" "$token" || exit 1
-    mark_surfaced "$STATE/$id.status"
-    wake "$reason"
+    selected_id=$id
+    selected_token=$token
+    selected_evidence=$evidence
+    break
   done
+  for pid in "$batch_dir"/*.id "$batch_dir"/*.out; do
+    [ -e "$pid" ] && rm -f "$pid"
+  done
+  rmdir "$batch_dir" 2>/dev/null || true
+  [ -n "$selected_id" ] || return 0
+  meta="$STATE/$selected_id.meta"
+  target=$(fm_backend_target_of_meta "$meta")
+  [ -n "$target" ] || target="fm-$selected_id"
+  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token")
+  reason="stale: $target $selected_evidence $marker"
+  fm_wake_append stale "$target" "$reason" || exit 1
+
+  fm_reconcile_advance_seen "$STATE" "$selected_id" || exit 1
+  mark_surfaced "$STATE/$selected_id.status"
+  wake "$reason"
 }
 
 run_check() {

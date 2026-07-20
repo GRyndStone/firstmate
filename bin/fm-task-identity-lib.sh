@@ -2,12 +2,14 @@
 # Authoritative task-id -> repository identity validation for lifecycle reuse.
 #
 # fm_task_identity_validate <state-dir> <task-id> <proposed-project>
+# fm_task_identity_repository_key <path>
 #
 # A new id (no meta) is accepted.  An existing id is accepted only when the
 # recorded project and proposed project resolve to the same physical directory
 # or the same git common directory.  That supports normal same-repository
 # recovery and delivery worktree changes while refusing silent migration to an
 # unrelated repository.  An absent/unresolvable recorded identity fails closed.
+# The repository-key accessor is also the persisted reconciliation identity.
 
 fm_task_identity_real_dir() {  # <path>
   [ -d "$1" ] || return 1
@@ -29,6 +31,18 @@ fm_task_identity_git_common_dir() {  # <path>
   fi
 }
 
+fm_task_identity_repository_key() {  # <path>
+  local path=$1 resolved
+  resolved=$(fm_task_identity_git_common_dir "$path" 2>/dev/null || true)
+  if [ -n "$resolved" ]; then
+    printf 'git:%s\n' "$resolved"
+    return 0
+  fi
+  resolved=$(fm_task_identity_real_dir "$path" 2>/dev/null || true)
+  [ -n "$resolved" ] || return 1
+  printf 'dir:%s\n' "$resolved"
+}
+
 fm_task_identity_meta_value() {  # <meta> <key>
   local meta=$1 key=$2
   [ -f "$meta" ] || return 0
@@ -36,18 +50,13 @@ fm_task_identity_meta_value() {  # <meta> <key>
 }
 
 fm_task_identity_validate() {  # <state-dir> <task-id> <proposed-project>
-  local state=$1 id=$2 proposed=$3 meta recorded recorded_real proposed_real recorded_git proposed_git
+  local state=$1 id=$2 proposed=$3 meta recorded recorded_key proposed_key
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
   recorded=$(fm_task_identity_meta_value "$meta" project)
-  recorded_real=$(fm_task_identity_real_dir "$recorded" 2>/dev/null || true)
-  proposed_real=$(fm_task_identity_real_dir "$proposed" 2>/dev/null || true)
-  if [ -n "$recorded_real" ] && [ "$recorded_real" = "$proposed_real" ]; then
-    return 0
-  fi
-  recorded_git=$(fm_task_identity_git_common_dir "$recorded" 2>/dev/null || true)
-  proposed_git=$(fm_task_identity_git_common_dir "$proposed" 2>/dev/null || true)
-  if [ -n "$recorded_git" ] && [ "$recorded_git" = "$proposed_git" ]; then
+  recorded_key=$(fm_task_identity_repository_key "$recorded" 2>/dev/null || true)
+  proposed_key=$(fm_task_identity_repository_key "$proposed" 2>/dev/null || true)
+  if [ -n "$recorded_key" ] && [ "$recorded_key" = "$proposed_key" ]; then
     return 0
   fi
   echo "error: task id '$id' is already bound to repository '${recorded:-<unrecorded>}' and cannot be reused for '$proposed'." >&2

@@ -542,6 +542,36 @@ test_normal_supervisor_self_handle_ack_preserves_unrelated_wake() {
   pass "normal supervisor acknowledges only its self-handled wake and preserves unrelated actionables"
 }
 
+test_normal_supervisor_replays_unaccepted_reconciled_wake() {
+  local dir state record reason count
+  dir=$(make_supercase reconcile-replay)
+  state="$dir/state"
+  record="$state/task.reconciled"
+  reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence) [fm-reconcile=task,transition:1]'
+  fm_write_meta "$record" \
+    'schema=fm-reconciled.v1' \
+    'task=task' \
+    'state=idle' \
+    'source=pane' \
+    'pending_action_token=transition:1' \
+    'pending_action_reason=reconciled-transition (working -> idle from positive pane evidence)' \
+    'notified_action_token='
+  append_wake "$state" stale session:fm-task "$reason"
+
+  FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal bash -c '
+    . "$1"
+    . "$2"
+    replay_reconciled_queue "$3"
+    replay_reconciled_queue "$3"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$state" \
+    || fail "normal supervisor could not replay the queued reconciled action"
+  [ "$(fm_reconcile_record_value "$record" notified_action_token)" = 'transition:1' ] \
+    || fail "durable daemon replay did not acknowledge consumer handoff"
+  count=$(wc -l < "$state/.subsuper-escalations" 2>/dev/null || echo 0)
+  [ "$count" -eq 1 ] || fail "replayed reconciled action reached the durable consumer $count times"
+  pass "normal supervisor replays and accepts an unacknowledged queued reconciled action once"
+}
+
 # A pause whose pane became busy again (the crew resumed) drops its marker without
 # escalating, exactly like a resumed wedge.
 test_housekeeping_paused_resumed_cleared() {
@@ -1957,6 +1987,7 @@ test_normal_supervisor_quiet_hour_is_shell_only
 test_normal_supervisor_direct_pause_activity_wakes_once
 test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
+test_normal_supervisor_replays_unaccepted_reconciled_wake
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause

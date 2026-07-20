@@ -140,7 +140,11 @@ test_active_review_parks_without_stale_cadence() {
   printf 'state: parked · source: run-step · parked at fix_review: 1 finding(s)\n' > "$dir/live"
   wait_for_watch_exit "$pid" || fail "watcher did not wake for active-review -> parked: $(cat "$out")"
   assert_contains "$(cat "$out")" 'reconciled-transition (working -> parked' "active review canary woke through the wrong path"
+  [ -z "$(fm_reconcile_record_value "$state/task.reconciled" notified_action_token)" ] \
+    || fail "watcher producer acknowledged the transition before consumer delivery"
   assert_one_wake "$state" 'working -> parked'
+  [ -n "$(fm_reconcile_record_value "$state/task.reconciled" notified_action_token)" ] \
+    || fail "queue drain did not acknowledge delivered transition"
   assert_restart_quiet "$dir"
   pass "canary: running watcher wakes once for active review -> parked without stale/heartbeat cadence"
 }
@@ -315,11 +319,69 @@ SH
   pass "canary: idle harness plus advancing task-owned command stays quiet, then completion wakes once"
 }
 
+test_fleet_reconciliation_observes_tasks_in_one_bounded_batch() {
+  local dir state out pid task record start elapsed
+  dir=$(make_canary parallel-batch 'working: parallel reconciliation baseline')
+  state="$dir/state"
+  out="$dir/watch.out"
+  rm -f "$state/task.meta" "$state/task.status" "$state/task.turn-ended"
+  mkdir -p "$dir/live-tasks" "$dir/started"
+  for task in task-a task-b task-c; do
+    mkdir -p "$dir/project-$task" "$dir/worktree-$task"
+    fm_write_meta "$state/$task.meta" \
+      "window=session:fm-$task" \
+      "worktree=$dir/worktree-$task" \
+      "project=$dir/project-$task" \
+      'kind=ship'
+    printf 'working: %s baseline\n' "$task" > "$state/$task.status"
+    record="$state/$task.reconciled"
+    fm_write_meta "$record" \
+      'schema=fm-reconciled.v1' \
+      "task=$task" \
+      "endpoint=session:fm-$task" \
+      'state=working' \
+      'source=pane' \
+      'evidence=state: working · source: pane · harness busy' \
+      'observed_at=1' \
+      'transition_sequence=0' \
+      'pending_action_token=' \
+      'pending_action_reason=' \
+      'notified_action_token='
+    printf 'state: working · source: pane · harness busy\n' > "$dir/live-tasks/$task"
+  done
+  printf 'state: idle · source: pane · foreground turn ended\n' > "$dir/live-tasks/task-c"
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_PARALLEL_STARTED/$1"
+i=0
+while [ "$(find "$FM_PARALLEL_STARTED" -type f | wc -l | tr -d '[:space:]')" -lt 3 ] && [ "$i" -lt 100 ]; do
+  sleep 0.02
+  i=$((i + 1))
+done
+[ "$i" -lt 100 ] || exit 70
+cat "$FM_PARALLEL_LIVE/$1"
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  export FM_PARALLEL_STARTED="$dir/started"
+  export FM_PARALLEL_LIVE="$dir/live-tasks"
+  start=$(date +%s)
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "bounded fleet reconciliation did not surface the ready task: $(cat "$out")"
+  elapsed=$(( $(date +%s) - start ))
+  [ "$elapsed" -lt 3 ] || fail "fleet reconciliation serialized task observers (${elapsed}s)"
+  assert_contains "$(cat "$out")" 'working -> idle' "parallel fleet batch missed the actionable task"
+  assert_one_wake "$state" 'working -> idle'
+  unset FM_PARALLEL_STARTED FM_PARALLEL_LIVE
+  pass "canary: fleet tasks reconcile concurrently under one bounded observation batch"
+}
+
 test_active_review_parks_without_stale_cadence
 test_stopped_without_claimed_done_preserves_turn_end_evidence
 test_oauth_callback_completion_after_park
 test_inflight_blocked_wait_without_observer_fails_loudly
 test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
+test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
 
 echo "# fm-reconcile-watch-e2e.test.sh: all assertions passed"
