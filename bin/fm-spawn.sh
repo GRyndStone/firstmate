@@ -188,9 +188,12 @@ fi
 if [ "$BACKEND" = orca ]; then
   fm_backend_orca_runtime_check || exit 1
 fi
-ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+SPAWN_CLAIMED=0
+SPAWN_META_PUBLISHED=0
+SPAWN_ENDPOINT_CREATED=0
+SPAWN_WORKTREE_CREATED=0
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -209,48 +212,72 @@ parse_orca_worktree_result() {
   fi
 }
 
-orca_spawn_abort_cleanup() {
-  local status=$? meta_tmp
-  [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
-  ORCA_ABORT_CLEANUP=0
-  if [ -n "${ORCA_TERMINAL:-}" ]; then
-    fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+spawn_abort_cleanup() {
+  local status=$? cleanup_failed=0 rescue token
+  [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
+  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" = orca ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
+    fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
+    SPAWN_ENDPOINT_CREATED=0
   fi
-  if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-    if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        meta_tmp="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
-        {
-          echo "window=$W"
-          echo "generation=$LIFECYCLE_GENERATION"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          echo "mode=${MODE:-no-mistakes}"
-          echo "yolo=${YOLO:-off}"
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=orca"
-          echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-          [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$meta_tmp" 2>/dev/null || true
-        if [ -f "$meta_tmp" ]; then
-          fm_reconcile_lock_acquire "$STATE" "$ID"
-          if ! fm_reconcile_tombstone_active "$STATE" "$ID"; then
-            mv -f "$meta_tmp" "$STATE/$ID.meta" 2>/dev/null || true
-          fi
-          rm -f "$meta_tmp"
-          fm_reconcile_lock_release "$STATE" "$ID"
-        fi
-      fi
+  if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
+    if [ "${BACKEND:-}" = orca ]; then
+      fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || cleanup_failed=1
+    elif [ "${KIND:-}" != secondmate ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ]; then
+      (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1 || cleanup_failed=1
     fi
+  fi
+  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
+    fm_backend_kill "${BACKEND:-tmux}" "${T:-$ORCA_TERMINAL}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+  fi
+  if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend" 2>/dev/null || true
+  fi
+  if [ -n "${TASK_TMP:-}" ]; then rm -rf "$TASK_TMP" 2>/dev/null || true; fi
+  if [ -n "${STATE:-}" ] && [ -n "${ID:-}" ]; then
+    token=$(cat "$STATE/$ID.grok-turnend-token" 2>/dev/null || true)
+    case "$token" in ''|*[!A-Za-z0-9._-]*) ;; *) rm -f "${GROK_AUTH_DIR:-/nonexistent}/$token" 2>/dev/null || true ;; esac
+    rm -f "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" 2>/dev/null || true
+  fi
+  if [ "$cleanup_failed" -eq 1 ] && [ "$SPAWN_CLAIMED" -eq 1 ]; then
+    rescue="$STATE/$ID.meta.rescue.${BASHPID:-$$}"
+    {
+      if [ "${BACKEND:-tmux}" = orca ]; then echo "window=${W:-fm-$ID}"; else echo "window=${T:-${W:-fm-$ID}}"; fi
+      echo "generation=$LIFECYCLE_GENERATION"
+      echo "worktree=${WT:-}"
+      echo "project=${PROJ_ABS:-}"
+      echo "harness=${HARNESS:-}"
+      echo "kind=${KIND:-ship}"
+      echo "mode=${MODE:-no-mistakes}"
+      echo "yolo=${YOLO:-off}"
+      echo "tasktmp=${TASK_TMP:-}"
+      echo "model=${MODEL:-default}"
+      echo "effort=${EFFORT:-default}"
+      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+      [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+      [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+      [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
+      [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
+      [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
+      [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
+      [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
+      [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
+      [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
+      [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
+      [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
+    } > "$rescue" 2>/dev/null || true
+    if [ -f "$rescue" ] && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
+      SPAWN_META_PUBLISHED=1
+      SPAWN_CLAIMED=0
+    fi
+    rm -f "$rescue"
+  fi
+  if [ "$SPAWN_CLAIMED" -eq 1 ]; then
+    fm_reconcile_spawn_claim_release "$STATE" "$ID" "$LIFECYCLE_GENERATION" 2>/dev/null || true
+    SPAWN_CLAIMED=0
   fi
   return "$status"
 }
-trap orca_spawn_abort_cleanup EXIT
+trap spawn_abort_cleanup EXIT
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -684,9 +711,15 @@ PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_AB
 # persistent home through the existing home/registry validators above; its meta
 # deliberately has no project= field, so repository identity validation here
 # would break legitimate dead-endpoint recovery.
+mkdir -p "$STATE"
 if [ "$KIND" != secondmate ]; then
   fm_task_identity_bind "$STATE" "$ID" "$PROJ_ABS_REAL" || exit 1
 fi
+if ! fm_reconcile_spawn_claim "$STATE" "$ID" "$LIFECYCLE_GENERATION"; then
+  echo "error: task $ID already has an active spawn lifecycle or teardown; refusing resource creation" >&2
+  exit 1
+fi
+SPAWN_CLAIMED=1
 
 real_path_or_raw() {  # <path>
   local path=$1 real
@@ -736,6 +769,7 @@ case "$BACKEND" in
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
     WT_TARGET="$WID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -773,6 +807,7 @@ EOF
       exit 1
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
@@ -785,6 +820,7 @@ EOF
       exit 1
     fi
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
@@ -797,6 +833,7 @@ EOF
       exit 1
     fi
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   orca)
     set +e
@@ -806,13 +843,15 @@ EOF
     if [ "$ORCA_WT_STATUS" -ne 0 ]; then
       if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
         if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-          ORCA_ABORT_CLEANUP=1
+          SPAWN_WORKTREE_CREATED=1
+          [ -z "$ORCA_TERMINAL" ] || SPAWN_ENDPOINT_CREATED=1
         fi
       fi
       exit 1
     fi
     parse_orca_worktree_result "$ORCA_WT_RAW" || true
-    ORCA_ABORT_CLEANUP=1
+    [ -z "$ORCA_WORKTREE_ID" ] || SPAWN_WORKTREE_CREATED=1
+    [ -z "$ORCA_TERMINAL" ] || SPAWN_ENDPOINT_CREATED=1
     if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
       echo "error: orca did not return a worktree id/path for $W" >&2
       exit 1
@@ -822,6 +861,7 @@ EOF
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
     T="$ORCA_TERMINAL"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
 esac
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
@@ -890,6 +930,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
+  SPAWN_WORKTREE_CREATED=1
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -1062,20 +1103,13 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$META_TMP"
-fm_reconcile_lock_acquire "$STATE" "$ID"
-if fm_reconcile_tombstone_active "$STATE" "$ID"; then
-  fm_reconcile_lock_release "$STATE" "$ID"
+if ! fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$META_TMP"; then
   rm -f "$META_TMP"
-  echo "error: task $ID is actively tearing down; refusing lifecycle metadata replacement" >&2
+  echo "error: task $ID lifecycle ownership changed before metadata publication; rolling back spawn resources" >&2
   exit 1
 fi
-if ! mv -f "$META_TMP" "$STATE/$ID.meta"; then
-  fm_reconcile_lock_release "$STATE" "$ID"
-  rm -f "$META_TMP"
-  exit 1
-fi
-fm_reconcile_lock_release "$STATE" "$ID"
-[ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+SPAWN_CLAIMED=0
+SPAWN_META_PUBLISHED=1
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

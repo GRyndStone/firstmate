@@ -13,16 +13,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
+case "$ID" in ''|*[!A-Za-z0-9._-]*) echo "error: invalid task id '$ID'" >&2; exit 2 ;; esac
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
+LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$META") \
+  || { echo "error: cannot resolve task lifecycle generation for $ID" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
-
-TMP="$META.tmp"
-grep -v '^kind=' "$META" > "$TMP"
-echo "kind=ship" >> "$TMP"
-mv "$TMP" "$META"
+fm_reconcile_meta_update "$STATE" "$ID" "$LIFECYCLE_GENERATION" --set kind ship \
+  || { echo "error: task $ID lifecycle changed while promotion was pending" >&2; exit 1; }
 
 HOME_Q=$(printf '%q' "$FM_HOME")
 echo "promoted $ID to ship (teardown protection restored)"

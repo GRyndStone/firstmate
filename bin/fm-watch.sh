@@ -634,7 +634,7 @@ watch_cleanup() {
 reconcile_cycle() {
   local meta id target out tag token version evidence reason marker worker_rc failure_evidence err_tail expected_generation
   local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_version='' selected_evidence=''
-  local pending pending_version notified notified_version record_repository record_generation current_generation kind queue_rc=0
+  local pending pending_version notified notified_version record_repository record_generation current_generation kind identity_failure_delivery queue_rc=0
   batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
   RECONCILE_BATCH_DIR=$batch_dir
   RECONCILE_BATCH_PIDS=
@@ -721,10 +721,14 @@ EOF
   current_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
   kind=$(fm_reconcile_meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
+  identity_failure_delivery=0
+  case "$selected_token:$selected_evidence" in
+    observer:*:failed:observer-failure\ \(repository\ identity\ cannot\ be\ resolved\ for\ *) identity_failure_delivery=1 ;;
+  esac
   if [ "$pending" != "$selected_token" ] || [ "$pending_version" != "$selected_version" ] \
     || { [ "$notified" = "$selected_token" ] && [ "$notified_version" = "$selected_version" ]; } \
     || [ -z "$record_generation" ] || [ "$record_generation" != "$current_generation" ] \
-    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ]; }; then
+    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ] && [ "$identity_failure_delivery" -ne 1 ]; }; then
     fm_reconcile_lock_release "$STATE" "$selected_id"
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0

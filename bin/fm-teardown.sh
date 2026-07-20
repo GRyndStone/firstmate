@@ -860,7 +860,7 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc remove_rc
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -925,7 +925,11 @@ cleanup_firstmate_home_children() {
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
-    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down"
+    fm_reconcile_lock_acquire "$sub_state" "$child_id"
+    remove_rc=0
+    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
+    fm_reconcile_lock_release "$sub_state" "$child_id"
+    [ "$remove_rc" -eq 0 ] || return "$remove_rc"
   done
 }
 
@@ -1059,7 +1063,11 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
+fm_reconcile_lock_acquire "$STATE" "$ID"
+remove_rc=0
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
+fm_reconcile_lock_release "$STATE" "$ID"
+[ "$remove_rc" -eq 0 ] || exit "$remove_rc"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

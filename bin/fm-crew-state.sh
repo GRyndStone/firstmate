@@ -168,11 +168,7 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
-
-if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
-  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
-  [ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
-fi
+META_GENERATION=$(fm_reconcile_meta_generation "$META" 2>/dev/null || true)
 
 # Normal point-in-time readers consume the durable watcher's fresh reconciled
 # observation, which includes the live source that superseded a stale event log.
@@ -186,6 +182,7 @@ if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
     reconciled_endpoint=$(fm_reconcile_record_value "$RECONCILED" endpoint)
     reconciled_state=$(fm_reconcile_record_value "$RECONCILED" state)
     reconciled_source=$(fm_reconcile_record_value "$RECONCILED" source)
+    reconciled_generation=$(fm_reconcile_record_value "$RECONCILED" lifecycle_generation)
     reconciled_detail=$(fm_reconcile_record_value "$RECONCILED" detail)
     reconciled_observed=$(fm_reconcile_record_value "$RECONCILED" observed_at)
     case "$reconciled_observed" in ''|*[!0-9]*) reconciled_observed=0 ;; esac
@@ -195,7 +192,9 @@ if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
     case "$reconciled_fresh_secs" in ''|*[!0-9]*|0) reconciled_fresh_secs=60 ;; esac
     if [ -n "$BACKEND_TARGET" ] \
       && [ "$reconciled_endpoint" = "$BACKEND_TARGET" ] \
+      && { [ -z "$META_GENERATION" ] || [ -z "$reconciled_generation" ] || [ "$reconciled_generation" = "$META_GENERATION" ]; } \
       && [ -n "$reconciled_state" ] \
+      && [ "$reconciled_source" != owned-command ] \
       && [ "$reconciled_observed" -gt 0 ] \
       && [ "$reconciled_age" -le "$reconciled_fresh_secs" ]; then
       emit "$reconciled_state" "${reconciled_source:-none}" \
@@ -628,6 +627,11 @@ if [ "$HAVE_RUN" = 1 ]; then
   esac
 
   emit "$RUN_STATE" run-step "$RUN_DETAIL"
+fi
+
+if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
+  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+  [ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
 fi
 
 # --- fallback: no run attributed to this crew ------------------------------

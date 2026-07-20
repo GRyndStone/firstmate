@@ -18,6 +18,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$ROOT/bin/fm-reconcile-lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
@@ -94,9 +96,10 @@ run_pr_merge() {
 }
 
 test_records_pr_and_head_before_merging() {
-  local case_dir rc
+  local case_dir rc generation
   case_dir=$(make_case records-before-merge)
   mkdir -p "$case_dir/wt"
+  printf 'pr_head=stale-head\n' >> "$case_dir/state/task-x1.meta"
   add_gh_mocks "$case_dir" deadbeefcafefeed0000000000000000deadbeef
   : > "$case_dir/gh-axi.log"
 
@@ -111,6 +114,16 @@ test_records_pr_and_head_before_merging() {
     "records-before-merge: pr= was not recorded"
   assert_grep 'pr_head=deadbeefcafefeed0000000000000000deadbeef' "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr_head= was not recorded"
+  generation=$(grep '^generation=' "$case_dir/state/task-x1.meta" | tail -1 | cut -d= -f2-)
+  [ -n "$generation" ] || fail "records-before-merge: legacy metadata was not upgraded to an explicit lifecycle generation"
+  assert_grep 'kind=legacy-check' "$case_dir/state/task-x1.wait" \
+    "records-before-merge: merge poll was not registered as a lifecycle-owned wait"
+  assert_grep "lifecycle_generation=$generation" "$case_dir/state/task-x1.wait" \
+    "records-before-merge: merge poll registration was not bound to the current lifecycle"
+  fm_reconcile_wait_load "$case_dir/state" task-x1
+  fm_reconcile_wait_evaluate /dev/null
+  [ "$FM_RECONCILE_WAIT_RESULT" = registered ] \
+    || fail "records-before-merge: lifecycle-owned merge poll evaluated as $FM_RECONCILE_WAIT_RESULT"
   grep -qxF 'pr merge 9 --repo example/repo --squash' "$case_dir/gh-axi.log" \
     || fail "records-before-merge: gh-axi pr merge was not invoked with number, --repo, and default --squash"
   pass "fm-pr-merge records pr= and pr_head= before invoking gh-axi pr merge"

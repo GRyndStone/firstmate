@@ -729,6 +729,114 @@ test_delivery_version_is_unique_across_task_lifecycles() {
   pass "delivery versions cannot be reused across task lifecycles"
 }
 
+test_process_identity_toctou_classifies_exit_as_complete() {
+  local result evidence
+  result=$(
+    calls=0
+    fm_reconcile_pid_alive() {
+      calls=$((calls + 1))
+      [ "$calls" -eq 1 ]
+    }
+    fm_reconcile_process_identity() { return 1; }
+    FM_RECONCILE_WAIT_PRESENT=1
+    FM_RECONCILE_WAIT_KIND=process
+    FM_RECONCILE_WAIT_DESCRIPTION='exiting process'
+    FM_RECONCILE_WAIT_SIGNATURE=process-race
+    FM_RECONCILE_WAIT_PID=4242
+    FM_RECONCILE_WAIT_PID_IDENTITY='recorded identity'
+    FM_RECONCILE_WAIT_ROLE=external-wait
+    FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
+    FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION='legacy:1:2'
+    fm_reconcile_wait_evaluate /dev/null 1
+    printf '%s\t%s\n' "$FM_RECONCILE_WAIT_RESULT" "$FM_RECONCILE_WAIT_EVIDENCE"
+  )
+  IFS=$(printf '\t') read -r result evidence <<EOF
+$result
+EOF
+  [ "$result" = complete ] || fail "process exit during identity read was classified as $result"
+  assert_contains "$evidence" 'exited' "process exit race lost its completion evidence"
+  pass "process exits between liveness and identity reads complete without a false failure"
+}
+
+test_owned_command_cannot_mask_newer_terminal_state() {
+  local dir state live pid identity physical_wt out token
+  command -v pgrep >/dev/null 2>&1 || { pass "owned-command terminal authority skipped without pgrep"; return; }
+  dir=$(make_reconcile_case owned-command-terminal-authority)
+  state="$dir/state"
+  live="$dir/live"
+  physical_wt=$(cd "$dir/worktree" && pwd -P)
+  sh -c 'cd "$1" || exit 1; while :; do sleep 0.1; done' _ "$physical_wt" &
+  pid=$!
+  sleep 0.1
+  identity=$(fm_reconcile_process_identity "$pid") || { kill "$pid" 2>/dev/null || true; fail "could not identify owned command"; }
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=background validation' \
+    "pid=$pid" \
+    "pid_identity=$identity" \
+    'role=working-command' \
+    'progress_grace=30' \
+    "owner_worktree=$physical_wt" \
+    'owner_tasktmp=' \
+    'registered_at=1'
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  printf 'done: current validation completed\n' > "$state/task.status"
+  printf 'state: done · source: run-step · current run completed\n' > "$live"
+  out=$(observe "$state" "$live")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" 'reconciled-transition (working -> done' \
+    "progressing owned command masked the newer terminal transition"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = "done" ] \
+    || fail "newer terminal state was not persisted"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = run-step ] \
+    || fail "owned command replaced the authoritative terminal source"
+  token=$(printf '%s' "$out" | cut -f2)
+  [ -n "$token" ] || fail "terminal transition emitted no delivery token"
+  pass "progressing owned commands do not mask newer terminal run-step truth"
+}
+
+test_generation_cas_and_spawn_claim_revalidate_lifecycle() {
+  local dir state meta tmp stale
+  dir="$TMP_ROOT/lifecycle-cas"
+  state="$dir/state"
+  meta="$state/task.meta"
+  mkdir -p "$state"
+  fm_write_meta "$meta" 'generation=lifecycle-one' 'window=session:fm-task' 'kind=scout'
+  fm_reconcile_meta_update "$state" task lifecycle-one --set pr https://example.test/pr/1 --set kind ship \
+    || fail "same-lifecycle metadata CAS failed"
+  [ "$(fm_reconcile_meta_value "$meta" pr)" = https://example.test/pr/1 ] || fail "metadata CAS lost pr update"
+  [ "$(fm_reconcile_meta_value "$meta" kind)" = ship ] || fail "metadata CAS lost kind update"
+  fm_write_meta "$meta" 'generation=lifecycle-two' 'window=session:fm-task-replacement' 'kind=ship'
+  if fm_reconcile_meta_update "$state" task lifecycle-one --set pr https://example.test/pr/stale; then
+    fail "stale lifecycle metadata CAS overwrote a replacement"
+  fi
+  [ -z "$(fm_reconcile_meta_value "$meta" pr)" ] || fail "stale lifecycle metadata update reached replacement meta"
+
+  rm -f "$meta"
+  fm_reconcile_spawn_claim "$state" task spawn-one || fail "spawn lifecycle claim failed"
+  if fm_reconcile_spawn_claim "$state" task spawn-two; then fail "second active spawn lifecycle acquired the same task id"; fi
+  tmp="$state/task.meta.new"
+  fm_write_meta "$tmp" 'generation=spawn-one' 'window=session:fm-task-new' 'kind=ship'
+  fm_reconcile_spawn_publish "$state" task spawn-one "$tmp" || fail "owned spawn lifecycle could not publish metadata"
+  [ ! -e "$state/task.spawn-claim" ] || fail "published spawn lifecycle retained its claim"
+
+  fm_reconcile_spawn_claim "$state" task spawn-two || fail "replacement spawn lifecycle claim failed"
+  fm_write_meta "$meta" 'generation=external-replacement' 'window=session:fm-external' 'kind=ship'
+  stale="$state/task.meta.stale"
+  fm_write_meta "$stale" 'generation=spawn-two' 'window=session:fm-stale' 'kind=ship'
+  if fm_reconcile_spawn_publish "$state" task spawn-two "$stale"; then
+    fail "spawn lifecycle published after metadata ownership changed"
+  fi
+  [ "$(fm_reconcile_meta_generation "$meta")" = external-replacement ] \
+    || fail "failed spawn publication replaced current lifecycle metadata"
+  rm -f "$stale"
+  fm_reconcile_spawn_claim_release "$state" task spawn-two
+  pass "metadata CAS and spawn claims reject replacement-lifecycle races"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -753,5 +861,8 @@ test_owned_command_overrides_historical_run_state_once
 test_repository_identity_failure_preserves_proven_binding
 test_lifecycle_generation_prevents_metadata_aba_publication
 test_delivery_version_is_unique_across_task_lifecycles
+test_process_identity_toctou_classifies_exit_as_complete
+test_owned_command_cannot_mask_newer_terminal_state
+test_generation_cas_and_spawn_claim_revalidate_lifecycle
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

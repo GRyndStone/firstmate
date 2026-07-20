@@ -424,6 +424,23 @@ SH
   pass "canary: observer crashes, timeouts, and malformed output fail loudly"
 }
 
+test_first_repository_identity_failure_is_delivered() {
+  local dir state out pid
+  dir=$(make_canary first-identity-failure 'working: identity proof fixture')
+  state="$dir/state"
+  out="$dir/watch.out"
+  rm -rf "$dir/project"
+  printf 'state: working · source: pane · harness busy\n' > "$dir/live"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "watcher did not deliver the first repository identity failure: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'observer-failure (repository identity cannot be resolved' \
+    "first repository identity failure was rejected as unproven ordinary state"
+  assert_one_wake "$state" 'repository identity cannot be resolved'
+  assert_restart_quiet "$dir"
+  pass "canary: first repository identity proof failures deliver while ordinary unproven actions stay closed"
+}
+
 test_later_worker_failure_is_recorded_after_first_action_selection() {
   local dir state out pid task record
   dir=$(make_canary later-worker-failure 'working: batch failure fixture')
@@ -508,6 +525,7 @@ test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
 test_observer_crashes_and_timeouts_fail_loudly
 test_later_worker_failure_is_recorded_after_first_action_selection
+test_first_repository_identity_failure_is_delivered
 test_watcher_exit_reaps_reconciliation_workers
 
 echo "# fm-reconcile-watch-e2e.test.sh: all assertions passed"

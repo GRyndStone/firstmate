@@ -33,6 +33,10 @@ if [ -f "$RESP/$n.exit" ]; then
   exit "$(cat "$RESP/$n.exit")"
 fi
 [ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
+if [ "${FM_ORCA_BLOCK_ON_COUNT:-}" = "$n" ]; then
+  : > "${FM_ORCA_BLOCK_READY:?}"
+  while [ ! -e "${FM_ORCA_BLOCK_CONTINUE:?}" ]; do sleep 0.01; done
+fi
 exit 0
 SH
   chmod +x "$fb/orca"
@@ -664,36 +668,47 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
 }
 
-test_spawn_releases_orca_resources_when_metadata_write_fails() {
-  local proj wt data state_file config id out status
-  id="orcametafailz9"
-  proj="$TMP_ROOT/meta-fail-project"
-  wt="$TMP_ROOT/meta-fail-wt"
-  data="$TMP_ROOT/meta-fail-data"
-  state_file="$TMP_ROOT/meta-fail-state-file"
-  config="$TMP_ROOT/meta-fail-config"
+test_spawn_rolls_back_orca_resources_when_teardown_claims_lifecycle() {
+  local proj wt data state config id out_file ready continue_file pid status i=0
+  id="orcalifecycleracez9"
+  proj="$TMP_ROOT/lifecycle-race-project"
+  wt="$TMP_ROOT/lifecycle-race-wt"
+  data="$TMP_ROOT/lifecycle-race-data"
+  state="$TMP_ROOT/lifecycle-race-state"
+  config="$TMP_ROOT/lifecycle-race-config"
+  out_file="$TMP_ROOT/lifecycle-race.out"
+  ready="$TMP_ROOT/lifecycle-race.ready"
+  continue_file="$TMP_ROOT/lifecycle-race.continue"
   fm_git_worktree "$proj" "$wt" "fm/$id"
-  mkdir -p "$data/$id" "$config"
-  : > "$state_file"
+  mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
-  orca_case meta-fail
+  touch "$state/.last-watcher-beat"
+  orca_case lifecycle-race
   printf '1\n' > "$RESP/1.exit"
-  printf '{"ok":true,"result":{"repo":{"id":"repo-meta-fail"}}}\n' > "$RESP/2.out"
-  printf '{"ok":true,"result":{"worktree":{"id":"wt-meta-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
-  printf '{"ok":true,"result":{"terminal":{"handle":"term-meta-fail"}}}\n' > "$RESP/4.out"
-  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
-    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state_file" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+  printf '{"ok":true,"result":{"repo":{"id":"repo-lifecycle-race"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-lifecycle-race","path":"%s"},"terminal":{"handle":"term-lifecycle-race"}}}\n' "$wt" > "$RESP/3.out"
+  printf '{"ok":true,"result":{"terminal":{"closed":true}}}\n' > "$RESP/4.out"
+  printf '{"ok":true,"result":{"worktree":{"removed":true}}}\n' > "$RESP/5.out"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ORCA_BLOCK_ON_COUNT=3 FM_ORCA_BLOCK_READY="$ready" FM_ORCA_BLOCK_CONTINUE="$continue_file" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
-  status=$?
-  [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
-  assert_contains "$out" "File exists" "spawn should fail at the state directory creation point"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
-    "Orca spawn should close the recorded terminal when a later abort occurs"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-meta-fail'$'\x1f''--force'$'\x1f''--json' \
-    "Orca spawn should remove the recorded worktree when a later abort occurs"
-  assert_absent "$state_file/$id.meta" "metadata-write abort should not leave metadata after successful cleanup"
-  pass "fm-spawn.sh --backend orca: releases terminal and worktree on later aborts"
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca > "$out_file" 2>&1 &
+  pid=$!
+  while [ ! -e "$ready" ] && kill -0 "$pid" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.01; i=$((i + 1)); done
+  [ -e "$ready" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fail "Orca spawn did not reach resource creation with a held lifecycle claim"; }
+  touch "$state/$id.tearing-down" "$continue_file"
+  if wait "$pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Orca spawn published after teardown claimed its lifecycle"
+  assert_contains "$(cat "$out_file")" "lifecycle ownership changed" \
+    "spawn did not explain its failed lifecycle revalidation"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-lifecycle-race'$'\x1f''--json' \
+    "lifecycle-race rollback did not close the created terminal"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-lifecycle-race'$'\x1f''--force'$'\x1f''--json' \
+    "lifecycle-race rollback did not remove the created worktree"
+  assert_absent "$state/$id.meta" "lifecycle-race rollback published replacement metadata"
+  assert_absent "$state/$id.spawn-claim" "lifecycle-race rollback retained its spawn claim"
+  pass "fm-spawn.sh --backend orca: lifecycle revalidation rolls back created resources"
 }
 
 test_peek_send_and_crew_state_route_through_orca_meta() {
@@ -853,7 +868,7 @@ test_teardown_removes_orca_worktree_when_path_missing() {
   data="$TMP_ROOT/missing-path-data"
   state="$TMP_ROOT/missing-path-state"
   config="$TMP_ROOT/missing-path-config"
-  mkdir -p "$data/$id" "$state" "$config"
+  mkdir -p "$proj" "$data/$id" "$state" "$config"
   printf 'report\n' > "$data/$id/report.md"
   touch "$state/.last-watcher-beat"
   fm_write_meta "$state/$id.meta" \
@@ -885,7 +900,7 @@ test_teardown_preserves_metadata_when_orca_remove_error_json() {
   data="$TMP_ROOT/remove-error-data"
   state="$TMP_ROOT/remove-error-state"
   config="$TMP_ROOT/remove-error-config"
-  mkdir -p "$data/$id" "$state" "$config"
+  mkdir -p "$proj" "$data/$id" "$state" "$config"
   printf 'report\n' > "$data/$id/report.md"
   touch "$state/.last-watcher-beat"
   fm_write_meta "$state/$id.meta" \
@@ -1304,7 +1319,7 @@ test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
-test_spawn_releases_orca_resources_when_metadata_write_fails
+test_spawn_rolls_back_orca_resources_when_teardown_claims_lifecycle
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json
 test_target_exists_rejects_orca_error_json

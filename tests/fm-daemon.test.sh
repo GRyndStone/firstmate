@@ -580,11 +580,12 @@ test_normal_supervisor_replays_unaccepted_reconciled_wake() {
 }
 
 test_reconciled_escalation_acknowledges_before_immediate_flush() {
-  local dir state record reason status count delivered
+  local dir state record reason status count delivered queue
   dir=$(make_supercase reconcile-immediate-flush)
   state="$dir/state"
   record="$state/task.reconciled"
   reason='stale: session:fm-task reconciled-transition (working -> failed from positive run-step evidence) [fm-reconcile=task,transition:1,1]'
+  queue="$state/.wake-queue"
   fm_write_meta "$record" \
     'schema=fm-reconciled.v1' \
     'task=task' \
@@ -597,17 +598,22 @@ test_reconciled_escalation_acknowledges_before_immediate_flush() {
     'notified_action_token=' \
     'notified_action_version=0' \
     'notified_action_observation_key='
+  append_wake "$state" stale session:fm-task "$reason"
 
-  (
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    . "$2"
     escalate_flush() { exit 91; }
-    FM_ESCALATE_BATCH_SECS=0 handle_wake "$reason" "$state"
-  )
+    FM_SUPERVISE_MODE=normal FM_ESCALATE_BATCH_SECS=0 handle_wake "$3" "$4"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$reason" "$state"
   status=$?
   [ "$status" -eq 91 ] || fail "immediate-flush crash seam exited $status instead of 91"
   [ "$(fm_reconcile_record_value "$record" notified_action_token)" = transition:1 ] \
     || fail "reconciled action was not acknowledged before immediate flush"
   [ -s "$state/.subsuper-escalations" ] \
     || fail "immediate-flush crash lost the durable escalation buffer"
+  grep -F "$reason" "$queue" >/dev/null 2>&1 \
+    && fail "accepted reconciled escalation remained queued across the immediate-flush crash"
 
   handle_wake "$reason" "$state" \
     || fail "restart replay rejected the already accepted reconciled action"
@@ -615,13 +621,50 @@ test_reconciled_escalation_acknowledges_before_immediate_flush() {
   [ "$count" -eq 1 ] || fail "restart replay duplicated the durable escalation $count times"
 
   delivered="$dir/delivered"
-  (
-    inject_msg() { printf '%s\n' "$1" >> "$delivered"; }
-    FM_SUPERVISE_MODE=normal escalate_flush "$state"
-  ) || fail "restart could not flush the preserved escalation buffer"
+  FM_STATE_OVERRIDE="$state" FM_TEST_DELIVERED="$delivered" bash -c '
+    . "$1"
+    inject_msg() { printf "%s\n" "$1" >> "$FM_TEST_DELIVERED"; }
+    FM_SUPERVISE_MODE=normal escalate_flush "$2"
+  ' _ "$DAEMON" "$state" || fail "restart could not flush the preserved escalation buffer"
   [ "$(wc -l < "$delivered" 2>/dev/null || echo 0)" -eq 1 ] \
     || fail "preserved escalation buffer delivered more than once"
   pass "reconciled escalation is accepted before immediate flush and survives restart exactly once"
+}
+
+test_daemon_self_evicts_when_singleton_ownership_changes() {
+  local dir state fakebin lock pidfile daemon_pid i=0
+  dir=$(make_supercase daemon-self-evict)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lock="$state/.supervise-daemon.lock"
+  pidfile="$state/.supervise-daemon.pid"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISE_MODE=normal \
+    FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
+    FM_POLL=5 FM_HOUSEKEEPING_TICK=60 "$DAEMON" > "$dir/stdout" 2> "$dir/stderr" &
+  daemon_pid=$!
+  while { [ ! -s "$pidfile" ] || [ ! -e "$lock" ]; } && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+  if [ "$i" -ge 100 ]; then
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "daemon did not acquire its singleton lock"
+  fi
+  rm -f "$lock"
+  mkdir "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  printf '%s\n' "$$" > "$pidfile"
+  i=0
+  while kill -0 "$daemon_pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "displaced daemon continued running after singleton ownership changed"
+  fi
+  wait "$daemon_pid" || fail "self-evicted daemon exited nonzero"
+  [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] \
+    || fail "self-evicted daemon removed the replacement owner's pidfile"
+  [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] \
+    || fail "self-evicted daemon removed the replacement owner's lock"
+  pass "durable daemon self-evicts without disturbing replacement singleton ownership"
 }
 
 # A pause whose pane became busy again (the crew resumed) drops its marker without
@@ -2041,6 +2084,7 @@ test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_normal_supervisor_replays_unaccepted_reconciled_wake
 test_reconciled_escalation_acknowledges_before_immediate_flush
+test_daemon_self_evicts_when_singleton_ownership_changes
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause

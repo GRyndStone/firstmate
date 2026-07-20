@@ -1325,7 +1325,7 @@ is_wake_reason() {  # <reason>
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
-  local reason=$1 state=$2 decision action distilled task last verdict reconciled_acked=0
+  local reason=$1 state=$2 decision action distilled task last verdict
   local kind="" arg=""
   if fm_reconcile_action_parse "$reason" && ! fm_reconcile_action_pending "$state" "$reason"; then
     log "wake already accepted by durable consumer: $reason"
@@ -1333,6 +1333,9 @@ handle_wake() {  # <reason> <state>
   fi
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
+    if normal_supervision_active "$state" && command -v fm_wake_ack_payload >/dev/null 2>&1; then
+      fm_wake_ack_payload "$reason" || return 1
+    fi
     fm_reconcile_consumer_ack_reason "$state" "$reason"
     return $?
   fi
@@ -1368,16 +1371,10 @@ handle_wake() {  # <reason> <state>
     escalate)
       log "escalate: $reason -> $distilled"
       escalate_add "$state" "$distilled" || return 1
-      if ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
-        log "ERROR: normal supervisor could not acknowledge reconciled action: $reason"
-        return 1
-      fi
-      reconciled_acked=1
       # A terminal-stale escalate must not leave a persistence marker behind, or
       # housekeeping re-escalates the same pane as a false wedge later.
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
       mark_escalated_seen "$kind" "$arg" "$state"
-      [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
       ;;
     pause)
       # Declared external-wait pause: record a pause marker (long re-surface
@@ -1408,17 +1405,20 @@ handle_wake() {  # <reason> <state>
       log "self-handle: $reason -> $distilled"
       ;;
   esac
-  if [ "$action" != escalate ] && normal_supervision_active "$state" \
+  if normal_supervision_active "$state" \
     && command -v fm_wake_ack_payload >/dev/null 2>&1; then
     if ! fm_wake_ack_payload "$reason"; then
-      log "ERROR: normal supervisor could not acknowledge self-handled wake: $reason"
+      log "ERROR: normal supervisor could not acknowledge accepted wake: $reason"
       escalate_add "$state" "supervisor queue acknowledgement failed; drain wakes before continuing"
       return 1
     fi
   fi
-  if [ "$reconciled_acked" -eq 0 ] && ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
+  if ! fm_reconcile_consumer_ack_reason "$state" "$reason"; then
     log "ERROR: normal supervisor could not acknowledge reconciled action: $reason"
     return 1
+  fi
+  if [ "$action" = escalate ] && [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
+    escalate_flush "$state" || true
   fi
 }
 
@@ -1483,8 +1483,9 @@ fm_super_main() {
     fi
     exit 1
   fi
-  echo "$$" > "$PIDFILE"
-  fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
+  local DAEMON_PID=${BASHPID:-$$}
+  echo "$DAEMON_PID" > "$PIDFILE"
+  fm_pid_identity "$DAEMON_PID" > "$LOCK/pid-identity" 2>/dev/null || true
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
   # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1
@@ -1571,9 +1572,10 @@ fm_super_main() {
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
+    local flush=${1:-1}
     trap - TERM INT
     wedge_alarm_stop_active_notifier
-    escalate_flush "$STATE" 2>/dev/null || true
+    [ "$flush" -eq 0 ] || escalate_flush "$STATE" 2>/dev/null || true
     if [ -n "${WATCHER_PID:-}" ]; then
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
@@ -1582,11 +1584,12 @@ fm_super_main() {
       rm -f "$CUR_TMP" 2>/dev/null || true
     fi
     fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
+    if [ "$(cat "$PIDFILE" 2>/dev/null || true)" = "$DAEMON_PID" ]; then
+      rm -f "$PIDFILE" 2>/dev/null || true
+    fi
     log "daemon shutting down"
-    exit 0
   }
-  trap cleanup TERM INT
+  trap 'cleanup 1; exit 0' TERM INT
 
   # --- crash-loop guard -----------------------------------------------------
   local crash_times=() backoff_secs=$CRASH_NORMAL_SLEEP
@@ -1611,7 +1614,7 @@ fm_super_main() {
   start_watcher() {
     local daemon_pid daemon_identity owner_mode=away-inject
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    daemon_pid=${BASHPID:-$$}
+    daemon_pid=$DAEMON_PID
     daemon_identity=$(cat "$LOCK/pid-identity" 2>/dev/null || true)
     normal_supervision_enabled && owner_mode=normal-inject
     FM_WATCH_OWNER_KIND=daemon \
@@ -1624,6 +1627,11 @@ fm_super_main() {
 
   local rc reason
   while true; do
+    if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" != "$DAEMON_PID" ]; then
+      log "daemon singleton ownership changed; self-evicting"
+      cleanup 0
+      return 0
+    fi
     if ! replay_reconciled_queue "$STATE"; then
       log "ERROR: queued reconciled action could not reach durable consumer state; retrying"
       sleep "$CRASH_NORMAL_SLEEP"

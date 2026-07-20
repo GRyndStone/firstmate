@@ -44,4 +44,26 @@ assert_contains "$live" 'state: paused · source: status-log' \
   "live-only watcher read did not bypass the persisted observation"
 pass "crew-state readers see fresh reconciled truth while the watcher retains a live-only evidence path"
 
+fm_write_meta "$state/task.meta" \
+  "window=$window" \
+  'generation=lifecycle-two' \
+  "worktree=$wt" \
+  "project=$dir/project" \
+  'kind=ship'
+fm_write_meta "$state/task.reconciled" \
+  'schema=fm-reconciled.v1' \
+  'task=task' \
+  'lifecycle_generation=lifecycle-one' \
+  "endpoint=$window" \
+  'state=done' \
+  'source=run-step' \
+  'detail=prior lifecycle completed' \
+  "observed_at=$(date +%s)"
+out=$(PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+  FM_STATE_OVERRIDE="$state" "$CREW_STATE" task)
+assert_not_contains "$out" 'state: done' "crew-state accepted a fresh same-target observation from another lifecycle"
+assert_contains "$out" 'state: paused · source: status-log' \
+  "crew-state did not fall through to current lifecycle evidence after rejecting stale reconciliation"
+pass "crew-state rejects same-target reconciled state from another lifecycle generation"
+
 echo "# fm-crew-state-reconciled.test.sh: all assertions passed"
