@@ -259,7 +259,7 @@ fm_backend_orca_worktree_name_absent() {
   fi
   [ "$repo_state" -eq 1 ] || return 2
   repo_id=$(printf '%s' "$repo_out" | fm_backend_orca_json_get repo-id 2>/dev/null) || return 2
-  list_out=$(orca worktree list --repo "id:$repo_id" --json 2>&1) || true
+  list_out=$(orca worktree list --repo "id:$repo_id" --json 2>&1) || return 2
   printf '%s' "$list_out" | node -e '
 const fs = require("fs");
 const want = process.argv[1];
@@ -269,16 +269,10 @@ try {
 } catch (_) {
   process.exit(2);
 }
-if (!data || data.ok === false) process.exit(2);
+if (!data || data.ok !== true) process.exit(2);
 const result = data.result;
-const worktrees = Array.isArray(result)
-  ? result
-  : result && Array.isArray(result.worktrees)
-    ? result.worktrees
-    : result && Array.isArray(result.items)
-      ? result.items
-      : null;
-if (!worktrees) process.exit(2);
+if (!result || Array.isArray(result) || typeof result !== "object" || !Array.isArray(result.worktrees)) process.exit(2);
+const worktrees = result.worktrees;
 if (!worktrees.every((worktree) => {
   if (!worktree || typeof worktree !== "object") return false;
   return [worktree.displayName, worktree.display_name, worktree.name, worktree.title]

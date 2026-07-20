@@ -367,7 +367,7 @@ SH
 }
 
 test_unobservable_parked_wait_fails_loudly_once() {
-  local dir state live out token
+  local dir state live out token first_seq first_key second_seq second_key
   dir=$(make_reconcile_case unobservable-parked)
   state="$dir/state"
   live="$dir/live"
@@ -378,7 +378,13 @@ test_unobservable_parked_wait_fails_loudly_once() {
   assert_contains "$out" 'parked task has no' "parked omission wake did not identify its missing observer"
   token=$(printf '%s' "$out" | cut -f2)
   fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
+  first_seq=$(fm_reconcile_record_value "$state/task.reconciled" wait_sequence)
+  first_key=$(fm_reconcile_record_value "$state/task.reconciled" observation_key)
   [ -z "$(observe "$state" "$live")" ] || fail "unchanged parked observer omission stormed"
+  second_seq=$(fm_reconcile_record_value "$state/task.reconciled" wait_sequence)
+  second_key=$(fm_reconcile_record_value "$state/task.reconciled" observation_key)
+  [ "$second_seq" = "$first_seq" ] || fail "unchanged parked observer omission advanced its wait sequence"
+  [ "$second_key" = "$first_key" ] || fail "unchanged parked observer omission changed its dedupe key"
   pass "unobservable parked waits fail loudly once"
 }
 
@@ -760,7 +766,7 @@ SH
 }
 
 test_unmanaged_legacy_check_remains_supported_with_generation_metadata() {
-  local dir state live out
+  local dir state live out generation
   dir=$(make_reconcile_case unmanaged-legacy-check)
   state="$dir/state"
   live="$dir/live"
@@ -768,10 +774,51 @@ test_unmanaged_legacy_check_remains_supported_with_generation_metadata() {
   chmod +x "$state/task.check.sh"
   printf 'state: parked · source: status-log · waiting for custom condition\n' > "$live"
   out=$(observe "$state" "$live")
+  generation=$(fm_reconcile_meta_generation "$state/task.meta")
+  fm_reconcile_wait_load "$state" task
+  [ "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" = "$generation" ] \
+    || fail "unmanaged legacy check was not bound to the current lifecycle generation"
   assert_contains "$out" 'external-wait-complete' "unmanaged legacy check was rejected under generation metadata"
   assert_contains "$out" 'custom condition complete' "unmanaged legacy check lost its completion evidence"
   assert_not_contains "$out" 'has no task lifecycle generation' "unmanaged legacy check was mistaken for a malformed managed registration"
   pass "unmanaged per-task checks remain supported across lifecycle generation upgrades"
+}
+
+test_stderr_only_success_does_not_complete_waits() {
+  local dir state live predicate out
+  dir=$(make_reconcile_case stderr-only-predicate)
+  state="$dir/state"
+  live="$dir/live"
+  predicate="$dir/predicate.sh"
+  printf '#!/usr/bin/env bash\nprintf "predicate warning\\n" >&2\nexit 0\n' > "$predicate"
+  chmod +x "$predicate"
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=stderr-only predicate' \
+    "predicate=$predicate" \
+    'registered_at=1'
+  printf 'state: blocked · source: status-log · waiting for predicate\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_not_contains "$out" 'external-wait-complete' "stderr-only predicate success completed its wait"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" wait_state)" = pending ] \
+    || fail "stderr-only predicate success did not remain pending"
+  assert_contains "$(fm_reconcile_record_value "$state/task.reconciled" wait_evidence)" 'predicate warning' \
+    "stderr-only predicate diagnostic was lost"
+
+  dir=$(make_reconcile_case stderr-only-legacy)
+  state="$dir/state"
+  live="$dir/live"
+  printf '#!/usr/bin/env bash\nprintf "legacy warning\\n" >&2\nexit 0\n' > "$state/task.check.sh"
+  chmod +x "$state/task.check.sh"
+  printf 'state: parked · source: status-log · waiting for legacy check\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_not_contains "$out" 'external-wait-complete' "stderr-only legacy success completed its wait"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" wait_state)" = pending ] \
+    || fail "stderr-only legacy success did not remain pending"
+  assert_contains "$(fm_reconcile_record_value "$state/task.reconciled" wait_evidence)" 'legacy warning' \
+    "stderr-only legacy diagnostic was lost"
+  pass "stderr-only successful observers remain pending"
 }
 
 test_legacy_check_registration_requires_atomic_commit() {
@@ -1022,7 +1069,6 @@ test_owned_command_revalidates_identity_after_progress_observation() {
     FM_RECONCILE_WAIT_OWNER_TASKTMP=
     FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
     FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION='legacy:1:2'
-    FM_RECONCILE_WAIT_UNMANAGED_LEGACY=0
     fm_reconcile_wait_evaluate /dev/null 10
     printf '%s\t%s\t%s\n' "$FM_RECONCILE_WAIT_RESULT" "$FM_RECONCILE_WAIT_EVIDENCE" "$FM_RECONCILE_WAIT_WORKING"
   )
@@ -1328,6 +1374,7 @@ test_owned_command_overrides_older_persisted_idle
 test_owned_command_overrides_historical_wait_events
 test_registered_legacy_check_completes_once_in_reconciliation
 test_unmanaged_legacy_check_remains_supported_with_generation_metadata
+test_stderr_only_success_does_not_complete_waits
 test_legacy_check_registration_requires_atomic_commit
 test_failed_legacy_check_output_is_failure
 test_repository_identity_failure_preserves_proven_binding

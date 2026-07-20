@@ -1697,6 +1697,38 @@ test_delivered_followup_operation_recovers_without_repost() {
   pass "delivered follow-up operations finalize locally without reposting"
 }
 
+test_delivered_v2_followup_operation_migrates_without_repost() {
+  local home fakebin log meta op generation out rc hash
+  home="$TMP_ROOT/followup-delivered-v2"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  mk_linked_task "$home" task-delivered-v2 req-delivered-v2 1700000000 0
+  meta="$home/state/task-delivered-v2.meta"
+  op="$home/state/task-delivered-v2.x-followup-op"
+  generation=$(bash -c '. "$1"; fm_reconcile_meta_generation "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$meta")
+  hash=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  fm_write_meta "$op" \
+    'schema=fm-x-followup-operation.v2' \
+    'state=delivered' \
+    "generation=$generation" \
+    'request_id=req-delivered-v2' \
+    'followup_count=0' \
+    "payload_digest=sha256:$hash" \
+    'final=0' \
+    "idempotency_key=fmx-$hash"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-x-followup.sh" task-delivered-v2 - <<<"new renderer context must not repost")
+  rc=$?
+  expect_code 0 "$rc" "delivered v2 follow-up migration exit"
+  [ "$out" = req-delivered-v2 ] || fail "delivered v2 migration returned the wrong request id"
+  ! grep -F 'url=https://relay.test/connector/followup' "$log" >/dev/null 2>&1 \
+    || fail "delivered v2 follow-up operation posted again during migration"
+  assert_grep 'x_followups=1' "$meta" "delivered v2 migration did not commit its counter"
+  [ ! -e "$op" ] || fail "delivered v2 migration retained its operation record"
+  pass "delivered v2 follow-up operations migrate locally without reposting"
+}
+
 test_followup_operation_rejects_payload_mutation() {
   local home fakebin log op img rc posts
   home="$TMP_ROOT/followup-payload-mutation"; mkdir -p "$home/state"
@@ -2134,6 +2166,7 @@ test_followup_check_cap_reached_prunes_link
 test_followup_post_increments_counter_keeps_link
 test_followup_prepares_idempotency_before_post
 test_delivered_followup_operation_recovers_without_repost
+test_delivered_v2_followup_operation_migrates_without_repost
 test_followup_operation_rejects_payload_mutation
 test_concurrent_followups_serialize_link_count
 test_followup_and_relink_are_one_cas_boundary

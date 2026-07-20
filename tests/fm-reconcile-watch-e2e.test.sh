@@ -223,6 +223,31 @@ SH
   pass "canary: running watcher wakes once when a parked OAuth callback completes"
 }
 
+test_unmanaged_task_check_has_one_execution_owner() {
+  local dir state out pid count
+  dir=$(make_canary unmanaged-check-owner 'working: waiting for custom poll')
+  state="$dir/state"
+  out="$dir/watch.out"
+  count="$dir/check-count"
+  cat > "$state/task.check.sh" <<'SH'
+#!/usr/bin/env bash
+n=$(cat "$FM_LEGACY_COUNT" 2>/dev/null || echo 0)
+printf '%s\n' "$((n + 1))" > "$FM_LEGACY_COUNT"
+SH
+  chmod +x "$state/task.check.sh"
+  printf 'state: working · source: pane · harness busy\n' > "$dir/live"
+  export FM_LEGACY_COUNT="$count"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_record_state "$state/task.reconciled" working || fail "watcher did not reconcile unmanaged task check fixture"
+  sleep 0.25
+  [ "$(cat "$count" 2>/dev/null || true)" = 1 ] \
+    || { stop_watch "$pid"; fail "unmanaged task check executed more than once in one watcher cycle"; }
+  stop_watch "$pid"
+  unset FM_LEGACY_COUNT
+  pass "canary: unmanaged task checks have one reconciliation owner"
+}
+
 test_inflight_blocked_wait_without_observer_fails_loudly() {
   local dir state out pid
   dir=$(make_canary inflight-unregistered 'blocked: callback listener running without registered completion observation')
@@ -584,6 +609,7 @@ SH
 test_active_review_parks_without_stale_cadence
 test_stopped_without_claimed_done_preserves_turn_end_evidence
 test_oauth_callback_completion_after_park
+test_unmanaged_task_check_has_one_execution_owner
 test_inflight_blocked_wait_without_observer_fails_loudly
 test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes

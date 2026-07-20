@@ -340,19 +340,39 @@ followup_operation_write() {  # <prepared|delivered> <key>
 
 OP_STATE=
 OP_KEY=
+OP_FINAL=$FINAL
 if [ -f "$FOLLOWUP_OP" ] \
   && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
   && [ "$(followup_operation_value request_id)" = "$RID" ] \
   && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
-  if [ "$(followup_operation_value schema)" != fm-x-followup-operation.v3 ] \
-    || [ "$(followup_operation_value payload_digest)" != "$PAYLOAD_DIGEST" ] \
-    || [ "$(followup_operation_value final)" != "$FINAL" ] \
-    || [ "$(followup_operation_value idempotency_key)" != "$EXPECTED_OP_KEY" ]; then
-    echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
-    exit 1
-  fi
+  OP_SCHEMA=$(followup_operation_value schema)
   OP_STATE=$(followup_operation_value state)
-  OP_KEY=$EXPECTED_OP_KEY
+  case "$OP_SCHEMA:$OP_STATE" in
+    fm-x-followup-operation.v3:prepared|fm-x-followup-operation.v3:delivered)
+      if [ "$(followup_operation_value payload_digest)" != "$PAYLOAD_DIGEST" ] \
+        || [ "$(followup_operation_value final)" != "$FINAL" ] \
+        || [ "$(followup_operation_value idempotency_key)" != "$EXPECTED_OP_KEY" ]; then
+        echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
+        exit 1
+      fi
+      OP_KEY=$EXPECTED_OP_KEY
+      ;;
+    fm-x-followup-operation.v2:delivered)
+      OP_DIGEST=$(followup_operation_value payload_digest)
+      OP_KEY=$(followup_operation_value idempotency_key)
+      OP_FINAL=$(followup_operation_value final)
+      case "$OP_DIGEST:$OP_KEY:$OP_FINAL" in
+        sha256:*:fmx-*:0|sha256:*:fmx-*:1) ;;
+        *) echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1 ;;
+      esac
+      [ "$OP_KEY" = "fmx-${OP_DIGEST#sha256:}" ] \
+        || { echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1; }
+      ;;
+    *)
+      echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
+      exit 1
+      ;;
+  esac
 fi
 case "$OP_STATE:$OP_KEY" in
   prepared:*|delivered:*)
@@ -398,12 +418,14 @@ fi
 
 case "$post_rc" in
   0)
-    followup_operation_write delivered "$OP_KEY" || {
-      echo "fm-x-followup: posted but could not persist the delivered operation for $ID" >&2
-      exit 1
-    }
+    if [ "$OP_STATE" != delivered ]; then
+      followup_operation_write delivered "$OP_KEY" || {
+        echo "fm-x-followup: posted but could not persist the delivered operation for $ID" >&2
+        exit 1
+      }
+    fi
     NEWCOUNT=$((COUNT + 1))
-    if [ "$FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
+    if [ "$OP_FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
       if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
         echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
         exit 1

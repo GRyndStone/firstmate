@@ -1046,7 +1046,8 @@ while :; do
       [ -e "$c" ] || continue
       check_id=${c##*/}
       check_id=${check_id%.check.sh}
-      if fm_reconcile_legacy_check_is_managed "$STATE" "$check_id" "$c"; then
+      if [ -f "$STATE/$check_id.meta" ] \
+        || fm_reconcile_legacy_check_is_managed "$STATE" "$check_id" "$c"; then
         continue
       fi
       out=$(run_check "$c")

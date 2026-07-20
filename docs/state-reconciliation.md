@@ -23,7 +23,7 @@ Fleet view and bearings consume that snapshot, and bearings never substitutes th
 ## Observable external waits
 
 Register an observer before appending `paused:`, `blocked:`, or a parked wait and parking foreground work.
-A predicate is an executable with no shell evaluation: exit 0 means complete, exit 1 means pending, and any other exit or a timeout is an actionable failure.
+A predicate is an executable with no shell evaluation: exit 0 with a non-empty stdout completion signal means complete, exit 0 without one or exit 1 means pending, and any other exit or a timeout is an actionable failure.
 A process registration captures both the pid and its operating-system identity, so process exit or pid reuse is completion while the identical live process remains pending.
 
 ```sh

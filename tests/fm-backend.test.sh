@@ -917,7 +917,7 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
 }
 
 test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
-  local dir proj invalid data state config log fb out status id kill_line lease_recheck_line
+  local dir proj invalid data state config log fb out status id kill_line return_line lease_recheck_line
   dir="$TMP_ROOT/spawn-invalid-treehouse"
   proj="$dir/project"
   invalid="$dir/not-a-worktree"
@@ -957,14 +957,67 @@ SH
   assert_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force'$'\x1f'"$invalid" \
     "spawn validation failure did not clean its uncertain treehouse worktree"
   kill_line=$(grep -nF $'tmux\x1f''kill-window' "$log" | tail -1 | cut -d: -f1)
+  return_line=$(grep -nF $'treehouse\x1f''return'$'\x1f''--force' "$log" | tail -1 | cut -d: -f1)
   lease_recheck_line=$(grep -nF $'treehouse\x1f''status' "$log" | tail -1 | cut -d: -f1)
-  [ -n "$kill_line" ] && [ -n "$lease_recheck_line" ] && [ "$kill_line" -lt "$lease_recheck_line" ] \
-    || fail "spawn cleanup did not recheck treehouse lease absence after endpoint cleanup"
+  [ -n "$kill_line" ] && [ -n "$return_line" ] && [ -n "$lease_recheck_line" ] \
+    && [ "$kill_line" -lt "$return_line" ] && [ "$return_line" -lt "$lease_recheck_line" ] \
+    || fail "spawn cleanup did not verify endpoint cleanup before returning and rechecking its treehouse lease"
   [ ! -e "$state/$id.spawn-claim" ] \
     || fail "verified treehouse cleanup retained spawn ownership"
   assert_contains "$out" 'did not yield an isolated worktree' \
     "spawn validation failure did not report the invalid treehouse path"
   pass "fm-spawn cleans treehouse worktrees when validation fails"
+}
+
+test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed() {
+  local dir proj invalid data state config log fb out status id
+  dir="$TMP_ROOT/spawn-unconfirmed-endpoint"
+  proj="$dir/project"
+  invalid="$dir/not-a-worktree"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/log"
+  id=unconfirmedendpointz8
+  fm_git_init_commit "$proj"
+  mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
+  printf 'brief\n' > "$data/$id/brief.md"
+  fb="$dir/fakebin"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
+    printf 'firstmate\\n'
+    ;;
+  new-window) printf '@9\\n' ;;
+  list-windows)
+    case " \$* " in *' -a '*) printf 'firstmate:fm-$id\\n' ;; esac
+    ;;
+esac
+exit 0
+SH
+  cat > "$fb/treehouse" <<'SH'
+#!/usr/bin/env bash
+{ printf 'treehouse'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
+exit 0
+SH
+  chmod +x "$fb/tmux" "$fb/treehouse"
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unconfirmed endpoint cleanup fixture unexpectedly spawned"
+  assert_not_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force' \
+    "unconfirmed endpoint cleanup returned its treehouse worktree"
+  assert_grep 'spawn_endpoint_uncertain=1' "$state/$id.meta" \
+    "unconfirmed endpoint cleanup did not preserve endpoint uncertainty"
+  assert_grep 'spawn_worktree_uncertain=1' "$state/$id.meta" \
+    "unconfirmed endpoint cleanup released treehouse ownership"
+  assert_grep "spawn_treehouse_holder=$id-" "$state/$id.meta" \
+    "unconfirmed endpoint cleanup omitted its treehouse lease holder"
+  assert_contains "$out" 'did not yield an isolated worktree' \
+    "unconfirmed endpoint cleanup fixture did not reach abort cleanup"
+  pass "fm-spawn retains treehouse ownership until endpoint cleanup is proven"
 }
 
 # --- old vs new: fm-teardown.sh ----------------------------------------------
@@ -1219,6 +1272,7 @@ test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
 test_spawn_validation_failure_cleans_uncertain_treehouse_worktree
+test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed
 test_teardown_quiesces_endpoint_before_treehouse_return
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag

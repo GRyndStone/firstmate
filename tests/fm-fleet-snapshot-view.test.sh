@@ -593,6 +593,32 @@ test_snapshot_rejects_stale_generation_reconciliation() {
   pass "snapshot rejects stale-generation reconciliation data"
 }
 
+test_snapshot_reports_unmanaged_check_as_lifecycle_current() {
+  local home fakebin out
+  home=$(make_home unmanaged-check-generation)
+  mkdir -p "$home/projects/unmanaged-check"
+  fm_write_meta "$home/state/unmanaged-check.meta" \
+    'generation=current-generation' \
+    'window=firstmate:fm-unmanaged-check' \
+    "worktree=$home/projects/unmanaged-check" \
+    "project=$home/projects/unmanaged-check" \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship'
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$home/state/unmanaged-check.check.sh"
+  chmod +x "$home/state/unmanaged-check.check.sh"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "unmanaged-check")
+    | .external_wait.registered == true
+      and .external_wait.kind == "legacy-check"
+      and .external_wait.lifecycle_generation == "current-generation"
+      and .external_wait.lifecycle_current == true
+  ' >/dev/null || fail "snapshot reported the controlling unmanaged check as historical: $out"
+  pass "snapshot lifecycle-binds unmanaged task checks"
+}
+
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
 # append-only stream. This is the fmdev masking bug: last-event-wins read the trailing
 # `done` and reported pending_decision=false while a needs-decision was still open. The
@@ -755,3 +781,4 @@ test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
 test_snapshot_separates_reconciled_truth_event_history_and_wait
 test_snapshot_rejects_stale_generation_reconciliation
+test_snapshot_reports_unmanaged_check_as_lifecycle_current

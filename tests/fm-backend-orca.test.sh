@@ -29,10 +29,10 @@ if [ "${1:-}" = status ] && [ "${FM_ORCA_STATUS_RESPONSE:-ready}" != sequence ];
 fi
 n=$next
 echo "$n" > "$COUNT_FILE"
+[ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
 if [ -f "$RESP/$n.exit" ]; then
   exit "$(cat "$RESP/$n.exit")"
 fi
-[ -f "$RESP/$n.out" ] && cat "$RESP/$n.out"
 if [ "${FM_ORCA_BLOCK_ON_COUNT:-}" = "$n" ]; then
   : > "${FM_ORCA_BLOCK_READY:?}"
   while [ ! -e "${FM_ORCA_BLOCK_CONTINUE:?}" ]; do sleep 0.01; done
@@ -367,6 +367,13 @@ test_worktree_name_absence_is_repository_scoped_and_fail_closed() {
   printf '{}\n' > "$RESP/6.out"
   printf '{"ok":false,"error":{"code":"repository_not_found"}}\n' > "$RESP/7.out"
   printf '{"ok":false,"error":{"code":"permission_denied"}}\n' > "$RESP/8.out"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/9.out"
+  printf '{"result":{"worktrees":[]}}\n' > "$RESP/10.out"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/11.out"
+  printf '{"ok":true,"result":[]}\n' > "$RESP/12.out"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/13.out"
+  printf '{"ok":true,"result":{"worktrees":[]}}\n' > "$RESP/14.out"
+  printf '1\n' > "$RESP/14.exit"
   set +e
   PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
@@ -391,6 +398,24 @@ test_worktree_name_absence_is_repository_scoped_and_fail_closed() {
   status=$?
   set -e
   expect_code 2 "$status" "non-absence repository errors must remain unknown"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "Orca worktree inventory without ok:true must remain unknown"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "alternate Orca worktree result shapes must remain unknown"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "nonzero Orca worktree-list status must remain unknown despite success-shaped output"
   assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''list'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--json' \
     "Orca name absence did not bind inventory to the persisted repository"
   set +e

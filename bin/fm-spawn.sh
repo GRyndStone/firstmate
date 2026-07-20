@@ -245,26 +245,6 @@ spawn_abort_cleanup() {
         cleanup_failed=1
       fi
     fi
-  elif [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] \
-    && [ "${KIND:-}" != secondmate ] && [ -n "${PROJ_ABS:-}" ]; then
-    if [ -z "${WT:-}" ]; then
-      if WT=$(fm_backend_treehouse_lease_path "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"); then
-        :
-      elif fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
-        SPAWN_WORKTREE_CREATED=0
-      else
-        cleanup_failed=1
-      fi
-    fi
-    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${WT:-}" ]; then
-      if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" bash -c \
-        'cd "$1" && treehouse return --force "$2"' fm-treehouse-return "$PROJ_ABS" "$WT" >/dev/null 2>&1 \
-        && fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
-        SPAWN_WORKTREE_CREATED=0
-      else
-        cleanup_failed=1
-      fi
-    fi
   fi
   if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" != orca ]; then
     case "${BACKEND:-tmux}" in
@@ -314,6 +294,28 @@ spawn_abort_cleanup() {
       cleanup_failed=1
     else
       SPAWN_ENDPOINT_CREATED=0
+    fi
+  fi
+  if [ "${BACKEND:-}" != orca ] && [ "${KIND:-}" != secondmate ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] \
+    && [ -n "${PROJ_ABS:-}" ]; then
+    if [ -z "${WT:-}" ]; then
+      if WT=$(fm_backend_treehouse_lease_path "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"); then
+        :
+      elif fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${WT:-}" ]; then
+      if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" bash -c \
+        'cd "$1" && treehouse return --force "$2"' fm-treehouse-return "$PROJ_ABS" "$WT" >/dev/null 2>&1 \
+        && fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
     fi
   fi
   if [ "${BACKEND:-}" != orca ] && [ "${KIND:-}" != secondmate ] \
