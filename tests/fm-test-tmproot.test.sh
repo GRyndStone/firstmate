@@ -161,13 +161,48 @@ test_command_substitution_is_unsafe_and_static_rejected() {
 
   scan_tmproot_command_substitutions() {
     local scan_root=$1 scan_output status
-    if ! command -v rg >/dev/null 2>&1; then
-      printf 'rg is required for the fm_test_tmproot static scan\n' >&2
+    if ! command -v perl >/dev/null 2>&1; then
+      printf 'perl is required for the fm_test_tmproot static scan\n' >&2
       return 127
     fi
-    scan_output=$(rg -U -n --pcre2 \
-      '(?m:^[\t ]*# fm-tmproot-static-allow:.*(?:\n|$))(*SKIP)(*F)|(?s:\$\((?:(?>\x27[^\x27]*\x27)|(?:"(?:\\.|[^"\\])*")|(?:#[^\n]*(?:\n|$))|(?:\\.)|[^\x27"\\#)])*?\bfm_test_tmproot\b)' \
-      "$scan_root" --glob '*.sh' 2>&1)
+    scan_output=$(perl -MFile::Find -e '
+      use strict;
+      use warnings;
+      my $root = shift;
+      my $failed = 0;
+      find(
+        {
+          no_chdir => 1,
+          wanted => sub {
+            return unless -f $_ && /[.]sh\z/;
+            my $file = $File::Find::name;
+            open my $fh, "<", $file or do {
+              warn "$file: $!\n";
+              $failed = 1;
+              return;
+            };
+            local $/;
+            my $source = <$fh> // "";
+            close $fh or do {
+              warn "$file: $!\n";
+              $failed = 1;
+              return;
+            };
+            while ($source =~ /(?m:^[\t ]*# fm-tmproot-static-allow:.*(?:\n|$))(*SKIP)(*F)|(?s:\$\((?:(?>\x27[^\x27]*\x27)|(?:"(?:\\.|[^"\\])*")|(?:#[^\n]*(?:\n|$))|(?:\\.)|[^\x27"\\#)])*?\bfm_test_tmproot\b)/g) {
+              my $prefix = substr($source, 0, $-[0]);
+              my $line = 1 + ($prefix =~ tr/\n//);
+              my $line_start = rindex($source, "\n", $-[0] - 1) + 1;
+              my $line_end = index($source, "\n", $+[0]);
+              $line_end = length($source) if $line_end < 0;
+              my $matching_lines = substr($source, $line_start, $line_end - $line_start);
+              print "$file:$line:$matching_lines\n";
+            }
+          },
+        },
+        $root
+      );
+      exit $failed;
+    ' "$scan_root" 2>&1)
     status=$?
     case "$status" in
       0|1) printf '%s' "$scan_output" ;;
@@ -194,10 +229,6 @@ test_command_substitution_is_unsafe_and_static_rejected() {
   scan_status=$?
   [ "$scan_status" -eq 0 ] || fail "wrapped fixture scan failed with $scan_status"
   assert_contains "$hits" "TMPDIR=/tmp fm_test_tmproot ROOT wrapped" "wrapped command substitution bypassed the scanner"
-
-  hits=$(PATH="$fixture/no-rg" scan_tmproot_command_substitutions "$fixture" 2>&1)
-  scan_status=$?
-  [ "$scan_status" -eq 127 ] || fail "missing-rg scan must fail closed, got $scan_status"
 
   hits=$(scan_tmproot_command_substitutions "$REPO_ROOT/tests")
   scan_status=$?
