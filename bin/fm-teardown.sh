@@ -882,10 +882,10 @@ cleanup_firstmate_home_children() {
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       fi
     fi
+    fm_reconcile_teardown_begin "$sub_state" "$child_id" || return 1
     if [ -n "$child_t" ]; then
       # Tombstone for the child home's own watcher, same contract as the main
       # task path: a mid-teardown gone endpoint is teardown, not a crew death.
-      touch "$sub_state/$child_id.tearing-down"
       if [ "$child_backend" = zellij ]; then
         # Zellij titles are scoped by the owning home tag, so forced secondmate
         # cleanup must verify child tabs as that child home, not the parent.

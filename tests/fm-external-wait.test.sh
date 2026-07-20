@@ -14,9 +14,10 @@ state="$TMP_ROOT/state"
 wt="$TMP_ROOT/worktree"
 live="$TMP_ROOT/live"
 fake="$TMP_ROOT/fm-crew-state.sh"
-mkdir -p "$state" "$wt"
+mkdir -p "$state" "$wt" "$TMP_ROOT/project"
 fm_write_meta "$state/task.meta" \
   'window=session:fm-task' \
+  'generation=lifecycle-one' \
   "worktree=$wt" \
   "project=$TMP_ROOT/project" \
   'kind=ship'
@@ -55,7 +56,7 @@ SH
   assert_contains "$out" 'external-wait-failed' "a registered predicate disappearing did not fail loudly"
   assert_contains "$out" 'predicate missing or not executable' "missing predicate failure lost its evidence"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "could not acknowledge missing-predicate failure"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge missing-predicate failure"
   [ -z "$(observe)" ] || fail "acknowledged missing predicate emitted a duplicate"
   if FM_STATE_OVERRIDE="$state" "$WAIT" register-predicate task "$TMP_ROOT/no-such-predicate" 2> "$err"; then
     fail "registration accepted a missing completion predicate"
@@ -78,7 +79,7 @@ test_process_completion_signal() {
   assert_contains "$out" 'external-wait-complete' "tracked process exit did not emit completion"
   assert_contains "$out" "registered process $pid exited" "process completion lost its exact evidence"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "could not acknowledge tracked process completion"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge tracked process completion"
   [ -z "$(observe)" ] || fail "acknowledged process completion emitted a duplicate"
   pass "tracked process identity emits exactly one model-free completion signal"
 }
@@ -137,7 +138,7 @@ test_owned_command_progress_and_scope() {
   out=$(observe)
   assert_contains "$out" 'external-wait-complete' "owned command exit did not emit immediate completion"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "could not acknowledge owned-command completion"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge owned-command completion"
   [ -z "$(observe)" ] || fail "acknowledged owned-command completion emitted a duplicate"
   pass "task-owned command progress is positive working evidence, scope is enforced, and exit wakes once"
 }
@@ -165,10 +166,69 @@ test_stalled_owned_command_ages_out() {
   assert_contains "$out" 'reconciled-transition (working -> idle from positive owned-command evidence' \
     "stalled owned command did not surface its loss of positive progress"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "could not acknowledge stalled-command transition"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge stalled-command transition"
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   pass "a live but non-progressing registered command ages out instead of masking a wedge indefinitely"
+}
+
+test_registration_and_clear_revalidate_serialized_lifecycle() {
+  local predicate register_pid clear_pid i err trace
+  predicate="$TMP_ROOT/serialized-predicate.sh"
+  err="$TMP_ROOT/serialized-register.err"
+  trace="$TMP_ROOT/serialized-clear.trace"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$predicate"
+  FM_STATE_OVERRIDE="$state" "$WAIT" clear task >/dev/null || fail "could not clear prior registration"
+  fm_reconcile_lock_acquire "$state" task
+  FM_STATE_OVERRIDE="$state" "$WAIT" register-predicate task "$predicate" 'serialized registration' > /dev/null 2> "$err" &
+  register_pid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    find "$state" -maxdepth 1 -name 'task.wait.tmp.*' -print | grep -q . && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$i" -lt 100 ] || { fm_reconcile_lock_release "$state" task; kill "$register_pid" 2>/dev/null || true; fail "registration did not reach serialized publication"; }
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task' \
+    'generation=lifecycle-two' \
+    "worktree=$wt" \
+    "project=$TMP_ROOT/project" \
+    'kind=ship'
+  fm_reconcile_lock_release "$state" task
+  if wait "$register_pid"; then fail "registration attached to a replacement lifecycle"; fi
+  [ ! -e "$state/task.wait" ] || fail "failed old-lifecycle registration published a wait file"
+  assert_contains "$(cat "$err")" 'lifecycle changed' "registration lifecycle race did not explain its refusal"
+
+  FM_STATE_OVERRIDE="$state" "$WAIT" register-predicate task "$predicate" 'current registration' >/dev/null \
+    || fail "current lifecycle predicate registration failed"
+  fm_reconcile_lock_acquire "$state" task
+  FM_STATE_OVERRIDE="$state" bash -x "$WAIT" clear task > /dev/null 2> "$trace" &
+  clear_pid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -q 'fm_reconcile_lock_acquire' "$trace" 2>/dev/null && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$i" -lt 100 ] || { fm_reconcile_lock_release "$state" task; kill "$clear_pid" 2>/dev/null || true; fail "clear did not reach serialized publication"; }
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=replacement registration' \
+    'registration_id=replacement-registration' \
+    'lifecycle_generation=lifecycle-two' \
+    "predicate=$predicate" \
+    'registered_at=2'
+  fm_reconcile_lock_release "$state" task
+  if wait "$clear_pid"; then fail "clear removed a replacement wait registration"; fi
+  [ -e "$state/task.wait" ] || fail "clear race deleted the replacement registration"
+  assert_contains "$(cat "$trace")" 'registration changed while clear was pending' "clear race did not explain its refusal"
+  pass "external-wait registration and clear serialize and revalidate lifecycle ownership"
 }
 
 test_help_without_task_id() {
@@ -181,6 +241,7 @@ test_predicate_registration_and_missing_failure
 test_process_completion_signal
 test_owned_command_progress_and_scope
 test_stalled_owned_command_ages_out
+test_registration_and_clear_revalidate_serialized_lifecycle
 test_help_without_task_id
 
 echo "# fm-external-wait.test.sh: all assertions passed"

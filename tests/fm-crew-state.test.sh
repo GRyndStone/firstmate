@@ -129,7 +129,7 @@ SH
 make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
   local dir=$1 tb="$1/notimeoutbin" tool real
   mkdir -p "$tb"
-  for tool in bash git grep sed head cut tail dirname perl; do
+  for tool in bash git grep sed head cut tail dirname perl mkdir uname stat date; do
     real=$(command -v "$tool" || true)
     [ -n "$real" ] || fail "missing tool for no-timeout path: $tool"
     ln -s "$real" "$tb/$tool"
@@ -893,7 +893,7 @@ test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle() {
 test_idle_herdr_with_progressing_owned_command_is_working() {
   command -v jq >/dev/null 2>&1 || { pass "owned-command Herdr case skipped without jq"; return; }
   reset_fakes
-  local d pid out cwd physical_wt i=0
+  local d pid out live_only_out cwd physical_wt i=0
   d=$(new_case herdr-idle-owned-command)
   make_repo_on_branch "$d/wt" fm/feat-owned-command
   make_fakebin "$d" >/dev/null
@@ -916,18 +916,21 @@ test_idle_herdr_with_progressing_owned_command_is_working() {
   FM_OWNED_COMMAND_PROGRESS_GRACE=2 FM_STATE_OVERRIDE="$d/state" \
     "$ROOT/bin/fm-external-wait.sh" register-command feat-owned-command "$pid" 'background full suite' >/dev/null \
     || { kill "$pid" 2>/dev/null || true; fail "could not register task-owned full suite"; }
-  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-owned-command)"
   FM_FAKE_RUNS_LIST=""
   FM_FAKE_TMUX_MISSING=1
   FM_FAKE_HERDR_AGENT_STATUS=idle
   FM_FAKE_HERDR_BUSY=0
+  live_only_out=$(FM_CREW_STATE_LIVE_ONLY=1 run_crew_state "$d" feat-owned-command)
   out=$(run_crew_state "$d" feat-owned-command)
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   assert_contains "$out" 'state: working' "progressing task-owned command did not override idle harness"
   assert_contains "$out" 'source: owned-command' "owned command was not exposed as a distinct current-state source"
   assert_contains "$out" 'descendant progress observed' "owned command current state omitted progress freshness"
-  pass "idle Herdr harness plus progressing identity-bound task command remains positive working evidence"
+  assert_contains "$live_only_out" 'state: parked' "live-only read did not expose the underlying historical run state"
+  assert_not_contains "$live_only_out" 'source: owned-command' "live-only read double-observed the owned command"
+  pass "progressing owned commands override historical runs without double observation"
 }
 
 # (g) no run + idle pane -> the status-log verb, as-is

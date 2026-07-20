@@ -307,7 +307,7 @@ test_lock_does_not_steal_live_lock() {
 }
 
 test_lock_reclaims_reused_pid_identity() {
-  local dir state lockdir live out newpid
+  local dir state lockdir live fresh out newpid
   dir=$(make_case lock-reused-pid)
   state="$dir/state"
   lockdir="$state/.contend.lock"
@@ -316,6 +316,12 @@ test_lock_reclaims_reused_pid_identity() {
   mkdir "$lockdir"
   printf '%s\n' "$live" > "$lockdir/pid"
   printf '%s\n' 'stale process identity' > "$lockdir/pid-identity"
+  fresh=$(FM_LOCK_IDENTITY_GRACE=60 FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then echo acquired; else echo held; fi
+  ' _ "$LIB" "$lockdir")
+  [ "$fresh" = held ] || fail "identity-mismatched live-pid lock was reclaimed before its grace elapsed"
+  touch -t 200001010000 "$lockdir"
   out=$(FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     if fm_lock_try_acquire "$2" 1; then cat "$2/pid"; else exit 7; fi
@@ -326,7 +332,30 @@ test_lock_reclaims_reused_pid_identity() {
   newpid=$out
   [ -n "$newpid" ] && [ "$newpid" != "$live" ] \
     || fail "identity-mismatched lock retained the reused pid: $out"
-  pass "identity-mismatched live-pid lock is reclaimed without signaling the reused process"
+  pass "identity-mismatched live-pid lock is reclaimed after grace without signaling the reused process"
+}
+
+test_lock_reclaims_missing_identity_after_grace() {
+  local dir state lockdir live out newpid
+  dir=$(make_case lock-missing-identity)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  touch -t 200001010000 "$lockdir"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then cat "$2/pid"; else exit 7; fi
+  ' _ "$LIB" "$lockdir") || fail "stale live-pid lock with missing identity was not reclaimed"
+  kill -0 "$live" 2>/dev/null || fail "reclaiming a missing-identity lock killed the unrelated pid"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  newpid=$out
+  [ -n "$newpid" ] && [ "$newpid" != "$live" ] \
+    || fail "missing-identity lock retained the unrelated live pid: $out"
+  pass "missing lock identity recovers after a bounded grace"
 }
 
 test_lock_empty_pid_uses_minimum_grace() {
@@ -677,33 +706,34 @@ test_arm_waits_for_peer_beacon_after_child_stands_down() {
   pass "arm attaches to a peer watcher after child stands down and exits when peer dies"
 }
 
-test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
-  local dir state fakebin armout live armpid status
-  dir=$(make_case arm-failed-stale)
+test_arm_recovers_missing_identity_after_grace() {
+  local dir state fakebin armout live armpid watcher_pid i
+  dir=$(make_case arm-recovers-missing-identity)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   sleep 300 &
   live=$!
-  # A live process holds the lock but is NOT a confirmable watcher (no identity),
-  # and the beacon is stale. The fresh child cannot steal a LIVE lock, so no
-  # watcher can ever be confirmed - the honest answer is FAILED, not healthy.
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   touch -t 200001010000 "$state/.last-watcher-beat"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" > "$armout" &
+  touch -t 200001010000 "$state/.watch.lock"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=5 "$WATCH_ARM" > "$armout" &
   armpid=$!
-  wait_for_exit "$armpid" 120
-  status=$?
-  [ "$status" -ne 124 ] || fail "arm never returned for an unconfirmable watcher"
-  [ "$status" -ne 0 ] || fail "arm exited zero when no fresh watcher could be confirmed"
-  grep -F 'watcher: FAILED - no live watcher with a fresh beacon' "$armout" >/dev/null || fail "arm did not print the FAILED line"
-  ! grep -qE 'watcher: (healthy|attached)' "$armout" || fail "arm reported attached/healthy off a stale beacon"
-  ! grep -qF 'watcher: started' "$armout" || fail "arm falsely reported started"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ "$i" -lt 100 ] && [ -n "$watcher_pid" ] && [ "$watcher_pid" != "$live" ] \
+    || fail "arm did not recover a stale missing-identity lock: $(cat "$armout")"
   is_live_non_zombie "$live" || fail "arm killed the unrelated live lock holder"
-  kill "$live" 2>/dev/null || true
+  kill "$armpid" "$watcher_pid" "$live" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
-  pass "arm reports FAILED and exits non-zero when no fresh watcher can be confirmed"
+  pass "arm recovers stale missing lock identity after grace"
 }
 
 test_pid_identity_is_locale_invariant() {
@@ -740,6 +770,7 @@ test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_does_not_steal_live_lock
 test_lock_reclaims_reused_pid_identity
+test_lock_reclaims_missing_identity_after_grace
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
@@ -751,4 +782,4 @@ test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
-test_arm_fails_loud_when_no_fresh_watcher_confirmable
+test_arm_recovers_missing_identity_after_grace

@@ -376,7 +376,7 @@ backlog_json() {
 task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
   local pr pr_source event_json current_json prior_json wait_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json reconciled_json wait_path_json
-  local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
+  local last_event_raw current_state current_source current_freshness pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
   for meta in "$STATE"/*.meta; do
@@ -413,6 +413,7 @@ task_json_lines() {
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
     current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
     current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
+    current_freshness=$(printf '%s' "$current_json" | jq -r '.freshness // ""')
 
     # Durable keyed open-decision set: fold the WHOLE status stream
     # (fm-classify-lib.sh's status_open_decisions) so a later unrelated event can
@@ -433,7 +434,8 @@ task_json_lines() {
     # non-authoritative status-log/none read on a still-live task, keeps the fold's
     # open decision surfacing.
     open_decisions_tsv=$(status_open_decisions "$status_log")
-    if [ "$kind" != secondmate ] && \
+    if [ "$kind" != secondmate ] \
+       && { [ "$current_freshness" = fresh ] || [ "$current_freshness" = unpersisted ]; } && \
        { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ] || [ "$current_source" = owned-command ]; } \
            && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
          || { [ "$current_state" = "done" ] || [ "$current_state" = "failed" ]; }; }; then

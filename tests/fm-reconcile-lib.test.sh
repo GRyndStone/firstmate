@@ -58,7 +58,7 @@ test_active_review_parks_once_past_stale_pause() {
   assert_contains "$out" $'action\t' "working -> parked did not become actionable"
   assert_contains "$out" 'reconciled-transition' "parked wake lacks transition evidence"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "could not acknowledge parked transition"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge parked transition"
   [ -z "$(observe "$state" "$live")" ] || fail "unchanged acknowledged park emitted a duplicate"
   [ "$(fm_reconcile_record_value "$record" prior_state)" = working ] || fail "prior observed state was not retained"
   [ "$(fm_reconcile_record_value "$record" last_status_event)" = 'paused: old no-mistakes head is still under review' ] \
@@ -78,7 +78,7 @@ test_notified_observation_does_not_mask_newer_live_transition() {
   printf 'state: parked · source: run-step · review findings ready\n' > "$live"
   out=$(observe "$state" "$live")
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "parked transition could not be acknowledged"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "parked transition could not be acknowledged"
   fm_reconcile_is_quiet_notified "$state" task session:fm-task \
     || fail "acknowledged parked observation was not quiet"
 
@@ -106,7 +106,7 @@ test_stopped_endpoint_without_claimed_done_wakes_once() {
   out=$(observe "$state" "$live")
   assert_contains "$out" 'working -> unknown' "stopped endpoint without done event did not wake"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   [ -z "$(observe "$state" "$live")" ] || fail "stopped endpoint transition re-fired after acknowledgement"
   record="$state/task.reconciled"
   [ "$(fm_reconcile_record_value "$record" status_sequence)" = 1 ] || fail "observed status sequence is not verifiable"
@@ -137,7 +137,7 @@ test_same_repository_endpoint_replacement_preserves_working_baseline() {
   out=$(observe "$state" "$live")
   assert_contains "$out" 'working -> idle' "same-repository endpoint replacement lost its working baseline"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   [ -z "$(observe "$state" "$live")" ] || fail "recovered endpoint transition duplicated after acknowledgement"
   pass "same-repository endpoint replacement preserves and reconciles the working baseline"
 }
@@ -156,7 +156,7 @@ test_positive_working_source_loss_wakes_past_stale_working_event() {
   assert_contains "$out" 'from positive pane evidence' "stale working event masked loss of positive pane evidence"
   assert_contains "$out" 'source now status-log' "source-loss wake did not expose the stale status-log fallback"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   [ -z "$(observe "$state" "$live")" ] || fail "acknowledged positive-source loss emitted a duplicate"
   pass "loss of positive working evidence wakes even when stale status prose still says working"
 }
@@ -194,7 +194,7 @@ SH
   out=$(FM_WAIT_TEST_STATE="$dir/wait-state" observe "$state" "$live")
   assert_contains "$out" 'external-wait-complete' "OAuth callback completion did not wake through its predicate"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   [ -z "$(FM_WAIT_TEST_STATE="$dir/wait-state" observe "$state" "$live")" ] \
     || fail "completed callback predicate emitted a duplicate wake"
 
@@ -223,6 +223,7 @@ test_live_process_with_unreadable_identity_fails_observation() {
     'registered_at=1'
 
   out=$(
+    # shellcheck disable=SC2329
     fm_reconcile_process_identity() { return 1; }
     observe "$state" "$live"
   )
@@ -261,7 +262,7 @@ SH
   out=$(observe "$state" "$live")
   assert_contains "$out" 'external-wait-complete' "completed wait fixture did not establish its terminal baseline"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token" || fail "completed wait baseline could not be acknowledged"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "completed wait baseline could not be acknowledged"
 
   printf 'state: idle · source: pane · resumed foreground turn ended\n' > "$live"
   out=$(observe "$state" "$live")
@@ -296,7 +297,7 @@ test_unobservable_pause_fails_loudly_and_busy_stays_quiet() {
   out=$(observe "$state" "$live")
   assert_contains "$out" 'external-wait-unobservable' "pause without a completion predicate did not fail loudly"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   [ -z "$(observe "$state" "$live")" ] || fail "unchanged already-notified invalid pause stormed"
 
   printf 'state: working · source: pane · harness busy\n' > "$live"
@@ -318,7 +319,7 @@ test_inflight_unregistered_blocked_wait_fails_loudly_once() {
   assert_contains "$out" 'external-wait-unobservable' "in-flight blocked wait omission did not fail loudly"
   assert_contains "$out" 'blocked task has no' "blocked omission wake did not identify its missing observer"
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   restarted=$(FM_RECONCILE_CREW_STATE_BIN="$dir/fm-crew-state.sh" \
     FM_FAKE_RECONCILED_STATE_FILE="$live" \
     bash -c '. "$1"; fm_reconcile_observe "$2" task' _ "$RECONCILE" "$state")
@@ -342,7 +343,7 @@ SH
 }
 
 test_unacknowledged_transition_is_not_replaced_by_newer_state() {
-  local dir state live first second token
+  local dir state live first second token first_version second_version
   dir=$(make_reconcile_case pending-race)
   state="$dir/state"
   live="$dir/live"
@@ -353,6 +354,7 @@ test_unacknowledged_transition_is_not_replaced_by_newer_state() {
   printf 'state: idle · source: pane · foreground turn ended\n' > "$live"
   first=$(observe "$state" "$live")
   token=$(printf '%s' "$first" | cut -f2)
+  first_version=$(printf '%s' "$first" | cut -f3)
   assert_contains "$first" 'working -> idle' "pending-race fixture did not create its first transition"
 
   # Simulate a watcher crash after observation but before queue acknowledgement.
@@ -360,6 +362,7 @@ test_unacknowledged_transition_is_not_replaced_by_newer_state() {
   printf 'blocked: callback wait omitted registration\n' > "$state/task.status"
   printf 'state: blocked · source: status-log · callback wait omitted registration\n' > "$live"
   second=$(observe "$state" "$live")
+  second_version=$(printf '%s' "$second" | cut -f3)
   [ "$(printf '%s' "$second" | cut -f2)" = "$token" ] \
     || fail "newer blocked evidence replaced the unacknowledged transition token"
   assert_contains "$second" 'working -> idle' "original unacknowledged transition evidence was lost"
@@ -367,8 +370,13 @@ test_unacknowledged_transition_is_not_replaced_by_newer_state() {
     "newer blocked omission was not folded into the pending wake"
   [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = blocked ] \
     || fail "latest current state was not persisted while retaining the pending event"
+  [ "$second_version" != "$first_version" ] \
+    || fail "folded observation did not advance the pending delivery version"
+  if fm_reconcile_ack "$state" task "$token" "$first_version"; then
+    fail "older queued delivery acknowledged a newer folded observation"
+  fi
 
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$second_version"
   [ -z "$(observe "$state" "$live")" ] || fail "combined pending transition emitted a duplicate after acknowledgement"
   pass "unacknowledged transition survives newer live truth without loss or replacement"
 }
@@ -423,7 +431,7 @@ SH
   observer_pid=$!
   while [ ! -e "$dir/observer-started" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
   [ "$i" -lt 100 ] || fail "acknowledgement-race observer did not start"
-  fm_reconcile_ack "$state" task "$token" || fail "concurrent acknowledgement failed"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$first" | cut -f3)" || fail "concurrent acknowledgement failed"
   touch "$dir/observer-release"
   wait "$observer_pid" || fail "observer failed after concurrent acknowledgement"
   [ "$(fm_reconcile_record_value "$state/task.reconciled" notified_action_token)" = "$token" ] \
@@ -487,7 +495,7 @@ test_delivery_race_preserves_later_status_and_turn_events() {
   printf 'done: claimed after the reconciled observation\n' >> "$state/task.status"
   touch "$state/task.turn-ended"
   fm_reconcile_advance_seen "$state" task || fail "delivery-race suppressors could not be advanced"
-  fm_reconcile_ack "$state" task "$token" || fail "delivery-race transition could not be acknowledged"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "delivery-race transition could not be acknowledged"
 
   seen_status=$(cat "$state/.seen-task_status")
   seen_turn=$(cat "$state/.seen-task_turn-ended")
@@ -513,12 +521,212 @@ test_restart_preserves_transition_dedup() {
   printf 'state: idle · source: pane · backend reports idle\n' > "$live"
   out=$(observe "$state" "$live")
   token=$(printf '%s' "$out" | cut -f2)
-  fm_reconcile_ack "$state" task "$token"
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)"
   restarted=$(FM_RECONCILE_CREW_STATE_BIN="$dir/fm-crew-state.sh" \
     FM_FAKE_RECONCILED_STATE_FILE="$live" \
     bash -c '. "$1"; fm_reconcile_observe "$2" task' _ "$RECONCILE" "$state")
   [ -z "$restarted" ] || fail "supervisor restart duplicated an acknowledged transition: $restarted"
   pass "durable observation and acknowledgement survive supervisor restart"
+}
+
+test_stale_teardown_tombstone_stops_suppressing_observation() {
+  local dir state live out
+  dir=$(make_reconcile_case stale-tombstone)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'working: implementation active\n' > "$state/task.status"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  touch "$state/task.tearing-down"
+  printf 'state: idle · source: pane · foreground turn ended\n' > "$live"
+  [ -z "$(observe "$state" "$live")" ] || fail "fresh teardown tombstone did not suppress observation"
+  touch -t 200001010000 "$state/task.tearing-down"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'working -> idle' "stale teardown tombstone suppressed reconciliation indefinitely"
+  pass "stale teardown tombstones fail back to live observation"
+}
+
+test_predicate_output_is_capped_with_exit_status_preserved() {
+  local dir state live predicate out evidence
+  dir=$(make_reconcile_case predicate-output-cap)
+  state="$dir/state"
+  live="$dir/live"
+  predicate="$dir/noisy-predicate.sh"
+  printf 'blocked: noisy external predicate\n' > "$state/task.status"
+  printf 'state: blocked · source: status-log · noisy external predicate\n' > "$live"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt 10000 ]; do printf x; i=$((i + 1)); done
+exit 7
+SH
+  chmod +x "$predicate"
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=noisy predicate' \
+    "predicate=$predicate" \
+    'registered_at=1'
+  out=$(FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES=64 observe "$state" "$live")
+  assert_contains "$out" 'predicate exited 7' "capped predicate output lost the predicate exit status"
+  evidence=$(fm_reconcile_record_value "$state/task.reconciled" wait_evidence)
+  [ "${#evidence}" -le 128 ] || fail "predicate evidence exceeded its configured output cap: ${#evidence} bytes"
+  pass "predicate output is capped while its exit status remains actionable"
+}
+
+test_malformed_live_state_values_are_rejected() {
+  if fm_reconcile_parse_state_line 'state: invented · source: pane · invalid state'; then
+    fail "live-state parser accepted a noncanonical state"
+  fi
+  if fm_reconcile_parse_state_line 'state: working · source: invented · invalid source'; then
+    fail "live-state parser accepted a noncanonical source"
+  fi
+  if fm_reconcile_parse_state_line $'state: working · source: pane · valid first line\nunexpected second line'; then
+    fail "live-state parser accepted trailing observer output"
+  fi
+  pass "live-state parser rejects noncanonical and multiline observations"
+}
+
+test_owned_command_overrides_historical_run_state_once() {
+  local dir state live pid identity physical_wt out
+  command -v pgrep >/dev/null 2>&1 || { pass "owned-command run override skipped without pgrep"; return; }
+  dir=$(make_reconcile_case owned-command-run-override)
+  state="$dir/state"
+  live="$dir/live"
+  physical_wt=$(cd "$dir/worktree" && pwd -P)
+  sh -c 'cd "$1" || exit 1; while :; do sleep 0.1; done' _ "$physical_wt" &
+  pid=$!
+  sleep 0.1
+  identity=$(fm_reconcile_process_identity "$pid") || { kill "$pid" 2>/dev/null || true; fail "could not identify owned command"; }
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=background validation' \
+    "pid=$pid" \
+    "pid_identity=$identity" \
+    'role=working-command' \
+    'progress_grace=30' \
+    "owner_worktree=$physical_wt" \
+    'owner_tasktmp=' \
+    'registered_at=1'
+  printf 'done: historical validation run\n' > "$state/task.status"
+  printf 'state: done · source: run-step · historical run completed\n' > "$live"
+  out=$(observe "$state" "$live")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ -z "$out" ] || fail "new owned-command working baseline unexpectedly woke: $out"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = working ] \
+    || fail "historical terminal run masked a progressing owned command"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = owned-command ] \
+    || fail "owned command was not the single reconciled live-state source"
+  pass "progressing owned commands override historical run state in one observation"
+}
+
+test_repository_identity_failure_preserves_proven_binding() {
+  local dir state live out before after
+  dir=$(make_reconcile_case repository-resolution-failure)
+  state="$dir/state"
+  live="$dir/live"
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  before=$(fm_reconcile_record_value "$state/task.reconciled" repository_identity)
+  mv "$dir/project" "$dir/project-gone"
+  printf 'state: idle · source: pane · foreground stopped\n' > "$live"
+  out=$(observe "$state" "$live")
+  after=$(fm_reconcile_record_value "$state/task.reconciled" repository_identity)
+  assert_contains "$out" 'observer-failure' "repository identity resolution failure did not fail loudly"
+  assert_contains "$out" 'repository identity cannot be resolved' "repository identity failure lost its evidence"
+  [ -n "$before" ] && [ "$after" = "$before" ] \
+    || fail "repository identity failure erased the proven binding"
+  pass "repository resolution failures preserve proven identity and fail loudly"
+}
+
+test_lifecycle_generation_prevents_metadata_aba_publication() {
+  local dir state live observer_pid i=0
+  dir=$(make_reconcile_case lifecycle-generation-aba)
+  state="$dir/state"
+  live="$dir/live"
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task' \
+    'generation=generation-one' \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    'kind=ship'
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  cat > "$dir/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_ABA_STARTED"
+while [ ! -e "$FM_ABA_RELEASE" ]; do sleep 0.02; done
+cat "$FM_FAKE_RECONCILED_STATE_FILE"
+SH
+  chmod +x "$dir/fm-crew-state.sh"
+  (
+    # shellcheck disable=SC2329
+    fm_reconcile_file_signature() { printf 'forced-identical-signature'; }
+    FM_RECONCILE_CREW_STATE_BIN="$dir/fm-crew-state.sh" \
+      FM_FAKE_RECONCILED_STATE_FILE="$live" \
+      FM_ABA_STARTED="$dir/observer-started" \
+      FM_ABA_RELEASE="$dir/observer-release" \
+      fm_reconcile_observe "$state" task
+  ) > "$dir/observer.out" &
+  observer_pid=$!
+  while [ ! -e "$dir/observer-started" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || fail "metadata ABA observer did not start"
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task' \
+    'generation=generation-two' \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    'kind=ship'
+  touch "$dir/observer-release"
+  wait "$observer_pid" || fail "metadata ABA observer failed"
+  [ ! -s "$dir/observer.out" ] || fail "old lifecycle observer published after metadata replacement"
+  [ ! -e "$state/task.reconciled" ] || fail "old lifecycle observer wrote into the replacement lifecycle"
+  pass "lifecycle generation prevents metadata ABA publication"
+}
+
+test_delivery_version_is_unique_across_task_lifecycles() {
+  local dir state live first second first_token first_version second_token second_version old_reason
+  dir=$(make_reconcile_case delivery-lifecycle-version)
+  state="$dir/state"
+  live="$dir/live"
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task' \
+    'generation=lifecycle-one' \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    'kind=ship'
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  printf 'state: idle · source: pane · foreground ended\n' > "$live"
+  first=$(observe "$state" "$live")
+  first_token=$(printf '%s' "$first" | cut -f2)
+  first_version=$(printf '%s' "$first" | cut -f3)
+
+  rm -f "$state/task.reconciled"
+  fm_write_meta "$state/task.meta" \
+    'window=session:fm-task' \
+    'generation=lifecycle-two' \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    'kind=ship'
+  printf 'state: working · source: pane · harness busy\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  printf 'state: idle · source: pane · foreground ended\n' > "$live"
+  second=$(observe "$state" "$live")
+  second_token=$(printf '%s' "$second" | cut -f2)
+  second_version=$(printf '%s' "$second" | cut -f3)
+  [ "$second_token" = "$first_token" ] || fail "lifecycle replay fixture did not reuse its action token"
+  [ "$second_version" != "$first_version" ] || fail "replacement lifecycle reused an old delivery version"
+
+  old_reason="stale: session:fm-task old lifecycle $(fm_reconcile_action_marker task "$first_token" "$first_version")"
+  fm_reconcile_consumer_ack_reason "$state" "$old_reason" \
+    || fail "obsolete lifecycle marker returned an acknowledgement error"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" notified_action_version)" != "$second_version" ] \
+    || fail "obsolete lifecycle marker acknowledged the replacement observation"
+  fm_reconcile_ack "$state" task "$second_token" "$second_version" \
+    || fail "current lifecycle delivery could not be acknowledged"
+  pass "delivery versions cannot be reused across task lifecycles"
 }
 
 test_active_review_parks_once_past_stale_pause
@@ -538,5 +746,12 @@ test_acknowledgement_race_preserves_notified_token
 test_teardown_tombstone_prevents_record_resurrection
 test_delivery_race_preserves_later_status_and_turn_events
 test_restart_preserves_transition_dedup
+test_stale_teardown_tombstone_stops_suppressing_observation
+test_predicate_output_is_capped_with_exit_status_preserved
+test_malformed_live_state_values_are_rejected
+test_owned_command_overrides_historical_run_state_once
+test_repository_identity_failure_preserves_proven_binding
+test_lifecycle_generation_prevents_metadata_aba_publication
+test_delivery_version_is_unique_across_task_lifecycles
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

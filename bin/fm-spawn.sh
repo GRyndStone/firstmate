@@ -108,8 +108,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-task-identity-lib.sh
-. "$SCRIPT_DIR/fm-task-identity-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -210,7 +210,7 @@ parse_orca_worktree_result() {
 }
 
 orca_spawn_abort_cleanup() {
-  local status=$?
+  local status=$? meta_tmp
   [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
   ORCA_ABORT_CLEANUP=0
   if [ -n "${ORCA_TERMINAL:-}" ]; then
@@ -220,8 +220,10 @@ orca_spawn_abort_cleanup() {
     if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
       mkdir -p "$STATE" 2>/dev/null || true
       if [ -d "$STATE" ]; then
+        meta_tmp="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
         {
           echo "window=$W"
+          echo "generation=$LIFECYCLE_GENERATION"
           echo "worktree=${WT:-}"
           echo "project=$PROJ_ABS"
           echo "harness=$HARNESS"
@@ -234,7 +236,15 @@ orca_spawn_abort_cleanup() {
           echo "backend=orca"
           echo "orca_worktree_id=$ORCA_WORKTREE_ID"
           [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
+        } > "$meta_tmp" 2>/dev/null || true
+        if [ -f "$meta_tmp" ]; then
+          fm_reconcile_lock_acquire "$STATE" "$ID"
+          if ! fm_reconcile_tombstone_active "$STATE" "$ID"; then
+            mv -f "$meta_tmp" "$STATE/$ID.meta" 2>/dev/null || true
+          fi
+          rm -f "$meta_tmp"
+          fm_reconcile_lock_release "$STATE" "$ID"
+        fi
       fi
     fi
   fi
@@ -279,6 +289,8 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   exit "$rc"
 fi
 ID=${POS[0]}
+LIFECYCLE_GENERATION=$(fm_task_identity_new_token) \
+  || { echo "error: cannot create lifecycle generation for task $ID" >&2; exit 1; }
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -1009,8 +1021,10 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
 {
   echo "window=$META_WINDOW"
+  echo "generation=$LIFECYCLE_GENERATION"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
@@ -1047,7 +1061,20 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-} > "$STATE/$ID.meta"
+} > "$META_TMP"
+fm_reconcile_lock_acquire "$STATE" "$ID"
+if fm_reconcile_tombstone_active "$STATE" "$ID"; then
+  fm_reconcile_lock_release "$STATE" "$ID"
+  rm -f "$META_TMP"
+  echo "error: task $ID is actively tearing down; refusing lifecycle metadata replacement" >&2
+  exit 1
+fi
+if ! mv -f "$META_TMP" "$STATE/$ID.meta"; then
+  fm_reconcile_lock_release "$STATE" "$ID"
+  rm -f "$META_TMP"
+  exit 1
+fi
+fm_reconcile_lock_release "$STATE" "$ID"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")

@@ -9,6 +9,8 @@ STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
 FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
 FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
+FM_LOCK_IDENTITY_GRACE="${FM_LOCK_IDENTITY_GRACE:-2}"
+case "$FM_LOCK_IDENTITY_GRACE" in ''|*[!0-9]*|0) FM_LOCK_IDENTITY_GRACE=2 ;; esac
 mkdir -p "$STATE"
 
 fm_current_pid() {
@@ -150,9 +152,12 @@ fm_lock_pid_is_live_owner() {  # <lock-path> <pid> [identity-bound]
   fm_pid_alive "$pid" || return 1
   [ "$identity_bound" -eq 1 ] || return 0
   recorded_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
-  [ -n "$recorded_identity" ] || return 0
-  current_identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 0
-  [ "$current_identity" = "$recorded_identity" ]
+  current_identity=$(fm_pid_identity "$pid" 2>/dev/null || true)
+  if [ -n "$recorded_identity" ] && [ -n "$current_identity" ] \
+    && [ "$current_identity" = "$recorded_identity" ]; then
+    return 0
+  fi
+  [ "$(fm_path_age "$lockdir")" -lt "$FM_LOCK_IDENTITY_GRACE" ]
 }
 
 fm_lock_clean_known_files() {

@@ -570,9 +570,20 @@ reconcile_terminate_descendants() {  # <pid>
   done
 }
 
+reconcile_worker_signal_cleanup() {
+  local active
+  for active in ${child:-} $(jobs -pr 2>/dev/null); do
+    reconcile_terminate_descendants "$active"
+    kill -TERM "$active" 2>/dev/null || true
+  done
+  for active in ${child:-} $(jobs -pr 2>/dev/null); do
+    wait "$active" 2>/dev/null || true
+  done
+}
+
 reconcile_worker() {  # <id>
   local id=$1 child='' worker_rc
-  trap 'if [ -n "${child:-}" ]; then reconcile_terminate_descendants "$child"; kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; exit 143' TERM INT HUP
+  trap 'reconcile_worker_signal_cleanup; exit 143' TERM INT HUP
   # shellcheck disable=SC2016
   fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
     export FM_RECONCILE_CREW_STATE_BIN=$1
@@ -589,17 +600,18 @@ reconcile_worker() {  # <id>
 }
 
 reconcile_batch_cleanup() {
-  local pid file batch_dir=$RECONCILE_BATCH_DIR
-  for pid in $RECONCILE_BATCH_PIDS; do
+  local pid file batch_dir=$RECONCILE_BATCH_DIR live_pids
+  live_pids="$RECONCILE_BATCH_PIDS $(jobs -pr 2>/dev/null)"
+  for pid in $live_pids; do
     kill -TERM "$pid" 2>/dev/null || true
   done
-  for pid in $RECONCILE_BATCH_PIDS; do
+  for pid in $live_pids; do
     wait "$pid" 2>/dev/null || true
   done
   RECONCILE_BATCH_PIDS=
   case "$batch_dir" in
     "$STATE"/.reconcile-cycle.*)
-      for file in "$batch_dir"/*.id "$batch_dir"/*.out "$batch_dir"/*.err "$batch_dir"/*.rc; do
+      for file in "$batch_dir"/*.id "$batch_dir"/*.generation "$batch_dir"/*.out "$batch_dir"/*.err "$batch_dir"/*.rc; do
         [ -e "$file" ] && rm -f "$file"
       done
       rmdir "$batch_dir" 2>/dev/null || true
@@ -620,9 +632,9 @@ watch_cleanup() {
 # signatures; the daemon or queue drain acknowledges the token after durable
 # consumer handoff.
 reconcile_cycle() {
-  local meta id target out tag token evidence reason marker worker_rc failure_evidence err_tail
-  local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_evidence=''
-  local pending notified record_repository current_repository project queue_rc=0
+  local meta id target out tag token version evidence reason marker worker_rc failure_evidence err_tail expected_generation
+  local batch_dir pids='' pid index=0 selected_id='' selected_token='' selected_version='' selected_evidence=''
+  local pending pending_version notified notified_version record_repository record_generation current_generation kind queue_rc=0
   batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
   RECONCILE_BATCH_DIR=$batch_dir
   RECONCILE_BATCH_PIDS=
@@ -631,8 +643,11 @@ reconcile_cycle() {
     id=$(basename "$meta" .meta)
     index=$((index + 1))
     printf '%s\n' "$id" > "$batch_dir/$index.id" || exit 1
+    expected_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+    printf '%s\n' "$expected_generation" > "$batch_dir/$index.generation" || exit 1
     reconcile_worker "$id" > "$batch_dir/$index.out" 2> "$batch_dir/$index.err" &
-    pids="${pids:+$pids }$!"
+    pid=$!
+    pids="${pids:+$pids }$pid"
     RECONCILE_BATCH_PIDS=$pids
   done
   index=1
@@ -645,6 +660,7 @@ reconcile_cycle() {
   index=1
   while [ -f "$batch_dir/$index.id" ]; do
     id=$(cat "$batch_dir/$index.id")
+    expected_generation=$(cat "$batch_dir/$index.generation" 2>/dev/null || true)
     out=$(cat "$batch_dir/$index.out" 2>/dev/null || true)
     worker_rc=$(cat "$batch_dir/$index.rc" 2>/dev/null || echo 125)
     if [ "$worker_rc" -ne 0 ]; then
@@ -655,16 +671,18 @@ reconcile_cycle() {
       esac
       err_tail=$(tail -1 "$batch_dir/$index.err" 2>/dev/null || true)
       [ -z "$err_tail" ] || failure_evidence="$failure_evidence: $err_tail"
-      if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" "$failure_evidence"); then
+      if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" "$failure_evidence" "$expected_generation"); then
         reconcile_batch_cleanup
         exit 1
       fi
     elif [ -n "$out" ]; then
-      IFS=$(printf '\t') read -r tag token evidence <<EOF
+      IFS=$(printf '\t') read -r tag token version evidence <<EOF
 $out
 EOF
+      case "$version" in ''|*[!A-Za-z0-9._:-]*) tag=malformed ;; esac
+      case "$out" in *$'\n'*) tag=malformed ;; esac
       if [ "$tag" != action ] || [ -z "$token" ]; then
-        if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" 'task state observer returned malformed output'); then
+        if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" 'task state observer returned malformed output' "$expected_generation"); then
           reconcile_batch_cleanup
           exit 1
         fi
@@ -672,39 +690,48 @@ EOF
     fi
     index=$((index + 1))
     [ -n "$out" ] || continue
-    IFS=$(printf '\t') read -r tag token evidence <<EOF
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
 $out
 EOF
     [ "$tag" = action ] && [ -n "$token" ] || continue
-    selected_id=$id
-    selected_token=$token
-    selected_evidence=$evidence
-    break
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) continue ;; esac
+    if [ -z "$selected_id" ]; then
+      selected_id=$id
+      selected_token=$token
+      selected_version=$version
+      selected_evidence=$evidence
+    fi
   done
   reconcile_batch_cleanup
   [ -n "$selected_id" ] || return 0
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   fm_reconcile_lock_acquire "$STATE" "$selected_id"
   meta="$STATE/$selected_id.meta"
-  if [ ! -f "$meta" ] || [ -e "$STATE/$selected_id.tearing-down" ]; then
+  if [ ! -f "$meta" ] || fm_reconcile_tombstone_active "$STATE" "$selected_id"; then
     fm_reconcile_lock_release "$STATE" "$selected_id"
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
   pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_version)
   notified=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_token)
+  notified_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_version)
   record_repository=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" repository_identity)
-  project=$(fm_reconcile_meta_value "$meta" project)
-  current_repository=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
-  if [ "$pending" != "$selected_token" ] || [ "$notified" = "$selected_token" ] \
-    || [ -z "$record_repository" ] || [ "$record_repository" != "$current_repository" ]; then
+  record_generation=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" lifecycle_generation)
+  current_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  kind=$(fm_reconcile_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  if [ "$pending" != "$selected_token" ] || [ "$pending_version" != "$selected_version" ] \
+    || { [ "$notified" = "$selected_token" ] && [ "$notified_version" = "$selected_version" ]; } \
+    || [ -z "$record_generation" ] || [ "$record_generation" != "$current_generation" ] \
+    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ]; }; then
     fm_reconcile_lock_release "$STATE" "$selected_id"
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || target="fm-$selected_id"
-  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token")
+  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token" "$selected_version")
   reason="stale: $target $selected_evidence $marker"
   fm_wake_append_locked stale "$target" "$reason" || queue_rc=$?
   if [ "$queue_rc" -eq 0 ]; then
@@ -922,7 +949,7 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+if ! fm_lock_try_acquire "$WATCH_LOCK" 1; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then

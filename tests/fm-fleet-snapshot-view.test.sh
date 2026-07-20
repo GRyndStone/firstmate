@@ -190,7 +190,8 @@ test_event_hints_follow_reconciled_current_state() {
     "$home/projects/active-decision" \
     "$home/projects/active-blocked" \
     "$home/projects/stale-decision" \
-    "$home/projects/stale-blocked"
+    "$home/projects/stale-blocked" \
+    "$home/projects/stale-observation"
   fm_write_meta "$home/state/active-decision.meta" \
     "window=firstmate:fm-active-decision" \
     "worktree=$home/projects/active-decision" \
@@ -223,6 +224,22 @@ test_event_hints_follow_reconciled_current_state() {
     "kind=ship" \
     "mode=ship"
   printf 'blocked: old failure\n' > "$home/state/stale-blocked.status"
+  fm_write_meta "$home/state/stale-observation.meta" \
+    "window=firstmate:fm-stale-observation" \
+    "worktree=$home/projects/stale-observation" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  printf 'needs-decision [key=fresh-question]: choose the current API shape\n' > "$home/state/stale-observation.status"
+  fm_write_meta "$home/state/stale-observation.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=stale-observation' \
+    'endpoint=firstmate:fm-stale-observation' \
+    'state=working' \
+    'source=pane' \
+    'evidence=state: working · source: pane · old busy evidence' \
+    'observed_at=1'
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -235,6 +252,8 @@ test_event_hints_follow_reconciled_current_state() {
       and task("stale-decision").hints.pending_decision == false
       and task("stale-blocked").current_state.state == "working"
       and task("stale-blocked").hints.blocked_event == false
+      and task("stale-observation").current_state.freshness == "stale"
+      and task("stale-observation").hints.pending_decision == true
   ' >/dev/null || fail "event hints must follow reconciled current state"
   pass "snapshot event hints follow reconciled current state"
 }

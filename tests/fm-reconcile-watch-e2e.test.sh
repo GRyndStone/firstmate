@@ -407,7 +407,68 @@ SH
   assert_contains "$(cat "$out")" 'observer-failure' "timed-out observer woke through the wrong path"
   assert_contains "$(cat "$out")" 'timed out after 1s' "observer timeout budget was not reported"
   assert_one_wake "$state" 'timed out after 1s'
-  pass "canary: observer crashes and timeouts emit durable failure wakes"
+
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'state: working · source: pane · harness busy\n'
+printf 'unexpected extra observer line\n'
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "malformed live-state output was silently accepted: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'observer-failure' "malformed live-state output did not become an observer failure"
+  assert_contains "$(cat "$out")" 'malformed live-state output' "malformed live-state failure lost its evidence"
+  assert_one_wake "$state" 'malformed live-state output'
+  pass "canary: observer crashes, timeouts, and malformed output fail loudly"
+}
+
+test_later_worker_failure_is_recorded_after_first_action_selection() {
+  local dir state out pid task record
+  dir=$(make_canary later-worker-failure 'working: batch failure fixture')
+  state="$dir/state"
+  out="$dir/watch.out"
+  rm -f "$state/task.meta" "$state/task.status" "$state/task.turn-ended"
+  for task in task-a task-b; do
+    mkdir -p "$dir/project-$task" "$dir/worktree-$task"
+    fm_write_meta "$state/$task.meta" \
+      "window=session:fm-$task" \
+      "worktree=$dir/worktree-$task" \
+      "project=$dir/project-$task" \
+      'kind=ship'
+    printf 'working: %s baseline\n' "$task" > "$state/$task.status"
+  done
+  record="$state/task-a.reconciled"
+  fm_write_meta "$record" \
+    'schema=fm-reconciled.v1' \
+    'task=task-a' \
+    'endpoint=session:fm-task-a' \
+    'state=working' \
+    'source=pane' \
+    'evidence=state: working · source: pane · harness busy' \
+    'observed_at=1' \
+    'transition_sequence=0' \
+    'pending_action_token=' \
+    'notified_action_token='
+  cat > "$dir/fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  task-a) printf 'state: idle · source: pane · foreground ended\n' ;;
+  task-b) exit 70 ;;
+esac
+SH
+  chmod +x "$dir/fakebin/fm-crew-state.sh"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "first batch action did not wake: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'working -> idle' "first batch action was not selected"
+  [ "$(fm_reconcile_record_value "$state/task-b.reconciled" observer_state)" = failed ] \
+    || fail "later worker failure was not persisted after selecting the first action"
+  assert_contains "$(fm_reconcile_record_value "$state/task-b.reconciled" observer_evidence)" 'status 70' \
+    "later worker failure lost its exit evidence"
+  assert_one_wake "$state" 'working -> idle'
+  pass "canary: every batch worker failure is recorded after first-action selection"
 }
 
 test_watcher_exit_reaps_reconciliation_workers() {
@@ -446,6 +507,7 @@ test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
 test_observer_crashes_and_timeouts_fail_loudly
+test_later_worker_failure_is_recorded_after_first_action_selection
 test_watcher_exit_reaps_reconciliation_workers
 
 echo "# fm-reconcile-watch-e2e.test.sh: all assertions passed"

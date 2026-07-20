@@ -24,6 +24,13 @@ fm_task_identity_bind "$fresh_state" fresh "$repo" \
 [ -f "$fresh_state/fresh.identity" ] \
   || fail "task identity binding did not persist into its newly created state directory"
 pass "task identity binding creates its lock parent on a clean home"
+repo_key=$(fm_task_identity_repository_key "$repo") || fail "repository instance key could not be resolved"
+linked_key=$(fm_task_identity_repository_key "$same_wt") || fail "linked worktree instance key could not be resolved"
+case "$repo_key" in git:v3:*) ;; *) fail "repository identity still uses recyclable filesystem coordinates: $repo_key" ;; esac
+[ "$linked_key" = "$repo_key" ] || fail "linked worktree did not share its repository instance identity"
+common_dir=$(fm_task_identity_git_common_dir "$repo") || fail "git common directory could not be resolved"
+[ -f "$common_dir/firstmate-repository-id" ] || fail "repository instance identity was not persisted in the git common directory"
+pass "repository identity is durable, non-filesystem-derived, and shared by linked worktrees"
 
 fm_write_meta "$state/task.meta" \
   'window=session:fm-task' \
@@ -36,6 +43,22 @@ fm_task_identity_validate "$state" task "$repo" \
 fm_task_identity_validate "$state" task "$same_wt" \
   || fail "same-repository linked-worktree recovery should remain valid"
 pass "task identity accepts exact and linked-worktree recovery in the same repository"
+
+legacy_state="$TMP_ROOT/legacy-state"
+mkdir -p "$legacy_state"
+legacy_key=$(fm_task_identity_legacy_repository_key "$repo") || fail "legacy repository key could not be resolved"
+fm_write_meta "$legacy_state/legacy.identity" \
+  'schema=fm-task-identity.v2' \
+  'task=legacy' \
+  "repository_identity=$legacy_key" \
+  "project=$repo"
+fm_task_identity_bind "$legacy_state" legacy "$same_wt" \
+  || fail "same-repository legacy binding could not migrate"
+[ "$(fm_task_identity_meta_value "$legacy_state/legacy.identity" schema)" = fm-task-identity.v3 ] \
+  || fail "legacy repository binding did not migrate to the durable identity schema"
+[ "$(fm_task_identity_meta_value "$legacy_state/legacy.identity" repository_identity)" = "$repo_key" ] \
+  || fail "legacy repository binding did not adopt the shared repository instance id"
+pass "legacy repository bindings migrate to durable instance identity"
 
 err="$TMP_ROOT/cross.err"
 if fm_task_identity_validate "$state" task "$other" 2> "$err"; then
@@ -83,8 +106,11 @@ grep -F "task id 'task' is already bound" "$err" >/dev/null \
 pass "task identity remains repository-bound after volatile metadata removal"
 
 retired_repo="$TMP_ROOT/retired-repo"
+retired_key=$(fm_task_identity_repository_key "$repo") || fail "retired repository key could not be captured"
 mv "$repo" "$retired_repo"
 fm_git_init_commit "$repo"
+replacement_key=$(fm_task_identity_repository_key "$repo") || fail "replacement repository key could not be resolved"
+[ "$replacement_key" != "$retired_key" ] || fail "replacement repository recycled the retired instance identity"
 if fm_task_identity_validate "$state" task "$repo" 2> "$err"; then
   fail "repository replacement at the same path reused a durable task id"
 fi

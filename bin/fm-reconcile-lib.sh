@@ -42,15 +42,14 @@
 # Public functions:
 #   fm_reconcile_observe <state-dir> <id>
 #     Persist one observation.  Print nothing when quiet, or one TAB-separated
-#     "action<TAB>token<TAB>reason" record while an action is unacknowledged.
-#   fm_reconcile_ack <state-dir> <id> <token>
-#     Acknowledge only the token already persisted in the record after consumer
-#     handoff.
+#     "action<TAB>token<TAB>version<TAB>reason" record while an action is unacknowledged.
+#   fm_reconcile_ack <state-dir> <id> <token> <version>
+#     Acknowledge only the exact version already persisted after consumer handoff.
 #   fm_reconcile_observer_failure <state-dir> <id> <evidence>
 #     Persist and emit one deduplicated observer-failure action.
 #   fm_reconcile_teardown_begin <state-dir> <id>
 #     Serialize and publish the teardown tombstone before destructive cleanup.
-#   fm_reconcile_action_marker <id> <token>
+#   fm_reconcile_action_marker <id> <token> <version>
 #     Print the durable wake marker that binds a queue payload to its action.
 #   fm_reconcile_action_pending <state-dir> <reason>
 #     True when a marked queue payload still needs consumer handoff.
@@ -75,6 +74,10 @@ _FM_RECONCILE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)
 FM_RECONCILE_CREW_STATE_BIN="${FM_RECONCILE_CREW_STATE_BIN:-${FM_CREW_STATE_BIN:-$_FM_RECONCILE_LIB_DIR/fm-crew-state.sh}}"
 FM_EXTERNAL_WAIT_TIMEOUT=${FM_EXTERNAL_WAIT_TIMEOUT:-5}
 case "$FM_EXTERNAL_WAIT_TIMEOUT" in ''|*[!0-9]*|0) FM_EXTERNAL_WAIT_TIMEOUT=5 ;; esac
+FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES=${FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES:-4096}
+case "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES" in ''|*[!0-9]*|0) FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES=4096 ;; esac
+FM_TEARDOWN_TOMBSTONE_SECS=${FM_TEARDOWN_TOMBSTONE_SECS:-120}
+case "$FM_TEARDOWN_TOMBSTONE_SECS" in ''|*[!0-9]*|0) FM_TEARDOWN_TOMBSTONE_SECS=120 ;; esac
 
 fm_reconcile_record_value() {  # <record> <key>
   local record=$1 key=$2
@@ -156,6 +159,7 @@ fm_reconcile_parse_state_line() {  # <line>; populates FM_RECONCILE_CURRENT_*
   FM_RECONCILE_CURRENT_SOURCE=none
   FM_RECONCILE_CURRENT_DETAIL=
   case "$line" in
+    *$'\n'*) return 1 ;;
     state:\ *"$sep"source:\ *)
       rest=${line#state: }
       FM_RECONCILE_CURRENT_STATE=${rest%%"$sep"source: *}
@@ -168,7 +172,11 @@ fm_reconcile_parse_state_line() {  # <line>; populates FM_RECONCILE_CURRENT_*
         *) FM_RECONCILE_CURRENT_SOURCE=$rest ;;
       esac
       ;;
+    *) return 1 ;;
   esac
+  case "$FM_RECONCILE_CURRENT_STATE" in working|idle|parked|done|blocked|paused|failed|unknown) ;; *) return 1 ;; esac
+  case "$FM_RECONCILE_CURRENT_SOURCE" in run-step|owned-command|pane|status-log|none) ;; *) return 1 ;; esac
+  return 0
 }
 
 fm_reconcile_bounded() {  # <seconds> <command...>
@@ -267,11 +275,16 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
   FM_RECONCILE_WAIT_PROGRESS_GRACE=0
   FM_RECONCILE_WAIT_OWNER_WORKTREE=
   FM_RECONCILE_WAIT_OWNER_TASKTMP=
+  FM_RECONCILE_WAIT_REGISTRATION_ID=
+  FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
+  FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)
   if [ -f "$wait_file" ]; then
     FM_RECONCILE_WAIT_PRESENT=1
     FM_RECONCILE_WAIT_KIND=$(fm_reconcile_record_value "$wait_file" kind)
     FM_RECONCILE_WAIT_DESCRIPTION=$(fm_reconcile_record_value "$wait_file" description)
     FM_RECONCILE_WAIT_SIGNATURE=$(fm_reconcile_file_signature "$wait_file")
+    FM_RECONCILE_WAIT_REGISTRATION_ID=$(fm_reconcile_record_value "$wait_file" registration_id)
+    FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=$(fm_reconcile_record_value "$wait_file" lifecycle_generation)
     case "$FM_RECONCILE_WAIT_KIND" in
       predicate) FM_RECONCILE_WAIT_TARGET=$(fm_reconcile_record_value "$wait_file" predicate) ;;
       process)
@@ -297,7 +310,7 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
 }
 
 fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/EVIDENCE/progress
-  local record=${1:-} now=${2:-} out='' rc=0 current_identity current_cwd current_progress
+  local record=${1:-} now=${2:-} out='' rc=0 current_identity current_cwd current_progress rc_file
   local old_registration old_progress old_progress_at progress_age
   [ -n "$now" ] || now=$(date +%s)
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
@@ -315,6 +328,24 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
   FM_RECONCILE_WAIT_WORKING=0
   FM_RECONCILE_WAIT_PROGRESS_SIGNATURE=$old_progress
   FM_RECONCILE_WAIT_PROGRESS_AT=$old_progress_at
+  if [ "$FM_RECONCILE_WAIT_PRESENT" -eq 1 ]; then
+    if [ -n "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" ] \
+      && [ "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" != "$FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION" ]; then
+      FM_RECONCILE_WAIT_RESULT=failed
+      FM_RECONCILE_WAIT_EVIDENCE='external-wait registration belongs to a different task lifecycle'
+      return
+    fi
+    case "$FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION" in
+      legacy:*) ;;
+      *)
+        if [ -z "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" ]; then
+          FM_RECONCILE_WAIT_RESULT=failed
+          FM_RECONCILE_WAIT_EVIDENCE='external-wait registration has no task lifecycle generation'
+          return
+        fi
+        ;;
+    esac
+  fi
   case "$FM_RECONCILE_WAIT_KIND" in
     predicate)
       if [ -z "$FM_RECONCILE_WAIT_TARGET" ] || [ ! -f "$FM_RECONCILE_WAIT_TARGET" ] || [ ! -x "$FM_RECONCILE_WAIT_TARGET" ]; then
@@ -322,11 +353,17 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
         FM_RECONCILE_WAIT_EVIDENCE="predicate missing or not executable: ${FM_RECONCILE_WAIT_TARGET:-<empty>}"
         return
       fi
-      if out=$(fm_reconcile_bounded "$FM_EXTERNAL_WAIT_TIMEOUT" "$FM_RECONCILE_WAIT_TARGET" 2>&1); then
-        rc=0
-      else
-        rc=$?
-      fi
+      rc_file="$FM_RECONCILE_WAIT_FILE.predicate-rc.${BASHPID:-$$}"
+      out=$(
+        fm_reconcile_bounded "$FM_EXTERNAL_WAIT_TIMEOUT" "$FM_RECONCILE_WAIT_TARGET" 2>&1 | {
+          head -c "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES"
+          cat >/dev/null
+        }
+        printf '%s\n' "${PIPESTATUS[0]}" > "$rc_file"
+      )
+      rc=$(cat "$rc_file" 2>/dev/null || printf '125')
+      rm -f "$rc_file"
+      case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
       out=$(fm_reconcile_clean_value "$out")
       case "$rc" in
         0) FM_RECONCILE_WAIT_RESULT=complete ;;
@@ -437,6 +474,7 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
   {
     printf 'schema=fm-reconciled.v1\n'
     printf 'task=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_ID")"
+    printf 'lifecycle_generation=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_LIFECYCLE_GENERATION")"
     printf 'repository_identity=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_REPOSITORY_IDENTITY")"
     printf 'endpoint=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_ENDPOINT")"
     printf 'state=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_STATE")"
@@ -466,10 +504,13 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
     printf 'wait_sequence=%s\n' "$FM_RECONCILE_WRITE_WAIT_SEQUENCE"
     printf 'wait_progress_signature=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_WAIT_PROGRESS_SIGNATURE")"
     printf 'wait_progress_at=%s\n' "$FM_RECONCILE_WRITE_WAIT_PROGRESS_AT"
+    printf 'wait_lifecycle_generation=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_WAIT_LIFECYCLE_GENERATION")"
     printf 'pending_action_token=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_TOKEN")"
+    printf 'pending_action_version=%s\n' "$FM_RECONCILE_WRITE_PENDING_VERSION"
     printf 'pending_action_reason=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_REASON")"
     printf 'pending_action_observation_key=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_OBSERVATION_KEY")"
     printf 'notified_action_token=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_NOTIFIED_TOKEN")"
+    printf 'notified_action_version=%s\n' "$FM_RECONCILE_WRITE_NOTIFIED_VERSION"
     printf 'notified_action_observation_key=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_NOTIFIED_OBSERVATION_KEY")"
     printf 'observer_state=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_OBSERVER_STATE")"
     printf 'observer_evidence=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_OBSERVER_EVIDENCE")"
@@ -490,35 +531,71 @@ fm_reconcile_lock_release() {  # <state-dir> <id>
   fm_lock_release "$(fm_reconcile_lock_path "$1" "$2")"
 }
 
-fm_reconcile_meta_matches() {  # <state-dir> <id> <signature>
-  local state=$1 id=$2 expected=$3 meta
-  meta="$state/$id.meta"
+fm_reconcile_meta_generation() {  # <meta>
+  local meta=$1 generation identity
   [ -f "$meta" ] || return 1
-  [ ! -e "$state/$id.tearing-down" ] || return 1
-  [ "$(fm_reconcile_file_signature "$meta")" = "$expected" ]
+  generation=$(fm_reconcile_meta_value "$meta" generation)
+  if [ -n "$generation" ]; then
+    case "$generation" in *[!A-Za-z0-9._:-]*) return 1 ;; esac
+    printf '%s\n' "$generation"
+    return 0
+  fi
+  if [ "$(uname)" = Darwin ]; then
+    identity=$(stat -f '%d:%i' "$meta" 2>/dev/null) || return 1
+  else
+    identity=$(stat -c '%d:%i' "$meta" 2>/dev/null) || return 1
+  fi
+  case "$identity" in ''|*[!0-9:]*) return 1 ;; esac
+  printf 'legacy:%s\n' "$identity"
 }
 
-fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state>
-  local state=$1 id=$2 meta_signature=$3 raw=$4 meta record status_file project repository_identity endpoint now
+fm_reconcile_tombstone_active() {  # <state-dir> <id>
+  local tombstone="$1/$2.tearing-down"
+  [ -e "$tombstone" ] || return 1
+  [ "$(fm_path_age "$tombstone")" -lt "$FM_TEARDOWN_TOMBSTONE_SECS" ]
+}
+
+fm_reconcile_meta_matches() {  # <state-dir> <id> <signature> <generation>
+  local state=$1 id=$2 expected=$3 expected_generation=$4 meta
+  meta="$state/$id.meta"
+  [ -f "$meta" ] || return 1
+  ! fm_reconcile_tombstone_active "$state" "$id" || return 1
+  [ "$(fm_reconcile_file_signature "$meta")" = "$expected" ] || return 1
+  [ "$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)" = "$expected_generation" ]
+}
+
+fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-generation> <live-state>
+  local state=$1 id=$2 meta_signature=$3 lifecycle_generation=$4 raw=$5 meta record status_file project kind repository_identity identity_error endpoint now
   local old_repository_identity old_endpoint old_state old_source old_evidence old_observed old_transition_seq
   local old_prior_endpoint old_prior_state old_prior_source old_prior_evidence old_prior_observed
   local old_wait_kind old_wait_sig old_wait_state old_wait_seq old_pending old_reason old_notified
-  local old_pending_observation old_notified_observation
+  local old_pending_version old_notified_version old_pending_observation old_notified_observation
   local old_status_signal old_turn_signal old_observer_seq
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
-  local wait_seq pending reason observation_key pending_observation candidate_token='' candidate_reason='' event_note=''
+  local wait_seq pending pending_version reason observation_key pending_observation candidate_token='' candidate_reason='' event_note=''
   local pending_unacked=0 positive_working=0 current_positive_working=0
   local endpoint_changed=0 state_changed=0 source_changed=0 same_repository=0
 
   meta="$state/$id.meta"
-  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || return 0
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || return 0
   record="$state/$id.reconciled"
   status_file="$state/$id.status"
   project=$(fm_reconcile_meta_value "$meta" project)
-  repository_identity=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
+  kind=$(fm_reconcile_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  repository_identity=
+  if [ "$kind" != secondmate ]; then
+    if ! repository_identity=$(fm_task_identity_resolve "$state" "$id" "$project" 2>&1); then
+      identity_error=$(fm_reconcile_clean_value "$repository_identity")
+      fm_reconcile_observer_failure_locked "$state" "$id" \
+        "repository identity cannot be resolved for ${project:-<empty>}${identity_error:+: $identity_error}" \
+        "$lifecycle_generation"
+      return
+    fi
+  fi
   endpoint=$(fm_reconcile_endpoint "$meta")
-  fm_reconcile_parse_state_line "$raw"
+  fm_reconcile_parse_state_line "$raw" || return 65
   current_state=$FM_RECONCILE_CURRENT_STATE
   current_source=$FM_RECONCILE_CURRENT_SOURCE
   current_detail=$FM_RECONCILE_CURRENT_DETAIL
@@ -553,8 +630,10 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   old_wait_state=$(fm_reconcile_record_value "$record" wait_state)
   old_wait_seq=$(fm_reconcile_record_value "$record" wait_sequence)
   old_pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  old_pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
   old_reason=$(fm_reconcile_record_value "$record" pending_action_reason)
   old_notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  old_notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
   old_pending_observation=$(fm_reconcile_record_value "$record" pending_action_observation_key)
   old_notified_observation=$(fm_reconcile_record_value "$record" notified_action_observation_key)
   old_status_signal=$(fm_reconcile_record_value "$record" status_signal_signature)
@@ -563,6 +642,8 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   case "$old_transition_seq" in ''|*[!0-9]*) old_transition_seq=0 ;; esac
   case "$old_wait_seq" in ''|*[!0-9]*) old_wait_seq=0 ;; esac
   case "$old_observer_seq" in ''|*[!0-9]*) old_observer_seq=0 ;; esac
+  case "$old_pending_version" in *[!A-Za-z0-9._:-]*) old_pending_version= ;; esac
+  case "$old_notified_version" in *[!A-Za-z0-9._:-]*) old_notified_version= ;; esac
 
   prior_endpoint=$old_prior_endpoint
   prior_state=$old_prior_state
@@ -571,10 +652,27 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   prior_observed=$old_prior_observed
   transition_seq=$old_transition_seq
   pending=$old_pending
+  pending_version=$old_pending_version
   reason=$old_reason
   pending_observation=$old_pending_observation
-  if [ -n "$old_pending" ] && [ "$old_pending" != "$old_notified" ]; then
+  if [ -n "$old_pending" ] \
+    && { [ "$old_pending" != "$old_notified" ] || [ "$old_pending_version" != "$old_notified_version" ]; }; then
     pending_unacked=1
+  fi
+
+  fm_reconcile_wait_load "$state" "$id"
+  fm_reconcile_wait_evaluate "$record" "$now"
+  wait_seq=$old_wait_seq
+  if [ "$old_wait_kind" != "$FM_RECONCILE_WAIT_KIND" ] \
+    || [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    || [ "$old_wait_state" != "$FM_RECONCILE_WAIT_RESULT" ]; then
+    wait_seq=$((old_wait_seq + 1))
+  fi
+  if [ "$FM_RECONCILE_WAIT_RESULT" = pending ] && [ "$FM_RECONCILE_WAIT_WORKING" -eq 1 ]; then
+    current_state=working
+    current_source=owned-command
+    current_detail=$FM_RECONCILE_WAIT_EVIDENCE
+    raw="state: working · source: owned-command · $current_detail"
   fi
 
   if [ -n "$old_state" ]; then
@@ -598,15 +696,6 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   fi
   if [ "$current_state" = working ]; then
     case "$current_source" in run-step|pane|owned-command) current_positive_working=1 ;; esac
-  fi
-
-  fm_reconcile_wait_load "$state" "$id"
-  fm_reconcile_wait_evaluate "$record" "$now"
-  wait_seq=$old_wait_seq
-  if [ "$old_wait_kind" != "$FM_RECONCILE_WAIT_KIND" ] \
-    || [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
-    || [ "$old_wait_state" != "$FM_RECONCILE_WAIT_RESULT" ]; then
-    wait_seq=$((old_wait_seq + 1))
   fi
 
   case "$current_state" in
@@ -656,8 +745,9 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   fi
 
   observation_key=$(fm_reconcile_observation_key \
-    "$repository_identity" "$endpoint" "$current_state" "$current_source" "$transition_seq" \
-    "$FM_RECONCILE_WAIT_SIGNATURE" "$FM_RECONCILE_WAIT_RESULT" "$wait_seq" ok "$old_observer_seq")
+    "$lifecycle_generation" "$repository_identity" "$endpoint" "$current_state" "$current_source" "$transition_seq" \
+    "$FM_RECONCILE_WAIT_SIGNATURE" "$FM_RECONCILE_WAIT_RESULT" "$wait_seq" \
+    "$status_signal_sig" "$turn_signal_sig" "$status_seq" ok "$old_observer_seq")
 
   # Never replace an unacknowledged action with a newer observation.  The
   # watcher persists the action before enqueueing it, so replacement during a
@@ -667,18 +757,29 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   if [ "$pending_unacked" -eq 1 ]; then
     if [ -n "$candidate_token" ] && [ "$candidate_token" != "$old_pending" ]; then
       reason="$old_reason; newer observation before delivery: $candidate_reason"
+      pending_version=$(fm_task_identity_new_token) || return 1
+      pending_observation=$observation_key
     elif [ "$state_changed" -eq 1 ]; then
       reason="$old_reason; current observation before delivery: $current_state from $current_source (${current_detail:-no detail})${event_note:+; $event_note}"
+      pending_version=$(fm_task_identity_new_token) || return 1
+      pending_observation=$observation_key
     elif [ -n "$event_note" ]; then
       reason="$old_reason; newer sparse event before delivery: $event_note"
+      pending_version=$(fm_task_identity_new_token) || return 1
+      pending_observation=$observation_key
+    elif [ -z "$pending_version" ]; then
+      pending_version=$(fm_task_identity_new_token) || return 1
+      pending_observation=$observation_key
     fi
   elif [ -n "$candidate_token" ]; then
     pending=$candidate_token
+    pending_version=$(fm_task_identity_new_token) || return 1
     reason=$candidate_reason
     pending_observation=$observation_key
   fi
 
   FM_RECONCILE_WRITE_ID=$id
+  FM_RECONCILE_WRITE_LIFECYCLE_GENERATION=$lifecycle_generation
   FM_RECONCILE_WRITE_REPOSITORY_IDENTITY=$repository_identity
   FM_RECONCILE_WRITE_ENDPOINT=$endpoint
   FM_RECONCILE_WRITE_STATE=$current_state
@@ -708,34 +809,42 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <live-state
   FM_RECONCILE_WRITE_WAIT_SEQUENCE=$wait_seq
   FM_RECONCILE_WRITE_WAIT_PROGRESS_SIGNATURE=$FM_RECONCILE_WAIT_PROGRESS_SIGNATURE
   FM_RECONCILE_WRITE_WAIT_PROGRESS_AT=$FM_RECONCILE_WAIT_PROGRESS_AT
+  FM_RECONCILE_WRITE_WAIT_LIFECYCLE_GENERATION=$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION
   FM_RECONCILE_WRITE_PENDING_TOKEN=$pending
+  FM_RECONCILE_WRITE_PENDING_VERSION=$pending_version
   FM_RECONCILE_WRITE_PENDING_REASON=$reason
   FM_RECONCILE_WRITE_PENDING_OBSERVATION_KEY=$pending_observation
   FM_RECONCILE_WRITE_NOTIFIED_TOKEN=$old_notified
+  FM_RECONCILE_WRITE_NOTIFIED_VERSION=$old_notified_version
   FM_RECONCILE_WRITE_NOTIFIED_OBSERVATION_KEY=$old_notified_observation
   FM_RECONCILE_WRITE_OBSERVER_STATE=ok
   FM_RECONCILE_WRITE_OBSERVER_EVIDENCE=
   FM_RECONCILE_WRITE_OBSERVER_SEQUENCE=$old_observer_seq
-  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || return 0
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || return 0
   fm_reconcile_write_record "$record" || return 1
 
-  if [ -n "$pending" ] && [ "$pending" != "$old_notified" ]; then
-    printf 'action\t%s\t%s\n' "$pending" "$reason"
+  if [ -n "$pending" ] \
+    && { [ "$pending" != "$old_notified" ] || [ "$pending_version" != "$old_notified_version" ]; }; then
+    printf 'action\t%s\t%s\t%s\n' "$pending" "$pending_version" "$reason"
   fi
 }
 
 fm_reconcile_observe() {  # <state-dir> <id>
-  local state=$1 id=$2 meta meta_signature raw observe_rc
+  local state=$1 id=$2 meta meta_signature lifecycle_generation raw observe_rc
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
-  [ ! -e "$state/$id.tearing-down" ] || return 0
+  ! fm_reconcile_tombstone_active "$state" "$id" || return 0
   meta_signature=$(fm_reconcile_file_signature "$meta")
+  lifecycle_generation=$(fm_reconcile_meta_generation "$meta") || return 65
   raw=$(
     FM_CREW_STATE_LIVE_ONLY=1 FM_STATE_OVERRIDE="$state" "$FM_RECONCILE_CREW_STATE_BIN" "$id" 2>/dev/null
   ) || return $?
-  raw=$(printf '%s\n' "$raw" | head -1)
+  if ! fm_reconcile_parse_state_line "$raw"; then
+    printf 'malformed live-state output for task %s\n' "$id" >&2
+    return 65
+  fi
   fm_reconcile_lock_acquire "$state" "$id"
-  if fm_reconcile_observe_locked "$state" "$id" "$meta_signature" "$raw"; then
+  if fm_reconcile_observe_locked "$state" "$id" "$meta_signature" "$lifecycle_generation" "$raw"; then
     observe_rc=0
   else
     observe_rc=$?
@@ -744,58 +853,85 @@ fm_reconcile_observe() {  # <state-dir> <id>
   return "$observe_rc"
 }
 
-fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
-  local state=$1 id=$2 evidence=$3 meta meta_signature record input tmp project repository_identity endpoint now
-  local old_state old_evidence old_sequence old_pending old_reason old_notified pending reason token
+fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expected-lifecycle-generation]
+  local state=$1 id=$2 evidence=$3 expected_generation=${4:-} meta meta_signature lifecycle_generation record input tmp project kind repository_identity resolved_identity endpoint now
+  local old_state old_evidence old_sequence old_pending old_reason old_notified old_pending_version old_notified_version pending pending_version reason token
   local old_pending_observation observation_key pending_observation
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
-  [ ! -e "$state/$id.tearing-down" ] || return 0
+  ! fm_reconcile_tombstone_active "$state" "$id" || return 0
   meta_signature=$(fm_reconcile_file_signature "$meta")
+  lifecycle_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  [ -n "$lifecycle_generation" ] || return 0
+  [ -z "$expected_generation" ] || [ "$expected_generation" = "$lifecycle_generation" ] || return 0
   record="$state/$id.reconciled"
   project=$(fm_reconcile_meta_value "$meta" project)
-  repository_identity=$(fm_task_identity_repository_key "$project" 2>/dev/null || true)
+  kind=$(fm_reconcile_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  repository_identity=$(fm_reconcile_record_value "$record" repository_identity)
+  if [ -z "$repository_identity" ]; then
+    repository_identity=$(fm_task_identity_meta_value "$state/$id.identity" repository_identity)
+  fi
+  if [ "$kind" != secondmate ]; then
+    resolved_identity=$(fm_task_identity_resolve "$state" "$id" "$project" 2>/dev/null || true)
+    [ -z "$resolved_identity" ] || repository_identity=$resolved_identity
+  fi
   endpoint=$(fm_reconcile_endpoint "$meta")
   old_state=$(fm_reconcile_record_value "$record" observer_state)
   old_evidence=$(fm_reconcile_record_value "$record" observer_evidence)
   old_sequence=$(fm_reconcile_record_value "$record" observer_sequence)
   old_pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  old_pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
   old_reason=$(fm_reconcile_record_value "$record" pending_action_reason)
   old_notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  old_notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
   old_pending_observation=$(fm_reconcile_record_value "$record" pending_action_observation_key)
   case "$old_sequence" in ''|*[!0-9]*) old_sequence=0 ;; esac
+  case "$old_pending_version" in *[!A-Za-z0-9._:-]*) old_pending_version= ;; esac
+  case "$old_notified_version" in *[!A-Za-z0-9._:-]*) old_notified_version= ;; esac
   evidence=$(fm_reconcile_clean_value "$evidence")
   pending=$old_pending
+  pending_version=$old_pending_version
   reason=$old_reason
   pending_observation=$old_pending_observation
   if [ "$old_state" != failed ] || [ "$old_evidence" != "$evidence" ]; then
     old_sequence=$((old_sequence + 1))
     token="observer:$old_sequence:failed"
     observation_key=$(fm_reconcile_observation_key \
-      "$repository_identity" "$endpoint" \
+      "$lifecycle_generation" "$repository_identity" "$endpoint" \
       "$(fm_reconcile_record_value "$record" state)" \
       "$(fm_reconcile_record_value "$record" source)" \
       "$(fm_reconcile_record_value "$record" transition_sequence)" \
       "$(fm_reconcile_record_value "$record" wait_signature)" \
       "$(fm_reconcile_record_value "$record" wait_state)" \
       "$(fm_reconcile_record_value "$record" wait_sequence)" failed "$old_sequence")
-    if [ -n "$old_pending" ] && [ "$old_pending" != "$old_notified" ]; then
+    if [ -n "$old_pending" ] \
+      && { [ "$old_pending" != "$old_notified" ] || [ "$old_pending_version" != "$old_notified_version" ]; }; then
       reason="$old_reason; newer observation before delivery: observer-failure ($evidence)"
+      pending_version=$(fm_task_identity_new_token) || return 1
+      pending_observation=$observation_key
     else
       pending=$token
+      pending_version=$(fm_task_identity_new_token) || return 1
       reason="observer-failure ($evidence)"
       pending_observation=$observation_key
     fi
   fi
   if [ -z "${observation_key:-}" ]; then
     observation_key=$(fm_reconcile_observation_key \
-      "$repository_identity" "$endpoint" \
+      "$lifecycle_generation" "$repository_identity" "$endpoint" \
       "$(fm_reconcile_record_value "$record" state)" \
       "$(fm_reconcile_record_value "$record" source)" \
       "$(fm_reconcile_record_value "$record" transition_sequence)" \
       "$(fm_reconcile_record_value "$record" wait_signature)" \
       "$(fm_reconcile_record_value "$record" wait_state)" \
       "$(fm_reconcile_record_value "$record" wait_sequence)" failed "$old_sequence")
+  fi
+  if [ -n "$pending" ] \
+    && { [ "$pending" != "$old_notified" ] || [ "$pending_version" != "$old_notified_version" ]; } \
+    && [ -z "$pending_version" ]; then
+    pending_version=$(fm_task_identity_new_token) || return 1
+    pending_observation=$observation_key
   fi
   now=$(date +%s)
   tmp="$record.observer.${BASHPID:-$$}"
@@ -803,6 +939,7 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
   [ -f "$input" ] || input=/dev/null
   awk \
     -v task="$id" \
+    -v lifecycle_generation="$lifecycle_generation" \
     -v repository_identity="$repository_identity" \
     -v endpoint="$endpoint" \
     -v now="$now" \
@@ -810,11 +947,13 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
     -v observer_sequence="$old_sequence" \
     -v observation_key="$observation_key" \
     -v pending="$pending" \
+    -v pending_version="$pending_version" \
     -v reason="$reason" \
     -v pending_observation="$pending_observation" '
     BEGIN {
       defaults["schema"] = "fm-reconciled.v1"
       defaults["task"] = task
+      defaults["lifecycle_generation"] = lifecycle_generation
       defaults["repository_identity"] = repository_identity
       defaults["endpoint"] = endpoint
       defaults["state"] = "unknown"
@@ -822,9 +961,14 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
       defaults["evidence"] = "observer failure"
       defaults["observed_at"] = now
       defaults["notified_action_token"] = ""
+      defaults["notified_action_version"] = "0"
       defaults["notified_action_observation_key"] = ""
+      updates["lifecycle_generation"] = lifecycle_generation
+      updates["repository_identity"] = repository_identity
+      updates["endpoint"] = endpoint
       updates["observation_key"] = observation_key
       updates["pending_action_token"] = pending
+      updates["pending_action_version"] = pending_version
       updates["pending_action_reason"] = reason
       updates["pending_action_observation_key"] = pending_observation
       updates["observer_state"] = "failed"
@@ -844,22 +988,25 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
     END {
       order[1] = "schema"
       order[2] = "task"
-      order[3] = "repository_identity"
-      order[4] = "endpoint"
-      order[5] = "state"
-      order[6] = "source"
-      order[7] = "evidence"
-      order[8] = "observed_at"
-      order[9] = "observation_key"
-      order[10] = "pending_action_token"
-      order[11] = "pending_action_reason"
-      order[12] = "pending_action_observation_key"
-      order[13] = "notified_action_token"
-      order[14] = "notified_action_observation_key"
-      order[15] = "observer_state"
-      order[16] = "observer_evidence"
-      order[17] = "observer_sequence"
-      for (i = 1; i <= 17; i++) {
+      order[3] = "lifecycle_generation"
+      order[4] = "repository_identity"
+      order[5] = "endpoint"
+      order[6] = "state"
+      order[7] = "source"
+      order[8] = "evidence"
+      order[9] = "observed_at"
+      order[10] = "observation_key"
+      order[11] = "pending_action_token"
+      order[12] = "pending_action_version"
+      order[13] = "pending_action_reason"
+      order[14] = "pending_action_observation_key"
+      order[15] = "notified_action_token"
+      order[16] = "notified_action_version"
+      order[17] = "notified_action_observation_key"
+      order[18] = "observer_state"
+      order[19] = "observer_evidence"
+      order[20] = "observer_sequence"
+      for (i = 1; i <= 20; i++) {
         key = order[i]
         if (!(key in seen)) {
           if (key in updates) print key "=" updates[key]
@@ -868,17 +1015,18 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence>
       }
     }
   ' "$input" > "$tmp" || { rm -f "$tmp"; return 1; }
-  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" || { rm -f "$tmp"; return 0; }
+  fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || { rm -f "$tmp"; return 0; }
   mv -f "$tmp" "$record" || return 1
-  if [ -n "$pending" ] && [ "$pending" != "$old_notified" ]; then
-    printf 'action\t%s\t%s\n' "$pending" "$reason"
+  if [ -n "$pending" ] \
+    && { [ "$pending" != "$old_notified" ] || [ "$pending_version" != "$old_notified_version" ]; }; then
+    printf 'action\t%s\t%s\t%s\n' "$pending" "$pending_version" "$reason"
   fi
 }
 
-fm_reconcile_observer_failure() {  # <state-dir> <id> <evidence>
-  local state=$1 id=$2 evidence=$3 failure_rc
+fm_reconcile_observer_failure() {  # <state-dir> <id> <evidence> [expected-lifecycle-generation]
+  local state=$1 id=$2 evidence=$3 expected_generation=${4:-} failure_rc
   fm_reconcile_lock_acquire "$state" "$id"
-  if fm_reconcile_observer_failure_locked "$state" "$id" "$evidence"; then
+  if fm_reconcile_observer_failure_locked "$state" "$id" "$evidence" "$expected_generation"; then
     failure_rc=0
   else
     failure_rc=$?
@@ -887,31 +1035,34 @@ fm_reconcile_observer_failure() {  # <state-dir> <id> <evidence>
   return "$failure_rc"
 }
 
-fm_reconcile_ack_locked() {  # <state-dir> <id> <token>
-  local state=$1 id=$2 token=$3 record pending pending_observation tmp
+fm_reconcile_ack_locked() {  # <state-dir> <id> <token> <version>
+  local state=$1 id=$2 token=$3 version=$4 record pending pending_version pending_observation tmp
   record="$state/$id.reconciled"
   [ -f "$record" ] || return 1
   pending=$(fm_reconcile_record_value "$record" pending_action_token)
-  [ -n "$token" ] && [ "$pending" = "$token" ] || return 1
+  pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
+  [ -n "$token" ] && [ "$pending" = "$token" ] && [ "$pending_version" = "$version" ] || return 1
   pending_observation=$(fm_reconcile_record_value "$record" pending_action_observation_key)
   tmp="$record.ack.${BASHPID:-$$}"
-  awk -v token="$token" -v observation="$pending_observation" '
-    BEGIN { wrote_token = 0; wrote_observation = 0 }
+  awk -v token="$token" -v version="$version" -v observation="$pending_observation" '
+    BEGIN { wrote_token = 0; wrote_version = 0; wrote_observation = 0 }
     /^notified_action_token=/ { print "notified_action_token=" token; wrote_token = 1; next }
+    /^notified_action_version=/ { print "notified_action_version=" version; wrote_version = 1; next }
     /^notified_action_observation_key=/ { print "notified_action_observation_key=" observation; wrote_observation = 1; next }
     { print }
     END {
       if (!wrote_token) print "notified_action_token=" token
+      if (!wrote_version) print "notified_action_version=" version
       if (!wrote_observation) print "notified_action_observation_key=" observation
     }
   ' "$record" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$record"
 }
 
-fm_reconcile_ack() {  # <state-dir> <id> <token>
-  local state=$1 id=$2 token=$3 ack_rc
+fm_reconcile_ack() {  # <state-dir> <id> <token> <version>
+  local state=$1 id=$2 token=$3 version=$4 ack_rc
   fm_reconcile_lock_acquire "$state" "$id"
-  if fm_reconcile_ack_locked "$state" "$id" "$token"; then
+  if fm_reconcile_ack_locked "$state" "$id" "$token" "$version"; then
     ack_rc=0
   else
     ack_rc=$?
@@ -928,44 +1079,58 @@ fm_reconcile_teardown_begin() {  # <state-dir> <id>
   return "$mark_rc"
 }
 
-fm_reconcile_action_marker() {  # <id> <token>
-  printf '[fm-reconcile=%s,%s]' "$(fm_reconcile_clean_value "$1")" "$(fm_reconcile_clean_value "$2")"
+fm_reconcile_action_marker() {  # <id> <token> <version>
+  printf '[fm-reconcile=%s,%s,%s]' "$(fm_reconcile_clean_value "$1")" "$(fm_reconcile_clean_value "$2")" "$3"
 }
 
-fm_reconcile_action_parse() {  # <reason>; populates FM_RECONCILE_ACTION_ID/TOKEN
-  local reason=$1 marker
+fm_reconcile_action_parse() {  # <reason>; populates FM_RECONCILE_ACTION_ID/TOKEN/VERSION
+  local reason=$1 marker rest
   FM_RECONCILE_ACTION_ID=
   FM_RECONCILE_ACTION_TOKEN=
+  FM_RECONCILE_ACTION_VERSION=
   case "$reason" in *'[fm-reconcile='*']'*) ;; *) return 1 ;; esac
   marker=${reason##*'[fm-reconcile='}
   marker=${marker%%']'*}
-  case "$marker" in *,*) ;; *) return 1 ;; esac
+  case "$marker" in *,*,*) ;; *) return 1 ;; esac
   FM_RECONCILE_ACTION_ID=${marker%%,*}
-  FM_RECONCILE_ACTION_TOKEN=${marker#*,}
+  rest=${marker#*,}
+  FM_RECONCILE_ACTION_TOKEN=${rest%%,*}
+  FM_RECONCILE_ACTION_VERSION=${rest#*,}
   case "$FM_RECONCILE_ACTION_ID" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "$FM_RECONCILE_ACTION_TOKEN" in ''|*[!A-Za-z0-9:._-]*) return 1 ;; esac
+  case "$FM_RECONCILE_ACTION_VERSION" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; esac
 }
 
 fm_reconcile_action_pending() {  # <state-dir> <reason>
-  local state=$1 reason=$2 record pending notified
+  local state=$1 reason=$2 record pending pending_version notified notified_version
   fm_reconcile_action_parse "$reason" || return 1
   record="$state/$FM_RECONCILE_ACTION_ID.reconciled"
   [ -f "$record" ] || return 1
   pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
   notified=$(fm_reconcile_record_value "$record" notified_action_token)
-  [ "$pending" = "$FM_RECONCILE_ACTION_TOKEN" ] && [ "$notified" != "$FM_RECONCILE_ACTION_TOKEN" ]
+  notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
+  [ "$pending" = "$FM_RECONCILE_ACTION_TOKEN" ] \
+    && [ "$pending_version" = "$FM_RECONCILE_ACTION_VERSION" ] \
+    && { [ "$notified" != "$FM_RECONCILE_ACTION_TOKEN" ] || [ "$notified_version" != "$FM_RECONCILE_ACTION_VERSION" ]; }
 }
 
 fm_reconcile_consumer_ack_reason() {  # <state-dir> <reason>
-  local state=$1 reason=$2 record pending notified
+  local state=$1 reason=$2 record pending pending_version notified notified_version
   fm_reconcile_action_parse "$reason" || return 0
   record="$state/$FM_RECONCILE_ACTION_ID.reconciled"
   [ -f "$record" ] || return 0
   pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
   notified=$(fm_reconcile_record_value "$record" notified_action_token)
-  [ "$notified" != "$FM_RECONCILE_ACTION_TOKEN" ] || return 0
+  notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
+  if [ "$notified" = "$FM_RECONCILE_ACTION_TOKEN" ] \
+    && [ "$notified_version" = "$FM_RECONCILE_ACTION_VERSION" ]; then
+    return 0
+  fi
   [ "$pending" = "$FM_RECONCILE_ACTION_TOKEN" ] || return 0
-  fm_reconcile_ack "$state" "$FM_RECONCILE_ACTION_ID" "$FM_RECONCILE_ACTION_TOKEN"
+  [ "$pending_version" = "$FM_RECONCILE_ACTION_VERSION" ] || return 0
+  fm_reconcile_ack "$state" "$FM_RECONCILE_ACTION_ID" "$FM_RECONCILE_ACTION_TOKEN" "$FM_RECONCILE_ACTION_VERSION"
 }
 
 fm_reconcile_advance_seen() {  # <state-dir> <id>
@@ -985,18 +1150,20 @@ fm_reconcile_advance_seen() {  # <state-dir> <id>
 }
 
 fm_reconcile_is_quiet_notified() {  # <state-dir> <id> [endpoint]
-  local state=$1 id=$2 endpoint=${3:-} record current recorded pending notified observation notified_observation
+  local state=$1 id=$2 endpoint=${3:-} record current recorded pending pending_version notified notified_version observation notified_observation
   record="$state/$id.reconciled"
   [ -f "$record" ] || return 1
   current=$(fm_reconcile_record_value "$record" state)
   recorded=$(fm_reconcile_record_value "$record" endpoint)
   pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
   notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
   observation=$(fm_reconcile_record_value "$record" observation_key)
   notified_observation=$(fm_reconcile_record_value "$record" notified_action_observation_key)
   [ -z "$endpoint" ] || [ "$recorded" = "$endpoint" ] || return 1
   [ -n "$current" ] && [ "$current" != working ] || return 1
-  [ -n "$pending" ] && [ "$pending" = "$notified" ] \
+  [ -n "$pending" ] && [ "$pending" = "$notified" ] && [ "$pending_version" = "$notified_version" ] \
     && [ -n "$observation" ] && [ "$observation" = "$notified_observation" ]
 }
 
@@ -1012,8 +1179,10 @@ fm_reconcile_wait_registration() {  # <state-dir> <id> -> JSON
     --arg description "$FM_RECONCILE_WAIT_DESCRIPTION" \
     --arg target "$FM_RECONCILE_WAIT_TARGET" \
     --arg signature "$FM_RECONCILE_WAIT_SIGNATURE" \
+    --arg registration_id "$FM_RECONCILE_WAIT_REGISTRATION_ID" \
+    --arg lifecycle_generation "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" \
     --arg owner_worktree "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
     --arg owner_tasktmp "$FM_RECONCILE_WAIT_OWNER_TASKTMP" \
     --argjson progress_grace "${FM_RECONCILE_WAIT_PROGRESS_GRACE:-0}" \
-    '{registered:($registered == 1),path:$path,kind:$kind,role:$role,description:$description,target:$target,signature:$signature,owner_worktree:($owner_worktree | if . == "" then null else . end),owner_tasktmp:($owner_tasktmp | if . == "" then null else . end),progress_grace_seconds:($progress_grace | if . == 0 then null else . end)}'
+    '{registered:($registered == 1),path:$path,kind:$kind,role:$role,description:$description,target:$target,signature:$signature,registration_id:($registration_id | if . == "" then null else . end),lifecycle_generation:($lifecycle_generation | if . == "" then null else . end),owner_worktree:($owner_worktree | if . == "" then null else . end),owner_tasktmp:($owner_tasktmp | if . == "" then null else . end),progress_grace_seconds:($progress_grace | if . == 0 then null else . end)}'
 }

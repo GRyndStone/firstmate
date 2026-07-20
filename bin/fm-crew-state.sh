@@ -169,6 +169,11 @@ TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
 
+if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
+  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+  [ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
+fi
+
 # Normal point-in-time readers consume the durable watcher's fresh reconciled
 # observation, which includes the live source that superseded a stale event log.
 # The watcher itself sets FM_CREW_STATE_LIVE_ONLY=1 through fm-reconcile-lib.sh
@@ -633,9 +638,6 @@ fi
 # its exact pid/descendant progress is fresh.  Without that evidence, a dead or
 # unreadable target means the crew is gone: report unknown rather than trusting
 # a possibly-stale status log as the current state.
-owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
-[ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
-
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
 if [ "$TASK_BACKEND" = herdr ]; then
   herdr_pane_state

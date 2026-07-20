@@ -548,16 +548,18 @@ test_normal_supervisor_replays_unaccepted_reconciled_wake() {
   dir=$(make_supercase reconcile-replay)
   state="$dir/state"
   record="$state/task.reconciled"
-  old_reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence) [fm-reconcile=task,transition:1]'
-  reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence); newer sparse event before delivery: done: final evidence [fm-reconcile=task,transition:1]'
+  old_reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence) [fm-reconcile=task,transition:1,1]'
+  reason='stale: session:fm-task reconciled-transition (working -> idle from positive pane evidence); newer sparse event before delivery: done: final evidence [fm-reconcile=task,transition:1,1]'
   fm_write_meta "$record" \
     'schema=fm-reconciled.v1' \
     'task=task' \
     'state=idle' \
     'source=pane' \
     'pending_action_token=transition:1' \
+    'pending_action_version=1' \
     'pending_action_reason=reconciled-transition (working -> idle from positive pane evidence)' \
-    'notified_action_token='
+    'notified_action_token=' \
+    'notified_action_version=0'
   append_wake "$state" stale session:fm-task "$old_reason"
   append_wake "$state" stale session:fm-task "$reason"
 
@@ -582,16 +584,18 @@ test_reconciled_escalation_acknowledges_before_immediate_flush() {
   dir=$(make_supercase reconcile-immediate-flush)
   state="$dir/state"
   record="$state/task.reconciled"
-  reason='stale: session:fm-task reconciled-transition (working -> failed from positive run-step evidence) [fm-reconcile=task,transition:1]'
+  reason='stale: session:fm-task reconciled-transition (working -> failed from positive run-step evidence) [fm-reconcile=task,transition:1,1]'
   fm_write_meta "$record" \
     'schema=fm-reconciled.v1' \
     'task=task' \
     'state=failed' \
     'source=run-step' \
     'pending_action_token=transition:1' \
+    'pending_action_version=1' \
     'pending_action_reason=reconciled-transition (working -> failed from positive run-step evidence)' \
     'pending_action_observation_key=failed-observation' \
     'notified_action_token=' \
+    'notified_action_version=0' \
     'notified_action_observation_key='
 
   (
