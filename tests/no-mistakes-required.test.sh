@@ -9,6 +9,8 @@ workflow="$ROOT/.github/workflows/no-mistakes-required.yml"
 contributing="$ROOT/CONTRIBUTING.md"
 marker='Updates from [git push no-mistakes](https://github.com/GRyndStone/no-mistakes)'
 
+grep -F 'types: [opened, edited, synchronize, reopened]' "$workflow" >/dev/null \
+  || fail "required PR signature check does not rerun after body or branch updates"
 grep -F "marker='$marker'" "$workflow" >/dev/null \
   || fail "required PR signature marker does not reference the canonical private repository"
 grep -F 'https://github.com/GRyndStone/no-mistakes' "$contributing" >/dev/null \

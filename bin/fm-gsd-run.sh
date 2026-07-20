@@ -24,6 +24,12 @@
 #   whose wall-clock exceeds your harness's foreground command budget.
 #   The tab stays open after the run so its output stays inspectable; the
 #   watcher never adopts it because the label does not start with fm-.
+#   Launch preflight rolls back its created tab and owned exit-state directory
+#   on failures through the target-readiness check. Rollback refuses an
+#   ambiguous tab identity and refuses to close the workspace's last tab, so
+#   the safe failure may preserve an unused tab instead of deleting a workspace.
+#   After readiness, a failed atomic pane-run has an ambiguous launch outcome;
+#   the tab and exit state are preserved for inspection rather than rolled back.
 #   Exit code 96 is RESERVED for every wait-side abort - a run tab that
 #   closed before recording an exit code, an unreadable-pane-state streak,
 #   and a mid-wait herdr server restart - so a scripted caller can tell "the
@@ -125,11 +131,52 @@ gsd_run_server_identity() {
 
 RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
+
+# Container ensure first so missing-herdr / refused-container preflight never
+# leaves an unused mktemp root behind.
+# Container ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>";
+# the seeded tab id threads through to create_task untouched, which is the
+# only function allowed to prune it (see bin/backends/herdr.sh).
+CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$GSD_DIR_ABS") || exit 1
+CONTAINER=${CONTAINER_RAW%%$'\t'*}
+SEEDED_DEFAULT_TAB_ID=${CONTAINER_RAW#*$'\t'}
+SES=${CONTAINER%%:*}
+WSID=${CONTAINER#*:}
+TAB_ID=
+PANE_ID=
+OWNED_RUN_DIR=0
+RUN_DIR=
+
+# Arm unstarted-run rollback BEFORE create_task so a create that commits a tab
+# then fails/interrupts before IDs return still cleans via label-aware rollback.
+# shellcheck disable=SC2329
+cleanup_unstarted_run() {
+  if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "${RUN_DIR:-}" ]; then
+    rm -rf "$RUN_DIR"
+  fi
+  fm_backend_herdr_rollback_created_task_tab "$SES" "$WSID" "$LABEL" "${TAB_ID:-}" "" >/dev/null 2>&1 || true
+}
+trap cleanup_unstarted_run EXIT
+
+TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LABEL" "$GSD_DIR_ABS" "$SEEDED_DEFAULT_TAB_ID") || exit 1
+read -r TAB_ID PANE_ID <<EOF
+$TASK_IDS
+EOF
+if [ -z "$TAB_ID" ] || [ -z "$PANE_ID" ]; then
+  echo "error: herdr did not return a tab/pane id for run tab $LABEL" >&2
+  exit 1
+fi
+TARGET="$SES:$PANE_ID"
+
+# Exit-file dir only after the run tab exists. Default is a fresh mktemp root
+# per run (override with FM_GSD_RUN_STATE_DIR); owned roots are removed if
+# setup fails before the pane command starts.
 if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
   mkdir -p "$FM_GSD_RUN_STATE_DIR"
   RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
 else
   RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX")
+  OWNED_RUN_DIR=1
 fi
 EXIT_FILE="$RUN_DIR/$LABEL.exit"
 
@@ -142,27 +189,18 @@ for w in "$@"; do
 done
 PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
 
-# Container ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>";
-# the seeded tab id threads through to create_task untouched, which is the
-# only function allowed to prune it (see bin/backends/herdr.sh).
-CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$GSD_DIR_ABS") || exit 1
-CONTAINER=${CONTAINER_RAW%%$'\t'*}
-SEEDED_DEFAULT_TAB_ID=${CONTAINER_RAW#*$'\t'}
-SES=${CONTAINER%%:*}
-TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LABEL" "$GSD_DIR_ABS" "$SEEDED_DEFAULT_TAB_ID") || exit 1
-read -r TAB_ID PANE_ID <<EOF
-$TASK_IDS
-EOF
-if [ -z "$TAB_ID" ] || [ -z "$PANE_ID" ]; then
-  echo "error: herdr did not return a tab/pane id for run tab $LABEL" >&2
-  exit 1
-fi
-TARGET="$SES:$PANE_ID"
-
 SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
 
+# Keep unstarted-run rollback armed through deterministic pre-send readiness.
+# Once the target is ready, clear the trap so an ambiguous pane-run failure
+# preserves the tab and exit-file dir rather than destroying live work.
+fm_backend_herdr_target_ready "$TARGET" || {
+  echo "error: herdr target $TARGET is not ready for run tab $LABEL" >&2
+  exit 1
+}
+trap - EXIT
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
-  echo "error: failed to start the run in herdr tab $LABEL (target $TARGET)" >&2
+  echo "error: run launch outcome is ambiguous for herdr tab $LABEL (target $TARGET); the tab and exit state at $EXIT_FILE were preserved" >&2
   exit 1
 }
 echo "run: tab=$LABEL target=$TARGET exit_file=$EXIT_FILE"

@@ -451,6 +451,62 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
   esac
 }
 
+fm_backend_herdr_tab_id_in_list() {  # <tab_id> <newline-separated-tab-ids>
+  local tab_id=$1 tab_ids=$2 candidate
+  while IFS= read -r candidate; do
+    [ "$candidate" = "$tab_id" ] && return 0
+  done <<EOF
+$tab_ids
+EOF
+  return 1
+}
+
+fm_backend_herdr_rollback_created_task_tab() {  # <session> <workspace_id> <label> <known_tab_id> <preexisting_same-label-tab-ids>
+  local session=$1 wsid=$2 label=$3 tab_id=${4:-} preexisting_tab_ids=${5:-}
+  local list candidates candidate other_tabs
+  if [ -z "$tab_id" ]; then
+    list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
+      echo "warning: could not locate created herdr tab '$label' for rollback in workspace $wsid (session $session)" >&2
+      return 1
+    }
+    candidates=$(printf '%s' "$list" | jq -r --arg want "$label" 'if (.result.tabs | type) == "array" then .result.tabs[] | select(.label == $want) | .tab_id else error("missing result.tabs") end' 2>/dev/null) || {
+      echo "warning: could not locate created herdr tab '$label' for rollback in workspace $wsid (session $session)" >&2
+      return 1
+    }
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      fm_backend_herdr_tab_id_in_list "$candidate" "$preexisting_tab_ids" && continue
+      if [ -n "$tab_id" ]; then
+        echo "warning: created herdr tab '$label' was ambiguous during rollback in workspace $wsid (session $session)" >&2
+        return 1
+      fi
+      tab_id=$candidate
+    done <<EOF
+$candidates
+EOF
+  fi
+  if [ -z "$tab_id" ]; then
+    echo "warning: could not locate created herdr tab '$label' for rollback in workspace $wsid (session $session)" >&2
+    return 1
+  fi
+  # Closing a workspace's last tab deletes the whole workspace on real herdr.
+  # Never roll back the replacement when it is the sole remaining tab.
+  list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
+    echo "warning: could not list tabs before rollback of $tab_id in workspace $wsid (session $session); leaving tab in place" >&2
+    return 1
+  }
+  other_tabs=$(printf '%s' "$list" | jq -r --arg keep "$tab_id" \
+    'if (.result.tabs | type) == "array" then [.result.tabs[] | select(.tab_id != $keep) | .tab_id] | length else 0 end' 2>/dev/null) || other_tabs=0
+  if [ "${other_tabs:-0}" -eq 0 ]; then
+    echo "warning: refusing to roll back created herdr tab $tab_id for '$label' because it is the last tab in workspace $wsid (session $session); closing it would delete the workspace" >&2
+    return 1
+  fi
+  fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || {
+    echo "warning: could not close created herdr tab $tab_id for '$label' rollback in workspace $wsid (session $session)" >&2
+    return 1
+  }
+}
+
 # fm_backend_herdr_agent_alive: CONFIDENT liveness of a live harness-agent
 # PROCESS under <target> ("<session>:<pane_id>"), for the same
 # session-start secondmate-liveness sweep fm_backend_tmux_agent_alive serves
@@ -544,6 +600,7 @@ EOF
   pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
     echo "error: could not parse tab/pane id from herdr tab create output" >&2
+    fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
     return 1
   fi
   [ -z "$seeded_tab_id" ] || fm_backend_herdr_workspace_prune_seeded_default_tab "$session" "$wsid" "$seeded_tab_id"
@@ -556,10 +613,12 @@ $dup_tab_ids
 EOF
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
       echo "error: could not verify herdr husk removal for tab '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
       return 1
     }
     if ! printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1; then
       echo "error: could not parse herdr tab list output for workspace $wsid (session $session)" >&2
+      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
       return 1
     fi
     remaining_dup_tabs=$(printf '%s' "$list" | jq -r --arg want "$label" --arg replacement "$tab_id" \
@@ -567,6 +626,7 @@ EOF
     remaining_dup_tabs=${remaining_dup_tabs//$'\n'/ }
     if [ -n "$remaining_dup_tabs" ]; then
       echo "error: failed to remove preexisting herdr tab(s) $remaining_dup_tabs for label '$label' in workspace $wsid (session $session)" >&2
+      fm_backend_herdr_rollback_created_task_tab "$session" "$wsid" "$label" "$tab_id" "$dup_tab_ids" || true
       return 1
     fi
   fi

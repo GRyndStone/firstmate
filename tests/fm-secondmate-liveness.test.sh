@@ -42,7 +42,7 @@ set -u
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
 
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-liveness)
+fm_test_tmproot TMP_ROOT fm-secondmate-liveness
 
 # --- unit level: fm_backend_tmux_agent_alive --------------------------------
 

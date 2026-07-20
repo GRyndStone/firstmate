@@ -371,7 +371,7 @@ test_failopen_garbage_stdin() {
 
 test_failopen_missing_jq() {
   local dir fakebin rc real
-  dir=$(fm_test_tmproot fm-arm-pretool-check)
+  fm_test_tmproot dir fm-arm-pretool-check
   fakebin="$dir/fakebin"
   mkdir -p "$fakebin"
   local tool
@@ -387,7 +387,7 @@ test_failopen_missing_jq() {
 
 test_failopen_missing_node() {
   local dir fakebin rc real tool
-  dir=$(fm_test_tmproot fm-arm-pretool-node)
+  fm_test_tmproot dir fm-arm-pretool-node
   fakebin="$dir/fakebin"
   mkdir -p "$fakebin"
   for tool in bash dirname; do

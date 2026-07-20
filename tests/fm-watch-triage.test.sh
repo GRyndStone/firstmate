@@ -25,7 +25,7 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
+fm_test_tmproot TMP_ROOT fm-watch-triage-tests
 
 # Common watcher knobs: tight poll/grace, no check or heartbeat cadence unless a
 # test overrides them, so a test only exercises the path it targets. FM_CREW_STATE_BIN

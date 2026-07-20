@@ -27,7 +27,7 @@ set -u
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-secondmate-lifecycle)
+fm_test_tmproot TMP_ROOT fm-secondmate-lifecycle
 export FM_BACKEND=tmux
 
 HOME_DIR="$TMP_ROOT/main home"

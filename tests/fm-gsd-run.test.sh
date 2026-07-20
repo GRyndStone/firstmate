@@ -21,7 +21,7 @@ set -u
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
 
-TMP_ROOT=$(fm_test_tmproot fm-gsd-run)
+fm_test_tmproot TMP_ROOT fm-gsd-run
 mkdir -p "$TMP_ROOT"
 
 # make_gsd_fake_herdr: a stateless fake `herdr` answering exactly the calls
@@ -62,8 +62,25 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
-  "tab list") printf '{"result":{"tabs":[]}}\n' ;;
-  "tab create") printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n' ;;
+  "tab list")
+    if grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
+      label=$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)
+      if [ "${FM_FAKE_LAST_TAB:-0}" = 1 ]; then
+        printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
+      else
+        printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
+      fi
+    else
+      printf '{"result":{"tabs":[]}}\n'
+    fi
+    ;;
+  "tab create")
+    if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ]; then
+      printf '{"result":{}}\n'
+    else
+      printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n'
+    fi
+    ;;
   "pane get")
     if [ "${FM_FAKE_PANE_GONE:-0}" = 1 ]; then
       if [ -n "${FM_FAKE_DEAD_EXIT:-}" ]; then
@@ -78,6 +95,7 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "agent get") printf '{"error":{"code":"agent_not_found"}}\n' ;;
+  "pane run") [ "${FM_FAKE_PANE_RUN_FAIL:-0}" = 1 ] && exit 23 ;;
   *) : ;;
 esac
 exit 0
@@ -136,11 +154,82 @@ test_env_assignments_allowed_before_gsd() {
 # Without herdr on PATH the helper fails loudly instead of running the
 # command invisibly - the caller reports blocked rather than driving raw.
 test_missing_herdr_fails_closed() {
-  local out status
-  out=$( PATH="/usr/bin:/bin" "$ROOT/bin/fm-gsd-run.sh" task-h1 "$TMP_ROOT" gsd headless auto 2>&1 ) && status=0 || status=$?
+  local out status tmpdir
+  tmpdir="$TMP_ROOT/missing-herdr-tmp"
+  mkdir -p "$tmpdir"
+  out=$( /usr/bin/env -u FM_GSD_RUN_STATE_DIR PATH="/usr/bin:/bin" TMPDIR="$tmpdir" \
+    "$ROOT/bin/fm-gsd-run.sh" task-h1 "$TMP_ROOT" gsd headless auto 2>&1 ) && status=0 || status=$?
   [ "$status" -ne 0 ] || fail "missing herdr must fail, not run invisibly"
   assert_contains "$out" "herdr" "missing-herdr failure does not name herdr"
+  [ -z "$(find "$tmpdir" -maxdepth 1 -type d -name 'fm-gsd-run-task-h1.*' -print -quit)" ] \
+    || fail "missing-herdr preflight left fm-gsd-run-task-h1.* under isolated TMPDIR"
   pass "fm-gsd-run.sh: missing herdr fails closed"
+}
+
+test_state_setup_failure_closes_created_tab() {
+  local dir fb log proj state_file out status
+  dir="$TMP_ROOT/state-failure"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_file="$dir/not-a-directory"; : > "$state_file"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$state_file" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-f1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "state-directory setup failure must fail the launch"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
+    "state-directory setup failure left the created herdr tab open"
+  pass "fm-gsd-run.sh: state setup failure closes the created run tab"
+}
+
+test_state_setup_failure_preserves_last_tab_workspace() {
+  local dir fb log proj state_file status
+  dir="$TMP_ROOT/state-failure-last-tab"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_file="$dir/not-a-directory"; : > "$state_file"
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_LAST_TAB=1 FM_GSD_RUN_STATE_DIR="$state_file" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-f2 "$proj" gsd headless auto >/dev/null 2>&1 \
+    && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "last-tab state-directory setup failure must fail the launch"
+  ! grep -q $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' "$log" \
+    || fail "state-directory setup failure closed the workspace's last tab"
+  pass "fm-gsd-run.sh: preflight rollback preserves the workspace's last tab"
+}
+
+test_post_create_failure_closes_created_tab() {
+  local dir fb log proj out status
+  dir="$TMP_ROOT/post-create-failure"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_TAB_CREATE_UNPARSEABLE=1 \
+    FM_GSD_RUN_STATE_DIR="$dir/state" "$ROOT/bin/fm-gsd-run.sh" --no-wait task-c1 "$proj" gsd headless auto 2>&1 ) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "post-create parsing failure must fail the launch"
+  assert_contains "$out" "could not parse tab/pane id" "post-create failure lost its parsing error"
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
+    "post-create failure leaked the created herdr tab"
+  assert_absent "$dir/state" "post-create failure created exit state before readiness"
+  pass "fm-gsd-run.sh: post-create failures roll back the created run tab"
+}
+
+test_ambiguous_send_failure_preserves_tab_and_state() {
+  local dir fb log proj state_root out status
+  dir="$TMP_ROOT/ambiguous-send"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_root="$dir/run-state"
+  mkdir -p "$state_root"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" TMPDIR="$state_root" \
+    FM_FAKE_PANE_RUN_FAIL=1 /usr/bin/env -u FM_GSD_RUN_STATE_DIR \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-a2 "$proj" gsd headless auto 2>&1) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "an ambiguous pane-run failure must fail the launch"
+  assert_contains "$out" "launch outcome is ambiguous" "ambiguous launch failure lost its warning"
+  ! grep -q $'\x1f''tab'$'\x1f''close' "$log" || fail "ambiguous launch failure closed the run tab"
+  [ -n "$(find "$state_root" -maxdepth 1 -type d -name 'fm-gsd-run-task-a2.*' -print -quit)" ] \
+    || fail "ambiguous launch failure deleted its exit-state directory"
+  pass "fm-gsd-run.sh: ambiguous send failure preserves tab and exit state"
 }
 
 test_no_wait_launches_visible_tab() {
@@ -321,6 +410,10 @@ test_script_parses_and_help
 test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
+test_state_setup_failure_closes_created_tab
+test_state_setup_failure_preserves_last_tab_workspace
+test_post_create_failure_closes_created_tab
+test_ambiguous_send_failure_preserves_tab_and_state
 test_no_wait_launches_visible_tab
 test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code

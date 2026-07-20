@@ -89,7 +89,7 @@ test_rejects_wrong_shellcheck_version() {
   # Version-independent: a fake shellcheck reporting a different version must be
   # refused before any lint, proving local and CI cannot silently diverge.
   local tmp fakebin out rc
-  tmp=$(fm_test_tmproot fm-lint-ver)
+  fm_test_tmproot tmp fm-lint-ver
   fakebin=$(fm_fakebin "$tmp")
   cat > "$fakebin/shellcheck" <<'SH'
 #!/usr/bin/env bash
@@ -121,7 +121,7 @@ test_catches_a_real_lint_defect() {
   # warning present at default severity (and is itself one of the recurring
   # classes that slipped through, PR 474).
   local tmp bad out rc
-  tmp=$(fm_test_tmproot fm-lint-bad)
+  fm_test_tmproot tmp fm-lint-bad
   mkdir -p "$tmp"
   bad="$tmp/bad.sh"
   cat > "$bad" <<'SH'
@@ -145,7 +145,7 @@ test_ignores_ambient_shellcheck_opts() {
     return
   fi
   local tmp bad out rc
-  tmp=$(fm_test_tmproot fm-lint-opts)
+  fm_test_tmproot tmp fm-lint-opts
   mkdir -p "$tmp"
   bad="$tmp/bad.sh"
   cat > "$bad" <<'SH'
@@ -169,7 +169,7 @@ test_clean_fixture_passes() {
     return
   fi
   local tmp good rc
-  tmp=$(fm_test_tmproot fm-lint-good)
+  fm_test_tmproot tmp fm-lint-good
   mkdir -p "$tmp"
   good="$tmp/good.sh"
   cat > "$good" <<'SH'

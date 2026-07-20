@@ -43,10 +43,23 @@ pass() {
 
 # --- self-cleaning temp root ------------------------------------------------
 #
-# fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal
-# on EXIT. The first call installs the cleanup trap. A test file that needs
-# extra teardown (e.g. killing a daemon) should define its own EXIT trap and
-# call fm_test_cleanup from inside it so registered dirs are still removed.
+# fm_test_tmproot <varname> <prefix>
+#   Creates a fresh temp dir under TMPDIR, assigns its path to <varname> in the
+#   caller's shell (via printf -v; works with caller-local variables), and
+#   registers it for removal on EXIT. The first registration installs
+#   `trap fm_test_cleanup EXIT` in the parent shell.
+#
+# fm-tmproot-static-allow: unsafe historical example `root=$(fm_test_tmproot ...)`
+# runs the function in a subshell. The EXIT trap then fires in that subshell and
+# deletes the empty root before the caller receives the path; the parent never
+# gets the array entry or the trap. Callers that recreate the path (mkdir -p
+# under it) then leak the recreated tree. Always call as:
+#   fm_test_tmproot TMP_ROOT fm-my-suite
+#
+# A test file that needs extra teardown (e.g. killing a daemon) should define
+# its own EXIT trap and call fm_test_cleanup from inside it so registered dirs
+# are still removed. Overwriting the trap without calling fm_test_cleanup drops
+# cleanup of every root registered so far.
 
 FM_TEST_CLEANUP_DIRS=()
 
@@ -55,16 +68,28 @@ fm_test_cleanup() {
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  FM_TEST_CLEANUP_DIRS=()
 }
 
 fm_test_tmproot() {
-  local prefix=${1:-fm-test} root
-  root=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+  local __varname __prefix __root
+  if [ "$#" -ne 2 ]; then
+    printf 'fm_test_tmproot: usage: fm_test_tmproot VAR prefix\n' >&2
+    return 1
+  fi
+  __varname=$1
+  __prefix=$2
+  if [ -z "${__varname:-}" ] || [[ ! "$__varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf 'fm_test_tmproot: need a valid variable name as arg1 (got %q)\n' "${__varname:-}" >&2
+    return 1
+  fi
+  __root=$(mktemp -d "${TMPDIR:-/tmp}/${__prefix}.XXXXXX") || return 1
   if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
     trap fm_test_cleanup EXIT
   fi
-  FM_TEST_CLEANUP_DIRS+=("$root")
-  printf '%s\n' "$root"
+  FM_TEST_CLEANUP_DIRS+=("$__root")
+  # printf -v assigns through dynamic scope: a caller-local varname is updated.
+  printf -v "$__varname" '%s' "$__root"
 }
 
 # --- fakebin / PATH shims ---------------------------------------------------

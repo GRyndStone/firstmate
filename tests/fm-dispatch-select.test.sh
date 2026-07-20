@@ -6,7 +6,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
-TMP_ROOT=$(fm_test_tmproot fm-dispatch-select-tests)
+fm_test_tmproot TMP_ROOT fm-dispatch-select-tests
 mkdir -p "$TMP_ROOT"
 
 write_quota() {
