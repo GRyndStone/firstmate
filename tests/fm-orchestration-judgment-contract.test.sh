@@ -10,6 +10,16 @@ SECTION_ONE=$(sed -n '1,/^## 2\./p' "$AGENTS")
 
 assert_contains "$SECTION_ONE" 'Treat every delegated or tool-produced conclusion as evidence, never authority' \
   "AGENTS.md does not load independent orchestration judgment as a prime directive"
+assert_contains "$SECTION_ONE" "reconstruct the captain-approved ideal state from the captain's intent and project truth" \
+  "AGENTS.md does not require reconstructing the captain-approved ideal state"
+assert_contains "$SECTION_ONE" 'inspect the primary evidence' \
+  "AGENTS.md does not require inspecting primary evidence"
+assert_contains "$SECTION_ONE" 'distinguish proven facts, assumptions, uncertainty or confidence limits, and contradictions' \
+  "AGENTS.md does not require distinguishing evidence, uncertainty, and contradictions"
+assert_contains "$SECTION_ONE" 'decide the real implication and recommended action' \
+  "AGENTS.md does not require independent implication analysis and recommendation"
+assert_contains "$SECTION_ONE" 'Never adopt or forward a conclusion merely because' \
+  "AGENTS.md does not prohibit adopting delegated or tool conclusions on assertion alone"
 assert_grep 'a gate verdict is an input to Firstmate' "$AGENTS" \
   "validation workflow does not apply the evidence-not-authority rule at its highest-risk boundary"
 assert_no_grep 'Relay the findings to the captain' "$AGENTS" \
