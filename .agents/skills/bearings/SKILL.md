@@ -18,7 +18,8 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
 
 1. **Gather live fleet state with one deterministic command.**
    Run `bin/fm-bearings-snapshot.sh` and read its compact output.
-   It is the single bounded, deterministic source for this report and renders TOON by default.
+   It is the single bounded, deterministic source for fleet-state facts in this report and renders TOON by default.
+   Treat any substantive delegated conclusion or pending decision under `AGENTS.md` section 1's evidence-not-authority rule rather than treating the snapshot as conclusion authority.
    Do not hand-probe the snapshot schema and do not make ad-hoc `gh-axi`/`gh` calls to assemble fleet facts; this command already assembles them.
    The command's header and `--help` output own its exact fields, bounds, opt-ins, and output contract.
    When the captain asks to include PRs, use the command's live-PR opt-in; otherwise keep the default local-only read.
@@ -26,7 +27,8 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
    A queued item under `gates` only becomes "next work" when its blocker is gone and its time/date gate has arrived; until then it stays queued with the reason.
 
 2. **Compose the report with these sections, matching the worked example's structure, tone, and level of detail.**
-   The gather step is deterministic; your judgment is scoped to the last mile only - ranking the command's facts by what matters right now and writing the scannable prose.
+   The gather step is deterministic; for ordinary operational facts, your judgment is scoped to ranking what matters right now and writing the scannable prose.
+   Before including a substantive result or pending decision, inspect its primary evidence and use `AGENTS.md` section 1's independent-analysis and response-shape contract.
    The exemplar is `data/status-report-2026-07-06.md` in this home's `data/` when present; match its scannability, not a raw state dump.
    - **Title** - `# Bearings - <day> <YYYY-MM-DD>` (the exemplar used "Morning status" for a morning brief; use that phrasing when the captain specifically asks for a morning brief).
    - **TL;DR** - two or three sentences framing where things stand.
@@ -34,7 +36,7 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
    - **Landed** since the captain last worked - merged PRs, completed scouts, and finished local-only work, drawn from the Done section and recent merges.
    - **In flight** now - each live direct report with its current state in one line; if nothing is in flight, say so plainly rather than omitting the section.
    - **Plans / main pickup points** - pointers to the relevant `data/<id>/report.md` files and any Lavish boards (`.lavish/*.html`) the captain should reopen.
-   - **Decisions pending** from the captain - relayed verbatim from needs-decision findings, with options where the crewmate offered them.
+   - **Decisions pending** from the captain - presented with `AGENTS.md` section 1's exact response shape after Firstmate's independent analysis, never relayed as the crewmate's conclusion.
    - **Date-gated / queued** next work - queued items whose blocker is gone and whose gate has arrived, plus anything still blocked with the reason.
 
 3. **Write the report to a dated file so it persists, and surface a concise version in chat.**
@@ -54,4 +56,4 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
 
 This skill is read-mostly and changes no fleet state.
 Do not tear down a task, merge a PR, dispatch queued work, or mutate any `state/` or `data/` file other than the single report file as a side effect of generating the brief.
-If the state you read suggests an action - a PR ready to merge, a queued item whose gate has arrived, a needs-decision finding - name it in the report under "Check first" or "Date-gated / queued" and let the captain decide, rather than taking the action from inside this skill.
+If the state you read suggests an action - a PR ready to merge, a queued item whose gate has arrived, a needs-decision finding - name it in the report under "Check first" or "Date-gated / queued", include section 1's analysis and recommendation when substantive, and let the captain decide rather than taking the action from inside this skill.
