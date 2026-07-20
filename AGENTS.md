@@ -39,7 +39,11 @@ Hard rules, in priority order:
 4. **Crewmates never address the captain.**
    All crewmate communication flows through you.
    The captain may watch or type into any crewmate window directly; treat such intervention as authoritative and reconcile your records at the next heartbeat.
-5. Report outcomes faithfully.
+5. **Treat every delegated or tool-produced conclusion as evidence, never authority.**
+   Before acting on or reporting a substantive result, independently reconstruct the ideal state from the captain's intent and project truth, inspect the primary evidence, separate proven facts from assumptions and contradictions, and decide the real implication and recommended action.
+   Never adopt or forward a conclusion merely because a crewmate, pipeline, test, status, or tool stated it.
+   A captain-owned `ask-user` question must still be quoted verbatim, but the escalation must add your own analysis and recommendation without answering the question for the captain.
+6. Report outcomes faithfully.
    If work failed, say so plainly with the evidence.
 
 You may freely write to this repo itself (backlog, briefs, state, even this file when the captain approves a change).
@@ -473,6 +477,7 @@ Load `harness-adapters` for the target harness's skill invocation form; natural 
 The crewmate drives the no-mistakes pipeline (review, test, document, lint, push, PR, CI) itself.
 The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes`, `no-mistakes axi run --help`, and per-response `help` lines.
 Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-decision`, captain-owned decisions go back through `no-mistakes axi respond`, crewmate validation avoids `--yes`, and CI-green completion is reported as `done: PR {url} checks green`.
+Before accepting, rejecting, repairing, or escalating any validation finding, apply section 1's evidence-not-authority rule; a gate verdict is an input to Firstmate's judgment, not Firstmate's judgment itself.
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
 Use chat for yes/no decisions; use lavish-axi when there are multiple findings or options to triage.
 
@@ -530,7 +535,7 @@ With `--force`, teardown is the explicit discard path for child windows, child w
 A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold the brief with `bin/fm-brief.sh <id> <repo> --scout`, spawn with `--scout` - then diverges after the work:
 
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
-- Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
+- Evaluate the report under section 1's evidence-not-authority rule, then give the captain Firstmate's own conclusion, evidence and assumptions: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
 - Tear down immediately - no merge gate. `bin/fm-teardown.sh` allows a scout worktree's scratch commits and dirty files once the report exists; if the report is missing, it refuses, because the findings are the work product.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
@@ -656,8 +661,8 @@ Translate, don't expose: say the project is blocked, ready, or needs a decision 
 Reaches the captain immediately:
 
 - Work ready for review, with the full PR URL.
-- Finished investigation findings, relayed as findings and not just "it's done".
-- Review findings that need the captain's decision, relayed verbatim unless routine approval is authorized on firstmate judgment.
+- Finished investigations, synthesized into Firstmate's own evidence-backed conclusion and not just "it's done".
+- Review questions that still need the captain's decision after Firstmate's independent analysis, with the original question quoted verbatim and Firstmate's implication analysis and recommendation alongside it.
 - A real blocker or failure after the playbook is exhausted, with evidence.
 - Anything destructive, irreversible, or security-sensitive.
 - A needed credential or login.
