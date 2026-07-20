@@ -597,6 +597,125 @@ fm_backend_worktree_absent() {  # <backend> <worktree-id>
   esac
 }
 
+fm_backend_spawn_label_absent() {  # <backend> <label> <scope>
+  local backend=$1 label=$2 scope=${3:-}
+  [ -n "$label" ] || return 2
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    tmux)
+      [ -n "$scope" ] || return 2
+      fm_backend_target_absent tmux "$scope:$label" '' "$label"
+      ;;
+    herdr)
+      [ -n "$scope" ] || return 2
+      fm_backend_herdr_task_label_absent "$scope" "$label"
+      ;;
+    zellij)
+      [ -n "$scope" ] || return 2
+      fm_backend_zellij_tab_absent "$scope" '' "$label"
+      ;;
+    orca)
+      return 2
+      ;;
+    cmux)
+      fm_backend_cmux_workspace_absent '' "$label"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-}
+  local endpoint_uncertain worktree_uncertain target resource_id worktree_id endpoint_rc=2 worktree_rc=0
+  if [ ! -f "$rescue" ]; then
+    fm_backend_spawn_label_absent "$backend" "$label" "$scope"
+    return
+  fi
+  endpoint_uncertain=$(fm_meta_get "$rescue" spawn_endpoint_uncertain)
+  worktree_uncertain=$(fm_meta_get "$rescue" spawn_worktree_uncertain)
+  case "$endpoint_uncertain" in
+    0) endpoint_rc=0 ;;
+    1)
+      if [ "$backend" = orca ]; then
+        target=$(fm_meta_get "$rescue" terminal)
+      else
+        target=$(fm_meta_get "$rescue" window)
+      fi
+      case "$backend" in
+        herdr)
+          resource_id=$(fm_meta_get "$rescue" herdr_tab_id)
+          if [ -n "$resource_id" ] && [ -n "$(fm_meta_get "$rescue" herdr_session)" ]; then
+            fm_backend_source herdr || return 2
+            if fm_backend_herdr_tab_absent \
+              "$(fm_meta_get "$rescue" herdr_session)" \
+              "$(fm_meta_get "$rescue" herdr_workspace_id)" "$resource_id"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          elif fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+            endpoint_rc=0
+          else
+            endpoint_rc=$?
+          fi
+          ;;
+        zellij)
+          resource_id=$(fm_meta_get "$rescue" zellij_tab_id)
+          if [ -n "$scope" ]; then
+            fm_backend_source zellij || return 2
+            if fm_backend_zellij_tab_absent "$scope" "$resource_id" "$label" \
+              "$(fm_meta_get "$rescue" zellij_pane_id)"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          fi
+          ;;
+        *)
+          if [ -n "$target" ]; then
+            if fm_backend_target_absent "$backend" "$target" "$resource_id" "$label"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          elif fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+            endpoint_rc=0
+          else
+            endpoint_rc=$?
+          fi
+          ;;
+      esac
+      ;;
+    *)
+      if fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+        endpoint_rc=0
+      else
+        endpoint_rc=$?
+      fi
+      ;;
+  esac
+  case "$worktree_uncertain" in
+    ''|0) worktree_rc=0 ;;
+    1)
+      if [ "$backend" = orca ]; then
+        worktree_id=$(fm_meta_get "$rescue" orca_worktree_id)
+        if [ -n "$worktree_id" ] && fm_backend_worktree_absent orca "$worktree_id"; then
+          worktree_rc=0
+        else
+          worktree_rc=$?
+          [ -n "$worktree_id" ] || worktree_rc=2
+        fi
+      else
+        worktree_rc=2
+      fi
+      ;;
+    *) worktree_rc=2 ;;
+  esac
+  [ "$endpoint_rc" -ne 1 ] || return 1
+  [ "$worktree_rc" -ne 1 ] || return 1
+  [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] || return 2
+}
+
 fm_backend_worktree_path() {  # <backend> <worktree-id>
   local backend=$1
   shift

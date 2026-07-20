@@ -1162,6 +1162,19 @@ fm_backend_herdr_pane_for_tab() {  # <session> <workspace_id> <tab_id>
     '.result.panes[]? | select(.tab_id == $tab) | .pane_id' 2>/dev/null | head -1
 }
 
+fm_backend_herdr_task_label_absent() {  # <session> <label>
+  local session=$1 label=$2 wsid tabs
+  wsid=$(fm_backend_herdr_workspace_find "$session") || return 2
+  [ -n "$wsid" ] || return 0
+  tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 2
+  printf '%s' "$tabs" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1 || return 2
+  if printf '%s' "$tabs" | jq -e --arg want "$label" \
+    '[.result.tabs[]? | select(.label == $want)] | length > 0' >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
 # fm_backend_herdr_resolve_bare_selector: the live-tab-listing fallback for an
 # ad hoc selector with no meta (mirrors tmux's list-windows grep). Searches
 # every RUNNING named herdr session (herdr session list) for a tab whose label

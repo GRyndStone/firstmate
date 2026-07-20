@@ -745,8 +745,10 @@ test_escalation_requires_durable_sink_acknowledgement() {
   key=$(delivery_key_from_message "$(cat "$delivered")")
   [ -n "$key" ] || fail "submitted escalation omitted its delivery key"
   [ -s "$state/.subsuper-escalations" ] || fail "unacknowledged submit trimmed its durable buffer"
-  [ "$(cat "$state/.subsuper-escalation-delivered" 2>/dev/null)" = "$key" ] \
+  [ "$(escalation_receipt_key "$state/.subsuper-escalation-delivered")" = "$key" ] \
     || fail "unacknowledged submit lost its retry receipt"
+  [ "$(escalation_receipt_state "$state/.subsuper-escalation-delivered")" = submitted ] \
+    || fail "locally confirmed submit did not advance its prepared receipt"
   (
     fm_backend_capture() { printf 'unsubmitted composer [fm-delivery=%s]\n' "$key"; }
     inject_msg() { return 1; }
@@ -765,6 +767,69 @@ test_escalation_requires_durable_sink_acknowledgement() {
   [ ! -s "$state/.subsuper-escalations" ] || fail "sink-acknowledged escalation remained buffered"
   [ ! -e "$state/.subsuper-escalation-ack" ] || fail "consumed sink acknowledgement was not cleared"
   pass "sink acknowledgements exclude composer state and survive scrollback loss"
+}
+
+test_acknowledged_prefix_transfer_recovers_after_commit_crash() {
+  local dir state inflight buf receipt msg key delivered status
+  dir=$(make_supercase acknowledged-transfer-crash)
+  state="$dir/state"
+  inflight="$state/.subsuper-escalations.inflight"
+  buf="$state/.subsuper-escalations"
+  receipt="$state/.subsuper-escalation-delivered"
+  delivered="$dir/delivered"
+  printf 'prefix A\nlater B\n' > "$inflight"
+  printf 'later C\n' > "$buf"
+  msg='Supervisor escalate (1 event(s)): prefix A (pre-read; re-arm not needed — watcher daemon-managed)'
+  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  escalation_receipt_write "$receipt" "$key" submitted || fail "acknowledged transfer receipt setup failed"
+  fm_supervisor_delivery_ack "$state" "$key" || fail "acknowledged transfer sink setup failed"
+  (
+    escalation_transfer_finalize() { return 93; }
+    escalate_flush "$state"
+  )
+  status=$?
+  [ "$status" -ne 0 ] || fail "acknowledged transfer crash seam unexpectedly finalized"
+  [ -s "$state/.subsuper-escalation-transfer" ] || fail "acknowledged transfer did not retain its durable phase"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$delivered"; acknowledge_injected_delivery "$state" "$1"; }
+    escalate_flush "$state"
+  ) || fail "acknowledged transfer did not recover after its commit seam"
+  assert_no_grep 'prefix A' "$delivered" "committed acknowledged prefix was replayed after restart"
+  [ "$(grep -cF 'later B' "$delivered" 2>/dev/null || true)" -eq 1 ] \
+    || fail "acknowledged transfer recovery duplicated later B"
+  [ "$(grep -cF 'later C' "$delivered" 2>/dev/null || true)" -eq 1 ] \
+    || fail "acknowledged transfer recovery duplicated later C"
+  [ ! -e "$state/.subsuper-escalation-transfer" ] || fail "recovered acknowledged transfer retained its phase"
+  pass "acknowledged-prefix transfer is idempotent after its commit seam"
+}
+
+test_failed_inflight_transfer_recovers_after_commit_crash() {
+  local dir state inflight buf delivered status
+  dir=$(make_supercase failed-transfer-crash)
+  state="$dir/state"
+  inflight="$state/.subsuper-escalations.inflight"
+  buf="$state/.subsuper-escalations"
+  delivered="$dir/delivered"
+  printf 'inflight A\n' > "$inflight"
+  printf 'buffered B\n' > "$buf"
+  (
+    inject_msg() { return 1; }
+    escalation_transfer_finalize() { return 94; }
+    escalate_flush "$state"
+  )
+  status=$?
+  [ "$status" -ne 0 ] || fail "failed inflight transfer crash seam unexpectedly finalized"
+  [ -s "$state/.subsuper-escalation-transfer" ] || fail "failed inflight transfer did not retain its durable phase"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$delivered"; acknowledge_injected_delivery "$state" "$1"; }
+    escalate_flush "$state"
+  ) || fail "failed inflight transfer did not recover after its commit seam"
+  [ "$(grep -cF 'inflight A' "$delivered" 2>/dev/null || true)" -eq 1 ] \
+    || fail "failed inflight transfer recovery duplicated inflight A"
+  [ "$(grep -cF 'buffered B' "$delivered" 2>/dev/null || true)" -eq 1 ] \
+    || fail "failed inflight transfer recovery duplicated buffered B"
+  [ ! -e "$state/.subsuper-escalation-transfer" ] || fail "recovered failed transfer retained its phase"
+  pass "inflight-to-buffer transfer is idempotent after its commit seam"
 }
 
 test_watcher_reconciled_exit_dispatches_through_claim() {
@@ -1751,6 +1816,29 @@ test_max_defer_pending_composer_alarms_without_typing() {
   pass "max-defer on a pending composer alarms without typing"
 }
 
+test_max_defer_prepared_receipt_does_not_suppress_alarm() {
+  local dir state fakebin sent msg key
+  dir=$(make_bordered_case maxdefer-prepared-receipt)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '│ > human draft │\n' > "$dir/composer"
+  escalate_add "$state" "needs-decision: prepared only"
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  msg='Supervisor escalate (1 event(s)): needs-decision: prepared only (pre-read; re-arm not needed — watcher daemon-managed)'
+  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  escalation_receipt_write "$state/.subsuper-escalation-delivered" "$key" prepared \
+    || fail "prepared max-defer receipt setup failed"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    housekeeping "$state"
+  [ -s "$state/.subsuper-inject-wedged" ] \
+    || fail "fresh prepared-only receipt suppressed the max-defer wedge alarm"
+  [ "$(escalation_receipt_state "$state/.subsuper-escalation-delivered")" = prepared ] \
+    || fail "failed prepared-only retry claimed an actual submission"
+  pass "prepared-only receipts never suppress max-defer wedge alarms"
+}
+
 test_normal_flush_clears_stale_wedge_marker() {
   local dir state fakebin sent status
   dir=$(make_bordered_case normal-clears-wedge)
@@ -2422,6 +2510,8 @@ test_sink_verified_escalation_is_not_replayed
 test_escalation_receipt_precedes_external_submit
 test_delivered_escalation_prefix_is_not_replayed
 test_escalation_requires_durable_sink_acknowledgement
+test_acknowledged_prefix_transfer_recovers_after_commit_crash
+test_failed_inflight_transfer_recovers_after_commit_crash
 test_drain_preserves_delivered_dead_owner_claim
 test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append
@@ -2455,6 +2545,7 @@ test_submit_ack_reports_pending_on_persistent_swallow
 test_max_defer_empty_swallow_types_once_and_alarms
 test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
+test_max_defer_prepared_receipt_does_not_suppress_alarm
 test_normal_flush_clears_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm

@@ -1109,6 +1109,44 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
 
+test_spawn_failure_without_handles_retains_creation_claim() {
+  local dir proj data state config fake log id out status
+  dir="$TMP_ROOT/no-handle-create"
+  proj="$dir/project"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  fake="$dir/fakebin"
+  log="$dir/tmux.log"
+  id=failcreatez6
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config" "$fake"
+  printf 'brief\n' > "$data/$id/brief.md"
+  cat > "$fake/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  new-window) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$fake/tmux"
+  fm_fake_exit0 "$fake" treehouse
+  out=$(PATH="$fake:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_TMUX_LOG="$log" "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "handle-less backend creation failure unexpectedly spawned"
+  assert_grep 'creation_phase=backend-creation' "$state/$id.spawn-claim" \
+    "handle-less backend creation failure released its uncertain ownership"
+  assert_contains "$out" 'retained spawn ownership' \
+    "handle-less backend creation failure did not report retained ownership"
+  [ ! -e "$state/$id.meta" ] || fail "handle-less backend creation failure published ordinary metadata"
+  pass "fm-spawn retains uncertain creation ownership without returned handles"
+}
+
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
@@ -1137,3 +1175,4 @@ test_spawn_refuses_unknown_fm_backend_env
 test_spawn_default_backend_writes_no_meta_field
 test_spawn_explicit_backend_flag_beats_autodetect_herdr_env
 test_spawn_autodetect_nesting_resolves_tmux_silently
+test_spawn_failure_without_handles_retains_creation_claim

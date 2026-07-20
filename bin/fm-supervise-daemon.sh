@@ -739,6 +739,123 @@ escalation_sink_clear_delivery() {  # <state> <delivery-key>
   rm -f "$ack"
 }
 
+escalation_receipt_key() {  # <receipt>
+  local receipt=$1 key
+  key=$(fm_reconcile_record_value "$receipt" delivery_key)
+  if [ -n "$key" ]; then
+    printf '%s\n' "$key"
+  elif [ -s "$receipt" ]; then
+    sed -n '1p' "$receipt"
+  fi
+}
+
+escalation_receipt_state() {  # <receipt>
+  local receipt=$1 state
+  state=$(fm_reconcile_record_value "$receipt" delivery_state)
+  if [ -n "$state" ]; then
+    printf '%s\n' "$state"
+  elif [ -s "$receipt" ]; then
+    printf 'prepared\n'
+  fi
+}
+
+escalation_receipt_write() {  # <receipt> <delivery-key> <prepared|submitted>
+  local receipt=$1 key=$2 state=$3 tmp prepared_at submitted_at
+  case "$state" in prepared|submitted) ;; *) return 2 ;; esac
+  prepared_at=$(fm_reconcile_record_value "$receipt" prepared_at)
+  [ -n "$prepared_at" ] || prepared_at=$(date +%s)
+  submitted_at=$(fm_reconcile_record_value "$receipt" submitted_at)
+  [ "$state" != submitted ] || submitted_at=$(date +%s)
+  tmp="$receipt.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-escalation-delivery.v1\n'
+    printf 'delivery_key=%s\n' "$key"
+    printf 'delivery_state=%s\n' "$state"
+    printf 'prepared_at=%s\n' "$prepared_at"
+    [ -z "$submitted_at" ] || printf 'submitted_at=%s\n' "$submitted_at"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$receipt" || { rm -f "$tmp"; return 1; }
+}
+
+escalation_transfer_finalize() {  # <state> <ack-key>
+  local state=$1 ack_key=${2:-} inflight receipt transfer
+  inflight="$state/.subsuper-escalations.inflight"
+  receipt="$state/.subsuper-escalation-delivered"
+  transfer="$state/.subsuper-escalation-transfer"
+  rm -f "$inflight" || return 1
+  if [ -n "$ack_key" ]; then
+    rm -f "$receipt" || return 1
+    escalation_sink_clear_delivery "$state" "$ack_key" || return 1
+  fi
+  rm -f "$transfer"
+}
+
+escalation_transfer_recover() {  # <state>
+  local state=$1 buf inflight transfer before_inflight before_buffer result_buffer skip ack_key
+  local current_inflight current_buffer next
+  buf="$state/.subsuper-escalations"
+  inflight="$state/.subsuper-escalations.inflight"
+  transfer="$state/.subsuper-escalation-transfer"
+  [ -f "$transfer" ] || return 0
+  before_inflight=$(fm_reconcile_record_value "$transfer" inflight_signature)
+  before_buffer=$(fm_reconcile_record_value "$transfer" buffer_signature)
+  result_buffer=$(fm_reconcile_record_value "$transfer" result_buffer_signature)
+  skip=$(fm_reconcile_record_value "$transfer" skip_prefix)
+  ack_key=$(fm_reconcile_record_value "$transfer" acknowledgement_key)
+  case "$skip" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$before_inflight" ] && [ -n "$before_buffer" ] && [ -n "$result_buffer" ] || return 1
+  current_inflight=$(fm_reconcile_file_signature "$inflight")
+  current_buffer=$(fm_reconcile_file_signature "$buf")
+  if [ "$current_inflight" = "$before_inflight" ] && [ "$current_buffer" = "$before_buffer" ]; then
+    next="$buf.transfer-recover.${BASHPID:-$$}"
+    if ! { tail -n "+$((skip + 1))" "$inflight"; cat "$buf" 2>/dev/null || true; } > "$next"; then
+      rm -f "$next"
+      return 1
+    fi
+    [ "$(fm_reconcile_file_signature "$next")" = "$result_buffer" ] \
+      || { rm -f "$next"; return 1; }
+    mv -f "$next" "$buf" || { rm -f "$next"; return 1; }
+  elif [ "$current_inflight" = "$before_inflight" ] && [ "$current_buffer" = "$result_buffer" ]; then
+    :
+  elif [ "$current_inflight" = absent ] && [ "$current_buffer" = "$result_buffer" ]; then
+    :
+  else
+    return 1
+  fi
+  escalation_transfer_finalize "$state" "$ack_key"
+}
+
+escalation_transfer_to_buffer() {  # <state> <skip-prefix> [ack-key]
+  local state=$1 skip=$2 ack_key=${3:-} buf inflight transfer next transfer_tmp
+  local before_inflight before_buffer result_buffer
+  buf="$state/.subsuper-escalations"
+  inflight="$state/.subsuper-escalations.inflight"
+  transfer="$state/.subsuper-escalation-transfer"
+  case "$skip" in ''|*[!0-9]*) return 2 ;; esac
+  escalation_transfer_recover "$state" || return 1
+  [ -s "$inflight" ] || return 1
+  before_inflight=$(fm_reconcile_file_signature "$inflight")
+  before_buffer=$(fm_reconcile_file_signature "$buf")
+  next="$buf.transfer-next.${BASHPID:-$$}"
+  if ! { tail -n "+$((skip + 1))" "$inflight"; cat "$buf" 2>/dev/null || true; } > "$next"; then
+    rm -f "$next"
+    return 1
+  fi
+  result_buffer=$(fm_reconcile_file_signature "$next")
+  transfer_tmp="$transfer.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-escalation-transfer.v1\n'
+    printf 'inflight_signature=%s\n' "$before_inflight"
+    printf 'buffer_signature=%s\n' "$before_buffer"
+    printf 'result_buffer_signature=%s\n' "$result_buffer"
+    printf 'skip_prefix=%s\n' "$skip"
+    [ -z "$ack_key" ] || printf 'acknowledgement_key=%s\n' "$ack_key"
+  } > "$transfer_tmp" || { rm -f "$next" "$transfer_tmp"; return 1; }
+  mv -f "$transfer_tmp" "$transfer" || { rm -f "$next" "$transfer_tmp"; return 1; }
+  mv -f "$next" "$buf" || { rm -f "$next"; return 1; }
+  escalation_transfer_finalize "$state" "$ack_key"
+}
+
 escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
   local buf=$1 key=$2 total i=1 msg candidate
   total=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
@@ -761,10 +878,11 @@ escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
 # and another non-zero status on inject failure. The buffer is preserved on every
 # non-zero return.
 escalate_flush() {  # <state>
-  local state=$1 buf inflight n msg sink_msg receipt delivery_key receipt_tmp claim_delivery_key claim_delivery_state retry_tmp receipt_key prefix_count sink_ack_key injected=0
+  local state=$1 buf inflight n msg sink_msg receipt delivery_key claim_delivery_key claim_delivery_state receipt_key receipt_state prefix_count sink_ack_key injected=0
   buf="$state/.subsuper-escalations"
   inflight="$state/.subsuper-escalations.inflight"
   receipt="$state/.subsuper-escalation-delivered"
+  escalation_transfer_recover "$state" || return 1
   while :; do
     if [ ! -s "$inflight" ]; then
       rm -f "$inflight"
@@ -792,7 +910,8 @@ escalate_flush() {  # <state>
       && command -v fm_wake_reconcile_claim_delivery_state >/dev/null 2>&1; then
       claim_delivery_state=$(fm_wake_reconcile_claim_delivery_state "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
     fi
-    receipt_key=$(cat "$receipt" 2>/dev/null || true)
+    receipt_key=$(escalation_receipt_key "$receipt")
+    receipt_state=$(escalation_receipt_state "$receipt")
     sink_ack_key=$(escalation_sink_delivery_key "$state" 2>/dev/null || true)
     if [ -n "$sink_ack_key" ]; then
       prefix_count=$(escalation_prefix_count_for_key "$inflight" "$sink_ack_key" 2>/dev/null || true)
@@ -802,14 +921,7 @@ escalate_flush() {  # <state>
           && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
           fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$sink_ack_key" acknowledged || return 1
         fi
-        retry_tmp="$buf.retry.${BASHPID:-$$}"
-        if ! { tail -n "+$((prefix_count + 1))" "$inflight"; cat "$buf"; } > "$retry_tmp"; then
-          rm -f "$retry_tmp"
-          return 1
-        fi
-        mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
-        rm -f "$inflight" "$receipt"
-        escalation_sink_clear_delivery "$state" "$sink_ack_key" || return 1
+        escalation_transfer_to_buffer "$state" "$prefix_count" "$sink_ack_key" || return 1
         if [ ! -s "$buf" ]; then
           rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
           return 0
@@ -818,7 +930,16 @@ escalate_flush() {  # <state>
       fi
     fi
     if [ -z "$receipt_key" ] && [ -n "$claim_delivery_key" ]; then
-      case "$claim_delivery_state" in prepared|delivered|acknowledged) receipt_key=$claim_delivery_key ;; esac
+      case "$claim_delivery_state" in
+        prepared|submitted|acknowledged)
+          receipt_key=$claim_delivery_key
+          receipt_state=$claim_delivery_state
+          ;;
+        delivered)
+          receipt_key=$claim_delivery_key
+          receipt_state=submitted
+          ;;
+      esac
     fi
     if [ -n "$receipt_key" ]; then
       prefix_count=$(escalation_prefix_count_for_key "$inflight" "$receipt_key" 2>/dev/null || true)
@@ -838,40 +959,39 @@ escalate_flush() {  # <state>
       fi
     fi
     if [ -z "$receipt_key" ]; then
-      receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
-      printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
-      mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+      escalation_receipt_write "$receipt" "$delivery_key" prepared || return 1
+      receipt_state=prepared
     elif [ ! -s "$receipt" ]; then
-      receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
-      printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
-      mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
+      escalation_receipt_write "$receipt" "$delivery_key" "$receipt_state" || return 1
     fi
     if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
       && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
-      if ! fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" prepared; then
-        retry_tmp="$buf.retry.${BASHPID:-$$}"
-        { cat "$inflight"; cat "$buf"; } > "$retry_tmp" \
-          && mv -f "$retry_tmp" "$buf" \
-          && rm -f "$inflight"
-        rm -f "$retry_tmp"
-        return 1
+      if [ "$claim_delivery_key" != "$delivery_key" ] \
+        || { [ "$claim_delivery_state" != submitted ] && [ "$claim_delivery_state" != delivered ] \
+          && [ "$claim_delivery_state" != acknowledged ]; }; then
+        if ! fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" prepared; then
+          escalation_transfer_to_buffer "$state" 0 || true
+          return 1
+        fi
       fi
     fi
     sink_msg="$msg [fm-delivery=$delivery_key] (acknowledge first: bin/fm-supervise-daemon.sh --ack-delivery $delivery_key)"
     injected=0
     if inject_msg "$sink_msg" "$state"; then
       injected=1
+      if ! escalation_receipt_write "$receipt" "$delivery_key" submitted; then
+        return 1
+      fi
       if [ "$(escalation_sink_delivery_key "$state" 2>/dev/null || true)" = "$delivery_key" ]; then
         continue
       fi
+      if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+        && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+        fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" submitted \
+          || return 1
+      fi
     fi
-    retry_tmp="$buf.retry.${BASHPID:-$$}"
-    if ! { cat "$inflight"; cat "$buf"; } > "$retry_tmp"; then
-      rm -f "$retry_tmp"
-      return 1
-    fi
-    mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
-    rm -f "$inflight"
+    escalation_transfer_to_buffer "$state" 0 || return 1
     [ "$injected" -eq 0 ] || return 3
     return 1
   done
@@ -1180,7 +1300,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs flush_rc receipt_was_old
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs flush_rc receipt_was_old receipt_state
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1208,11 +1328,15 @@ housekeeping() {  # <state>
     if [ "$oldest" -ge "$max_defer" ] \
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
       receipt_was_old=0
-      if [ -s "$state/.subsuper-escalation-delivered" ] \
+      receipt_state=$(escalation_receipt_state "$state/.subsuper-escalation-delivered")
+      if { [ "$receipt_state" = submitted ] || [ "$receipt_state" = delivered ]; } \
         && [ "$(_file_age "$state/.subsuper-escalation-delivered")" -lt "$max_defer" ]; then
         flush_rc=3
       else
-        [ ! -s "$state/.subsuper-escalation-delivered" ] || receipt_was_old=1
+        if { [ "$receipt_state" = submitted ] || [ "$receipt_state" = delivered ]; } \
+          && [ -s "$state/.subsuper-escalation-delivered" ]; then
+          receipt_was_old=1
+        fi
         if escalate_flush "$state"; then
           flush_rc=0
         else

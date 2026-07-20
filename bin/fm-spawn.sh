@@ -195,6 +195,7 @@ SPAWN_META_PUBLISHED=0
 SPAWN_ENDPOINT_CREATED=0
 SPAWN_WORKTREE_CREATED=0
 SPAWN_PARTIAL_ENDPOINT=0
+SPAWN_CREATION_STARTED=0
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -214,8 +215,13 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? cleanup_failed=0 rescue token
+  local status=$? cleanup_failed=0 rescue token creation_uncertain=0
   [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
+  if [ "$SPAWN_CREATION_STARTED" -eq 1 ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 0 ]; then
+    cleanup_failed=1
+    creation_uncertain=1
+  fi
   if [ "${BACKEND:-}" = orca ]; then
     if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
       fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
@@ -303,42 +309,46 @@ spawn_abort_cleanup() {
     rm -f "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" 2>/dev/null || true
   fi
   if [ "$cleanup_failed" -eq 1 ] && [ "$SPAWN_CLAIMED" -eq 1 ]; then
-    rescue="$STATE/$ID.meta.rescue.${BASHPID:-$$}"
-    fm_reconcile_spawn_claim_mark_rescue_pending "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue" 2>/dev/null || true
-    if {
-      if [ "${BACKEND:-tmux}" = orca ]; then echo "window=${W:-fm-$ID}"; else echo "window=${T:-${W:-fm-$ID}}"; fi
-      echo "generation=$LIFECYCLE_GENERATION"
-      echo "worktree=${WT:-}"
-      echo "project=${PROJ_ABS:-}"
-      echo "harness=${HARNESS:-}"
-      echo "kind=${KIND:-ship}"
-      echo "mode=${MODE:-no-mistakes}"
-      echo "yolo=${YOLO:-off}"
-      echo "tasktmp=${TASK_TMP:-}"
-      echo "model=${MODEL:-default}"
-      echo "effort=${EFFORT:-default}"
-      echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
-      echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
-      echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
-      echo "spawn_backend_label=${W:-fm-$ID}"
-      [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
-      [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-      [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-      [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
-      [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
-      [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
-      [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
-      [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
-      [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
-      [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
-      [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
-      [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
-    } > "$rescue" 2>/dev/null \
-      && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
-      SPAWN_META_PUBLISHED=1
-      SPAWN_CLAIMED=0
+    if [ "$creation_uncertain" -eq 1 ]; then
+      echo "error: $BACKEND spawn $ID exited after backend creation began without recoverable handles; retained spawn ownership" >&2
     else
-      echo "error: cleanup of partial $BACKEND spawn $ID could not be verified and rescue metadata was not published; retained spawn ownership" >&2
+      rescue="$STATE/$ID.meta.rescue.${BASHPID:-$$}"
+      fm_reconcile_spawn_claim_mark_rescue_pending "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue" 2>/dev/null || true
+      if {
+        if [ "${BACKEND:-tmux}" = orca ]; then echo "window=${W:-fm-$ID}"; else echo "window=${T:-${W:-fm-$ID}}"; fi
+        echo "generation=$LIFECYCLE_GENERATION"
+        echo "worktree=${WT:-}"
+        echo "project=${PROJ_ABS:-}"
+        echo "harness=${HARNESS:-}"
+        echo "kind=${KIND:-ship}"
+        echo "mode=${MODE:-no-mistakes}"
+        echo "yolo=${YOLO:-off}"
+        echo "tasktmp=${TASK_TMP:-}"
+        echo "model=${MODEL:-default}"
+        echo "effort=${EFFORT:-default}"
+        echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
+        echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
+        echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
+        echo "spawn_backend_label=${W:-fm-$ID}"
+        [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+        [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+        [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+        [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
+        [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
+        [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
+        [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
+        [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
+        [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
+        [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
+        [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
+        [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
+      } > "$rescue" 2>/dev/null \
+        && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
+        SPAWN_META_PUBLISHED=1
+        SPAWN_CLAIMED=0
+      else
+        echo "error: cleanup of partial $BACKEND spawn $ID could not be verified and rescue metadata was not published; retained spawn ownership" >&2
+      fi
     fi
   fi
   if [ "$SPAWN_CLAIMED" -eq 1 ] && [ "$cleanup_failed" -eq 0 ]; then
@@ -839,10 +849,33 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 W="fm-$ID"
-if ! fm_reconcile_spawn_claim_mark_creation_started "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$BACKEND" "$W"; then
+HERDR_LABEL_HOME=$FM_HOME
+if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
+  HERDR_LABEL_HOME=$PROJ_ABS
+fi
+SPAWN_BACKEND_HOME=$FM_HOME
+SPAWN_BACKEND_SCOPE=
+case "$BACKEND" in
+  tmux)
+    if [ -n "${TMUX:-}" ]; then
+      SPAWN_BACKEND_SCOPE=$(tmux display-message -p '#S' 2>/dev/null || true)
+    else
+      SPAWN_BACKEND_SCOPE=firstmate
+    fi
+    ;;
+  herdr)
+    SPAWN_BACKEND_SCOPE=$(fm_backend_herdr_session)
+    SPAWN_BACKEND_HOME=$HERDR_LABEL_HOME
+    ;;
+  zellij) SPAWN_BACKEND_SCOPE=$(fm_backend_zellij_session) ;;
+  orca) SPAWN_BACKEND_SCOPE=$PROJ_ABS_REAL ;;
+esac
+if ! fm_reconcile_spawn_claim_mark_creation_started "$STATE" "$ID" "$LIFECYCLE_GENERATION" \
+  "$BACKEND" "$W" "$SPAWN_BACKEND_SCOPE" "$SPAWN_BACKEND_HOME"; then
   echo "error: task $ID lifecycle ownership changed before backend creation; refusing resource creation" >&2
   exit 1
 fi
+SPAWN_CREATION_STARTED=1
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -869,10 +902,6 @@ case "$BACKEND" in
     # to PROJ_ABS for just these two calls (bash restores it automatically
     # after each prefixed simple-command call) so the secondmate's tab lands
     # in the secondmate's own workspace, not the primary's "firstmate" one.
-    HERDR_LABEL_HOME=$FM_HOME
-    if [ "$KIND" = secondmate ]; then
-      HERDR_LABEL_HOME=$PROJ_ABS
-    fi
     set +e
     HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS")
     CREATE_RC=$?

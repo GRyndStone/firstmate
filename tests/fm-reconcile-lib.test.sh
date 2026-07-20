@@ -40,6 +40,30 @@ observe() {
     fm_reconcile_observe "$state" task
 }
 
+make_absent_spawn_probe() {
+  local dir=$1 fake="$1/fakebin"
+  mkdir -p "$fake"
+  cat > "$fake/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  list-windows)
+    [ "${FM_FAKE_TMUX_PROBE:-absent}" = absent ] && exit 0
+    exit 2
+    ;;
+esac
+exit 1
+SH
+  chmod +x "$fake/tmux"
+  printf '%s\n' "$fake"
+}
+
+age_spawn_claim() {
+  local claim=$1 tmp="$1.tmp-age"
+  sed 's/^creation_started_at=.*/creation_started_at=1/; s/^owner_pid=.*/owner_pid=999999/' \
+    "$claim" > "$tmp"
+  mv "$tmp" "$claim"
+}
+
 test_active_review_parks_once_past_stale_pause() {
   local dir state live out token record
   dir=$(make_reconcile_case active-review)
@@ -983,13 +1007,15 @@ test_teardown_refuses_active_spawn_claim() {
 }
 
 test_partial_spawn_rescue_claim_survives_owner_exit() {
-  local dir state claim rescue generation
+  local dir state claim rescue generation fake old_path FM_SPAWN_CLAIM_RECOVERY_SECS FM_FAKE_TMUX_PROBE
   dir="$TMP_ROOT/spawn-rescue-claim"
   state="$dir/state"
   mkdir -p "$state"
   generation=lifecycle-one
   fm_write_meta "$state/task.meta" "generation=$generation" 'window=session:fm-task' 'kind=scout'
   fm_reconcile_spawn_claim "$state" task spawn-rescue || fail "rescue spawn claim setup failed"
+  fm_reconcile_spawn_claim_mark_creation_started "$state" task spawn-rescue tmux fm-task firstmate \
+    || fail "rescue spawn claim could not persist its backend scope"
   rescue="$state/task.meta.rescue.test"
   fm_reconcile_spawn_claim_mark_rescue_pending "$state" task spawn-rescue "$rescue" \
     || fail "spawn claim could not enter rescue-pending state"
@@ -998,42 +1024,55 @@ test_partial_spawn_rescue_claim_survives_owner_exit() {
     fail "missing rescue metadata unexpectedly published"
   fi
   assert_grep 'rescue_pending=1' "$claim" "failed rescue publication released spawn ownership"
-  sed 's/^owner_pid=.*/owner_pid=999999/' "$claim" > "$claim.tmp"
-  mv "$claim.tmp" "$claim"
+  age_spawn_claim "$claim"
+  FM_SPAWN_CLAIM_RECOVERY_SECS=1
+  fake=$(make_absent_spawn_probe "$dir")
+  old_path=$PATH
+  PATH="$fake:$PATH"
+  FM_FAKE_TMUX_PROBE=unknown
+  export FM_FAKE_TMUX_PROBE
   if fm_reconcile_spawn_claim "$state" task replacement; then
-    fail "replacement spawn stole a dead-owner rescue-pending claim"
-  fi
-  if fm_reconcile_teardown_begin "$state" task "$generation"; then
-    fail "teardown discarded a rescue-pending spawn claim"
+    fail "replacement spawn stole a rescue-pending claim before backend absence was proven"
   fi
   assert_grep 'rescue_pending=1' "$claim" "rescue-pending ownership marker was lost"
-  pass "partial spawn ownership survives until rescue metadata is published"
+  FM_FAKE_TMUX_PROBE=absent
+  fm_reconcile_teardown_begin "$state" task "$generation" \
+    || fail "bounded rescue-pending reconciliation did not accept proven backend absence"
+  PATH=$old_path
+  [ ! -e "$claim" ] || fail "proven-absent rescue-pending claim was not released"
+  pass "rescue-pending ownership releases only after bounded backend absence proof"
 }
 
 test_dead_spawn_claim_after_creation_started_is_retained() {
-  local dir state claim generation
+  local dir state claim generation fake old_path FM_SPAWN_CLAIM_RECOVERY_SECS
   dir="$TMP_ROOT/spawn-creation-started-claim"
   state="$dir/state"
   mkdir -p "$state"
   generation=lifecycle-one
   fm_write_meta "$state/task.meta" "generation=$generation" 'window=session:fm-task' 'kind=scout'
   fm_reconcile_spawn_claim "$state" task spawn-creating || fail "spawn claim setup failed"
-  fm_reconcile_spawn_claim_mark_creation_started "$state" task spawn-creating tmux fm-task \
+  fm_reconcile_spawn_claim_mark_creation_started "$state" task spawn-creating tmux fm-task firstmate \
     || fail "spawn claim could not persist backend-creation phase"
   claim="$state/task.spawn-claim"
   assert_grep 'creation_phase=backend-creation' "$claim" "spawn claim omitted its creation phase"
   assert_grep 'backend=tmux' "$claim" "spawn claim omitted its backend"
   assert_grep 'backend_label=fm-task' "$claim" "spawn claim omitted its backend label"
-  sed 's/^owner_pid=.*/owner_pid=999999/' "$claim" > "$claim.tmp"
-  mv "$claim.tmp" "$claim"
+  age_spawn_claim "$claim"
+  FM_SPAWN_CLAIM_RECOVERY_SECS=999999
   if fm_reconcile_spawn_claim "$state" task replacement; then
     fail "replacement spawn discarded a dead claim after backend creation may have begun"
   fi
-  if fm_reconcile_teardown_begin "$state" task "$generation"; then
-    fail "teardown discarded a dead claim after backend creation may have begun"
-  fi
   assert_grep 'creation_phase=backend-creation' "$claim" "dead creation-phase claim was not retained"
-  pass "dead spawn claims retain ownership after backend creation may have begun"
+  fake=$(make_absent_spawn_probe "$dir")
+  old_path=$PATH
+  PATH="$fake:$PATH"
+  FM_SPAWN_CLAIM_RECOVERY_SECS=1
+  fm_reconcile_spawn_claim "$state" task replacement \
+    || fail "bounded creation-phase reconciliation did not accept proven backend absence"
+  PATH=$old_path
+  assert_no_grep 'creation_phase=' "$claim" "replacement claim retained stale creation ownership"
+  fm_reconcile_spawn_claim_release "$state" task replacement || fail "replacement claim release failed"
+  pass "dead creation claims remain fail-closed until bounded absence proof"
 }
 
 test_active_review_parks_once_past_stale_pause

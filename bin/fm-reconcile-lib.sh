@@ -82,6 +82,10 @@ FM_LEGACY_CHECK_TIMEOUT=${FM_LEGACY_CHECK_TIMEOUT:-${FM_CHECK_TIMEOUT:-30}}
 case "$FM_LEGACY_CHECK_TIMEOUT" in ''|*[!0-9]*|0) FM_LEGACY_CHECK_TIMEOUT=30 ;; esac
 FM_TEARDOWN_TOMBSTONE_SECS=${FM_TEARDOWN_TOMBSTONE_SECS:-120}
 case "$FM_TEARDOWN_TOMBSTONE_SECS" in ''|*[!0-9]*|0) FM_TEARDOWN_TOMBSTONE_SECS=120 ;; esac
+FM_SPAWN_CLAIM_RECOVERY_SECS=${FM_SPAWN_CLAIM_RECOVERY_SECS:-30}
+case "$FM_SPAWN_CLAIM_RECOVERY_SECS" in ''|*[!0-9]*|0) FM_SPAWN_CLAIM_RECOVERY_SECS=30 ;; esac
+FM_SPAWN_CLAIM_PROBE_TIMEOUT=${FM_SPAWN_CLAIM_PROBE_TIMEOUT:-5}
+case "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" in ''|*[!0-9]*|0) FM_SPAWN_CLAIM_PROBE_TIMEOUT=5 ;; esac
 FM_RECONCILE_META_UPDATED_GENERATION=
 export FM_RECONCILE_META_UPDATED_GENERATION
 
@@ -851,7 +855,11 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
     existing_identity=$(fm_reconcile_record_value "$claim" owner_identity)
     current_identity=$(fm_reconcile_process_identity "$existing_pid" 2>/dev/null || true)
     if [ "$rescue_pending" = 1 ] || [ -n "$creation_phase" ]; then
-      claim_rc=5
+      if fm_reconcile_spawn_claim_recover_locked "$state" "$id" "$claim"; then
+        claim_rc=0
+      else
+        claim_rc=5
+      fi
     elif fm_reconcile_pid_alive "$existing_pid" \
       && { [ -z "$current_identity" ] || { [ -n "$existing_identity" ] && [ "$current_identity" = "$existing_identity" ]; }; }; then
       claim_rc=4
@@ -870,6 +878,7 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
       printf 'owner_identity=%s\n' "$(fm_reconcile_clean_value "$owner_identity")"
       printf 'expected_meta_signature=%s\n' "$expected_signature"
       printf 'expected_meta_generation=%s\n' "$expected_generation"
+      printf 'started_at=%s\n' "$(date +%s)"
     } > "$tmp" || claim_rc=1
     if [ "$claim_rc" -eq 0 ] && ! mv -f "$tmp" "$claim"; then claim_rc=1; fi
     rm -f "$tmp"
@@ -878,9 +887,9 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
   return "$claim_rc"
 }
 
-fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generation> <backend> <backend-label>
-  local state=$1 id=$2 generation=$3 backend=$4 backend_label=$5 claim tmp mark_rc=0
-  local owner_pid owner_identity expected_signature expected_generation
+fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generation> <backend> <backend-label> [scope] [home]
+  local state=$1 id=$2 generation=$3 backend=$4 backend_label=$5 backend_scope=${6:-} backend_home=${7:-} claim tmp mark_rc=0
+  local owner_pid owner_identity expected_signature expected_generation started_at
   claim="$state/$id.spawn-claim"
   fm_reconcile_lock_acquire "$state" "$id"
   if ! fm_reconcile_spawn_claim_matches_locked "$state" "$id" "$generation"; then
@@ -890,6 +899,7 @@ fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generati
     owner_identity=$(fm_reconcile_record_value "$claim" owner_identity)
     expected_signature=$(fm_reconcile_record_value "$claim" expected_meta_signature)
     expected_generation=$(fm_reconcile_record_value "$claim" expected_meta_generation)
+    started_at=$(fm_reconcile_record_value "$claim" started_at)
     tmp="$claim.tmp.${BASHPID:-$$}"
     {
       printf 'schema=fm-spawn-claim.v1\n'
@@ -898,9 +908,13 @@ fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generati
       printf 'owner_identity=%s\n' "$owner_identity"
       printf 'expected_meta_signature=%s\n' "$expected_signature"
       printf 'expected_meta_generation=%s\n' "$expected_generation"
+      printf 'started_at=%s\n' "$started_at"
+      printf 'creation_started_at=%s\n' "$(date +%s)"
       printf 'creation_phase=backend-creation\n'
       printf 'backend=%s\n' "$(fm_reconcile_clean_value "$backend")"
       printf 'backend_label=%s\n' "$(fm_reconcile_clean_value "$backend_label")"
+      [ -z "$backend_scope" ] || printf 'backend_scope=%s\n' "$(fm_reconcile_clean_value "$backend_scope")"
+      [ -z "$backend_home" ] || printf 'backend_home=%s\n' "$(fm_reconcile_clean_value "$backend_home")"
     } > "$tmp" || mark_rc=1
     if [ "$mark_rc" -eq 0 ] && ! mv -f "$tmp" "$claim"; then mark_rc=1; fi
     rm -f "$tmp"
@@ -911,7 +925,7 @@ fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generati
 
 fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation> <rescue-path>
   local state=$1 id=$2 generation=$3 rescue_path=$4 claim tmp mark_rc=0
-  local owner_pid owner_identity expected_signature expected_generation creation_phase backend backend_label
+  local owner_pid owner_identity expected_signature expected_generation creation_phase backend backend_label backend_scope backend_home started_at creation_started_at
   claim="$state/$id.spawn-claim"
   fm_reconcile_lock_acquire "$state" "$id"
   if ! fm_reconcile_spawn_claim_matches_locked "$state" "$id" "$generation"; then
@@ -924,6 +938,10 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
     creation_phase=$(fm_reconcile_record_value "$claim" creation_phase)
     backend=$(fm_reconcile_record_value "$claim" backend)
     backend_label=$(fm_reconcile_record_value "$claim" backend_label)
+    backend_scope=$(fm_reconcile_record_value "$claim" backend_scope)
+    backend_home=$(fm_reconcile_record_value "$claim" backend_home)
+    started_at=$(fm_reconcile_record_value "$claim" started_at)
+    creation_started_at=$(fm_reconcile_record_value "$claim" creation_started_at)
     tmp="$claim.tmp.${BASHPID:-$$}"
     {
       printf 'schema=fm-spawn-claim.v1\n'
@@ -932,9 +950,13 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
       printf 'owner_identity=%s\n' "$owner_identity"
       printf 'expected_meta_signature=%s\n' "$expected_signature"
       printf 'expected_meta_generation=%s\n' "$expected_generation"
+      [ -z "$started_at" ] || printf 'started_at=%s\n' "$started_at"
+      [ -z "$creation_started_at" ] || printf 'creation_started_at=%s\n' "$creation_started_at"
       [ -z "$creation_phase" ] || printf 'creation_phase=%s\n' "$creation_phase"
       [ -z "$backend" ] || printf 'backend=%s\n' "$backend"
       [ -z "$backend_label" ] || printf 'backend_label=%s\n' "$backend_label"
+      [ -z "$backend_scope" ] || printf 'backend_scope=%s\n' "$backend_scope"
+      [ -z "$backend_home" ] || printf 'backend_home=%s\n' "$backend_home"
       printf 'rescue_pending=1\n'
       printf 'rescue_path=%s\n' "$(fm_reconcile_clean_value "$rescue_path")"
     } > "$tmp" || mark_rc=1
@@ -943,6 +965,46 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
   fi
   fm_reconcile_lock_release "$state" "$id"
   return "$mark_rc"
+}
+
+fm_reconcile_spawn_claim_recover_locked() {  # <state-dir> <id> <claim>
+  local state=$1 id=$2 claim=$3 started age expected_signature expected_generation
+  local backend backend_label backend_scope backend_home rescue_path probe_root probe_rc owner_pid owner_identity current_identity
+  owner_pid=$(fm_reconcile_record_value "$claim" owner_pid)
+  owner_identity=$(fm_reconcile_record_value "$claim" owner_identity)
+  current_identity=$(fm_reconcile_process_identity "$owner_pid" 2>/dev/null || true)
+  if fm_reconcile_pid_alive "$owner_pid" \
+    && { [ -z "$current_identity" ] || { [ -n "$owner_identity" ] && [ "$current_identity" = "$owner_identity" ]; }; }; then
+    return 1
+  fi
+  started=$(fm_reconcile_record_value "$claim" creation_started_at)
+  case "$started" in
+    ''|*[!0-9]*) age=$(fm_path_age "$claim") ;;
+    *) age=$(( $(date +%s) - started )) ;;
+  esac
+  [ "$age" -ge "$FM_SPAWN_CLAIM_RECOVERY_SECS" ] || return 1
+  expected_signature=$(fm_reconcile_record_value "$claim" expected_meta_signature)
+  expected_generation=$(fm_reconcile_record_value "$claim" expected_meta_generation)
+  [ "$(fm_reconcile_file_signature "$state/$id.meta")" = "$expected_signature" ] || return 1
+  [ "$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)" = "$expected_generation" ] || return 1
+  backend=$(fm_reconcile_record_value "$claim" backend)
+  backend_label=$(fm_reconcile_record_value "$claim" backend_label)
+  backend_scope=$(fm_reconcile_record_value "$claim" backend_scope)
+  backend_home=$(fm_reconcile_record_value "$claim" backend_home)
+  rescue_path=$(fm_reconcile_record_value "$claim" rescue_path)
+  [ -n "$backend" ] && [ -n "$backend_label" ] || return 1
+  [ -n "$backend_home" ] || backend_home=${FM_HOME:-${FM_ROOT_OVERRIDE:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}}
+  probe_root=${FM_ROOT:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}
+  if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" env \
+    FM_HOME="$backend_home" FM_ROOT="$probe_root" FM_ROOT_OVERRIDE="${FM_ROOT_OVERRIDE:-}" \
+    bash -c '. "$1/fm-backend.sh"; fm_backend_spawn_claim_absent "$2" "$3" "$4" "$5"' \
+    fm-spawn-claim-probe "$_FM_RECONCILE_LIB_DIR" "$backend" "$backend_label" "$backend_scope" "$rescue_path"; then
+    probe_rc=0
+  else
+    probe_rc=$?
+  fi
+  [ "$probe_rc" -eq 0 ] || return 1
+  rm -f "$claim"
 }
 
 fm_reconcile_spawn_claim_matches_locked() {  # <state-dir> <id> <generation>
@@ -1521,7 +1583,11 @@ fm_reconcile_teardown_begin() {  # <state-dir> <id> [expected-generation]
     claim_identity=$(fm_reconcile_record_value "$claim" owner_identity)
     current_identity=$(fm_reconcile_process_identity "$claim_pid" 2>/dev/null || true)
     if [ "$rescue_pending" = 1 ] || [ -n "$creation_phase" ]; then
-      mark_rc=4
+      if fm_reconcile_spawn_claim_recover_locked "$state" "$id" "$claim"; then
+        mark_rc=0
+      else
+        mark_rc=4
+      fi
     elif fm_reconcile_pid_alive "$claim_pid" \
       && { [ -z "$current_identity" ] || { [ -n "$claim_identity" ] && [ "$current_identity" = "$claim_identity" ]; }; }; then
       mark_rc=4
