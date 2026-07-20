@@ -246,6 +246,45 @@ fm_backend_orca_worktree_absent() {  # <worktree-id>
   printf '%s' "$out" | fm_backend_orca_absence_from_json worktree_not_found worktree_id_not_found
 }
 
+fm_backend_orca_worktree_name_absent() {
+  local project=${1:-} name=${2:-} repo_out repo_id list_out
+  [ -n "$project" ] && [ -n "$name" ] || return 2
+  fm_backend_orca_tool_check || return 2
+  repo_out=$(orca repo show --repo "path:$project" --json 2>&1) || true
+  repo_id=$(printf '%s' "$repo_out" | fm_backend_orca_json_get repo-id 2>/dev/null) || return 2
+  list_out=$(orca worktree list --repo "id:$repo_id" --json 2>&1) || true
+  printf '%s' "$list_out" | node -e '
+const fs = require("fs");
+const want = process.argv[1];
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (_) {
+  process.exit(2);
+}
+if (!data || data.ok === false) process.exit(2);
+const result = data.result;
+const worktrees = Array.isArray(result)
+  ? result
+  : result && Array.isArray(result.worktrees)
+    ? result.worktrees
+    : result && Array.isArray(result.items)
+      ? result.items
+      : null;
+if (!worktrees) process.exit(2);
+if (!worktrees.every((worktree) => {
+  if (!worktree || typeof worktree !== "object") return false;
+  return [worktree.displayName, worktree.display_name, worktree.name, worktree.title]
+    .some((value) => typeof value === "string" || typeof value === "number");
+})) process.exit(2);
+const present = worktrees.some((worktree) => {
+  return [worktree.displayName, worktree.display_name, worktree.name, worktree.title]
+    .some((value) => String(value ?? "") === want);
+});
+process.exit(present ? 1 : 0);
+' "$name"
+}
+
 fm_backend_orca_capture() {  # <terminal-id> <lines>
   local terminal=$1 lines=${2:-40} out
   fm_backend_orca_tool_check || return 1

@@ -961,36 +961,70 @@ test_kill_is_best_effort_when_close_workspace_fails() {
 
 test_workspace_absence_requires_parseable_inventory() {
   local dir fb title status
-  dir="$TMP_ROOT/workspace-absence"; mkdir -p "$dir/responses"
   title=$(cmux_expected_scoped_title fm-task)
-  cmux_workspace_list_response "$dir" 1 aaaaaaaa-0000-0000-0000-000000000000 renamed-task
-  cmux_workspace_list_response "$dir" 2 bbbbbbbb-0000-0000-0000-000000000000 "$title"
-  printf '{}\n' > "$dir/responses/3.out"
-  cmux_workspace_list_response "$dir" 4
+  dir="$TMP_ROOT/workspace-absence-id"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 1
+  cmux_workspace_list_response "$dir" 2 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 3 aaaaaaaa-0000-0000-0000-000000000000 renamed-task
   fb=$(make_cmux_fakebin "$dir")
   set +e
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
   status=$?
   set -e
-  expect_code 1 "$status" "recorded cmux workspace id must be reported present after a rename"
+  expect_code 1 "$status" "recorded cmux workspace id in another window must be reported present after a rename"
+  dir="$TMP_ROOT/workspace-absence-label"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 1
+  cmux_workspace_list_response "$dir" 2 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 3 bbbbbbbb-0000-0000-0000-000000000000 "$title"
+  fb=$(make_cmux_fakebin "$dir")
   set +e
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
   status=$?
   set -e
-  expect_code 1 "$status" "matching cmux task label must be reported present under a replacement id"
+  expect_code 1 "$status" "matching cmux task label in another window must be reported present under a replacement id"
+  dir="$TMP_ROOT/workspace-absence-malformed"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1
+  printf '{}\n' > "$dir/responses/2.out"
+  fb=$(make_cmux_fakebin "$dir")
   set +e
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
   status=$?
   set -e
   expect_code 2 "$status" "malformed cmux inventory must remain unknown"
+  dir="$TMP_ROOT/workspace-absence-empty"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 0
+  cmux_workspace_list_response "$dir" 2
+  fb=$(make_cmux_fakebin "$dir")
   PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT" \
     || fail "empty parseable cmux inventory was not recognized as absent"
   set +e
   pass "cmux absence distinguishes empty inventories from failed reads"
+}
+
+test_kill_recovers_stale_target_across_windows() {
+  local dir fb title
+  dir="$TMP_ROOT/kill-stale-target-cross-window"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_workspace_list_response "$dir" 1
+  cmux_workspace_list_response "$dir" 2
+  cmux_windows_response "$dir" 3 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 2
+  cmux_workspace_list_response "$dir" 4 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 5 cccccccc-2222-2222-2222-222222222222 "$title" ffffffff-0000-0000-0000-000000000000 sibling
+  cmux_panes_response "$dir" 6 dddddddd-3333-3333-3333-333333333333
+  cmux_windows_response "$dir" 7 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 2
+  cmux_workspace_list_response "$dir" 8 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 9 cccccccc-2222-2222-2222-222222222222 "$title" ffffffff-0000-0000-0000-000000000000 sibling
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_kill "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" "" fm-label' "$ROOT"
+  expect_code 0 $? "kill should recover a stale cmux target from another window"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f''cccccccc-2222-2222-2222-222222222222' \
+    "kill did not close the refreshed cmux workspace in its owning window"
+  pass "fm_backend_cmux_kill: recovers stale targets across windows"
 }
 
 test_kill_recovers_stale_target_by_label() {
@@ -1113,5 +1147,6 @@ test_kill_adds_sibling_when_last_in_window
 test_kill_is_best_effort_when_close_workspace_fails
 test_workspace_absence_requires_parseable_inventory
 test_kill_recovers_stale_target_by_label
+test_kill_recovers_stale_target_across_windows
 test_list_live_filters_by_title_prefix
 test_secondmate_spawn_refuses_cmux_backend

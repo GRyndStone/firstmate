@@ -246,11 +246,24 @@ spawn_abort_cleanup() {
       fi
     fi
   elif [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] \
-    && [ "${KIND:-}" != secondmate ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ]; then
-    if (cd "$PROJ_ABS" && treehouse return --force "$WT") >/dev/null 2>&1; then
-      SPAWN_WORKTREE_CREATED=0
-    else
-      cleanup_failed=1
+    && [ "${KIND:-}" != secondmate ] && [ -n "${PROJ_ABS:-}" ]; then
+    if [ -z "${WT:-}" ]; then
+      if WT=$(fm_backend_treehouse_lease_path "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"); then
+        :
+      elif fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${WT:-}" ]; then
+      if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" bash -c \
+        'cd "$1" && treehouse return --force "$2"' fm-treehouse-return "$PROJ_ABS" "$WT" >/dev/null 2>&1 \
+        && fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
     fi
   fi
   if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" != orca ]; then
@@ -329,6 +342,9 @@ spawn_abort_cleanup() {
         echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
         echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
         echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
+        if [ "${BACKEND:-tmux}" != orca ] && [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
+          echo "spawn_treehouse_holder=$TREEHOUSE_LEASE_HOLDER"
+        fi
         echo "spawn_backend_label=${W:-fm-$ID}"
         [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
         [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
@@ -410,6 +426,7 @@ fi
 ID=${POS[0]}
 LIFECYCLE_GENERATION=$(fm_task_identity_new_token) \
   || { echo "error: cannot create lifecycle generation for task $ID" >&2; exit 1; }
+TREEHOUSE_LEASE_HOLDER="$ID-$LIFECYCLE_GENERATION"
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -855,6 +872,8 @@ if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
 fi
 SPAWN_BACKEND_HOME=$FM_HOME
 SPAWN_BACKEND_SCOPE=
+SPAWN_TREEHOUSE_PROJECT=
+SPAWN_TREEHOUSE_HOLDER=
 case "$BACKEND" in
   tmux)
     if [ -n "${TMUX:-}" ]; then
@@ -870,8 +889,13 @@ case "$BACKEND" in
   zellij) SPAWN_BACKEND_SCOPE=$(fm_backend_zellij_session) ;;
   orca) SPAWN_BACKEND_SCOPE=$PROJ_ABS_REAL ;;
 esac
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  SPAWN_TREEHOUSE_PROJECT=$PROJ_ABS
+  SPAWN_TREEHOUSE_HOLDER=$TREEHOUSE_LEASE_HOLDER
+fi
 if ! fm_reconcile_spawn_claim_mark_creation_started "$STATE" "$ID" "$LIFECYCLE_GENERATION" \
-  "$BACKEND" "$W" "$SPAWN_BACKEND_SCOPE" "$SPAWN_BACKEND_HOME"; then
+  "$BACKEND" "$W" "$SPAWN_BACKEND_SCOPE" "$SPAWN_BACKEND_HOME" \
+  "$SPAWN_TREEHOUSE_PROJECT" "$SPAWN_TREEHOUSE_HOLDER"; then
   echo "error: task $ID lifecycle ownership changed before backend creation; refusing resource creation" >&2
   exit 1
 fi
@@ -1090,9 +1114,10 @@ spawn_send_key() {  # <target> <key>
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  SPAWN_WORKTREE_CREATED=1
+  spawn_send_text_line "$WT_TARGET" "fm_treehouse_worktree=\$(treehouse get --lease --lease-holder $(shell_quote "$TREEHOUSE_LEASE_HOLDER")) && cd -- \"\$fm_treehouse_worktree\""
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the shell's explicit cd after treehouse returns the leased worktree path.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -1114,7 +1139,6 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
-  SPAWN_WORKTREE_CREATED=1
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't

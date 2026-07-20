@@ -664,6 +664,40 @@ test_partial_cleanup_absence_probes_fail_closed() {
   pass "partial Herdr cleanup probes distinguish absence from unreadable state"
 }
 
+test_task_label_absence_requires_valid_workspace_inventory() {
+  local dir log resp fb status
+  dir="$TMP_ROOT/task-label-absence"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '1\n' > "$resp/1.exit"
+  printf '{}\n' > "$resp/2.out"
+  printf '{"result":{"workspaces":[]}}\n' > "$resp/3.out"
+  printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' > "$resp/4.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"fm-task"}]}}\n' > "$resp/5.out"
+  fb=$(make_herdr_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_task_label_absent fmtest fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "failed Herdr workspace inventory must remain unknown"
+  set +e
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_task_label_absent fmtest fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed Herdr workspace inventory must remain unknown"
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_task_label_absent fmtest fm-task' "$ROOT" \
+    || fail "valid empty Herdr workspace inventory was not recognized as absent"
+  set +e
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_task_label_absent fmtest fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "live Herdr task label was not recognized as present"
+  set +e
+  pass "Herdr task-label absence fails closed on unreadable workspace inventories"
+}
+
 # --- container_ensure / create_task: --no-focus and per-home label ----------
 
 test_container_ensure_creates_with_no_focus_flag() {
@@ -2183,6 +2217,7 @@ test_create_task_rolls_back_unparseable_created_tab
 test_create_task_reports_partial_ids_on_incomplete_create_response
 test_container_ensure_reports_partial_workspace_after_ambiguous_create
 test_partial_cleanup_absence_probes_fail_closed
+test_task_label_absence_requires_valid_workspace_inventory
 test_create_task_creates_with_no_focus_flag
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only

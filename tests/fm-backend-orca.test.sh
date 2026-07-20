@@ -356,6 +356,36 @@ test_orca_absence_requires_typed_not_found() {
   pass "Orca absence probes distinguish typed absence from unknown reads"
 }
 
+test_worktree_name_absence_is_repository_scoped_and_fail_closed() {
+  local status
+  orca_case worktree-name-absence
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/1.out"
+  printf '{"ok":true,"result":{"worktrees":[{"id":"wt-1","displayName":"fm-task"}]}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/3.out"
+  printf '{"ok":true,"result":{"worktrees":[]}}\n' > "$RESP/4.out"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/5.out"
+  printf '{}\n' > "$RESP/6.out"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "matching repository-scoped Orca worktree name must be reported present"
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT" \
+    || fail "valid empty Orca worktree inventory was not recognized as absent"
+  set +e
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_name_absent /repo/path fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed Orca worktree inventory must remain unknown"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''list'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--json' \
+    "Orca name absence did not bind inventory to the persisted repository"
+  set +e
+  pass "Orca worktree-name absence is repository-scoped and fail-closed"
+}
+
 test_orca_create_failures_report_unknown_partial_state() {
   local out status
   orca_case create-unknown-partial
@@ -1383,6 +1413,7 @@ test_send_key_refuses_unknown_key
 test_send_key_refuses_escape_until_supported
 test_kill_reports_unconfirmed_close
 test_orca_absence_requires_typed_not_found
+test_worktree_name_absence_is_repository_scoped_and_fail_closed
 test_orca_create_failures_report_unknown_partial_state
 test_remove_worktree_refuses_empty_id
 test_remove_worktree_rejects_orca_error_json

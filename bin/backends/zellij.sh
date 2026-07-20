@@ -318,7 +318,7 @@ fm_backend_zellij_tab_absent() {  # <session> <tab-id> <label> [pane-id]
       panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 2
       printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
       if printf '%s' "$panes" | jq -e --argjson id "$pane_id" \
-        '[.[]? | select(.id == $id)] | length > 0' >/dev/null 2>&1; then
+        '[.[]? | select(.id == $id and .is_plugin == false)] | length > 0' >/dev/null 2>&1; then
         return 1
       fi
       ;;

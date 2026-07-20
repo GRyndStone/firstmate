@@ -112,12 +112,14 @@ For tmux that confirmation is a cleared composer, using the same corrected,
 border-aware detector as the composer guard.
 For herdr, normal idle-baseline submits are confirmed by native agent-state showing a real turn started; the ANSI-aware composer classifier remains the affirmative-empty pre-injection guard and conservative fallback for non-idle or unreadable baselines.
 A bordered-empty or ghost-only composer is recognized as empty where that backend uses composer confirmation, rather than mistaken for a swallowed Enter.
-Before typing, the daemon persists a local prepared receipt and keeps the escalation buffer intact.
-Backend submit confirmation proves only that the injection left the composer or started a turn; it does not authorize buffer trimming.
-The receiving firstmate runs `bin/fm-supervise-daemon.sh --ack-delivery <key>` from the marked digest, which atomically writes `state/.subsuper-escalation-ack`.
+Before typing, the daemon persists a local `prepared` receipt and keeps the escalation buffer intact.
+Backend submit confirmation advances that receipt to `submitted`, proving only that the injection left the composer or started a turn without authorizing buffer trimming.
+The receiving firstmate runs the absolute, state-scoped `FM_STATE_OVERRIDE=<state> <firstmate-root>/bin/fm-supervise-daemon.sh --ack-delivery <key>` command from the marked digest, which atomically writes `state/.subsuper-escalation-ack`.
 Only that payload-bound sink acknowledgement authorizes the daemon to trim the matching delivered prefix and mark a reconciliation delivery complete.
 The daemon never searches pane capture or scrollback for delivery markers, so unsubmitted composer input cannot acknowledge a delivery and an acknowledged delivery cannot expire with scrollback.
-A crash with only the local prepared receipt retries the same verified prefix; a crash after the sink acknowledgement consumes that durable acknowledgement without replaying the prefix.
+A restart with a `prepared` receipt retries the same verified prefix.
+A restart with a `submitted` receipt does not replay it, keeps the prefix buffered, and raises the stale-submission alarm when its bounded deadline expires.
+A restart after sink acknowledgement consumes the durable `acknowledged` state without replaying the prefix.
 `fm-send.sh` uses the same primitive and exits non-zero
 when a steer's Enter is positively swallowed, so firstmate learns an instruction
 did not land instead of leaving it unsubmitted.
@@ -187,10 +189,10 @@ the marker lets firstmate distinguish it from a real captain message.
   cleared.
   For herdr's normal idle-baseline path it means native agent-state observed a real turn start; herdr uses the ANSI-aware structural classifier for the pre-injection composer guard and fallback paths.
   This lets ghost-only or bordered-empty composers count as empty where a composer read is the active confirmation signal.
-- **Sink-owned delivery acknowledgement** - a backend-confirmed submit remains buffered under its durable local prepared receipt until the receiving firstmate runs the payload-bound acknowledgement command carried by the digest.
+- **Sink-owned delivery acknowledgement** - the durable receipt advances from `prepared` before typing, to `submitted` after backend confirmation, to `acknowledged` only after the receiving firstmate runs the payload-bound acknowledgement command carried by the digest.
   The resulting atomic `state/.subsuper-escalation-ack` is the only delivery evidence that permits prefix trimming.
   Pane capture, scrollback, and composer contents are never delivery evidence.
-  An unacknowledged local receipt is retried, while a sink-acknowledged prefix is not replayed across restart.
+  Restarts retry `prepared`, never replay `submitted`, retain submitted prefixes for the stale-submission alarm, and consume `acknowledged` without replay.
 - **Marker strip** - `strip_injection_marker` removes the sentinel prefix before
   classification or relay, so the digest text firstmate sees is clean.
 - **Portable singleton lock** - the daemon uses the repo's portable lock helper

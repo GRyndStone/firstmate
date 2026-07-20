@@ -615,7 +615,8 @@ fm_backend_spawn_label_absent() {  # <backend> <label> <scope>
       fm_backend_zellij_tab_absent "$scope" '' "$label"
       ;;
     orca)
-      return 2
+      [ -n "$scope" ] || return 2
+      fm_backend_orca_worktree_name_absent "$scope" "$label"
       ;;
     cmux)
       fm_backend_cmux_workspace_absent '' "$label"
@@ -624,12 +625,126 @@ fm_backend_spawn_label_absent() {  # <backend> <label> <scope>
   esac
 }
 
-fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta]
-  local backend=$1 label=$2 scope=${3:-} rescue=${4:-}
-  local endpoint_uncertain worktree_uncertain target resource_id worktree_id endpoint_rc=2 worktree_rc=0
+fm_backend_treehouse_inventory() {
+  local project=${1:-} output line status path holder suffix tilde='~'
+  [ -n "$project" ] || return 2
+  if command -v fm_reconcile_bounded >/dev/null 2>&1; then
+    output=$(cd "$project" && fm_reconcile_bounded "${FM_SPAWN_CLAIM_PROBE_TIMEOUT:-5}" \
+      env NO_COLOR=1 TREEHOUSE_NO_UPDATE_CHECK=1 treehouse status 2>/dev/null) || return 2
+  else
+    output=$(cd "$project" && NO_COLOR=1 TREEHOUSE_NO_UPDATE_CHECK=1 treehouse status 2>/dev/null) || return 2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      ' '*) continue ;;
+      *'  available '*) status=available ;;
+      *'  in-use '*) status=in-use ;;
+      *'  dirty '*) status=dirty ;;
+      *'  leased '*) status=leased ;;
+      *'  you'\''re here '*) status="you're here" ;;
+      *) return 2 ;;
+    esac
+    path=$(printf '%s\n' "$line" | awk -v state="$status" '
+      {
+        pattern = "  " state " +"
+        if (!match($0, pattern)) exit 2
+        print substr($0, RSTART + RLENGTH)
+      }
+    ') || return 2
+    holder=
+    if [ "$status" = leased ]; then
+      holder=$(printf '%s\n' "$path" | sed -n 's/^.*  (held by \(.*\))$/\1/p')
+      if [ -n "$holder" ]; then
+        suffix="  (held by $holder)"
+        path=${path%"$suffix"}
+      fi
+    fi
+    case "$path" in
+      "$tilde") path=$HOME ;;
+      "$tilde/"*) path="$HOME/${path#*/}" ;;
+    esac
+    printf '%s\t%s\t%s\n' "$status" "$path" "$holder"
+  done <<EOF
+$output
+EOF
+}
+
+fm_backend_treehouse_lease_path() {
+  local project=${1:-} holder=${2:-} inventory status path candidate found=
+  [ -n "$holder" ] || return 2
+  inventory=$(fm_backend_treehouse_inventory "$project") || return 2
+  while IFS=$'\t' read -r status path candidate; do
+    [ "$status" = leased ] && [ "$candidate" = "$holder" ] || continue
+    [ -z "$found" ] || return 2
+    found=$path
+  done <<EOF
+$inventory
+EOF
+  [ -n "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+fm_backend_treehouse_lease_absent() {
+  local rc
+  if fm_backend_treehouse_lease_path "$1" "$2" >/dev/null; then
+    return 1
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] && return 0
+  return 2
+}
+
+fm_backend_treehouse_worktree_absent() {
+  local project=${1:-} target=${2:-} inventory status path target_real path_real listed line
+  [ -n "$project" ] && [ -n "$target" ] || return 2
+  if target_real=$(cd "$target" 2>/dev/null && pwd -P); then :; else target_real=$target; fi
+  inventory=$(fm_backend_treehouse_inventory "$project") || return 2
+  while IFS=$'\t' read -r status path _; do
+    if path_real=$(cd "$path" 2>/dev/null && pwd -P); then :; else path_real=$path; fi
+    [ "$path_real" = "$target_real" ] || continue
+    [ "$status" = available ] && return 0
+    return 1
+  done <<EOF
+$inventory
+EOF
+  listed=$(git -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      'worktree '*)
+        path=${line#worktree }
+        if path_real=$(cd "$path" 2>/dev/null && pwd -P); then :; else path_real=$path; fi
+        [ "$path_real" != "$target_real" ] || return 2
+        ;;
+    esac
+  done <<EOF
+$listed
+EOF
+  return 0
+}
+
+fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [treehouse-project] [treehouse-holder]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-} claim_treehouse_project=${5:-} claim_treehouse_holder=${6:-}
+  local endpoint_uncertain worktree_uncertain target resource_id worktree_id project holder endpoint_rc=2 worktree_rc=0
   if [ ! -f "$rescue" ]; then
-    fm_backend_spawn_label_absent "$backend" "$label" "$scope"
-    return
+    if fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+      endpoint_rc=0
+    else
+      endpoint_rc=$?
+    fi
+    if [ -z "$claim_treehouse_holder" ]; then
+      return "$endpoint_rc"
+    fi
+    if fm_backend_treehouse_lease_absent "$claim_treehouse_project" "$claim_treehouse_holder"; then
+      worktree_rc=0
+    else
+      worktree_rc=$?
+    fi
+    [ "$endpoint_rc" -ne 1 ] || return 1
+    [ "$worktree_rc" -ne 1 ] || return 1
+    [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] && return 0
+    return 2
   fi
   endpoint_uncertain=$(fm_meta_get "$rescue" spawn_endpoint_uncertain)
   worktree_uncertain=$(fm_meta_get "$rescue" spawn_worktree_uncertain)
@@ -706,7 +821,24 @@ fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta]
           [ -n "$worktree_id" ] || worktree_rc=2
         fi
       else
-        worktree_rc=2
+        project=$(fm_meta_get "$rescue" project)
+        holder=$(fm_meta_get "$rescue" spawn_treehouse_holder)
+        worktree_id=$(fm_meta_get "$rescue" worktree)
+        if [ -n "$holder" ]; then
+          if fm_backend_treehouse_lease_absent "$project" "$holder"; then
+            worktree_rc=0
+          else
+            worktree_rc=$?
+          fi
+        elif [ -n "$worktree_id" ]; then
+          if fm_backend_treehouse_worktree_absent "$project" "$worktree_id"; then
+            worktree_rc=0
+          else
+            worktree_rc=$?
+          fi
+        else
+          worktree_rc=2
+        fi
       fi
       ;;
     *) worktree_rc=2 ;;

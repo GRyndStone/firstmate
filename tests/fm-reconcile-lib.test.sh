@@ -680,6 +680,42 @@ test_owned_command_overrides_older_persisted_idle() {
   pass "new progressing commands override older persisted idle"
 }
 
+test_owned_command_overrides_historical_wait_events() {
+  local historical dir state live pid identity physical_wt
+  command -v pgrep >/dev/null 2>&1 || { pass "owned-command historical wait override skipped without pgrep"; return; }
+  for historical in paused blocked parked; do
+    dir=$(make_reconcile_case "owned-command-$historical-override")
+    state="$dir/state"
+    live="$dir/live"
+    printf 'state: %s · source: status-log · historical wait event\n' "$historical" > "$live"
+    observe "$state" "$live" >/dev/null
+    physical_wt=$(cd "$dir/worktree" && pwd -P)
+    sh -c 'cd "$1" || exit 1; while :; do sleep 0.1; done' _ "$physical_wt" &
+    pid=$!
+    sleep 0.1
+    identity=$(fm_reconcile_process_identity "$pid") || { kill "$pid" 2>/dev/null || true; fail "could not identify owned command"; }
+    fm_write_meta "$state/task.wait" \
+      'schema=fm-external-wait.v1' \
+      'kind=process' \
+      'description=background validation' \
+      "pid=$pid" \
+      "pid_identity=$identity" \
+      'role=working-command' \
+      'progress_grace=30' \
+      "owner_worktree=$physical_wt" \
+      'owner_tasktmp=' \
+      'registered_at=1'
+    observe "$state" "$live" >/dev/null
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = working ] \
+      || fail "progressing owned command did not override historical $historical event"
+    [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = owned-command ] \
+      || fail "progressing owned command did not own reconciliation over historical $historical event"
+  done
+  pass "progressing owned commands override historical wait events"
+}
+
 test_registered_legacy_check_completes_once_in_reconciliation() {
   local dir state live generation check_tmp out token version
   dir=$(make_reconcile_case registered-legacy-check)
@@ -886,6 +922,49 @@ EOF
   pass "process exits between liveness and identity reads complete without a false failure"
 }
 
+test_owned_command_observation_races_classify_exit_as_complete() {
+  local seam evaluation result evidence
+  for seam in cwd progress; do
+    evaluation=$(
+      calls=0
+      fm_reconcile_pid_alive() {
+        calls=$((calls + 1))
+        [ "$calls" -eq 1 ]
+      }
+      fm_reconcile_process_identity() { printf 'recorded identity'; }
+      if [ "$seam" = cwd ]; then
+        fm_reconcile_process_cwd() { return 1; }
+        fm_reconcile_process_tree_signature() { printf progress; }
+      else
+        fm_reconcile_process_cwd() { printf '/tmp/fm-owned-command-race'; }
+        fm_reconcile_process_tree_signature() { return 1; }
+      fi
+      FM_RECONCILE_WAIT_PRESENT=1
+      FM_RECONCILE_WAIT_KIND=process
+      FM_RECONCILE_WAIT_DESCRIPTION='exiting owned command'
+      FM_RECONCILE_WAIT_SIGNATURE="process-$seam-race"
+      FM_RECONCILE_WAIT_PID=4242
+      FM_RECONCILE_WAIT_PID_IDENTITY='recorded identity'
+      FM_RECONCILE_WAIT_ROLE=working-command
+      FM_RECONCILE_WAIT_PROGRESS_GRACE=30
+      FM_RECONCILE_WAIT_OWNER_WORKTREE=/tmp/fm-owned-command-race
+      FM_RECONCILE_WAIT_OWNER_TASKTMP=
+      FM_RECONCILE_WAIT_PROGRESS_SIGNATURE=old-progress
+      FM_RECONCILE_WAIT_PROGRESS_AT=1
+      FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
+      FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION='legacy:1:2'
+      fm_reconcile_wait_evaluate /dev/null 1
+      printf '%s\t%s\n' "$FM_RECONCILE_WAIT_RESULT" "$FM_RECONCILE_WAIT_EVIDENCE"
+    )
+    IFS=$(printf '\t') read -r result evidence <<EOF
+$evaluation
+EOF
+    [ "$result" = complete ] || fail "owned command exit during $seam read was classified as $result"
+    assert_contains "$evidence" 'exited' "owned command $seam race lost its completion evidence"
+  done
+  pass "owned command exits during observation complete without false failures"
+}
+
 test_owned_command_cannot_mask_newer_terminal_state() {
   local dir state live pid identity physical_wt out token
   command -v pgrep >/dev/null 2>&1 || { pass "owned-command terminal authority skipped without pgrep"; return; }
@@ -976,6 +1055,11 @@ test_teardown_claim_is_live_and_generation_bound() {
   touch -t 200001010000 "$tombstone"
   fm_reconcile_tombstone_active "$state" task \
     || fail "live teardown owner stopped holding its tombstone after the age bound"
+  (
+    fm_reconcile_pid_alive() { return 0; }
+    fm_reconcile_process_identity() { return 1; }
+    fm_reconcile_tombstone_active "$state" task
+  ) || fail "live teardown owner with unreadable identity stopped holding its tombstone"
   if fm_reconcile_spawn_claim "$state" task replacement-spawn; then
     fail "replacement spawn acquired a task while its teardown owner was live"
   fi
@@ -1043,6 +1127,63 @@ test_partial_spawn_rescue_claim_survives_owner_exit() {
   pass "rescue-pending ownership releases only after bounded backend absence proof"
 }
 
+test_treehouse_rescue_reconciles_by_persisted_holder() {
+  local dir project rescue fake status leased_path
+  dir="$TMP_ROOT/treehouse-holder-rescue"
+  project="$dir/project"
+  rescue="$dir/task.meta.rescue"
+  fake="$dir/fakebin"
+  mkdir -p "$project" "$fake"
+  cat > "$fake/treehouse" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = status ] || exit 1
+printf '%s\n' "${FM_FAKE_TREEHOUSE_STATUS:-}"
+exit "${FM_FAKE_TREEHOUSE_EXIT:-0}"
+SH
+  cat > "$fake/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in list-windows) exit 0 ;; esac
+exit 1
+SH
+  chmod +x "$fake/treehouse" "$fake/tmux"
+  fm_write_meta "$rescue" \
+    'spawn_endpoint_uncertain=0' \
+    'spawn_worktree_uncertain=1' \
+    "project=$project" \
+    'spawn_treehouse_holder=task'
+  set +e
+  PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_STATUS="1  leased  $dir/worktree  (held by task)" \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_spawn_claim_absent tmux fm-task firstmate "$2"' _ "$ROOT" "$rescue"
+  status=$?
+  set -e
+  expect_code 1 "$status" "persisted treehouse holder must keep a live uncertain worktree claimed"
+  leased_path=$(PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_STATUS='1  leased  ~/worktree  (held by task)' \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_treehouse_lease_path "$2" task' _ "$ROOT" "$project") \
+    || fail "treehouse lease path could not expand a home-relative inventory entry"
+  [ "$leased_path" = "$HOME/worktree" ] \
+    || fail "treehouse lease path expanded to '$leased_path' instead of '$HOME/worktree'"
+  set +e
+  PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_STATUS="1  leased  $dir/worktree  (held by task)" \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_spawn_claim_absent tmux fm-task firstmate "" "$2" task' _ "$ROOT" "$project"
+  status=$?
+  set -e
+  expect_code 1 "$status" "durable creation claim released while its treehouse holder was live"
+  PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_STATUS="1  leased  $dir/worktree  (held by another-task)" \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_spawn_claim_absent tmux fm-task firstmate "$2"' _ "$ROOT" "$rescue" \
+    || fail "absent persisted treehouse holder did not release uncertain worktree ownership"
+  PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_STATUS="1  leased  $dir/worktree  (held by another-task)" \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_spawn_claim_absent tmux fm-task firstmate "" "$2" task' _ "$ROOT" "$project" \
+    || fail "durable creation claim did not reconcile an absent treehouse holder"
+  set +e
+  PATH="$fake:$PATH" FM_FAKE_TREEHOUSE_EXIT=1 \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_spawn_claim_absent tmux fm-task firstmate "$2"' _ "$ROOT" "$rescue"
+  status=$?
+  set -e
+  expect_code 2 "$status" "failed treehouse inventory must keep uncertain worktree ownership unknown"
+  set +e
+  pass "treehouse rescue ownership reconciles by persisted lease holder"
+}
+
 test_dead_spawn_claim_after_creation_started_is_retained() {
   local dir state claim generation fake old_path FM_SPAWN_CLAIM_RECOVERY_SECS
   dir="$TMP_ROOT/spawn-creation-started-claim"
@@ -1058,7 +1199,7 @@ test_dead_spawn_claim_after_creation_started_is_retained() {
   assert_grep 'backend=tmux' "$claim" "spawn claim omitted its backend"
   assert_grep 'backend_label=fm-task' "$claim" "spawn claim omitted its backend label"
   age_spawn_claim "$claim"
-  FM_SPAWN_CLAIM_RECOVERY_SECS=999999
+  FM_SPAWN_CLAIM_RECOVERY_SECS=9999999999
   if fm_reconcile_spawn_claim "$state" task replacement; then
     fail "replacement spawn discarded a dead claim after backend creation may have begun"
   fi
@@ -1097,6 +1238,7 @@ test_predicate_output_is_capped_with_exit_status_preserved
 test_malformed_live_state_values_are_rejected
 test_owned_command_does_not_override_first_terminal_observation
 test_owned_command_overrides_older_persisted_idle
+test_owned_command_overrides_historical_wait_events
 test_registered_legacy_check_completes_once_in_reconciliation
 test_legacy_check_registration_requires_atomic_commit
 test_failed_legacy_check_output_is_failure
@@ -1104,11 +1246,13 @@ test_repository_identity_failure_preserves_proven_binding
 test_lifecycle_generation_prevents_metadata_aba_publication
 test_delivery_version_is_unique_across_task_lifecycles
 test_process_identity_toctou_classifies_exit_as_complete
+test_owned_command_observation_races_classify_exit_as_complete
 test_owned_command_cannot_mask_newer_terminal_state
 test_generation_cas_and_spawn_claim_revalidate_lifecycle
 test_teardown_claim_is_live_and_generation_bound
 test_teardown_refuses_active_spawn_claim
 test_partial_spawn_rescue_claim_survives_owner_exit
+test_treehouse_rescue_reconciles_by_persisted_holder
 test_dead_spawn_claim_after_creation_started_is_retained
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

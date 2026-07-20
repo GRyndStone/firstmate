@@ -195,16 +195,21 @@ fm_backend_herdr_server_ensure() {  # <session>
 # (list order, normally creation order/oldest) rather than disambiguating -
 # identical in spirit to the pre-existing tab duplicate-label check below.
 fm_backend_herdr_workspace_find() {  # <session>
-  local session=$1 label list
+  local session=$1 label list wsid
   label=$(fm_backend_herdr_workspace_label)
-  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 0
+  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 2
+  printf '%s' "$list" | jq -e '
+    (.result.workspaces | type) == "array"
+    and all(.result.workspaces[]?; (.workspace_id | type) == "string" and (.label | type) == "string")
+  ' >/dev/null 2>&1 || return 2
   # NOTE: the jq variable is $want, NOT $label - `label` is a jq reserved
   # keyword (label/break), so declaring a jq variable named "label" is a
   # compile error that `2>/dev/null` would silently swallow, making this find
   # ALWAYS return empty and every spawn mint a fresh "firstmate" workspace
   # (the workspace leak).
-  printf '%s' "$list" | jq -r --arg want "$label" \
-    '.result.workspaces[]? | select(.label == $want) | .workspace_id' 2>/dev/null | head -1
+  wsid=$(printf '%s' "$list" | jq -r --arg want "$label" \
+    '[.result.workspaces[]? | select(.label == $want) | .workspace_id][0] // empty' 2>/dev/null) || return 2
+  printf '%s' "$wsid"
 }
 
 # fm_backend_herdr_workspace_prune_seeded_default_tab: close EXACTLY
@@ -331,7 +336,7 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
   FM_BACKEND_HERDR_WS_ID=""
   FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
   FM_BACKEND_HERDR_WS_PARTIAL=0
-  wsid=$(fm_backend_herdr_workspace_find "$session")
+  wsid=$(fm_backend_herdr_workspace_find "$session") || return 2
   if [ -n "$wsid" ]; then
     FM_BACKEND_HERDR_WS_ID=$wsid
     printf '%s' "$wsid"
@@ -343,7 +348,10 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd>
   fi
   wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
   if [ -z "$wsid" ]; then
-    wsid=$(fm_backend_herdr_workspace_find "$session")
+    if ! wsid=$(fm_backend_herdr_workspace_find "$session"); then
+      FM_BACKEND_HERDR_WS_PARTIAL=1
+      return 2
+    fi
     FM_BACKEND_HERDR_WS_PARTIAL=1
   fi
   if [ -z "$wsid" ]; then
@@ -1167,7 +1175,10 @@ fm_backend_herdr_task_label_absent() {  # <session> <label>
   wsid=$(fm_backend_herdr_workspace_find "$session") || return 2
   [ -n "$wsid" ] || return 0
   tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 2
-  printf '%s' "$tabs" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$tabs" | jq -e '
+    (.result.tabs | type) == "array"
+    and all(.result.tabs[]?; (.tab_id | type) == "string" and (.label | type) == "string")
+  ' >/dev/null 2>&1 || return 2
   if printf '%s' "$tabs" | jq -e --arg want "$label" \
     '[.result.tabs[]? | select(.label == $want)] | length > 0' >/dev/null 2>&1; then
     return 1

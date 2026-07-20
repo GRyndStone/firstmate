@@ -502,15 +502,24 @@ fm_wake_reconcile_claim_owner_live() {  # <claim-file>
   pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
   identity=$(fm_wake_reconcile_claim_value "$claim" owner_identity)
   fm_pid_alive "$pid" || return 1
-  [ -n "$identity" ] || return 1
-  current=$(fm_pid_identity "$pid") || return 1
-  [ "$current" = "$identity" ]
+  [ -n "$identity" ] || return 2
+  current=$(fm_pid_identity "$pid") || return 2
+  [ "$current" = "$identity" ] || return 1
 }
 
 fm_wake_reconcile_claimed_marker_locked() {
-  local claim="$STATE/.wake-queue.reconcile-claim" delivery_key
+  local claim="$STATE/.wake-queue.reconcile-claim" delivery_key owner_state
   [ -f "$claim" ] || return 1
-  if ! fm_wake_reconcile_claim_owner_live "$claim"; then
+  if fm_wake_reconcile_claim_owner_live "$claim"; then
+    owner_state=0
+  else
+    owner_state=$?
+  fi
+  if [ "$owner_state" -eq 2 ]; then
+    fm_wake_reconcile_claim_value "$claim" marker
+    return
+  fi
+  if [ "$owner_state" -eq 1 ]; then
     delivery_key=$(fm_wake_reconcile_claim_value "$claim" delivery_key)
     if [ -n "$delivery_key" ]; then
       fm_wake_reconcile_claim_value "$claim" marker
@@ -524,13 +533,19 @@ fm_wake_reconcile_claimed_marker_locked() {
 
 fm_wake_reconcile_claim_payload() {
   local claim="$STATE/.wake-queue.reconcile-claim" tmp selected marker payload queue_sequence='' owner_pid owner_identity
-  local existing_pid delivery_key='' delivery_state='' status=0
+  local existing_pid existing_owner_state delivery_key='' delivery_state='' status=0
   owner_pid=${BASHPID:-$$}
   owner_identity=$(fm_pid_identity "$owner_pid") || return 1
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   if [ -f "$claim" ]; then
     existing_pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
-    if fm_wake_reconcile_claim_owner_live "$claim" && [ "$existing_pid" != "$owner_pid" ]; then
+    if fm_wake_reconcile_claim_owner_live "$claim"; then
+      existing_owner_state=0
+    else
+      existing_owner_state=$?
+    fi
+    if [ "$existing_pid" != "$owner_pid" ] \
+      && { [ "$existing_owner_state" -eq 0 ] || [ "$existing_owner_state" -eq 2 ]; }; then
       fm_lock_release "$FM_WAKE_QUEUE_LOCK"
       return 2
     fi

@@ -259,6 +259,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Rules
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
+   The state-owned wait helper below may also write its registration under the supplied \`FM_STATE_OVERRIDE\`.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -338,6 +339,7 @@ When firstmate replies, feed the decision to GSD; when it replies or a blocker c
 # Rules
 1. Never push to any remote and never open a PR from this worktree.
 2. The only writable areas are this worktree, the GSD project the task names, the status file below, your handoff note at \`$DATA/$ID/handoff.md\`, and your report.
+   The state-owned wait helper below may also write its registration under the supplied \`FM_STATE_OVERRIDE\`.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -447,6 +449,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 # Rules
 $RULE1
 2. Stay inside this worktree; modify nothing outside it.
+   The state-owned wait helper below is the sole exception and may write its registration under the supplied \`FM_STATE_OVERRIDE\`.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`

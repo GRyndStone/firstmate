@@ -334,18 +334,39 @@ fm_backend_cmux_workspace_id_for_label() {  # <label>
     | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
 }
 
+fm_backend_cmux_workspace_inventory_all() {
+  local wins wid workspaces
+  wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>/dev/null) || return 2
+  printf '%s' "$wins" | jq -e 'type == "array" and all(.[]?; (.id | type) == "string" and (.id | length) > 0)' >/dev/null 2>&1 || return 2
+  while IFS= read -r wid; do
+    [ -n "$wid" ] || continue
+    workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>/dev/null) || return 2
+    printf '%s' "$workspaces" | jq -e '
+      (.workspaces | type) == "array"
+      and all(.workspaces[]?; (.id | type) == "string" and (.id | length) > 0 and (.title | type) == "string")
+    ' >/dev/null 2>&1 || return 2
+    printf '%s' "$workspaces" | jq -c '.workspaces[]?' 2>/dev/null || return 2
+  done < <(printf '%s' "$wins" | jq -r '.[].id' 2>/dev/null)
+}
+
+fm_backend_cmux_workspace_id_for_label_all() {
+  local label=$1 inventory
+  inventory=$(fm_backend_cmux_workspace_inventory_all) || return 2
+  printf '%s\n' "$inventory" | jq -sr --arg want "$label" \
+    '[.[]? | select(.title == $want) | .id][0] // empty' 2>/dev/null
+}
+
 fm_backend_cmux_workspace_absent() {  # <workspace-id> [expected-label]
-  local wsid=${1:-} expected_label=${2:-} title workspaces
-  workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 2
-  printf '%s' "$workspaces" | jq -e '(.workspaces | type) == "array"' >/dev/null 2>&1 || return 2
-  if [ -n "$wsid" ] && printf '%s' "$workspaces" | jq -e --arg id "$wsid" \
-    '[.workspaces[]? | select(.id == $id)] | length > 0' >/dev/null 2>&1; then
+  local wsid=${1:-} expected_label=${2:-} title inventory
+  inventory=$(fm_backend_cmux_workspace_inventory_all) || return 2
+  if [ -n "$wsid" ] && printf '%s\n' "$inventory" | jq -se --arg id "$wsid" \
+    '[.[]? | select(.id == $id)] | length > 0' >/dev/null 2>&1; then
     return 1
   fi
   if [ -n "$expected_label" ]; then
     title=$(fm_backend_cmux_scoped_title "$expected_label")
-    if printf '%s' "$workspaces" | jq -e --arg title "$title" \
-      '[.workspaces[]? | select(.title == $title)] | length > 0' >/dev/null 2>&1; then
+    if printf '%s\n' "$inventory" | jq -se --arg title "$title" \
+      '[.[]? | select(.title == $title)] | length > 0' >/dev/null 2>&1; then
       return 1
     fi
     return 0
@@ -443,6 +464,9 @@ fm_backend_cmux_target_ready() {  # <target> [expected-label]
       return 1
     else
       wsid=$(fm_backend_cmux_workspace_id_for_label "$expected_title")
+      if [ -z "$wsid" ]; then
+        wsid=$(fm_backend_cmux_workspace_id_for_label_all "$expected_title") || return 1
+      fi
       [ -n "$wsid" ] || return 1
     fi
     sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")

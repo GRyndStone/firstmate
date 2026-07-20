@@ -297,6 +297,12 @@ test_external_wait_registration_renders_all_brief_scaffolds() {
       "$kind brief omitted task-owned background-command progress registration"
     assert_grep 'unobservable parked task wakes as a runtime failure' "$brief" \
       "$kind brief did not state the fail-loud parking contract"
+    if [ "$kind" != secondmate ]; then
+      assert_grep 'state-owned wait helper' "$brief" \
+        "$kind brief did not exempt state-owned wait registration from its worktree boundary"
+      assert_grep 'supplied `FM_STATE_OVERRIDE`' "$brief" \
+        "$kind brief did not scope its wait-helper boundary exception"
+    fi
   done
   pass "fm-brief.sh: every scaffold binds observable waits to the authoritative task state"
 }

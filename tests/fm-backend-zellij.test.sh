@@ -836,6 +836,19 @@ test_tab_absence_requires_parseable_inventory() {
   pass "zellij absence distinguishes empty inventories from failed reads"
 }
 
+test_tab_absence_ignores_plugin_id_collisions() {
+  local dir fb
+  dir="$TMP_ROOT/tab-absence-plugin-collision"; mkdir -p "$dir/responses"
+  printf '[{"id":7,"tab_id":99,"is_plugin":true}]\n' > "$dir/responses/1.out"
+  printf '[]\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_tab_absent firstmate "" "" 7' "$ROOT" \
+    || fail "plugin pane id collision falsely kept a terminal task live"
+  pass "zellij absence ignores plugin pane-id collisions"
+}
+
 test_teardown_passes_recorded_tab_id_to_zellij_kill() {
   local dir state data config project fb out status
   dir="$TMP_ROOT/teardown-zellij-ghost"; state="$dir/state"; data="$dir/data"; config="$dir/config"; project="$dir/project"
@@ -1110,6 +1123,7 @@ test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent
 test_tab_absence_requires_parseable_inventory
+test_tab_absence_ignores_plugin_id_collisions
 test_teardown_passes_recorded_tab_id_to_zellij_kill
 test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag
 test_send_text_submit_detects_landed_send

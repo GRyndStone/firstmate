@@ -913,6 +913,9 @@ escalate_flush() {  # <state>
     receipt_key=$(escalation_receipt_key "$receipt")
     receipt_state=$(escalation_receipt_state "$receipt")
     sink_ack_key=$(escalation_sink_delivery_key "$state" 2>/dev/null || true)
+    if [ -z "$sink_ack_key" ] && [ "$claim_delivery_state" = acknowledged ]; then
+      sink_ack_key=$claim_delivery_key
+    fi
     if [ -n "$sink_ack_key" ]; then
       prefix_count=$(escalation_prefix_count_for_key "$inflight" "$sink_ack_key" 2>/dev/null || true)
       if [ -n "$prefix_count" ]; then
@@ -975,7 +978,13 @@ escalate_flush() {  # <state>
         fi
       fi
     fi
-    sink_msg="$msg [fm-delivery=$delivery_key] (acknowledge first: bin/fm-supervise-daemon.sh --ack-delivery $delivery_key)"
+    case "$receipt_state" in
+      submitted|delivered|acknowledged)
+        escalation_transfer_to_buffer "$state" 0 || return 1
+        return 3
+        ;;
+    esac
+    sink_msg="$msg [fm-delivery=$delivery_key] (acknowledge first: FM_STATE_OVERRIDE=$(printf '%q' "$state") $(printf '%q' "$FM_DAEMON_DIR/fm-supervise-daemon.sh") --ack-delivery $delivery_key)"
     injected=0
     if inject_msg "$sink_msg" "$state"; then
       injected=1

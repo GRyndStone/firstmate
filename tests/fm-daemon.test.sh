@@ -643,6 +643,39 @@ SH
   pass "reconciliation queue claims exclude drain and preserve post-claim evidence"
 }
 
+test_reconcile_claim_preserves_live_owner_with_unreadable_identity() {
+  local dir state reason marker
+  dir=$(make_supercase reconcile-claim-unreadable-owner)
+  state="$dir/state"
+  reason='stale: session:fm-task reconciled-transition [fm-reconcile=task,transition:1,version-one]'
+  marker='[fm-reconcile=task,transition:1,version-one]'
+  append_wake "$state" stale session:fm-task "$reason"
+  fm_write_meta "$state/.wake-queue.reconcile-claim" \
+    'schema=fm-wake-reconcile-claim.v1' \
+    "marker=$marker" \
+    "payload=$reason" \
+    'queue_sequence=1' \
+    'owner_pid=4242' \
+    'owner_identity=recorded-owner'
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_pid_alive() { [ "$1" = 4242 ]; }
+    fm_pid_identity() {
+      if [ "$1" = 4242 ]; then return 1; fi
+      printf "current-owner"
+    }
+    [ "$(fm_wake_reconcile_claimed_marker_locked)" = "$2" ]
+    if fm_wake_reconcile_claim_payload >/dev/null; then
+      exit 91
+    else
+      [ "$?" -eq 2 ]
+    fi
+    grep -qx "owner_pid=4242" "$STATE/.wake-queue.reconcile-claim"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$marker" \
+    || fail "live reconciliation owner with unreadable identity lost its claim"
+  pass "reconciliation claims fail closed on unreadable live-owner identity"
+}
+
 test_prepared_escalation_receipt_does_not_claim_delivery() {
   local dir state buf item n msg key delivered
   dir=$(make_supercase post-submit-receipt)
@@ -730,7 +763,7 @@ test_delivered_escalation_prefix_is_not_replayed() {
 }
 
 test_escalation_requires_durable_sink_acknowledgement() {
-  local dir state delivered key status
+  local dir state delivered key status before after
   dir=$(make_supercase durable-sink-ack)
   state="$dir/state"
   delivered="$dir/delivered"
@@ -744,18 +777,33 @@ test_escalation_requires_durable_sink_acknowledgement() {
   [ "$status" -eq 3 ] || fail "a locally confirmed submit without sink acknowledgement returned $status instead of 3"
   key=$(delivery_key_from_message "$(cat "$delivered")")
   [ -n "$key" ] || fail "submitted escalation omitted its delivery key"
+  assert_contains "$(cat "$delivered")" "FM_STATE_OVERRIDE=$(printf '%q' "$state")" \
+    "delivery acknowledgement omitted its authoritative state scope"
+  assert_contains "$(cat "$delivered")" "$ROOT/bin/fm-supervise-daemon.sh --ack-delivery $key" \
+    "delivery acknowledgement command was not absolute"
   [ -s "$state/.subsuper-escalations" ] || fail "unacknowledged submit trimmed its durable buffer"
   [ "$(escalation_receipt_key "$state/.subsuper-escalation-delivered")" = "$key" ] \
     || fail "unacknowledged submit lost its retry receipt"
   [ "$(escalation_receipt_state "$state/.subsuper-escalation-delivered")" = submitted ] \
     || fail "locally confirmed submit did not advance its prepared receipt"
+  fm_write_meta "$state/.subsuper-escalation-delivered" \
+    'schema=fm-escalation-delivery.v1' \
+    "delivery_key=$key" \
+    'delivery_state=submitted' \
+    'prepared_at=1' \
+    'submitted_at=1'
+  before=$(wc -l < "$delivered" | tr -d '[:space:]')
   (
     fm_backend_capture() { printf 'unsubmitted composer [fm-delivery=%s]\n' "$key"; }
-    inject_msg() { return 1; }
+    inject_msg() { printf 'unexpected replay\n' >> "$delivered"; return 0; }
     if escalate_flush "$state"; then
       fail "a pane-visible marker without sink acknowledgement retired delivery"
     fi
   )
+  after=$(wc -l < "$delivered" | tr -d '[:space:]')
+  [ "$after" -eq "$before" ] || fail "submitted escalation was replayed before sink acknowledgement"
+  [ "$(fm_reconcile_record_value "$state/.subsuper-escalation-delivered" submitted_at)" = 1 ] \
+    || fail "submitted escalation retry refreshed its stale-alarm timestamp"
   [ -s "$state/.subsuper-escalations" ] || fail "pane-visible composer text trimmed the escalation"
   FM_STATE_OVERRIDE="$state" "$DAEMON" --ack-delivery "$key" \
     || fail "sink could not persist its delivery acknowledgement"
@@ -767,6 +815,19 @@ test_escalation_requires_durable_sink_acknowledgement() {
   [ ! -s "$state/.subsuper-escalations" ] || fail "sink-acknowledged escalation remained buffered"
   [ ! -e "$state/.subsuper-escalation-ack" ] || fail "consumed sink acknowledgement was not cleared"
   pass "sink acknowledgements exclude composer state and survive scrollback loss"
+}
+
+test_afk_contract_distinguishes_receipt_restart_states() {
+  local skill="$ROOT/.agents/skills/afk/SKILL.md"
+  assert_grep 'A restart with a `prepared` receipt retries' "$skill" \
+    "AFK contract omitted prepared-receipt restart semantics"
+  assert_grep 'A restart with a `submitted` receipt does not replay it' "$skill" \
+    "AFK contract omitted submitted-receipt restart semantics"
+  assert_grep 'durable `acknowledged` state without replaying' "$skill" \
+    "AFK contract omitted acknowledged-receipt restart semantics"
+  assert_grep 'absolute, state-scoped `FM_STATE_OVERRIDE=<state>' "$skill" \
+    "AFK contract omitted the durable acknowledgement scope"
+  pass "AFK contract distinguishes prepared, submitted, and acknowledged restarts"
 }
 
 test_acknowledged_prefix_transfer_recovers_after_commit_crash() {
@@ -1839,6 +1900,32 @@ test_max_defer_prepared_receipt_does_not_suppress_alarm() {
   pass "prepared-only receipts never suppress max-defer wedge alarms"
 }
 
+test_max_defer_submitted_receipt_alarms_without_replay() {
+  local dir state fakebin sent msg key receipt
+  dir=$(make_bordered_case maxdefer-submitted-receipt)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '│ > │\n' > "$dir/composer"
+  escalate_add "$state" "needs-decision: submitted receipt"
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  msg='Supervisor escalate (1 event(s)): needs-decision: submitted receipt (pre-read; re-arm not needed — watcher daemon-managed)'
+  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  receipt="$state/.subsuper-escalation-delivered"
+  escalation_receipt_write "$receipt" "$key" submitted \
+    || fail "submitted max-defer receipt setup failed"
+  touch -t 200001010000 "$receipt"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    housekeeping "$state"
+  [ ! -s "$sent" ] || fail "submitted max-defer receipt replayed its digest"
+  [ -s "$state/.subsuper-inject-wedged" ] \
+    || fail "stale submitted receipt did not raise the max-defer wedge alarm"
+  [ "$(escalation_receipt_state "$receipt")" = submitted ] \
+    || fail "stale submitted receipt lost its durable delivery state"
+  pass "stale submitted receipts alarm without replay"
+}
+
 test_normal_flush_clears_stale_wedge_marker() {
   local dir state fakebin sent status
   dir=$(make_bordered_case normal-clears-wedge)
@@ -2492,6 +2579,7 @@ test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_normal_supervisor_replays_unaccepted_reconciled_wake
 test_reconciled_queue_claim_excludes_concurrent_drain
+test_reconcile_claim_preserves_live_owner_with_unreadable_identity
 test_watcher_reconciled_exit_dispatches_through_claim
 test_reconciled_escalation_acknowledges_before_immediate_flush
 test_reconciled_claim_retains_post_submit_receipt_until_completion
@@ -2510,6 +2598,7 @@ test_sink_verified_escalation_is_not_replayed
 test_escalation_receipt_precedes_external_submit
 test_delivered_escalation_prefix_is_not_replayed
 test_escalation_requires_durable_sink_acknowledgement
+test_afk_contract_distinguishes_receipt_restart_states
 test_acknowledged_prefix_transfer_recovers_after_commit_crash
 test_failed_inflight_transfer_recovers_after_commit_crash
 test_drain_preserves_delivered_dead_owner_claim
@@ -2546,6 +2635,7 @@ test_max_defer_empty_swallow_types_once_and_alarms
 test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
 test_max_defer_prepared_receipt_does_not_suppress_alarm
+test_max_defer_submitted_receipt_alarms_without_replay
 test_normal_flush_clears_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm

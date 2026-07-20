@@ -904,6 +904,8 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
   assert_contains "$out" "worktree=$wt" \
     "fm-spawn.sh did not resolve a symlinked-prefix project to its real worktree when the backend reports $first_reply cwd"
+  assert_contains "$(cat "$log")" "treehouse get --lease --lease-holder '$id-" \
+    "fm-spawn.sh did not bind an uncertain treehouse allocation to its task id"
 
   rm -rf "/tmp/fm-$id"
 }
@@ -912,6 +914,53 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
   run_spawn_symlink_case physical physical
   run_spawn_symlink_case logical logical
   pass "fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal"
+}
+
+test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
+  local dir proj invalid data state config log fb out status id
+  dir="$TMP_ROOT/spawn-invalid-treehouse"
+  proj="$dir/project"
+  invalid="$dir/not-a-worktree"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/log"
+  id=invalidtreehousez7
+  fm_git_init_commit "$proj"
+  mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
+  printf 'brief\n' > "$data/$id/brief.md"
+  fb="$dir/fakebin"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
+    printf 'firstmate\\n'
+    ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  status) printf '1  available  %s\\n' "$invalid" ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux" "$fb/treehouse"
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "non-worktree treehouse path unexpectedly passed spawn validation"
+  assert_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force'$'\x1f'"$invalid" \
+    "spawn validation failure did not clean its uncertain treehouse worktree"
+  [ ! -e "$state/$id.spawn-claim" ] \
+    || fail "verified treehouse cleanup retained spawn ownership"
+  assert_contains "$out" 'did not yield an isolated worktree' \
+    "spawn validation failure did not report the invalid treehouse path"
+  pass "fm-spawn cleans treehouse worktrees when validation fails"
 }
 
 # --- old vs new: fm-teardown.sh ----------------------------------------------
@@ -1141,6 +1190,10 @@ SH
   [ "$status" -ne 0 ] || fail "handle-less backend creation failure unexpectedly spawned"
   assert_grep 'creation_phase=backend-creation' "$state/$id.spawn-claim" \
     "handle-less backend creation failure released its uncertain ownership"
+  assert_grep 'treehouse_project=' "$state/$id.spawn-claim" \
+    "handle-less backend creation failure omitted its treehouse project scope"
+  assert_grep "treehouse_holder=$id-" "$state/$id.spawn-claim" \
+    "handle-less backend creation failure omitted its lifecycle-scoped treehouse holder"
   assert_contains "$out" 'retained spawn ownership' \
     "handle-less backend creation failure did not report retained ownership"
   [ ! -e "$state/$id.meta" ] || fail "handle-less backend creation failure published ordinary metadata"
@@ -1168,6 +1221,7 @@ test_tmux_absence_probe_is_fail_closed_on_inventory_errors
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
+test_spawn_validation_failure_cleans_uncertain_treehouse_worktree
 test_teardown_conformance_old_vs_new
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag

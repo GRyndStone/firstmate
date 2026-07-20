@@ -464,14 +464,26 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
                   FM_RECONCILE_WAIT_EVIDENCE='registered command progress grace is invalid'
                   ;;
                 *)
-                  current_cwd=$(fm_reconcile_process_cwd "$FM_RECONCILE_WAIT_PID" || true)
-                  if ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
+                  if ! current_cwd=$(fm_reconcile_process_cwd "$FM_RECONCILE_WAIT_PID"); then
+                    if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+                      FM_RECONCILE_WAIT_RESULT=complete
+                      FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
+                    else
+                      FM_RECONCILE_WAIT_RESULT=failed
+                      FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID cwd is unreadable"
+                    fi
+                  elif ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
                     && ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_TASKTMP"; then
                     FM_RECONCILE_WAIT_RESULT=failed
                     FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID left its task-scoped roots (cwd ${current_cwd:-unreadable})"
                   elif ! current_progress=$(fm_reconcile_process_tree_signature "$FM_RECONCILE_WAIT_PID"); then
-                    FM_RECONCILE_WAIT_RESULT=failed
-                    FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID progress is not observable"
+                    if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+                      FM_RECONCILE_WAIT_RESULT=complete
+                      FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
+                    else
+                      FM_RECONCILE_WAIT_RESULT=failed
+                      FM_RECONCILE_WAIT_EVIDENCE="registered command $FM_RECONCILE_WAIT_PID progress is not observable"
+                    fi
                   else
                     FM_RECONCILE_WAIT_PROGRESS_SIGNATURE=$current_progress
                     if [ -z "$old_progress" ] || [ "$current_progress" != "$old_progress" ]; then
@@ -664,10 +676,10 @@ fm_reconcile_tombstone_active() {  # <state-dir> <id>
   [ -e "$tombstone" ] || return 1
   owner_pid=$(fm_reconcile_record_value "$tombstone" owner_pid)
   owner_identity=$(fm_reconcile_record_value "$tombstone" owner_identity)
-  current_identity=$(fm_reconcile_process_identity "$owner_pid" 2>/dev/null || true)
-  if fm_reconcile_pid_alive "$owner_pid" \
-    && [ -n "$owner_identity" ] && [ "$current_identity" = "$owner_identity" ]; then
-    return 0
+  if fm_reconcile_pid_alive "$owner_pid"; then
+    [ -n "$owner_identity" ] || return 0
+    current_identity=$(fm_reconcile_process_identity "$owner_pid" 2>/dev/null) || return 0
+    [ "$current_identity" = "$owner_identity" ] && return 0
   fi
   [ "$(fm_path_age "$tombstone")" -lt "$FM_TEARDOWN_TOMBSTONE_SECS" ]
 }
@@ -887,8 +899,8 @@ fm_reconcile_spawn_claim() {  # <state-dir> <id> <generation>
   return "$claim_rc"
 }
 
-fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generation> <backend> <backend-label> [scope] [home]
-  local state=$1 id=$2 generation=$3 backend=$4 backend_label=$5 backend_scope=${6:-} backend_home=${7:-} claim tmp mark_rc=0
+fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generation> <backend> <backend-label> [scope] [home] [treehouse-project] [treehouse-holder]
+  local state=$1 id=$2 generation=$3 backend=$4 backend_label=$5 backend_scope=${6:-} backend_home=${7:-} treehouse_project=${8:-} treehouse_holder=${9:-} claim tmp mark_rc=0
   local owner_pid owner_identity expected_signature expected_generation started_at
   claim="$state/$id.spawn-claim"
   fm_reconcile_lock_acquire "$state" "$id"
@@ -915,6 +927,8 @@ fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generati
       printf 'backend_label=%s\n' "$(fm_reconcile_clean_value "$backend_label")"
       [ -z "$backend_scope" ] || printf 'backend_scope=%s\n' "$(fm_reconcile_clean_value "$backend_scope")"
       [ -z "$backend_home" ] || printf 'backend_home=%s\n' "$(fm_reconcile_clean_value "$backend_home")"
+      [ -z "$treehouse_project" ] || printf 'treehouse_project=%s\n' "$(fm_reconcile_clean_value "$treehouse_project")"
+      [ -z "$treehouse_holder" ] || printf 'treehouse_holder=%s\n' "$(fm_reconcile_clean_value "$treehouse_holder")"
     } > "$tmp" || mark_rc=1
     if [ "$mark_rc" -eq 0 ] && ! mv -f "$tmp" "$claim"; then mark_rc=1; fi
     rm -f "$tmp"
@@ -925,7 +939,7 @@ fm_reconcile_spawn_claim_mark_creation_started() {  # <state-dir> <id> <generati
 
 fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation> <rescue-path>
   local state=$1 id=$2 generation=$3 rescue_path=$4 claim tmp mark_rc=0
-  local owner_pid owner_identity expected_signature expected_generation creation_phase backend backend_label backend_scope backend_home started_at creation_started_at
+  local owner_pid owner_identity expected_signature expected_generation creation_phase backend backend_label backend_scope backend_home treehouse_project treehouse_holder started_at creation_started_at
   claim="$state/$id.spawn-claim"
   fm_reconcile_lock_acquire "$state" "$id"
   if ! fm_reconcile_spawn_claim_matches_locked "$state" "$id" "$generation"; then
@@ -940,6 +954,8 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
     backend_label=$(fm_reconcile_record_value "$claim" backend_label)
     backend_scope=$(fm_reconcile_record_value "$claim" backend_scope)
     backend_home=$(fm_reconcile_record_value "$claim" backend_home)
+    treehouse_project=$(fm_reconcile_record_value "$claim" treehouse_project)
+    treehouse_holder=$(fm_reconcile_record_value "$claim" treehouse_holder)
     started_at=$(fm_reconcile_record_value "$claim" started_at)
     creation_started_at=$(fm_reconcile_record_value "$claim" creation_started_at)
     tmp="$claim.tmp.${BASHPID:-$$}"
@@ -957,6 +973,8 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
       [ -z "$backend_label" ] || printf 'backend_label=%s\n' "$backend_label"
       [ -z "$backend_scope" ] || printf 'backend_scope=%s\n' "$backend_scope"
       [ -z "$backend_home" ] || printf 'backend_home=%s\n' "$backend_home"
+      [ -z "$treehouse_project" ] || printf 'treehouse_project=%s\n' "$treehouse_project"
+      [ -z "$treehouse_holder" ] || printf 'treehouse_holder=%s\n' "$treehouse_holder"
       printf 'rescue_pending=1\n'
       printf 'rescue_path=%s\n' "$(fm_reconcile_clean_value "$rescue_path")"
     } > "$tmp" || mark_rc=1
@@ -969,7 +987,7 @@ fm_reconcile_spawn_claim_mark_rescue_pending() {  # <state-dir> <id> <generation
 
 fm_reconcile_spawn_claim_recover_locked() {  # <state-dir> <id> <claim>
   local state=$1 id=$2 claim=$3 started age expected_signature expected_generation
-  local backend backend_label backend_scope backend_home rescue_path probe_root probe_rc owner_pid owner_identity current_identity
+  local backend backend_label backend_scope backend_home treehouse_project treehouse_holder rescue_path probe_root probe_rc owner_pid owner_identity current_identity
   owner_pid=$(fm_reconcile_record_value "$claim" owner_pid)
   owner_identity=$(fm_reconcile_record_value "$claim" owner_identity)
   current_identity=$(fm_reconcile_process_identity "$owner_pid" 2>/dev/null || true)
@@ -991,14 +1009,16 @@ fm_reconcile_spawn_claim_recover_locked() {  # <state-dir> <id> <claim>
   backend_label=$(fm_reconcile_record_value "$claim" backend_label)
   backend_scope=$(fm_reconcile_record_value "$claim" backend_scope)
   backend_home=$(fm_reconcile_record_value "$claim" backend_home)
+  treehouse_project=$(fm_reconcile_record_value "$claim" treehouse_project)
+  treehouse_holder=$(fm_reconcile_record_value "$claim" treehouse_holder)
   rescue_path=$(fm_reconcile_record_value "$claim" rescue_path)
   [ -n "$backend" ] && [ -n "$backend_label" ] || return 1
   [ -n "$backend_home" ] || backend_home=${FM_HOME:-${FM_ROOT_OVERRIDE:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}}
   probe_root=${FM_ROOT:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}
   if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" env \
     FM_HOME="$backend_home" FM_ROOT="$probe_root" FM_ROOT_OVERRIDE="${FM_ROOT_OVERRIDE:-}" \
-    bash -c '. "$1/fm-backend.sh"; fm_backend_spawn_claim_absent "$2" "$3" "$4" "$5"' \
-    fm-spawn-claim-probe "$_FM_RECONCILE_LIB_DIR" "$backend" "$backend_label" "$backend_scope" "$rescue_path"; then
+    bash -c '. "$1/fm-backend.sh"; fm_backend_spawn_claim_absent "$2" "$3" "$4" "$5" "$6" "$7"' \
+    fm-spawn-claim-probe "$_FM_RECONCILE_LIB_DIR" "$backend" "$backend_label" "$backend_scope" "$rescue_path" "$treehouse_project" "$treehouse_holder"; then
     probe_rc=0
   else
     probe_rc=$?
@@ -1160,7 +1180,9 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     wait_seq=$((old_wait_seq + 1))
   fi
   if [ "$FM_RECONCILE_WAIT_RESULT" = pending ] && [ "$FM_RECONCILE_WAIT_WORKING" -eq 1 ] \
-    && { [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ]; }; then
+    && { [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ] \
+      || { [ "$current_source" = status-log ] \
+        && { [ "$current_state" = paused ] || [ "$current_state" = blocked ] || [ "$current_state" = parked ]; }; }; }; then
     current_state=working
     current_source=owned-command
     current_detail=$FM_RECONCILE_WAIT_EVIDENCE
