@@ -37,6 +37,7 @@ SH
 
 test_mount_entries_and_probe_failures_refuse_candidate() {
   local candidate fb log out real_find recursive_log tools tool
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
   candidate=$(make_candidate fm-secondmate-safety.mounted)
   mkdir -p "$candidate/empty-mount"
   fb=$(make_lsof_fake "$TMP_ROOT/mount-fake")
