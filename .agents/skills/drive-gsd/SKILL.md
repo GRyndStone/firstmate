@@ -44,15 +44,15 @@ While any `needs-decision:` or `blocked:` line is open - keyed or not - the brie
 When you need current GSD progress, steer the crewmate to run `gsd headless status` and report back; never run `gsd` against the external project yourself and never peek the project's files for state - the crewmate is the single driver of that project.
 The visible run tab `bin/fm-gsd-run.sh` opened is the sanctioned live view of a driving run: peeking it is observation, not driving, and does not violate the single-driver rule.
 Milestone completions arrive as keyed `needs-decision [key=milestone-<id>]: milestone <id> complete - <question>` boundary events, so they surface immediately instead of being absorbed behind the `paused:` last line; `working:` lines are only rare mid-milestone progress.
-Relay each completed milestone to the captain as an outcome together with its proceed/UAT question.
+Evaluate each completed milestone under `AGENTS.md` section 1 using the visible run tab and brief as primary evidence, then present the original proceed/UAT question with Firstmate's analysis and recommendation.
 The brief's context self-preservation rule can surface `paused: context handoff written, requesting relaunch`; treat that as a healthy rotation request, not a failure, and recover per the pattern below with `data/<id>/handoff.md` as the starting state.
 
 ## Decision routing
 
 The brief routes every NEEDS-HUMAN gate, milestone-boundary decision, and substantive GSD question to you as a keyed `needs-decision:` line - gates as `[key=gsd-gate-<slug>]`, milestone boundaries as `[key=milestone-<id>]` - with interpolated ids slugified to the key grammar.
-Relay anything about the captain's intent, scope, or dispositions to the captain; answer purely procedural questions yourself from the brief's task text.
+Anything about the captain's intent, scope, or dispositions remains captain-owned; evaluate it under `AGENTS.md` section 1 and use that section's exact response shape rather than relaying the delegated conclusion.
 Send the answer back with `fm-send`, and expect the crewmate's `resolved:` line - carrying the same `[key=...]` when one opened the decision - once it feeds the decision to GSD and resumes.
-At a milestone boundary the task did not name as final, the crewmate reports and waits; decide with the captain whether to continue, extend the task, or stand the manager down.
+At a milestone boundary the task did not name as final, the crewmate reports and waits; give the captain Firstmate's analysis and recommendation, then follow the captain's decision whether to continue, extend the task, or stand the manager down.
 
 ## Recovery
 

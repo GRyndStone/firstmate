@@ -61,7 +61,7 @@ There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task'
 A crewmate picking up such a brief should load the skill even if the brief predates this instruction.
 When supervising live crewmates, keep firstmate's own long validation or build commands in the background so watcher wakes can still be handled.
 Crewmate validation follows the installed no-mistakes version's SKILL.md and live `axi` help instead of duplicating gate mechanics in firstmate docs.
-Firstmate's wrapper still matters: `ask-user` findings route to the captain through firstmate, and crewmates avoid `--yes` because it silently resolves captain-owned decisions without escalation.
+Firstmate's wrapper still matters: `ask-user` findings route to the captain through firstmate, `AGENTS.md` section 1 owns the required independent analysis and captain-facing response shape, and crewmates avoid `--yes` because it silently resolves captain-owned decisions without escalation.
 Local `.no-mistakes/` state and test evidence stay out of this repo; `.no-mistakes.yaml` keeps evidence in a temp directory and pins the gate's lint and test commands to the same `bin/fm-lint.sh` and bash behavior suite as CI, so the pre-push gate runs the exact checks CI enforces.
 That is firstmate-specific; do not commit `.no-mistakes/evidence/` here even when another no-mistakes-managed target project keeps committed PR evidence.
 
