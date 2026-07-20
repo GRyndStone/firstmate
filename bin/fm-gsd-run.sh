@@ -150,6 +150,7 @@ TARGET="$SES:$PANE_ID"
 # setup fails before the pane command starts.
 OWNED_RUN_DIR=0
 RUN_DIR=
+# shellcheck disable=SC2329
 cleanup_unstarted_run() {
   if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "$RUN_DIR" ]; then
     rm -rf "$RUN_DIR"
@@ -177,11 +178,11 @@ PANE_CMD="$PANE_CMD; echo \$? > $(shell_quote "$EXIT_FILE")"
 
 SERVER_IDENTITY=$(gsd_run_server_identity) || SERVER_IDENTITY=""
 
+trap - EXIT
 fm_backend_herdr_send_text_line "$TARGET" "$PANE_CMD" || {
-  echo "error: failed to start the run in herdr tab $LABEL (target $TARGET)" >&2
+  echo "error: run launch outcome is ambiguous for herdr tab $LABEL (target $TARGET); the tab and exit state at $EXIT_FILE were preserved" >&2
   exit 1
 }
-trap - EXIT
 echo "run: tab=$LABEL target=$TARGET exit_file=$EXIT_FILE"
 
 if [ "$NO_WAIT" -eq 1 ]; then

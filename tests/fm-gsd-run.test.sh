@@ -78,6 +78,7 @@ case "${1:-} ${2:-}" in
     fi
     ;;
   "agent get") printf '{"error":{"code":"agent_not_found"}}\n' ;;
+  "pane run") [ "${FM_FAKE_PANE_RUN_FAIL:-0}" = 1 ] && exit 23 ;;
   *) : ;;
 esac
 exit 0
@@ -161,6 +162,25 @@ test_state_setup_failure_closes_created_tab() {
   assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
     "state-directory setup failure left the created herdr tab open"
   pass "fm-gsd-run.sh: state setup failure closes the created run tab"
+}
+
+test_ambiguous_send_failure_preserves_tab_and_state() {
+  local dir fb log proj state_root out status
+  dir="$TMP_ROOT/ambiguous-send"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_root="$dir/run-state"
+  mkdir -p "$state_root"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" TMPDIR="$state_root" \
+    FM_FAKE_PANE_RUN_FAIL=1 /usr/bin/env -u FM_GSD_RUN_STATE_DIR \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-a2 "$proj" gsd headless auto 2>&1) && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "an ambiguous pane-run failure must fail the launch"
+  assert_contains "$out" "launch outcome is ambiguous" "ambiguous launch failure lost its warning"
+  ! grep -q $'\x1f''tab'$'\x1f''close' "$log" || fail "ambiguous launch failure closed the run tab"
+  [ -n "$(find "$state_root" -maxdepth 1 -type d -name 'fm-gsd-run-task-a2.*' -print -quit)" ] \
+    || fail "ambiguous launch failure deleted its exit-state directory"
+  pass "fm-gsd-run.sh: ambiguous send failure preserves tab and exit state"
 }
 
 test_no_wait_launches_visible_tab() {
@@ -342,6 +362,7 @@ test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
 test_state_setup_failure_closes_created_tab
+test_ambiguous_send_failure_preserves_tab_and_state
 test_no_wait_launches_visible_tab
 test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code

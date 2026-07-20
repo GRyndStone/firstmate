@@ -17,8 +17,8 @@
 #   1. Exact path prefix: basename matches <prefix>.* under the scan base only
 #      (no recursion into unrelated trees; no symlink escape of the base).
 #   2. Owner: directory owner UID equals the invoking user (id -u).
-#   3. Age/freshness: mtime and (when available) birth time are both older than
-#      --min-age-hours (default 6). Fresh or actively rewritten roots are refused.
+#   3. Age/freshness: the newest mtime and (when available) birth time anywhere
+#      in the tree are both older than --min-age-hours (default 6).
 #   4. Live process references: no process command line or cwd/root points at
 #      the path (best-effort via ps and lsof).
 #   5. Open files: lsof reports no open handles under the path.
@@ -105,52 +105,68 @@ for prefix in "${PREFIXES[@]}"; do
 done
 
 path_bytes() {
-  # Allocated size in bytes via du -sk * 1024 (matches prior audit method).
-  local p=$1 kib
-  kib=$(du -sk "$p" 2>/dev/null | awk '{print $1}')
-  if [ -z "${kib:-}" ]; then
-    printf '0'
-    return
+  local p=$1 output kib
+  if ! output=$(du -sk "$p" 2>/dev/null); then
+    return 1
   fi
-  awk -v k="$kib" 'BEGIN { printf "%d", k * 1024 }'
+  kib=$(awk 'NR == 1 { print $1 }' <<< "$output")
+  if ! [[ "$kib" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  printf '%s' "$((kib * 1024))"
 }
 
-path_mtime_epoch() {
-  local p=$1
-  if stat -f %m "$p" >/dev/null 2>&1; then
-    stat -f %m "$p"
+PATH_NEWEST_MTIME=
+PATH_NEWEST_BIRTH=
+path_activity_epochs() {
+  local p=$1 probe stats summary
+  PATH_NEWEST_MTIME=
+  PATH_NEWEST_BIRTH=
+  probe=$(stat -c %Y "$p" 2>/dev/null) || probe=
+  if [[ "$probe" =~ ^[0-9]+$ ]]; then
+    if ! stats=$(find "$p" -exec stat -c '%Y %W' {} + 2>/dev/null); then
+      return 1
+    fi
   else
-    stat -c %Y "$p"
-  fi
-}
-
-path_birth_epoch() {
-  local p=$1 b
-  # macOS: %B is birth; Linux often has %W (0 if unknown).
-  if b=$(stat -f %B "$p" 2>/dev/null); then
-    if [ -n "$b" ] && [ "$b" != "0" ] && [ "$b" != "-1" ]; then
-      printf '%s\n' "$b"
-      return
+    probe=$(stat -f %m "$p" 2>/dev/null) || probe=
+    if ! [[ "$probe" =~ ^[0-9]+$ ]]; then
+      return 1
+    fi
+    if ! stats=$(find "$p" -exec stat -f '%m %B' {} + 2>/dev/null); then
+      return 1
     fi
   fi
-  if b=$(stat -c %W "$p" 2>/dev/null); then
-    if [ -n "$b" ] && [ "$b" != "0" ]; then
-      printf '%s\n' "$b"
-      return
-    fi
+  if ! summary=$(awk '
+      NF != 2 || $1 !~ /^[0-9]+$/ || $2 !~ /^-?[0-9]+$/ { bad=1; next }
+      {
+        if (!seen || $1 > newest_mtime) newest_mtime=$1
+        birth=($2 > 0 ? $2 : $1)
+        if (!seen || birth > newest_birth) newest_birth=birth
+        seen=1
+      }
+      END {
+        if (bad || !seen) exit 1
+        printf "%.0f %.0f\n", newest_mtime, newest_birth
+      }
+    ' <<< "$stats"); then
+    return 1
   fi
-  # Unknown birth: treat as mtime for the age gate (conservative enough when
-  # combined with mtime, and documented).
-  path_mtime_epoch "$p"
+  PATH_NEWEST_MTIME=${summary%% *}
+  PATH_NEWEST_BIRTH=${summary#* }
+  [[ "$PATH_NEWEST_MTIME" =~ ^[0-9]+$ ]] \
+    && [[ "$PATH_NEWEST_BIRTH" =~ ^[0-9]+$ ]]
 }
 
 owner_uid() {
-  local p=$1
-  if stat -f %u "$p" >/dev/null 2>&1; then
-    stat -f %u "$p"
-  else
-    stat -c %u "$p"
+  local p=$1 value
+  value=$(stat -c %u "$p" 2>/dev/null) || value=
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return
   fi
+  value=$(stat -f %u "$p" 2>/dev/null) || value=
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
 }
 
 has_open_files() {
@@ -180,40 +196,60 @@ has_live_process_ref() {
   if ! output=$(ps -ax -o pid= -o command= 2>/dev/null); then
     return 0
   fi
-  if printf '%s\n' "$output" | awk -v me="$$" -v pp="$PPID" '
+  if awk -v me="$$" -v pp="$PPID" '
       BEGIN { root=ENVIRON["FM_CLEANUP_PROBE_PATH"] }
       $1 == me || $1 == pp { next }
-      index($0, root) > 0 { found=1; exit }
+      index($0, root) > 0 { found=1 }
       END { exit !found }
-    '; then
+    ' <<< "$output"; then
     return 0
   fi
   return 1
 }
 
-# classify_path <raw-or-resolved-path>
-# Prints "OK|<resolved>|<bytes>" when every safety gate passes, or
-# "REFUSE|<path>|<reason>|<bytes>" when any gate fails. Shared by the initial
-# scan and the immediate pre-delete recheck so apply mode cannot TOCTOU-skip
-# owner/age/live/open-file gates.
+CLASS_KIND=
+CLASS_PATH=
+CLASS_REASON=
+CLASS_BYTES=0
+
+add_class_reason() {
+  local reason=$1
+  if [ -n "$CLASS_REASON" ]; then
+    CLASS_REASON="$CLASS_REASON,$reason"
+  else
+    CLASS_REASON=$reason
+  fi
+}
+
+set_class_refusal() {
+  CLASS_KIND=REFUSE
+  CLASS_PATH=$1
+  CLASS_REASON=$2
+  CLASS_BYTES=${3:-0}
+}
+
 classify_path() {
-  local raw=$1 resolved base_name prefix_ok=0 ouid mtime birth age_m age_b bytes
-  local reason_csv="" r
+  local raw=$1 resolved base_name prefix_ok=0 ouid age_m age_b bytes r
   local now
+  CLASS_KIND=
+  CLASS_PATH=$raw
+  CLASS_REASON=
+  CLASS_BYTES=0
   now=$(date +%s)
 
   if [ ! -d "$raw" ]; then
-    printf 'REFUSE|%s|not-a-directory-anymore|0\n' "$raw"
+    set_class_refusal "$raw" not-a-directory-anymore
     return
   fi
   resolved=$(cd "$raw" && pwd -P) || {
-    printf 'REFUSE|%s|resolve-failed|0\n' "$raw"
+    set_class_refusal "$raw" resolve-failed
     return
   }
+  CLASS_PATH=$resolved
   case "$resolved" in
     "$BASE"/*) : ;;
     *)
-      printf 'REFUSE|%s|escaped-base-via-symlink-or-resolve|0\n' "$resolved"
+      set_class_refusal "$resolved" escaped-base-via-symlink-or-resolve
       return
       ;;
   esac
@@ -224,43 +260,50 @@ classify_path() {
     esac
   done
   if [ "$prefix_ok" -ne 1 ]; then
-    printf 'REFUSE|%s|basename-prefix-mismatch|0\n' "$resolved"
+    set_class_refusal "$resolved" basename-prefix-mismatch
     return
   fi
 
-  bytes=$(path_bytes "$resolved")
-  ouid=$(owner_uid "$resolved")
-  if [ "$ouid" != "$ME_UID" ]; then
-    reason_csv="owner-uid-$ouid-ne-$ME_UID"
+  if bytes=$(path_bytes "$resolved") && [[ "$bytes" =~ ^[0-9]+$ ]]; then
+    CLASS_BYTES=$bytes
+  else
+    add_class_reason size-probe-failed
+  fi
+  if ouid=$(owner_uid "$resolved"); then
+    if [ "$ouid" != "$ME_UID" ]; then
+      add_class_reason "owner-uid-$ouid-ne-$ME_UID"
+    fi
+  else
+    add_class_reason owner-probe-failed
   fi
 
-  mtime=$(path_mtime_epoch "$resolved")
-  birth=$(path_birth_epoch "$resolved")
-  age_m=$((now - mtime))
-  age_b=$((now - birth))
-  if [ "$age_m" -lt "$MIN_AGE_SECS" ]; then
-    r="mtime-too-fresh-${age_m}s"
-    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
-  fi
-  if [ "$age_b" -lt "$MIN_AGE_SECS" ]; then
-    r="birth-too-fresh-${age_b}s"
-    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+  if path_activity_epochs "$resolved"; then
+    age_m=$((now - PATH_NEWEST_MTIME))
+    age_b=$((now - PATH_NEWEST_BIRTH))
+    if [ "$age_m" -lt "$MIN_AGE_SECS" ]; then
+      r="mtime-too-fresh-${age_m}s"
+      add_class_reason "$r"
+    fi
+    if [ "$age_b" -lt "$MIN_AGE_SECS" ]; then
+      r="birth-too-fresh-${age_b}s"
+      add_class_reason "$r"
+    fi
+  else
+    add_class_reason freshness-probe-failed
   fi
 
   if has_live_process_ref "$resolved"; then
-    r="live-process-command-or-cwd"
-    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+    add_class_reason live-process-command-or-cwd
   fi
   if has_open_files "$resolved"; then
-    r="open-files-cwd-root-or-lsof-unavailable"
-    if [ -n "$reason_csv" ]; then reason_csv="$reason_csv,$r"; else reason_csv=$r; fi
+    add_class_reason open-files-cwd-root-or-lsof-unavailable
   fi
 
-  if [ -n "$reason_csv" ]; then
-    printf 'REFUSE|%s|%s|%s\n' "$resolved" "$reason_csv" "$bytes"
+  if [ -n "$CLASS_REASON" ]; then
+    CLASS_KIND=REFUSE
     return
   fi
-  printf 'OK|%s|%s\n' "$resolved" "$bytes"
+  CLASS_KIND=OK
 }
 
 eligible=()
@@ -283,27 +326,23 @@ printf '\n'
 
 for raw in "${candidates[@]:-}"; do
   [ -n "$raw" ] || continue
-  verdict=$(classify_path "$raw")
-  case "$verdict" in
-    OK\|*)
-      resolved=${verdict#OK|}
-      bytes=${resolved##*|}
-      resolved=${resolved%|*}
-      eligible+=("$resolved")
-      eligible_bytes+=("$bytes")
-      total_eligible_bytes=$((total_eligible_bytes + bytes))
-      total_scan_bytes=$((total_scan_bytes + bytes))
+  classify_path "$raw"
+  case "$CLASS_KIND" in
+    OK)
+      eligible+=("$CLASS_PATH")
+      eligible_bytes+=("$CLASS_BYTES")
+      total_eligible_bytes=$((total_eligible_bytes + CLASS_BYTES))
+      total_scan_bytes=$((total_scan_bytes + CLASS_BYTES))
       ;;
-    REFUSE\|*)
-      rest=${verdict#REFUSE|}
-      resolved=${rest%%|*}
-      rest=${rest#*|}
-      reason=${rest%%|*}
-      bytes=${rest#*|}
-      refused+=("$resolved")
-      refused_reasons+=("$reason")
-      total_refused_bytes=$((total_refused_bytes + bytes))
-      total_scan_bytes=$((total_scan_bytes + bytes))
+    REFUSE)
+      refused+=("$CLASS_PATH")
+      refused_reasons+=("$CLASS_REASON")
+      total_refused_bytes=$((total_refused_bytes + CLASS_BYTES))
+      total_scan_bytes=$((total_scan_bytes + CLASS_BYTES))
+      ;;
+    *)
+      refused+=("$raw")
+      refused_reasons+=(classification-failed)
       ;;
   esac
 done
@@ -314,7 +353,7 @@ if [ "${#eligible[@]}" -eq 0 ]; then
 else
   i=0
   for p in "${eligible[@]}"; do
-    printf '  bytes=%s path=%s\n' "${eligible_bytes[$i]}" "$p"
+    printf '  bytes=%s path=%q\n' "${eligible_bytes[$i]}" "$p"
     i=$((i + 1))
   done
 fi
@@ -327,7 +366,7 @@ if [ "${#refused[@]}" -eq 0 ]; then
 else
   i=0
   for p in "${refused[@]}"; do
-    printf '  reason=%s path=%s\n' "${refused_reasons[$i]}" "$p"
+    printf '  reason=%s path=%q\n' "${refused_reasons[$i]}" "$p"
     i=$((i + 1))
   done
 fi
@@ -355,32 +394,24 @@ deleted_bytes=0
 failed=0
 for p in "${eligible[@]:-}"; do
   [ -n "$p" ] || continue
-  # Immediate pre-delete recheck: every safety gate, not just basename/existence.
-  verdict=$(classify_path "$p")
-  case "$verdict" in
-    OK\|*)
-      resolved=${verdict#OK|}
-      bytes=${resolved##*|}
-      resolved=${resolved%|*}
-      if rm -rf "$resolved"; then
+  classify_path "$p"
+  case "$CLASS_KIND" in
+    OK)
+      if rm -rf "$CLASS_PATH"; then
         deleted=$((deleted + 1))
-        deleted_bytes=$((deleted_bytes + bytes))
-        printf 'deleted: %s\t%s\n' "$bytes" "$resolved"
+        deleted_bytes=$((deleted_bytes + CLASS_BYTES))
+        printf 'deleted: %s\t%q\n' "$CLASS_BYTES" "$CLASS_PATH"
       else
-        printf 'delete-failed: %s\n' "$resolved"
+        printf 'delete-failed: %q\n' "$CLASS_PATH"
         failed=$((failed + 1))
       fi
       ;;
-    REFUSE\|*)
-      rest=${verdict#REFUSE|}
-      resolved=${rest%%|*}
-      rest=${rest#*|}
-      reason=${rest%%|*}
-      printf 'skip-recheck: reason=%s path=%s\n' "$reason" "$resolved"
+    REFUSE)
+      printf 'skip-recheck: reason=%s path=%q\n' "$CLASS_REASON" "$CLASS_PATH"
       failed=$((failed + 1))
       ;;
     *)
-      printf 'skip-recheck: reason=classify-error path=%s\n' "$p"
+      printf 'skip-recheck: reason=classify-error path=%q\n' "$p"
       failed=$((failed + 1))
       ;;
   esac
@@ -392,7 +423,12 @@ remain_count=0
 for prefix in "${PREFIXES[@]}"; do
   while IFS= read -r -d '' p; do
     remain_count=$((remain_count + 1))
-    remain_bytes=$((remain_bytes + $(path_bytes "$p")))
+    if bytes=$(path_bytes "$p") && [[ "$bytes" =~ ^[0-9]+$ ]]; then
+      remain_bytes=$((remain_bytes + bytes))
+    else
+      printf 'measure-failed: %q\n' "$p"
+      failed=$((failed + 1))
+    fi
   done < <(find "$BASE" -maxdepth 1 -type d -name "${prefix}.*" -print0 2>/dev/null)
 done
 

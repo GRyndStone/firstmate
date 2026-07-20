@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
+# shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 fm_test_tmproot TMP_ROOT fm-cleanup-stale-test-roots
@@ -119,7 +120,97 @@ EOF
   pass "cleanup helper: apply rechecks full gates before delete"
 }
 
+test_pipe_names_remain_structured() {
+  local candidate candidate_q fb log out status
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate 'fm-secondmate-safety.left|middle|right')
+  printf -v candidate_q '%q' "$candidate"
+  fb=$(make_lsof_fake "$TMP_ROOT/pipe-fake")
+  log="$TMP_ROOT/pipe-lsof.log"; : > "$log"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=descendant \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 2>&1) && status=0 || status=$?
+  expect_code 0 "$status" "pipe-containing candidate must not corrupt classification"
+  assert_contains "$out" "path=$candidate_q" "pipe-containing candidate was split in the refusal record"
+  assert_contains "$out" "refused_count: 1" "pipe-containing candidate was not refused exactly once"
+  pass "cleanup helper: candidate paths are carried as structured values"
+}
+
+test_large_ps_match_refuses_candidate() {
+  local candidate fb out
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.large-ps)
+  fb="$TMP_ROOT/large-ps-fake/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/ps" <<'SH'
+#!/usr/bin/env bash
+printf '424242 sleep %s\n' "${FM_CLEANUP_PROBE_PATH:?}"
+i=0
+while [ "$i" -lt 50000 ]; do
+  printf '500000 unrelated-process-%s padding-padding-padding-padding\n' "$i"
+  i=$((i + 1))
+done
+SH
+  cat > "$fb/lsof" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fb/ps" "$fb/lsof"
+  out=$(PATH="$fb:$PATH" "$ROOT/bin/fm-cleanup-stale-test-roots.sh" \
+    --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "path=$candidate" "large-ps candidate disappeared from the inventory"
+  assert_contains "$out" "eligible_count: 0" "live reference was lost after a large ps snapshot"
+  assert_contains "$out" "live-process-command-or-cwd" "large-ps refusal lost its live-reference reason"
+  pass "cleanup helper: live-reference scan consumes a large ps snapshot"
+}
+
+test_descendant_freshness_refuses_candidate() {
+  local candidate fb log out
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.fresh-descendant)
+  touch -t 209901010000 "$candidate/nested/open-file"
+  fb=$(make_lsof_fake "$TMP_ROOT/fresh-descendant-fake")
+  log="$TMP_ROOT/fresh-descendant-lsof.log"; : > "$log"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "path=$candidate" "fresh-descendant candidate disappeared from the inventory"
+  assert_contains "$out" "eligible_count: 0" "fresh descendant did not refuse the candidate"
+  assert_contains "$out" "mtime-too-fresh" "fresh descendant refusal lost its freshness reason"
+  pass "cleanup helper: newest descendant activity controls freshness"
+}
+
+test_recheck_observes_descendant_rewrite() {
+  local candidate fb state out status
+  rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
+  candidate=$(make_candidate fm-secondmate-safety.rewrite-recheck)
+  fb="$TMP_ROOT/rewrite-recheck-fake/fakebin"
+  mkdir -p "$fb"
+  state="$TMP_ROOT/rewrite-recheck-state"
+  printf 'initial\n' > "$state"
+  cat > "$fb/lsof" <<'SH'
+#!/usr/bin/env bash
+if [ "$(cat "${FM_REWRITE_STATE:?}")" = initial ]; then
+  touch -t 209901010000 "${FM_REWRITE_PATH:?}"
+  printf 'rewritten\n' > "$FM_REWRITE_STATE"
+fi
+exit 1
+SH
+  chmod +x "$fb/lsof"
+  out=$(PATH="$fb:$PATH" FM_REWRITE_STATE="$state" \
+    FM_REWRITE_PATH="$candidate/nested/open-file" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" \
+    --min-age-hours 0 --apply-eligible 2>&1) && status=0 || status=$?
+  expect_code 4 "$status" "fresh descendant on recheck must refuse deletion"
+  assert_contains "$out" "eligible_count: 1" "candidate should pass before the descendant rewrite"
+  assert_contains "$out" "skip-recheck: reason=mtime-too-fresh" "recheck missed the descendant rewrite"
+  assert_present "$candidate" "recheck deleted a candidate with a freshly rewritten descendant"
+  pass "cleanup helper: pre-delete recheck includes descendant freshness"
+}
+
 test_descendant_handles_refuse_candidate
 test_missing_lsof_refuses_candidate
 test_clear_recursive_probe_allows_candidate
 test_apply_rechecks_gates_before_delete
+test_pipe_names_remain_structured
+test_large_ps_match_refuses_candidate
+test_descendant_freshness_refuses_candidate
+test_recheck_observes_descendant_rewrite

@@ -49,7 +49,7 @@ pass() {
 #   registers it for removal on EXIT. The first registration installs
 #   `trap fm_test_cleanup EXIT` in the parent shell.
 #
-# MUST NOT be used inside command substitution: `root=$(fm_test_tmproot ...)`
+# fm-tmproot-static-allow: unsafe historical example `root=$(fm_test_tmproot ...)`
 # runs the function in a subshell. The EXIT trap then fires in that subshell and
 # deletes the empty root before the caller receives the path; the parent never
 # gets the array entry or the trap. Callers that recreate the path (mkdir -p

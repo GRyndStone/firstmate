@@ -149,7 +149,7 @@ test_command_substitution_is_unsafe_and_static_rejected() {
   # Historical defect: command-substitution of the old echo-path helper left the
   # parent with no array entry and no trap; recreating the path leaked. The new
   # API requires the caller-assignment variable and prefix as separate args.
-  local rc=0 err hits
+  local rc=0 err hits scan_status fixture
   err=$(bash -c '
     set -u
     . "$1/tests/lib.sh"
@@ -159,14 +159,37 @@ test_command_substitution_is_unsafe_and_static_rejected() {
   [ "$rc" -ne 0 ] || fail "one-argument fm_test_tmproot call should fail"
   assert_contains "$err" "fm_test_tmproot VAR prefix" "old shape error message"
 
-  # Static rejection: non-comment command substitution of fm_test_tmproot.
-  # Comments in lib.sh may document the forbidden form; executable code must not.
-  hits=$(
-    rg -n '\$\(\s*fm_test_tmproot\b' "$REPO_ROOT/tests" --glob '*.sh' 2>/dev/null \
-      | grep -vE ':[0-9]+:[[:space:]]*#' \
-      | grep -vE 'fm-test-tmproot\.test\.sh:' \
-      || true
-  )
+  scan_tmproot_command_substitutions() {
+    local scan_root=$1 scan_output status
+    if ! command -v rg >/dev/null 2>&1; then
+      printf 'rg is required for the fm_test_tmproot static scan\n' >&2
+      return 127
+    fi
+    scan_output=$(rg -U -n --pcre2 \
+      '(?m)^[\t ]*# fm-tmproot-static-allow:.*(?:\n|$)(*SKIP)(*F)|\$\(\s*fm_test_tmproot\b' \
+      "$scan_root" --glob '*.sh' 2>&1)
+    status=$?
+    case "$status" in
+      0|1) printf '%s' "$scan_output" ;;
+      *) printf '%s\n' "$scan_output" >&2; return "$status" ;;
+    esac
+  }
+
+  fixture="$TMPDIR/tmproot-static-fixture"
+  mkdir -p "$fixture"
+  printf 'unsafe=$%s\n  fm_test_tmproot ROOT bad\n)\n' '(' > "$fixture/unsafe.sh"
+  hits=$(scan_tmproot_command_substitutions "$fixture")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "multiline fixture scan failed with $scan_status"
+  assert_contains "$hits" "fm_test_tmproot ROOT bad" "multiline command substitution bypassed the scanner"
+
+  hits=$(PATH="$fixture/no-rg" scan_tmproot_command_substitutions "$fixture" 2>&1)
+  scan_status=$?
+  [ "$scan_status" -eq 127 ] || fail "missing-rg scan must fail closed, got $scan_status"
+
+  hits=$(scan_tmproot_command_substitutions "$REPO_ROOT/tests")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "static scan failed with $scan_status"
   [ -z "$hits" ] || fail "static: non-comment command-sub of fm_test_tmproot remains"$'\n'"$hits"
   pass "command-substitution form rejected (runtime + static)"
 }
