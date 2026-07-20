@@ -88,7 +88,6 @@ if [ ! -d "$BASE" ]; then
 fi
 BASE=$(cd "$BASE" && pwd -P)
 ME_UID=$(id -u)
-NOW=$(date +%s)
 # shellcheck disable=SC2003
 MIN_AGE_SECS=$(awk -v h="$MIN_AGE_HOURS" 'BEGIN { printf "%d", h * 3600 }')
 
