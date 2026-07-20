@@ -165,11 +165,8 @@ test_command_substitution_is_unsafe_and_static_rejected() {
       printf 'rg is required for the fm_test_tmproot static scan\n' >&2
       return 127
     fi
-    # Allow shell-valid separators between $( and the helper name: whitespace,
-    # line continuations, and full-line or trailing comments. Still skips lines
-    # explicitly marked with the allow marker.
     scan_output=$(rg -U -n --pcre2 \
-      '(?m)^[\t ]*# fm-tmproot-static-allow:.*(?:\n|$)(*SKIP)(*F)|\$\((?:[\t\f\v\r ]|\\\r?\n|#[^\n]*(?:\r?\n))*fm_test_tmproot\b' \
+      '(?m:^[\t ]*# fm-tmproot-static-allow:.*(?:\n|$))(*SKIP)(*F)|(?s:\$\((?:(?>\x27[^\x27]*\x27)|(?:"(?:\\.|[^"\\])*")|(?:#[^\n]*(?:\n|$))|(?:\\.)|[^\x27"\\#)])*?\bfm_test_tmproot\b)' \
       "$scan_root" --glob '*.sh' 2>&1)
     status=$?
     case "$status" in
@@ -191,6 +188,12 @@ test_command_substitution_is_unsafe_and_static_rejected() {
   scan_status=$?
   [ "$scan_status" -eq 0 ] || fail "comment fixture scan failed with $scan_status"
   assert_contains "$hits" "fm_test_tmproot ROOT worse" "comment-separated command substitution bypassed the scanner"
+
+  printf 'wrapped=$%sTMPDIR=/tmp fm_test_tmproot ROOT wrapped; printf ok)\n' '(' > "$fixture/wrapped.sh"
+  hits=$(scan_tmproot_command_substitutions "$fixture")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "wrapped fixture scan failed with $scan_status"
+  assert_contains "$hits" "TMPDIR=/tmp fm_test_tmproot ROOT wrapped" "wrapped command substitution bypassed the scanner"
 
   hits=$(PATH="$fixture/no-rg" scan_tmproot_command_substitutions "$fixture" 2>&1)
   scan_status=$?

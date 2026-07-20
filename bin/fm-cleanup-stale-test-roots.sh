@@ -229,7 +229,7 @@ set_class_refusal() {
 }
 
 classify_path() {
-  local raw=$1 resolved base_name prefix_ok=0 ouid age_m age_b bytes r
+  local raw=$1 resolved resolved_parent base_name prefix_ok=0 ouid age_m age_b bytes r
   local now
   CLASS_KIND=
   CLASS_PATH=$raw
@@ -246,13 +246,12 @@ classify_path() {
     return
   }
   CLASS_PATH=$resolved
-  case "$resolved" in
-    "$BASE"/*) : ;;
-    *)
-      set_class_refusal "$resolved" escaped-base-via-symlink-or-resolve
-      return
-      ;;
-  esac
+  resolved_parent=${resolved%/*}
+  [ -n "$resolved_parent" ] || resolved_parent=/
+  if [ "$resolved_parent" != "$BASE" ]; then
+    set_class_refusal "$resolved" escaped-base-via-symlink-or-resolve
+    return
+  fi
   base_name=$(basename "$resolved")
   for prefix in "${PREFIXES[@]}"; do
     case "$base_name" in
@@ -314,51 +313,56 @@ classify_path() {
 }
 
 has_mount_descendant() {
-  local p=$1 root_dev entry entry_dev
+  local p=$1 output line mount_path saw_mount=0 root_dev stat_flag device_output entry_dev
+  if ! command -v mount >/dev/null 2>&1; then
+    return 0
+  fi
+  output=$(mount 2>/dev/null) || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    mount_path=
+    if [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]type[[:space:]] ]]; then
+      mount_path=${BASH_REMATCH[1]}
+    elif [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]\( ]]; then
+      mount_path=${BASH_REMATCH[1]}
+    else
+      continue
+    fi
+    saw_mount=1
+    mount_path=${mount_path//\\040/ }
+    case "$mount_path" in
+      "$p"|"$p"/*) return 0 ;;
+    esac
+  done <<< "$output"
+  [ "$saw_mount" -eq 1 ] || return 0
+
   # Fail closed if we cannot determine the root device id.
-  if root_dev=$(stat -f %d "$p" 2>/dev/null); then
-    :
-  elif root_dev=$(stat -c %d "$p" 2>/dev/null); then
-    :
+  if root_dev=$(stat -c %d "$p" 2>/dev/null); then
+    stat_flag=-c
+  elif root_dev=$(stat -f %d "$p" 2>/dev/null); then
+    stat_flag=-f
   else
     return 0
   fi
   # Walk every directory entry; any different device id is a mount/bind.
   # find failure is fail-closed (treat as mounted / refuse).
-  while IFS= read -r -d '' entry; do
-    if entry_dev=$(stat -f %d "$entry" 2>/dev/null); then
-      :
-    elif entry_dev=$(stat -c %d "$entry" 2>/dev/null); then
-      :
-    else
-      return 0
-    fi
+  device_output=$(find "$p" -exec /bin/sh -c "
+    flag=\$1
+    shift
+    for entry do
+      if entry_dev=\$(stat \"\$flag\" %d \"\$entry\" 2>/dev/null); then
+        printf '%s\n' \"\$entry_dev\"
+      else
+        printf 'device-probe-failed\n'
+      fi
+    done
+  " sh "$stat_flag" {} + 2>/dev/null) || return 0
+  [ -n "$device_output" ] || return 0
+  while IFS= read -r entry_dev; do
+    [[ "$entry_dev" =~ ^[0-9]+$ ]] || return 0
     if [ "$entry_dev" != "$root_dev" ]; then
       return 0
     fi
-  done < <(find "$p" -print0 2>/dev/null) || return 0
-  # Also refuse if the OS mount table names a mountpoint under this path.
-  if command -v mount >/dev/null 2>&1; then
-    local output line mount_path
-    if output=$(mount 2>/dev/null); then
-      while IFS= read -r line || [ -n "$line" ]; do
-        mount_path=""
-        if [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]type[[:space:]] ]]; then
-          mount_path=${BASH_REMATCH[1]}
-        elif [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]\( ]]; then
-          mount_path=${BASH_REMATCH[1]}
-        else
-          continue
-        fi
-        mount_path=${mount_path//\\040/ }
-        case "$mount_path" in
-          "$p"/*) return 0 ;;
-        esac
-      done <<< "$output"
-    else
-      return 0
-    fi
-  fi
+  done <<< "$device_output"
   return 1
 }
 

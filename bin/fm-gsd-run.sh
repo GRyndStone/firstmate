@@ -148,11 +148,7 @@ cleanup_unstarted_run() {
   if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "${RUN_DIR:-}" ]; then
     rm -rf "$RUN_DIR"
   fi
-  if [ -n "${TAB_ID:-}" ]; then
-    fm_backend_herdr_cli "$SES" tab close "$TAB_ID" >/dev/null 2>&1 || true
-  else
-    fm_backend_herdr_rollback_created_task_tab "$SES" "$WSID" "$LABEL" "" "" >/dev/null 2>&1 || true
-  fi
+  fm_backend_herdr_rollback_created_task_tab "$SES" "$WSID" "$LABEL" "${TAB_ID:-}" "" >/dev/null 2>&1 || true
 }
 trap cleanup_unstarted_run EXIT
 

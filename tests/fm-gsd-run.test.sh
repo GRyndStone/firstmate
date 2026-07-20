@@ -63,11 +63,13 @@ case "${1:-} ${2:-}" in
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
   "tab list")
-    if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ] && grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
-      # Include a sibling tab so last-tab-safe rollback can close the created run tab
-      # without deleting the whole workspace (real herdr closes the workspace when the
-      # last tab goes away).
-      printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)"
+    if grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
+      label=$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)
+      if [ "${FM_FAKE_LAST_TAB:-0}" = 1 ]; then
+        printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
+      else
+        printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
+      fi
     else
       printf '{"result":{"tabs":[]}}\n'
     fi
@@ -177,6 +179,22 @@ test_state_setup_failure_closes_created_tab() {
   assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' \
     "state-directory setup failure left the created herdr tab open"
   pass "fm-gsd-run.sh: state setup failure closes the created run tab"
+}
+
+test_state_setup_failure_preserves_last_tab_workspace() {
+  local dir fb log proj state_file status
+  dir="$TMP_ROOT/state-failure-last-tab"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  state_file="$dir/not-a-directory"; : > "$state_file"
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_FAKE_LAST_TAB=1 FM_GSD_RUN_STATE_DIR="$state_file" \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-f2 "$proj" gsd headless auto >/dev/null 2>&1 \
+    && status=0 || status=$?
+  [ "$status" -ne 0 ] || fail "last-tab state-directory setup failure must fail the launch"
+  ! grep -q $'\x1f''tab'$'\x1f''close'$'\x1f''w1:t9' "$log" \
+    || fail "state-directory setup failure closed the workspace's last tab"
+  pass "fm-gsd-run.sh: preflight rollback preserves the workspace's last tab"
 }
 
 test_post_create_failure_closes_created_tab() {
@@ -393,6 +411,7 @@ test_argument_validation
 test_env_assignments_allowed_before_gsd
 test_missing_herdr_fails_closed
 test_state_setup_failure_closes_created_tab
+test_state_setup_failure_preserves_last_tab_workspace
 test_post_create_failure_closes_created_tab
 test_ambiguous_send_failure_preserves_tab_and_state
 test_no_wait_launches_visible_tab

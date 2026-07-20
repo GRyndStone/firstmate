@@ -36,11 +36,21 @@ SH
 }
 
 test_mount_entries_and_probe_failures_refuse_candidate() {
-  local candidate fb log out
+  local candidate fb log out real_find recursive_log tools tool
   candidate=$(make_candidate fm-secondmate-safety.mounted)
   mkdir -p "$candidate/empty-mount"
   fb=$(make_lsof_fake "$TMP_ROOT/mount-fake")
   log="$TMP_ROOT/mount-lsof.log"; : > "$log"
+  real_find=$(command -v find)
+  cat > "$fb/mount" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' 'same-device on $candidate (bind, local)'
+EOF
+  chmod +x "$fb/mount"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "candidate root mount was not refused"
+
   cat > "$fb/mount" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' 'same-device on $candidate/empty-mount (bind, local)'
@@ -51,15 +61,52 @@ EOF
   assert_contains "$out" "cross-device-or-mount-descendant" "same-device bind mount was not refused"
   assert_present "$candidate" "dry-run removed a mount-containing candidate"
 
+  recursive_log="$TMP_ROOT/recursive-find.log"
+  cat > "$fb/find" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = -maxdepth ]; then
+    exec "${FM_REAL_FIND:?}" "$@"
+  fi
+done
+printf 'recursive\n' >> "${FM_RECURSIVE_FIND_LOG:?}"
+exit 72
+SH
+  chmod +x "$fb/find"
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    FM_REAL_FIND="$real_find" FM_RECURSIVE_FIND_LOG="$recursive_log" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "mount-table refusal was lost"
+  assert_absent "$recursive_log" "recursive device walk ran before the mount-table refusal"
+
   cat > "$fb/mount" <<'SH'
 #!/usr/bin/env bash
 exit 1
 SH
   chmod +x "$fb/mount"
   out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    FM_REAL_FIND="$real_find" FM_RECURSIVE_FIND_LOG="$recursive_log" \
     "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
   assert_contains "$out" "cross-device-or-mount-descendant" "failed mount probe did not fail closed"
   assert_present "$candidate" "failed mount probe removed its candidate"
+
+  cat > "$fb/mount" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'rootfs on / (local)'
+SH
+  out=$(PATH="$fb:$PATH" FM_LSOF_LOG="$log" FM_LSOF_MODE=clear \
+    FM_REAL_FIND="$real_find" FM_RECURSIVE_FIND_LOG="$recursive_log" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "failed recursive find did not fail closed"
+
+  tools="$TMP_ROOT/no-mount-bin"
+  mkdir -p "$tools"
+  for tool in dirname find id date awk basename; do
+    ln -s "$(command -v "$tool")" "$tools/$tool"
+  done
+  out=$(PATH="$tools" /bin/bash "$ROOT/bin/fm-cleanup-stale-test-roots.sh" \
+    --base "$TMP_ROOT" --min-age-hours 0)
+  assert_contains "$out" "cross-device-or-mount-descendant" "missing mount probe did not fail closed"
   pass "cleanup helper: mount entries and probe failures refuse candidates"
 }
 
@@ -92,7 +139,7 @@ test_dry_run_and_explicit_apply_modes() {
 }
 
 test_owner_and_resolved_path_checks_fail_closed() {
-  local candidate fb log out status real_stat base outside real_find
+  local candidate fb log out status real_stat base outside nested real_find
   rm -rf "$TMP_ROOT"/fm-secondmate-safety.*
   candidate=$(make_candidate fm-secondmate-safety.wrong-owner)
   fb=$(make_lsof_fake "$TMP_ROOT/owner-fake")
@@ -137,6 +184,17 @@ SH
   expect_code 3 "$status" "resolved path escape must refuse --apply"
   assert_contains "$out" "escaped-base-via-symlink-or-resolve" "resolved path escape refusal lost its reason"
   assert_present "$outside/sentinel" "resolved path escape deleted outside content"
+
+  base="$TMP_ROOT/nested-base"
+  candidate="$base/fm-secondmate-safety.escape"
+  nested="$base/unrelated/fm-secondmate-safety.target"
+  mkdir -p "$candidate" "$nested"
+  : > "$nested/sentinel"
+  out=$(PATH="$fb:$PATH" FM_ESCAPE_CANDIDATE="$candidate" FM_ESCAPE_OUTSIDE="$nested" FM_REAL_FIND="$real_find" \
+    "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$base" --min-age-hours 0 --apply 2>&1) && status=0 || status=$?
+  expect_code 3 "$status" "resolved nested path outside the direct scan scope must refuse --apply"
+  assert_contains "$out" "escaped-base-via-symlink-or-resolve" "nested path-scope refusal lost its reason"
+  assert_present "$nested/sentinel" "resolved nested target was deleted outside the direct scan scope"
   pass "cleanup helper: owner and resolved path gates fail closed"
 }
 
@@ -187,7 +245,7 @@ test_missing_lsof_refuses_candidate() {
   candidate=$(make_candidate fm-secondmate-safety.no-lsof)
   tools="$TMP_ROOT/no-lsof-bin"
   mkdir -p "$tools"
-  for tool in dirname find id date awk stat du basename ps; do
+  for tool in dirname find id date awk stat du basename ps mount; do
     ln -s "$(command -v "$tool")" "$tools/$tool"
   done
   out=$(PATH="$tools" /bin/bash "$ROOT/bin/fm-cleanup-stale-test-roots.sh" \
