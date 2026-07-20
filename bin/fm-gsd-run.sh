@@ -126,8 +126,8 @@ gsd_run_server_identity() {
 RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
 
-# Container ensure + create_task first so preflight failures (missing herdr,
-# refused container, etc.) never leave an unused mktemp root behind.
+# Container ensure first so missing-herdr / refused-container preflight never
+# leaves an unused mktemp root behind.
 # Container ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>";
 # the seeded tab id threads through to create_task untouched, which is the
 # only function allowed to prune it (see bin/backends/herdr.sh).
@@ -135,6 +135,27 @@ CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$GSD_DIR_ABS") || exit 1
 CONTAINER=${CONTAINER_RAW%%$'\t'*}
 SEEDED_DEFAULT_TAB_ID=${CONTAINER_RAW#*$'\t'}
 SES=${CONTAINER%%:*}
+WSID=${CONTAINER#*:}
+TAB_ID=
+PANE_ID=
+OWNED_RUN_DIR=0
+RUN_DIR=
+
+# Arm unstarted-run rollback BEFORE create_task so a create that commits a tab
+# then fails/interrupts before IDs return still cleans via label-aware rollback.
+# shellcheck disable=SC2329
+cleanup_unstarted_run() {
+  if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "${RUN_DIR:-}" ]; then
+    rm -rf "$RUN_DIR"
+  fi
+  if [ -n "${TAB_ID:-}" ]; then
+    fm_backend_herdr_cli "$SES" tab close "$TAB_ID" >/dev/null 2>&1 || true
+  else
+    fm_backend_herdr_rollback_created_task_tab "$SES" "$WSID" "$LABEL" "" "" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_unstarted_run EXIT
+
 TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LABEL" "$GSD_DIR_ABS" "$SEEDED_DEFAULT_TAB_ID") || exit 1
 read -r TAB_ID PANE_ID <<EOF
 $TASK_IDS
@@ -148,16 +169,6 @@ TARGET="$SES:$PANE_ID"
 # Exit-file dir only after the run tab exists. Default is a fresh mktemp root
 # per run (override with FM_GSD_RUN_STATE_DIR); owned roots are removed if
 # setup fails before the pane command starts.
-OWNED_RUN_DIR=0
-RUN_DIR=
-# shellcheck disable=SC2329
-cleanup_unstarted_run() {
-  if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "$RUN_DIR" ]; then
-    rm -rf "$RUN_DIR"
-  fi
-  fm_backend_herdr_cli "$SES" tab close "$TAB_ID" >/dev/null 2>&1 || true
-}
-trap cleanup_unstarted_run EXIT
 if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
   mkdir -p "$FM_GSD_RUN_STATE_DIR"
   RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)

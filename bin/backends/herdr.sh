@@ -463,7 +463,7 @@ EOF
 
 fm_backend_herdr_rollback_created_task_tab() {  # <session> <workspace_id> <label> <known_tab_id> <preexisting_same-label-tab-ids>
   local session=$1 wsid=$2 label=$3 tab_id=${4:-} preexisting_tab_ids=${5:-}
-  local list candidates candidate
+  local list candidates candidate other_tabs
   if [ -z "$tab_id" ]; then
     list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
       echo "warning: could not locate created herdr tab '$label' for rollback in workspace $wsid (session $session)" >&2
@@ -487,6 +487,18 @@ EOF
   fi
   if [ -z "$tab_id" ]; then
     echo "warning: could not locate created herdr tab '$label' for rollback in workspace $wsid (session $session)" >&2
+    return 1
+  fi
+  # Closing a workspace's last tab deletes the whole workspace on real herdr.
+  # Never roll back the replacement when it is the sole remaining tab.
+  list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || {
+    echo "warning: could not list tabs before rollback of $tab_id in workspace $wsid (session $session); leaving tab in place" >&2
+    return 1
+  }
+  other_tabs=$(printf '%s' "$list" | jq -r --arg keep "$tab_id" \
+    'if (.result.tabs | type) == "array" then [.result.tabs[] | select(.tab_id != $keep) | .tab_id] | length else 0 end' 2>/dev/null) || other_tabs=0
+  if [ "${other_tabs:-0}" -eq 0 ]; then
+    echo "warning: refusing to roll back created herdr tab $tab_id for '$label' because it is the last tab in workspace $wsid (session $session); closing it would delete the workspace" >&2
     return 1
   fi
   fm_backend_herdr_cli "$session" tab close "$tab_id" >/dev/null 2>&1 || {

@@ -164,7 +164,7 @@ SH
     FM_REAL_FIND="$real_find" FM_REAPPEAR_PATH="$candidate" \
     "$ROOT/bin/fm-cleanup-stale-test-roots.sh" --base "$TMP_ROOT" --min-age-hours 0 --apply-eligible 2>&1) && status=0 || status=$?
   expect_code 4 "$status" "replacement tree after delete must fail the apply"
-  assert_contains "$out" "delete-failed:" "replacement tree did not report deletion failure"
+  assert_contains "$out" "delete-incomplete:" "replacement tree did not report deletion failure"
   assert_present "$candidate/replacement" "replacement tree was deleted without a fresh safety recheck"
   pass "cleanup helper: a reappearing path is preserved and reported"
 }

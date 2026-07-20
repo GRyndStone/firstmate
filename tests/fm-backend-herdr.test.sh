@@ -514,7 +514,11 @@ test_create_task_refuses_when_preexisting_husk_tab_remains() {
   printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/4.out"
   printf '{"result":{"tab":{"tab_id":"w1:t3"},"root_pane":{"pane_id":"w1:p3"}}}\n' > "$resp/5.out"
   printf '1\n' > "$resp/6.exit"
+  # Verify still sees the husk (close failed) plus the replacement.
   printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-stale-husk","workspace_id":"w1"},{"tab_id":"w1:t3","label":"fm-stale-husk","workspace_id":"w1"}]}}\n' > "$resp/7.out"
+  # Rollback last-tab guard needs the same two-tab inventory so closing the
+  # replacement cannot delete the workspace.
+  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-stale-husk","workspace_id":"w1"},{"tab_id":"w1:t3","label":"fm-stale-husk","workspace_id":"w1"}]}}\n' > "$resp/8.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-stale-husk /tmp/proj' "$ROOT" 2>&1 )
@@ -595,9 +599,12 @@ test_create_task_creates_and_parses_ids() {
 test_create_task_rolls_back_unparseable_created_tab() {
   local dir log resp fb out status
   dir="$TMP_ROOT/create-task-unparseable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"tabs":[]}}\n' > "$resp/1.out"
+  # Workspace already has an unrelated sibling tab so last-tab-safe rollback can
+  # close the unparseable new tab without deleting the workspace.
+  printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"}]}}\n' > "$resp/1.out"
   printf '{"result":{}}\n' > "$resp/2.out"
-  printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-unparseable","workspace_id":"w1"}]}}\n' > "$resp/3.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t2","label":"fm-unparseable","workspace_id":"w1"}]}}\n' > "$resp/3.out"
+  printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t2","label":"fm-unparseable","workspace_id":"w1"}]}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-unparseable /tmp/proj' "$ROOT" 2>&1 )

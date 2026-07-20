@@ -264,6 +264,13 @@ classify_path() {
     return
   fi
 
+  # Mount/device check BEFORE any recursive probe (du/find/lsof) so a mounted
+  # network or external tree cannot hang the dry-run or be traversed.
+  if has_mount_descendant "$resolved"; then
+    set_class_refusal "$resolved" cross-device-or-mount-descendant
+    return
+  fi
+
   if bytes=$(path_bytes "$resolved") && [[ "$bytes" =~ ^[0-9]+$ ]]; then
     CLASS_BYTES=$bytes
   else
@@ -299,10 +306,6 @@ classify_path() {
     add_class_reason open-files-cwd-root-or-lsof-unavailable
   fi
 
-  if has_mount_descendant "$resolved"; then
-    add_class_reason cross-device-or-mount-descendant
-  fi
-
   if [ -n "$CLASS_REASON" ]; then
     CLASS_KIND=REFUSE
     return
@@ -311,32 +314,51 @@ classify_path() {
 }
 
 has_mount_descendant() {
-  local p=$1 output line mount_path seen=0
-  command -v mount >/dev/null 2>&1 || return 0
-  output=$(mount 2>/dev/null) || return 0
-  [ -n "$output" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^.*[[:space:]]on[[:space:]](.+)[[:space:]]type[[:space:]][^[:space:]]+[[:space:]]\( ]]; then
-      mount_path=${BASH_REMATCH[1]}
-    elif [[ "$line" =~ ^.*[[:space:]]on[[:space:]](.+)[[:space:]]\( ]]; then
-      mount_path=${BASH_REMATCH[1]}
+  local p=$1 root_dev entry entry_dev
+  # Fail closed if we cannot determine the root device id.
+  if root_dev=$(stat -f %d "$p" 2>/dev/null); then
+    :
+  elif root_dev=$(stat -c %d "$p" 2>/dev/null); then
+    :
+  else
+    return 0
+  fi
+  # Walk every directory entry; any different device id is a mount/bind.
+  # find failure is fail-closed (treat as mounted / refuse).
+  while IFS= read -r -d '' entry; do
+    if entry_dev=$(stat -f %d "$entry" 2>/dev/null); then
+      :
+    elif entry_dev=$(stat -c %d "$entry" 2>/dev/null); then
+      :
     else
       return 0
     fi
-    mount_path=${mount_path//\\040/ }
-    mount_path=${mount_path//\\011/$'\t'}
-    mount_path=${mount_path//\\012/$'\n'}
-    mount_path=${mount_path//\\134/\\}
-    case "$mount_path" in
-      /*) : ;;
-      *) return 0 ;;
-    esac
-    seen=$((seen + 1))
-    case "$mount_path" in
-      "$p"|"$p"/*) return 0 ;;
-    esac
-  done <<< "$output"
-  [ "$seen" -gt 0 ] || return 0
+    if [ "$entry_dev" != "$root_dev" ]; then
+      return 0
+    fi
+  done < <(find "$p" -print0 2>/dev/null) || return 0
+  # Also refuse if the OS mount table names a mountpoint under this path.
+  if command -v mount >/dev/null 2>&1; then
+    local output line mount_path
+    if output=$(mount 2>/dev/null); then
+      while IFS= read -r line || [ -n "$line" ]; do
+        mount_path=""
+        if [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]type[[:space:]] ]]; then
+          mount_path=${BASH_REMATCH[1]}
+        elif [[ "$line" =~ [[:space:]]on[[:space:]](.+)[[:space:]]\( ]]; then
+          mount_path=${BASH_REMATCH[1]}
+        else
+          continue
+        fi
+        mount_path=${mount_path//\\040/ }
+        case "$mount_path" in
+          "$p"/*) return 0 ;;
+        esac
+      done <<< "$output"
+    else
+      return 0
+    fi
+  fi
   return 1
 }
 
@@ -431,14 +453,19 @@ for p in "${eligible[@]:-}"; do
   classify_path "$p"
   case "$CLASS_KIND" in
     OK)
-      if find "$CLASS_PATH" -xdev -depth -delete 2>/dev/null \
-        && [ ! -e "$CLASS_PATH" ]; then
+      # Same-device-only delete. Never fall back to unrestricted rm -rf: a
+      # replacement tree that reappears after find -delete must not be removed
+      # without another full classify pass.
+      if ! find "$CLASS_PATH" -xdev -depth -delete 2>/dev/null; then
+        printf 'delete-failed: %q\n' "$CLASS_PATH"
+        failed=$((failed + 1))
+      elif [ -e "$CLASS_PATH" ]; then
+        printf 'delete-incomplete: path remains after same-device delete: %q\n' "$CLASS_PATH"
+        failed=$((failed + 1))
+      else
         deleted=$((deleted + 1))
         deleted_bytes=$((deleted_bytes + CLASS_BYTES))
         printf 'deleted: %s\t%q\n' "$CLASS_BYTES" "$CLASS_PATH"
-      else
-        printf 'delete-failed: %q\n' "$CLASS_PATH"
-        failed=$((failed + 1))
       fi
       ;;
     REFUSE)

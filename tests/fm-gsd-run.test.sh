@@ -64,7 +64,10 @@ case "${1:-} ${2:-}" in
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
   "tab list")
     if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ] && grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
-      printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)"
+      # Include a sibling tab so last-tab-safe rollback can close the created run tab
+      # without deleting the whole workspace (real herdr closes the workspace when the
+      # last tab goes away).
+      printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)"
     else
       printf '{"result":{"tabs":[]}}\n'
     fi
