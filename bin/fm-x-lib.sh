@@ -321,6 +321,10 @@ fmx_auth_header_file() {
   file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-x-auth.XXXXXX") || return 1
   chmod 600 "$file" 2>/dev/null || { rm -f "$file"; return 1; }
   printf 'Authorization: Bearer %s\n' "$FMX_TOKEN" > "$file" || { rm -f "$file"; return 1; }
+  if [ -n "${FMX_IDEMPOTENCY_KEY:-}" ]; then
+    case "$FMX_IDEMPOTENCY_KEY" in *[!A-Za-z0-9._:-]*) rm -f "$file"; return 1 ;; esac
+    printf 'Idempotency-Key: %s\n' "$FMX_IDEMPOTENCY_KEY" >> "$file" || { rm -f "$file"; return 1; }
+  fi
   printf '%s\n' "$file"
 }
 

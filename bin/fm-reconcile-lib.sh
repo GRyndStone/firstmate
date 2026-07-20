@@ -293,7 +293,13 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
     FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=$(fm_reconcile_record_value "$wait_file" lifecycle_generation)
     case "$FM_RECONCILE_WAIT_KIND" in
       predicate) FM_RECONCILE_WAIT_TARGET=$(fm_reconcile_record_value "$wait_file" predicate) ;;
-      legacy-check) FM_RECONCILE_WAIT_TARGET=$(fm_reconcile_record_value "$wait_file" check) ;;
+      legacy-check)
+        FM_RECONCILE_WAIT_TARGET=$(fm_reconcile_record_value "$wait_file" check)
+        if [ -n "$FM_RECONCILE_WAIT_REGISTRATION_ID" ] \
+          && ! fm_reconcile_legacy_check_registration_valid "$state" "$id"; then
+          FM_RECONCILE_WAIT_KIND=invalid-legacy-check
+        fi
+        ;;
       process)
         FM_RECONCILE_WAIT_PID=$(fm_reconcile_record_value "$wait_file" pid)
         FM_RECONCILE_WAIT_PID_IDENTITY=$(fm_reconcile_record_value "$wait_file" pid_identity)
@@ -306,7 +312,7 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
         FM_RECONCILE_WAIT_TARGET="pid:$FM_RECONCILE_WAIT_PID"
         ;;
     esac
-  elif [ -f "$legacy" ]; then
+  elif [ -f "$legacy" ] && ! fm_reconcile_legacy_check_is_managed "$state" "$id" "$legacy"; then
     FM_RECONCILE_WAIT_PRESENT=1
     FM_RECONCILE_WAIT_FILE=$legacy
     FM_RECONCILE_WAIT_KIND='legacy-check'
@@ -314,6 +320,36 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
     FM_RECONCILE_WAIT_TARGET=$legacy
     FM_RECONCILE_WAIT_SIGNATURE="legacy:$(fm_reconcile_file_signature "$legacy")"
   fi
+}
+
+fm_reconcile_legacy_check_marker() {  # <check-file>
+  sed -n 's/^# fm-wait-registration=\([A-Za-z0-9._:-][A-Za-z0-9._:-]*\)$/\1/p' "$1" 2>/dev/null | tail -1
+}
+
+fm_reconcile_legacy_check_is_managed() {  # <state-dir> <id> <check-file>
+  local state=$1 id=$2 check=$3 wait_file marker
+  marker=$(fm_reconcile_legacy_check_marker "$check")
+  [ -n "$marker" ] && return 0
+  wait_file="$state/$id.wait"
+  [ "$(fm_reconcile_record_value "$wait_file" kind)" = legacy-check ] \
+    && [ "$(fm_reconcile_record_value "$wait_file" check)" = "$check" ]
+}
+
+fm_reconcile_legacy_check_registration_valid() {  # <state-dir> <id>
+  local state=$1 id=$2 wait_file check commit registration generation
+  wait_file="$state/$id.wait"
+  check="$state/$id.check.sh"
+  commit="$state/$id.wait-commit"
+  registration=$(fm_reconcile_record_value "$wait_file" registration_id)
+  generation=$(fm_reconcile_record_value "$wait_file" lifecycle_generation)
+  [ -n "$registration" ] \
+    && [ "$(fm_reconcile_record_value "$wait_file" check)" = "$check" ] \
+    && [ "$(fm_reconcile_legacy_check_marker "$check")" = "$registration" ] \
+    && [ "$(fm_reconcile_record_value "$commit" schema)" = fm-external-wait-commit.v1 ] \
+    && [ "$(fm_reconcile_record_value "$commit" registration_id)" = "$registration" ] \
+    && [ "$(fm_reconcile_record_value "$commit" lifecycle_generation)" = "$generation" ] \
+    && [ "$(fm_reconcile_record_value "$commit" check_signature)" = "$(fm_reconcile_file_signature "$check")" ] \
+    && [ "$(fm_reconcile_record_value "$commit" wait_signature)" = "$(fm_reconcile_file_signature "$wait_file")" ]
 }
 
 fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/EVIDENCE/progress
@@ -493,25 +529,29 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
       rm -f "$rc_file"
       case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
       out=$(fm_reconcile_clean_value "$out")
-      if [ -n "$out" ]; then
-        FM_RECONCILE_WAIT_RESULT=complete
-        FM_RECONCILE_WAIT_EVIDENCE=$out
-      else
-        case "$rc" in
-          0|1)
+      case "$rc" in
+        0)
+          if [ -n "$out" ]; then
+            FM_RECONCILE_WAIT_RESULT=complete
+            FM_RECONCILE_WAIT_EVIDENCE=$out
+          else
             FM_RECONCILE_WAIT_RESULT=pending
             FM_RECONCILE_WAIT_EVIDENCE='legacy check pending'
-            ;;
-          124|125)
-            FM_RECONCILE_WAIT_RESULT=failed
-            FM_RECONCILE_WAIT_EVIDENCE='legacy check timeout or no bounded runner'
-            ;;
-          *)
-            FM_RECONCILE_WAIT_RESULT=failed
-            FM_RECONCILE_WAIT_EVIDENCE="legacy check exited $rc"
-            ;;
-        esac
-      fi
+          fi
+          ;;
+        1)
+          FM_RECONCILE_WAIT_RESULT=pending
+          FM_RECONCILE_WAIT_EVIDENCE=${out:-legacy check pending}
+          ;;
+        124|125)
+          FM_RECONCILE_WAIT_RESULT=failed
+          FM_RECONCILE_WAIT_EVIDENCE=${out:-legacy check timeout or no bounded runner}
+          ;;
+        *)
+          FM_RECONCILE_WAIT_RESULT=failed
+          FM_RECONCILE_WAIT_EVIDENCE="legacy check exited $rc${out:+: $out}"
+          ;;
+      esac
       ;;
     none) : ;;
     *)
@@ -743,33 +783,54 @@ fm_reconcile_meta_update() {  # <state-dir> <id> <expected-generation> [--set <k
 }
 
 fm_reconcile_legacy_check_register() {  # <state-dir> <id> <expected-generation> <check-temp> <description>
-  local state=$1 id=$2 expected_generation=$3 check_tmp=$4 description=$5 wait_file wait_tmp registration_id register_rc=0
+  local state=$1 id=$2 expected_generation=$3 check_tmp=$4 description=$5 wait_file wait_tmp check_file check_publish_tmp
+  local commit_file commit_tmp registration_id check_signature wait_signature register_rc=0
   fm_reconcile_task_id_valid "$id" && fm_reconcile_generation_valid "$expected_generation" && [ -d "$state" ] || return 2
   wait_file="$state/$id.wait"
+  check_file="$state/$id.check.sh"
+  commit_file="$state/$id.wait-commit"
   [ -f "$check_tmp" ] || return 1
   registration_id=$(fm_task_identity_new_token) || return 1
   wait_tmp="$wait_file.tmp.${BASHPID:-$$}"
+  check_publish_tmp="$check_file.tmp.${BASHPID:-$$}"
+  commit_tmp="$commit_file.tmp.${BASHPID:-$$}"
+  {
+    cat "$check_tmp"
+    printf '\n# fm-wait-registration=%s\n' "$registration_id"
+  } > "$check_publish_tmp" || { rm -f "$check_publish_tmp"; return 1; }
   {
     printf 'schema=fm-external-wait.v1\n'
     printf 'kind=legacy-check\n'
     printf 'description=%s\n' "$(fm_reconcile_clean_value "$description")"
     printf 'registration_id=%s\n' "$registration_id"
     printf 'lifecycle_generation=%s\n' "$expected_generation"
-    printf 'check=%s\n' "$state/$id.check.sh"
+    printf 'check=%s\n' "$check_file"
     printf 'registered_at=%s\n' "$(date +%s)"
-  } > "$wait_tmp" || { rm -f "$wait_tmp"; return 1; }
+  } > "$wait_tmp" || { rm -f "$check_publish_tmp" "$wait_tmp"; return 1; }
+  check_signature=$(fm_reconcile_file_signature "$check_publish_tmp")
+  wait_signature=$(fm_reconcile_file_signature "$wait_tmp")
+  {
+    printf 'schema=fm-external-wait-commit.v1\n'
+    printf 'registration_id=%s\n' "$registration_id"
+    printf 'lifecycle_generation=%s\n' "$expected_generation"
+    printf 'check_signature=%s\n' "$check_signature"
+    printf 'wait_signature=%s\n' "$wait_signature"
+  } > "$commit_tmp" || { rm -f "$check_publish_tmp" "$wait_tmp" "$commit_tmp"; return 1; }
   fm_reconcile_lock_acquire "$state" "$id"
   if [ "$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)" != "$expected_generation" ] \
     || fm_reconcile_tombstone_active "$state" "$id"; then
     register_rc=3
-  elif ! mv -f "$check_tmp" "$state/$id.check.sh"; then
+  elif ! mv -f "$check_publish_tmp" "$check_file"; then
     register_rc=1
   elif ! mv -f "$wait_tmp" "$wait_file"; then
-    rm -f "$state/$id.check.sh"
+    rm -f "$check_file" "$commit_file"
+    register_rc=1
+  elif ! mv -f "$commit_tmp" "$commit_file"; then
+    rm -f "$check_file" "$wait_file" "$commit_file"
     register_rc=1
   fi
   fm_reconcile_lock_release "$state" "$id"
-  rm -f "$check_tmp" "$wait_tmp"
+  rm -f "$check_tmp" "$check_publish_tmp" "$wait_tmp" "$commit_tmp"
   return "$register_rc"
 }
 
@@ -1371,16 +1432,29 @@ fm_reconcile_ack() {  # <state-dir> <id> <token> <version>
 
 fm_reconcile_teardown_begin() {  # <state-dir> <id> [expected-generation]
   local state=$1 id=$2 expected_generation=${3:-} mark_rc=0 tombstone tmp owner_pid owner_identity current_generation
+  local claim claim_pid claim_identity current_identity
   tombstone="$state/$id.tearing-down"
   owner_pid=${BASHPID:-$$}
   owner_identity=$(fm_reconcile_process_identity "$owner_pid") || return 1
   fm_reconcile_lock_acquire "$state" "$id"
   current_generation=$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)
   [ -n "$expected_generation" ] || expected_generation=$current_generation
+  claim="$state/$id.spawn-claim"
   if [ -z "$expected_generation" ] || [ "$current_generation" != "$expected_generation" ] \
     || fm_reconcile_tombstone_active "$state" "$id"; then
     mark_rc=3
-  else
+  elif [ -f "$claim" ]; then
+    claim_pid=$(fm_reconcile_record_value "$claim" owner_pid)
+    claim_identity=$(fm_reconcile_record_value "$claim" owner_identity)
+    current_identity=$(fm_reconcile_process_identity "$claim_pid" 2>/dev/null || true)
+    if fm_reconcile_pid_alive "$claim_pid" \
+      && { [ -z "$current_identity" ] || { [ -n "$claim_identity" ] && [ "$current_identity" = "$claim_identity" ]; }; }; then
+      mark_rc=4
+    elif ! rm -f "$claim"; then
+      mark_rc=1
+    fi
+  fi
+  if [ "$mark_rc" -eq 0 ]; then
     tmp="$tombstone.tmp.$owner_pid"
     {
       printf 'schema=fm-teardown-tombstone.v1\n'

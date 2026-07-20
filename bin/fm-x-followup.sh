@@ -208,10 +208,56 @@ if [ "$MODE" = check ]; then
   exit 0
 fi
 
+FOLLOWUP_OP="$STATE/$ID.x-followup-op"
+
+followup_operation_value() {  # <key>
+  fm_reconcile_record_value "$FOLLOWUP_OP" "$1"
+}
+
+followup_operation_write() {  # <prepared|delivered> <key>
+  local state=$1 key=$2 tmp
+  tmp="$FOLLOWUP_OP.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-x-followup-operation.v1\n'
+    printf 'state=%s\n' "$state"
+    printf 'generation=%s\n' "$META_GENERATION"
+    printf 'request_id=%s\n' "$RID"
+    printf 'followup_count=%s\n' "$COUNT"
+    printf 'idempotency_key=%s\n' "$key"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$FOLLOWUP_OP" || { rm -f "$tmp"; return 1; }
+}
+
+OP_STATE=
+OP_KEY=
+if [ -f "$FOLLOWUP_OP" ] \
+  && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
+  && [ "$(followup_operation_value request_id)" = "$RID" ] \
+  && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
+  OP_STATE=$(followup_operation_value state)
+  OP_KEY=$(followup_operation_value idempotency_key)
+fi
+case "$OP_STATE:$OP_KEY" in
+  prepared:*|delivered:*)
+    case "$OP_KEY" in ''|*[!A-Za-z0-9._:-]*) OP_STATE=; OP_KEY= ;; esac
+    ;;
+  *) OP_STATE=; OP_KEY= ;;
+esac
+if [ -z "$OP_KEY" ]; then
+  rm -f "$FOLLOWUP_OP"
+  OP_KEY=$(fm_task_identity_new_token) || exit 1
+  followup_operation_write prepared "$OP_KEY" || {
+    echo "fm-x-followup: could not prepare durable follow-up operation for $ID" >&2
+    exit 1
+  }
+  OP_STATE=prepared
+fi
+
 # Post the follow-up. fm-x-reply owns text reading, thread-split, dry-run, the
 # endpoint, and the never-inline safety; we only pass the text source and any
 # recorded reply-platform context through.
 declare -a REPLY_ENV=()
+REPLY_ENV+=("FMX_IDEMPOTENCY_KEY=$OP_KEY")
 case "$REQ_PLATFORM" in
   discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$REQ_PLATFORM") ;;
 esac
@@ -219,27 +265,42 @@ case "$REQ_REPLY_MAX" in
   ''|*[!0-9]*) ;;
   *) REPLY_ENV+=("FMX_REPLY_MAX_CHARS=$REQ_REPLY_MAX") ;;
 esac
-if [ "${#REPLY_ENV[@]}" -gt 0 ]; then
+if [ "$OP_STATE" = delivered ]; then
+  post_rc=0
+elif [ "${#REPLY_ENV[@]}" -gt 0 ]; then
+  set +e
   env "${REPLY_ENV[@]}" "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+  post_rc=$?
+  set -e
 else
+  set +e
   "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+  post_rc=$?
+  set -e
 fi
-post_rc=$?
 
 case "$post_rc" in
   0)
+    followup_operation_write delivered "$OP_KEY" || {
+      echo "fm-x-followup: posted but could not persist the delivered operation for $ID" >&2
+      exit 1
+    }
     NEWCOUNT=$((COUNT + 1))
     if [ "$FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
       if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
         echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
         exit 1
       fi
+      rm -f "$FOLLOWUP_OP"
     elif ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" set "$NEWCOUNT"; then
       if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
         echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
         exit 1
       fi
+      rm -f "$FOLLOWUP_OP"
       echo "fm-x-followup: warning: posted but could not record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
+    else
+      rm -f "$FOLLOWUP_OP"
     fi
     printf '%s\n' "$RID"
     exit 0
@@ -251,8 +312,11 @@ case "$post_rc" in
     # graceful-degradation path against an old relay that only ever supported
     # one follow-up, or a binding the relay already considers exhausted for any
     # other reason - either way, retrying would never succeed.
-    fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear \
-      || echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
+    if fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      rm -f "$FOLLOWUP_OP"
+    else
+      echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
+    fi
     echo "fm-x-followup: relay rejected the follow-up for $ID (cap or window exhausted); skipped and cleared the link" >&2
     exit 0
     ;;

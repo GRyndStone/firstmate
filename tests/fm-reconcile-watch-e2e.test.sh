@@ -37,7 +37,8 @@ start_watch() {  # <dir> <out>
     FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 \
-    FM_RECONCILE_TASK_TIMEOUT="${FM_CANARY_RECONCILE_TIMEOUT:-35}" \
+    FM_CHECK_TIMEOUT="${FM_CANARY_CHECK_TIMEOUT:-30}" \
+    FM_RECONCILE_TASK_TIMEOUT="${FM_CANARY_RECONCILE_TIMEOUT:-}" \
     FM_STALE_ESCALATE_SECS="${FM_CANARY_STALE_ESCALATE:-999999}" \
     "$WATCH" > "$out" 2>&1 &
   CANARY_PID=$!
@@ -424,6 +425,17 @@ SH
   pass "canary: observer crashes, timeouts, and malformed output fail loudly"
 }
 
+test_observer_budget_includes_configured_check_timeout() {
+  local dir out
+  dir=$(make_case observer-budget)
+  out=$(FM_STATE_OVERRIDE="$dir/state" FM_CHECK_TIMEOUT=60 FM_RECONCILE_CREW_READ_TIMEOUT=7 bash -c '
+    . "$1"
+    printf "%s\n" "$RECONCILE_TASK_TIMEOUT"
+  ' _ "$WATCH") || fail "could not inspect the watcher observer budget"
+  [ "$out" = 67 ] || fail "observer budget $out did not include 7s crew read plus 60s check timeout"
+  pass "observer timeout budgets crew-state reads plus configured check execution"
+}
+
 test_first_repository_identity_failure_is_delivered() {
   local dir state out pid
   dir=$(make_canary first-identity-failure 'working: identity proof fixture')
@@ -524,6 +536,7 @@ test_unchanged_pane_with_positive_busy_evidence_stays_quiet
 test_idle_harness_with_advancing_owned_command_stays_quiet_then_wakes
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch
 test_observer_crashes_and_timeouts_fail_loudly
+test_observer_budget_includes_configured_check_timeout
 test_later_worker_failure_is_recorded_after_first_action_selection
 test_first_repository_identity_failure_is_delivered
 test_watcher_exit_reaps_reconciliation_workers

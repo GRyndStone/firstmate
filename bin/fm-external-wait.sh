@@ -46,6 +46,7 @@ esac
 [ -f "$STATE/$id.meta" ] || { echo "error: no task metadata for $id in $STATE; register the wait against the live task id" >&2; exit 1; }
 
 wait_file="$STATE/$id.wait"
+wait_commit="$STATE/$id.wait-commit"
 mkdir -p "$STATE"
 meta="$STATE/$id.meta"
 meta_signature=$(fm_reconcile_file_signature "$meta")
@@ -74,7 +75,7 @@ registration_still_valid() {
 }
 
 write_wait() {  # <kind> <description> [<extra-key> <extra-value>]...
-  local kind=$1 description=$2 tmp key value registration_id write_rc=0
+  local kind=$1 description=$2 tmp key value registration_id write_rc=0 prior_kind
   shift 2
   [ $(( $# % 2 )) -eq 0 ] || return 2
   registration_id=$(fm_task_identity_new_token) || return 1
@@ -94,6 +95,7 @@ write_wait() {  # <kind> <description> [<extra-key> <extra-value>]...
     printf 'registered_at=%s\n' "$(date +%s)"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   fm_reconcile_lock_acquire "$STATE" "$id"
+  prior_kind=$(fm_reconcile_record_value "$wait_file" kind)
   if ! fm_reconcile_meta_matches "$STATE" "$id" "$meta_signature" "$lifecycle_generation"; then
     echo "error: task $id lifecycle changed while registering its external wait" >&2
     write_rc=1
@@ -102,6 +104,10 @@ write_wait() {  # <kind> <description> [<extra-key> <extra-value>]...
     write_rc=1
   elif ! mv -f "$tmp" "$wait_file"; then
     write_rc=1
+  elif [ "$prior_kind" = legacy-check ]; then
+    rm -f "$STATE/$id.check.sh" "$wait_commit" || write_rc=$?
+  else
+    rm -f "$wait_commit" || write_rc=$?
   fi
   fm_reconcile_lock_release "$STATE" "$id"
   [ "$write_rc" -eq 0 ] || rm -f "$tmp"
@@ -183,7 +189,11 @@ case "$command" in
       echo "error: task $id external-wait registration changed while clear was pending" >&2
       clear_rc=1
     else
-      rm -f "$wait_file" || clear_rc=$?
+      if [ "$(fm_reconcile_record_value "$wait_file" kind)" = legacy-check ]; then
+        rm -f "$wait_file" "$STATE/$id.check.sh" "$wait_commit" || clear_rc=$?
+      else
+        rm -f "$wait_file" "$wait_commit" || clear_rc=$?
+      fi
     fi
     fm_reconcile_lock_release "$STATE" "$id"
     [ "$clear_rc" -eq 0 ] || exit "$clear_rc"

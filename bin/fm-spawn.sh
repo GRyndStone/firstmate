@@ -232,12 +232,11 @@ spawn_abort_cleanup() {
       herdr)
         if [ -n "${HERDR_TAB_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
           fm_backend_herdr_cli "$HERDR_SES" tab close "$HERDR_TAB_ID" >/dev/null 2>&1 || true
-          remaining=$(fm_backend_herdr_cli "$HERDR_SES" tab list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null \
-            | jq -r --arg id "$HERDR_TAB_ID" '.result.tabs[]? | select(.tab_id == $id) | .tab_id' 2>/dev/null || true)
-          [ -z "$remaining" ] || cleanup_failed=1
+          fm_backend_herdr_tab_absent "$HERDR_SES" "${HERDR_WORKSPACE_ID:-}" "$HERDR_TAB_ID" \
+            || cleanup_failed=1
         elif [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
           fm_backend_kill herdr "$HERDR_SES:$HERDR_PANE_ID" 2>/dev/null || true
-          fm_backend_target_exists herdr "$HERDR_SES:$HERDR_PANE_ID" && cleanup_failed=1
+          fm_backend_herdr_pane_absent "$HERDR_SES" "$HERDR_PANE_ID" || cleanup_failed=1
         else
           cleanup_failed=1
         fi

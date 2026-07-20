@@ -119,8 +119,11 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
-RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-35}
-case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=35 ;; esac
+case "$CHECK_TIMEOUT" in ''|*[!0-9]*|0) CHECK_TIMEOUT=30 ;; esac
+RECONCILE_CREW_READ_TIMEOUT=${FM_RECONCILE_CREW_READ_TIMEOUT:-35}
+case "$RECONCILE_CREW_READ_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_CREW_READ_TIMEOUT=35 ;; esac
+RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT))}
+case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT)) ;; esac
 RECONCILE_BATCH_DIR=
 RECONCILE_BATCH_PIDS=
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
@@ -588,9 +591,10 @@ reconcile_worker() {  # <id>
   fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
     export FM_RECONCILE_CREW_STATE_BIN=$1
     export FM_EXTERNAL_WAIT_TIMEOUT=$2
-    . "$3"
-    fm_reconcile_observe "$4" "$5"
-  ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" \
+    export FM_LEGACY_CHECK_TIMEOUT=$3
+    . "$4"
+    fm_reconcile_observe "$5" "$6"
+  ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" "$CHECK_TIMEOUT" \
     "$SCRIPT_DIR/fm-reconcile-lib.sh" "$STATE" "$id" &
   child=$!
   if wait "$child"; then worker_rc=0; else worker_rc=$?; fi
@@ -1023,13 +1027,10 @@ while :; do
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     for c in "$STATE"/*.check.sh; do
       check_id=
-      check_wait=
       [ -e "$c" ] || continue
       check_id=${c##*/}
       check_id=${check_id%.check.sh}
-      check_wait="$STATE/$check_id.wait"
-      if [ "$(fm_reconcile_record_value "$check_wait" kind)" = legacy-check ] \
-        && [ "$(fm_reconcile_record_value "$check_wait" check)" = "$c" ]; then
+      if fm_reconcile_legacy_check_is_managed "$STATE" "$check_id" "$c"; then
         continue
       fi
       out=$(run_check "$c")

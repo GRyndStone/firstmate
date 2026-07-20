@@ -694,64 +694,138 @@ stale_window_is_busy() {  # <window> <state>
 }
 
 escalate_add() {  # <state> <distilled-item>
-  local state=$1 item=$2 buf
+  local state=$1 item=$2 buf inflight
   buf="$state/.subsuper-escalations"
+  inflight="$state/.subsuper-escalations.inflight"
   if [ -s "$buf" ] && grep -Fqx -- "$item" "$buf" 2>/dev/null; then
     return 0
   fi
+  if [ -s "$inflight" ] && grep -Fqx -- "$item" "$inflight" 2>/dev/null; then
+    return 0
+  fi
   if [ ! -s "$buf" ]; then
-    [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] || rm -f "$state/.subsuper-escalation-delivered"
+    [ -s "$inflight" ] || [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] || rm -f "$state/.subsuper-escalation-delivered"
     _now > "${buf}.since"
   fi
   printf '%s\n' "$item" >> "$buf"
+}
+
+escalation_prefix_count_for_key() {  # <buffer> <delivery-key>
+  local buf=$1 key=$2 total i=1 msg candidate
+  total=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
+  while [ "$i" -le "$total" ]; do
+    msg=$(head -n "$i" "$buf" | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+    msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$i" "$msg")
+    candidate=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+    if [ "$candidate" = "$key" ]; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf n msg receipt delivery_key receipt_tmp claim_delivery_key
+  local state=$1 buf inflight n msg receipt delivery_key receipt_tmp claim_delivery_key retry_tmp receipt_key prefix_count
   buf="$state/.subsuper-escalations"
+  inflight="$state/.subsuper-escalations.inflight"
   receipt="$state/.subsuper-escalation-delivered"
-  if [ ! -s "$buf" ]; then
-    rm -f "$receipt"
-    return 0
-  fi
-  n=$(wc -l < "$buf" 2>/dev/null | tr -d '[:space:]' || echo 0)
-  # Join buffered items with the literal " | " separator into one digest line.
-  msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
-  # safety net, but keeping the source single-line makes the intent explicit).
-  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  delivery_key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
-  claim_delivery_key=
-  if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
-    && command -v fm_wake_reconcile_claim_delivery_key >/dev/null 2>&1; then
-    claim_delivery_key=$(fm_wake_reconcile_claim_delivery_key "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
-  fi
-  if [ "$claim_delivery_key" = "$delivery_key" ] \
-    || [ "$(cat "$receipt" 2>/dev/null || true)" = "$delivery_key" ]; then
-    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
-      && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
-      fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
+  while :; do
+    if [ ! -s "$inflight" ]; then
+      rm -f "$inflight"
+      if [ ! -s "$buf" ]; then
+        rm -f "$receipt"
+        return 0
+      fi
+      mv -f "$buf" "$inflight" || return 1
+      if ! : > "$buf"; then
+        mv -f "$inflight" "$buf" 2>/dev/null || true
+        return 1
+      fi
     fi
-    : > "$buf"
-    rm -f "${buf}.since" "$state/.subsuper-inject-wedged" "$receipt"
-    return 0
-  fi
-  if inject_msg "$msg" "$state"; then
+    n=$(wc -l < "$inflight" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$inflight" 2>/dev/null)
+    msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+    delivery_key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+    claim_delivery_key=
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      && command -v fm_wake_reconcile_claim_delivery_key >/dev/null 2>&1; then
+      claim_delivery_key=$(fm_wake_reconcile_claim_delivery_key "$FM_RECONCILE_CLAIM_PAYLOAD" 2>/dev/null || true)
+    fi
+    if [ "$claim_delivery_key" = "$delivery_key" ] \
+      || [ "$(cat "$receipt" 2>/dev/null || true)" = "$delivery_key" ]; then
+      if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+        && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+        fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1
+      fi
+      rm -f "$inflight" || return 1
+      rm -f "$receipt"
+      if [ ! -s "$buf" ]; then
+        rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+        return 0
+      fi
+      continue
+    fi
+    receipt_key=$(cat "$receipt" 2>/dev/null || true)
+    if [ -n "$receipt_key" ]; then
+      prefix_count=$(escalation_prefix_count_for_key "$inflight" "$receipt_key" 2>/dev/null || true)
+      if [ -n "$prefix_count" ]; then
+        retry_tmp="$buf.retry.${BASHPID:-$$}"
+        if ! { tail -n "+$((prefix_count + 1))" "$inflight"; cat "$buf"; } > "$retry_tmp"; then
+          rm -f "$retry_tmp"
+          return 1
+        fi
+        mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
+        rm -f "$inflight" "$receipt"
+        continue
+      fi
+      rm -f "$receipt"
+    fi
     receipt_tmp="$receipt.tmp.${BASHPID:-$$}"
     printf '%s\n' "$delivery_key" > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 1; }
     mv -f "$receipt_tmp" "$receipt" || { rm -f "$receipt_tmp"; return 1; }
     if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
       && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
-      fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
+      if ! fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" prepared; then
+        rm -f "$receipt"
+        retry_tmp="$buf.retry.${BASHPID:-$$}"
+        { cat "$inflight"; cat "$buf"; } > "$retry_tmp" \
+          && mv -f "$retry_tmp" "$buf" \
+          && rm -f "$inflight"
+        rm -f "$retry_tmp"
+        return 1
+      fi
     fi
-    : > "$buf"
-    rm -f "${buf}.since" "$state/.subsuper-inject-wedged" "$receipt"
-    return 0
-  fi
-  return 1
+    if inject_msg "$msg" "$state"; then
+      if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+        && command -v fm_wake_reconcile_claim_mark_delivered >/dev/null 2>&1; then
+        fm_wake_reconcile_claim_mark_delivered "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" delivered || return 1
+      fi
+      rm -f "$inflight" || return 1
+      rm -f "$receipt"
+      if [ ! -s "$buf" ]; then
+        rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+      fi
+      return 0
+    fi
+    rm -f "$receipt"
+    if [ -n "${FM_RECONCILE_CLAIM_PAYLOAD:-}" ] \
+      && command -v fm_wake_reconcile_claim_clear_delivery >/dev/null 2>&1; then
+      fm_wake_reconcile_claim_clear_delivery "$FM_RECONCILE_CLAIM_PAYLOAD" "$delivery_key" || return 1
+    fi
+    retry_tmp="$buf.retry.${BASHPID:-$$}"
+    if ! { cat "$inflight"; cat "$buf"; } > "$retry_tmp"; then
+      rm -f "$retry_tmp"
+      return 1
+    fi
+    mv -f "$retry_tmp" "$buf" || { rm -f "$retry_tmp"; return 1; }
+    rm -f "$inflight"
+    return 1
+  done
 }
 
 # --- backend-independent active wedge alert ---------------------------------
@@ -1481,6 +1555,15 @@ replay_reconciled_queue() {  # <state>
   done
 }
 
+dispatch_watcher_wake() {  # <reason> <state>
+  local reason=$1 state=$2
+  if fm_reconcile_action_parse "$reason"; then
+    replay_reconciled_queue "$state"
+  else
+    handle_wake "$reason" "$state"
+  fi
+}
+
 # --- log --------------------------------------------------------------------
 # Uses LOG set by fm_super_main; harmless no-op-ish if unset (tests source fns
 # directly and pass state explicitly, so they do not call log).
@@ -1731,7 +1814,12 @@ fm_super_main() {
           continue
         fi
         log "wake: $reason"
-        handle_wake "$reason" "$STATE"
+        if ! dispatch_watcher_wake "$reason" "$STATE"; then
+          log "ERROR: watcher wake could not reach durable consumer state; retrying"
+          WATCHER_PID=""
+          sleep "$CRASH_NORMAL_SLEEP"
+          continue
+        fi
         trim_log
       fi
       start_watcher || continue

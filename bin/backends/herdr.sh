@@ -668,6 +668,30 @@ EOF
   printf '%s %s' "$tab_id" "$pane_id"
 }
 
+fm_backend_herdr_tab_absent() {  # <session> <workspace-id> <tab-id>
+  local session=$1 wsid=$2 tab_id=$3 list
+  [ -n "$session" ] && [ -n "$wsid" ] && [ -n "$tab_id" ] || return 2
+  list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 2
+  printf '%s' "$list" | jq -e '(.result.tabs | type) == "array"' >/dev/null 2>&1 || return 2
+  if printf '%s' "$list" | jq -e --arg id "$tab_id" '.result.tabs[]? | select(.tab_id == $id)' >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+fm_backend_herdr_pane_absent() {  # <session> <pane-id>
+  local session=$1 pane_id=$2 out
+  [ -n "$session" ] && [ -n "$pane_id" ] || return 2
+  out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>/dev/null) || true
+  if printf '%s' "$out" | jq -e --arg id "$pane_id" '.result.pane.pane_id == $id' >/dev/null 2>&1; then
+    return 1
+  fi
+  if printf '%s' "$out" | jq -e '.error.code == "pane_not_found"' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 2
+}
+
 # fm_backend_herdr_parse_target: split "<session>:<pane_id>" (pane_id itself
 # contains a colon, e.g. "w1:p2") on the FIRST colon only. Sets
 # FM_BACKEND_HERDR_SESSION and FM_BACKEND_HERDR_PANE for the caller.

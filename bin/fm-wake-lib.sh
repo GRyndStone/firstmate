@@ -508,9 +508,14 @@ fm_wake_reconcile_claim_owner_live() {  # <claim-file>
 }
 
 fm_wake_reconcile_claimed_marker_locked() {
-  local claim="$STATE/.wake-queue.reconcile-claim"
+  local claim="$STATE/.wake-queue.reconcile-claim" delivery_key
   [ -f "$claim" ] || return 1
   if ! fm_wake_reconcile_claim_owner_live "$claim"; then
+    delivery_key=$(fm_wake_reconcile_claim_value "$claim" delivery_key)
+    if [ -n "$delivery_key" ]; then
+      fm_wake_reconcile_claim_value "$claim" marker
+      return
+    fi
     rm -f "$claim"
     return 1
   fi
@@ -519,7 +524,7 @@ fm_wake_reconcile_claimed_marker_locked() {
 
 fm_wake_reconcile_claim_payload() {
   local claim="$STATE/.wake-queue.reconcile-claim" tmp selected marker payload queue_sequence='' owner_pid owner_identity
-  local existing_pid delivery_key='' status=0
+  local existing_pid delivery_key='' delivery_state='' status=0
   owner_pid=${BASHPID:-$$}
   owner_identity=$(fm_pid_identity "$owner_pid") || return 1
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
@@ -533,6 +538,7 @@ fm_wake_reconcile_claim_payload() {
     payload=$(fm_wake_reconcile_claim_value "$claim" payload)
     queue_sequence=$(fm_wake_reconcile_claim_value "$claim" queue_sequence)
     delivery_key=$(fm_wake_reconcile_claim_value "$claim" delivery_key)
+    delivery_state=$(fm_wake_reconcile_claim_value "$claim" delivery_state)
   else
     selected=$(awk -F '\t' '
       NF >= 5 && match($5, /\[fm-reconcile=[^]]+\]/) {
@@ -564,6 +570,7 @@ fm_wake_reconcile_claim_payload() {
     printf 'owner_pid=%s\n' "$owner_pid"
     printf 'owner_identity=%s\n' "$owner_identity"
     [ -z "$delivery_key" ] || printf 'delivery_key=%s\n' "$delivery_key"
+    [ -z "$delivery_state" ] || printf 'delivery_state=%s\n' "$delivery_state"
   } > "$tmp" || status=1
   if [ "$status" -eq 0 ] && ! mv -f "$tmp" "$claim"; then status=1; fi
   rm -f "$tmp"
@@ -580,8 +587,9 @@ fm_wake_reconcile_claim_delivery_key() {  # <payload>
   fm_wake_reconcile_claim_value "$claim" delivery_key
 }
 
-fm_wake_reconcile_claim_mark_delivered() {  # <payload> <delivery-key>
-  local payload=$1 delivery_key=$2 claim="$STATE/.wake-queue.reconcile-claim" tmp marker queue_sequence owner_pid owner_identity status=0
+fm_wake_reconcile_claim_mark_delivered() {  # <payload> <delivery-key> [prepared|delivered]
+  local payload=$1 delivery_key=$2 delivery_state=${3:-delivered} claim="$STATE/.wake-queue.reconcile-claim" tmp marker queue_sequence owner_pid owner_identity status=0
+  case "$delivery_state" in prepared|delivered) ;; *) return 2 ;; esac
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   if [ "$(fm_wake_reconcile_claim_value "$claim" payload)" != "$payload" ]; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
@@ -600,6 +608,34 @@ fm_wake_reconcile_claim_mark_delivered() {  # <payload> <delivery-key>
     printf 'owner_pid=%s\n' "$owner_pid"
     printf 'owner_identity=%s\n' "$owner_identity"
     printf 'delivery_key=%s\n' "$delivery_key"
+    printf 'delivery_state=%s\n' "$delivery_state"
+  } > "$tmp" || status=1
+  if [ "$status" -eq 0 ] && ! mv -f "$tmp" "$claim"; then status=1; fi
+  rm -f "$tmp"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
+fm_wake_reconcile_claim_clear_delivery() {  # <payload> <delivery-key>
+  local payload=$1 delivery_key=$2 claim="$STATE/.wake-queue.reconcile-claim" tmp marker queue_sequence owner_pid owner_identity status=0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ "$(fm_wake_reconcile_claim_value "$claim" payload)" != "$payload" ] \
+    || [ "$(fm_wake_reconcile_claim_value "$claim" delivery_key)" != "$delivery_key" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 1
+  fi
+  marker=$(fm_wake_reconcile_claim_value "$claim" marker)
+  queue_sequence=$(fm_wake_reconcile_claim_value "$claim" queue_sequence)
+  owner_pid=$(fm_wake_reconcile_claim_value "$claim" owner_pid)
+  owner_identity=$(fm_wake_reconcile_claim_value "$claim" owner_identity)
+  tmp="$claim.tmp.$(fm_current_pid)"
+  {
+    printf 'schema=fm-wake-reconcile-claim.v1\n'
+    printf 'marker=%s\n' "$marker"
+    printf 'payload=%s\n' "$payload"
+    printf 'queue_sequence=%s\n' "$queue_sequence"
+    printf 'owner_pid=%s\n' "$owner_pid"
+    printf 'owner_identity=%s\n' "$owner_identity"
   } > "$tmp" || status=1
   if [ "$status" -eq 0 ] && ! mv -f "$tmp" "$claim"; then status=1; fi
   rm -f "$tmp"

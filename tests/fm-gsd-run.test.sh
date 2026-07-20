@@ -63,7 +63,14 @@ case "${1:-} ${2:-}" in
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
   "tab list")
-    if grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
+    if [ "${FM_FAKE_PARTIAL_TAB:-0}" = 1 ]; then
+      if [ "${FM_FAKE_PARTIAL_REMAINS:-0}" = 1 ]; then
+        printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"partial","workspace_id":"w1"}]}}\n'
+      else
+        label=$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)
+        printf '{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","workspace_id":"w1"},{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
+      fi
+    elif grep -q $'\x1ftab\x1fcreate' "$LOG" 2>/dev/null; then
       label=$(tr '\037' '\n' < "$LOG" | sed -n '/^gsd-/p' | head -1)
       if [ "${FM_FAKE_LAST_TAB:-0}" = 1 ]; then
         printf '{"result":{"tabs":[{"tab_id":"w1:t9","label":"%s","workspace_id":"w1"}]}}\n' "$label"
@@ -77,10 +84,13 @@ case "${1:-} ${2:-}" in
   "tab create")
     if [ "${FM_FAKE_TAB_CREATE_UNPARSEABLE:-0}" = 1 ]; then
       printf '{"result":{}}\n'
+    elif [ "${FM_FAKE_PARTIAL_TAB:-0}" = 1 ]; then
+      printf '{"result":{"tab":{"tab_id":"w1:t9"}}}\n'
     else
       printf '{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p9"}}}\n'
     fi
     ;;
+  "tab close") : ;;
   "pane get")
     if [ "${FM_FAKE_PANE_GONE:-0}" = 1 ]; then
       if [ -n "${FM_FAKE_DEAD_EXIT:-}" ]; then
@@ -259,6 +269,37 @@ test_no_wait_launches_visible_tab() {
   pass "fm-gsd-run.sh: --no-wait opens the visible run tab and returns"
 }
 
+test_partial_task_create_cleans_or_records_rescue() {
+  local dir fb log proj out status partial
+  dir="$TMP_ROOT/partial-clean"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    FM_FAKE_PARTIAL_TAB=1 "$ROOT/bin/fm-gsd-run.sh" --no-wait task-p1 "$proj" gsd headless auto 2>&1) \
+    && status=0 || status=$?
+  expect_code 1 "$status" "partial create must fail the launch after cleanup"
+  assert_grep $'tab\x1fclose\x1fw1:t9' "$log" "partial task tab was not closed"
+  partial=$(find "$dir/state" -name '*.partial' -type f -print -quit 2>/dev/null)
+  [ -z "$partial" ] || fail "verified partial cleanup still recorded rescue metadata"
+
+  dir="$TMP_ROOT/partial-rescue"
+  fb=$(make_gsd_fake_herdr "$dir")
+  log="$dir/calls.log"; : > "$log"
+  proj="$dir/gsd-proj"; mkdir -p "$proj"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_GSD_RUN_STATE_DIR="$dir/state" \
+    FM_FAKE_PARTIAL_TAB=1 FM_FAKE_PARTIAL_REMAINS=1 \
+    "$ROOT/bin/fm-gsd-run.sh" --no-wait task-p2 "$proj" gsd headless auto 2>&1) \
+    && status=0 || status=$?
+  expect_code 1 "$status" "unverified partial create must fail the launch"
+  assert_contains "$out" "rescue metadata recorded" "unverified partial create did not report its rescue record"
+  partial=$(find "$dir/state" -name '*.partial' -type f -print -quit)
+  [ -n "$partial" ] || fail "unverified partial create discarded recoverable ids"
+  assert_grep 'tab_id=w1:t9' "$partial" "partial rescue record lost the tab id"
+  assert_grep 'workspace_id=w1' "$partial" "partial rescue record lost the workspace id"
+  pass "fm-gsd-run cleans partial Herdr tabs or records recoverable rescue metadata"
+}
+
 # Two runs for the same task id launched within the same second must not
 # share a tab label or exit file - a collision would let create_task classify
 # the first run's pane as a husk and close it under the live run.
@@ -415,6 +456,7 @@ test_state_setup_failure_preserves_last_tab_workspace
 test_post_create_failure_closes_created_tab
 test_ambiguous_send_failure_preserves_tab_and_state
 test_no_wait_launches_visible_tab
+test_partial_task_create_cleans_or_records_rescue
 test_same_second_runs_get_unique_labels
 test_wait_propagates_exit_code
 test_relative_state_dir_resolved_absolute

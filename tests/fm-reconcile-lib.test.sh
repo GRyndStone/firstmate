@@ -683,6 +683,49 @@ SH
   pass "registered legacy checks complete exactly once through reconciliation"
 }
 
+test_legacy_check_registration_requires_atomic_commit() {
+  local dir state generation check_tmp registration
+  dir=$(make_reconcile_case legacy-check-commit)
+  state="$dir/state"
+  generation=$(fm_reconcile_meta_generation "$state/task.meta")
+  check_tmp="$state/task.check.tmp"
+  printf '#!/usr/bin/env bash\nprintf "ready\\n"\n' > "$check_tmp"
+  fm_reconcile_legacy_check_register "$state" task "$generation" "$check_tmp" 'atomic poll' \
+    || fail "legacy check registration failed"
+  [ -s "$state/task.wait-commit" ] || fail "legacy check registration did not publish its commit manifest"
+  fm_reconcile_wait_load "$state" task
+  [ "$FM_RECONCILE_WAIT_KIND" = legacy-check ] || fail "committed legacy check was not observable"
+  registration=$(fm_reconcile_record_value "$state/task.wait" registration_id)
+  rm -f "$state/task.wait-commit"
+  fm_reconcile_wait_load "$state" task
+  [ "$FM_RECONCILE_WAIT_KIND" = invalid-legacy-check ] \
+    || fail "uncommitted legacy check registration was consumed"
+  [ "$(fm_reconcile_legacy_check_marker "$state/task.check.sh")" = "$registration" ] \
+    || fail "published legacy check lost its transaction marker"
+  fm_reconcile_legacy_check_is_managed "$state" task "$state/task.check.sh" \
+    || fail "uncommitted managed check fell through to the direct legacy scanner"
+  pass "legacy check and wait publication requires one validated commit manifest"
+}
+
+test_failed_legacy_check_output_is_failure() {
+  local dir state live generation check_tmp out
+  dir=$(make_reconcile_case failed-legacy-output)
+  state="$dir/state"
+  live="$dir/live"
+  generation=$(fm_reconcile_meta_generation "$state/task.meta")
+  check_tmp="$state/task.check.tmp"
+  printf '#!/usr/bin/env bash\nprintf "relay unavailable\\n" >&2\nexit 2\n' > "$check_tmp"
+  fm_reconcile_legacy_check_register "$state" task "$generation" "$check_tmp" 'failing poll' \
+    || fail "failing legacy check registration failed"
+  printf 'state: parked · source: status-log · waiting for relay\n' > "$live"
+  out=$(observe "$state" "$live")
+  assert_contains "$out" 'external-wait-failed' "stderr-producing failed legacy check reported completion"
+  assert_contains "$out" 'legacy check exited 2: relay unavailable' "legacy failure lost status and stderr evidence"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" wait_state)" = failed ] \
+    || fail "stderr-producing legacy check did not persist failed state"
+  pass "failed legacy checks remain failures even when they print output"
+}
+
 test_repository_identity_failure_preserves_proven_binding() {
   local dir state live out before after
   dir=$(make_reconcile_case repository-resolution-failure)
@@ -922,6 +965,23 @@ test_teardown_claim_is_live_and_generation_bound() {
   pass "teardown claims stay live and reject replacement lifecycle cleanup"
 }
 
+test_teardown_refuses_active_spawn_claim() {
+  local dir state generation
+  dir="$TMP_ROOT/teardown-active-spawn"
+  state="$dir/state"
+  mkdir -p "$state"
+  fm_write_meta "$state/task.meta" 'generation=lifecycle-one' 'window=session:fm-task' 'kind=scout'
+  generation=$(fm_reconcile_meta_generation "$state/task.meta")
+  fm_reconcile_spawn_claim "$state" task "$generation" || fail "active spawn claim setup failed"
+  if fm_reconcile_teardown_begin "$state" task "$generation"; then
+    fail "teardown overtook an active spawn claim"
+  fi
+  [ ! -e "$state/task.tearing-down" ] || fail "refused teardown still published a tombstone"
+  fm_reconcile_spawn_claim_release "$state" task "$generation" || fail "active spawn claim release failed"
+  fm_reconcile_teardown_begin "$state" task "$generation" || fail "teardown stayed blocked after spawn claim release"
+  pass "teardown serializes against active spawn claims"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -945,6 +1005,8 @@ test_malformed_live_state_values_are_rejected
 test_owned_command_does_not_override_first_terminal_observation
 test_owned_command_overrides_older_persisted_idle
 test_registered_legacy_check_completes_once_in_reconciliation
+test_legacy_check_registration_requires_atomic_commit
+test_failed_legacy_check_output_is_failure
 test_repository_identity_failure_preserves_proven_binding
 test_lifecycle_generation_prevents_metadata_aba_publication
 test_delivery_version_is_unique_across_task_lifecycles
@@ -952,5 +1014,6 @@ test_process_identity_toctou_classifies_exit_as_complete
 test_owned_command_cannot_mask_newer_terminal_state
 test_generation_cas_and_spawn_claim_revalidate_lifecycle
 test_teardown_claim_is_live_and_generation_bound
+test_teardown_refuses_active_spawn_claim
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"

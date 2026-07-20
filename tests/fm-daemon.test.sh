@@ -647,6 +647,102 @@ test_escalation_receipt_makes_post_submit_replay_idempotent() {
   pass "durable receipts make post-submit escalation replay idempotent"
 }
 
+test_escalation_receipt_precedes_external_submit() {
+  local dir state delivered
+  dir=$(make_supercase pre-submit-receipt)
+  state="$dir/state"
+  delivered="$dir/delivered"
+  escalate_add "$state" 'prepared before submit'
+  (
+    inject_msg() {
+      [ -s "$state/.subsuper-escalation-delivered" ] || return 71
+      [ -s "$state/.subsuper-escalations.inflight" ] || return 72
+      printf '%s\n' "$1" > "$delivered"
+    }
+    escalate_flush "$state"
+  ) || fail "escalation submit began before its durable receipt"
+  [ -s "$delivered" ] || fail "receipt-backed escalation was not submitted"
+  pass "escalation delivery is durably prepared before external submission"
+}
+
+test_delivered_escalation_prefix_is_not_replayed() {
+  local dir state delivered count msg key
+  dir=$(make_supercase delivered-prefix)
+  state="$dir/state"
+  delivered="$dir/delivered"
+  escalate_add "$state" 'prefix A'
+  msg='Supervisor escalate (1 event(s)): prefix A (pre-read; re-arm not needed — watcher daemon-managed)'
+  key=$(printf '%s' "$msg" | cksum | awk '{print $1 ":" $2}')
+  printf '%s\n' "$key" > "$state/.subsuper-escalation-delivered"
+  escalate_add "$state" 'later B'
+  (
+    inject_msg() {
+      printf '%s\n' "$1" >> "$delivered"
+    }
+    escalate_flush "$state"
+  ) || fail "delivered escalation prefix was not isolated from later appends"
+  count=$(grep -cF 'prefix A' "$delivered" 2>/dev/null || true)
+  count=${count:-0}
+  [ "$count" -eq 0 ] || fail "delivered prefix A was submitted $count additional times"
+  count=$(grep -cF 'later B' "$delivered" 2>/dev/null || true)
+  count=${count:-0}
+  [ "$count" -eq 1 ] \
+    || fail "later buffer item B was not submitted exactly once"
+  pass "delivered escalation prefixes remain isolated from later buffer appends"
+}
+
+test_watcher_reconciled_exit_dispatches_through_claim() {
+  local dir state reason observed
+  dir=$(make_supercase watcher-claimed-dispatch)
+  state="$dir/state"
+  observed="$dir/claim-observed"
+  reason='stale: session:fm-task reconciled-transition [fm-reconcile=task,transition:1,version-one]'
+  append_wake "$state" stale session:fm-task "$reason"
+  FM_STATE_OVERRIDE="$state" FM_TEST_CLAIM_OBSERVED="$observed" bash -c '
+    . "$1"
+    . "$2"
+    handle_wake() {
+      [ -s "$STATE/.wake-queue.reconcile-claim" ] || return 74
+      printf "%s\n" "$1" > "$FM_TEST_CLAIM_OBSERVED"
+    }
+    dispatch_watcher_wake "$3" "$4"
+  ' _ "$DAEMON" "$ROOT/bin/fm-wake-lib.sh" "$reason" "$state" \
+    || fail "watcher reconciled exit bypassed its queue claim"
+  [ "$(cat "$observed")" = "$reason" ] || fail "claimed watcher dispatch handled the wrong payload"
+  [ ! -e "$state/.wake-queue.reconcile-claim" ] || fail "claimed watcher dispatch retained its completed claim"
+  pass "watcher reconciled exits dispatch only through atomically claimed rows"
+}
+
+test_drain_preserves_delivered_dead_owner_claim() {
+  local dir state reason marker drain_out claimed
+  dir=$(make_supercase delivered-dead-claim)
+  state="$dir/state"
+  reason='stale: session:fm-task reconciled-transition [fm-reconcile=task,transition:1,version-one]'
+  marker='[fm-reconcile=task,transition:1,version-one]'
+  append_wake "$state" stale session:fm-task "$reason"
+  fm_write_meta "$state/.wake-queue.reconcile-claim" \
+    'schema=fm-wake-reconcile-claim.v1' \
+    "marker=$marker" \
+    "payload=$reason" \
+    'queue_sequence=1' \
+    'owner_pid=999999' \
+    'owner_identity=dead-owner' \
+    'delivery_key=123:456' \
+    'delivery_state=delivered'
+  drain_out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-wake-drain.sh") \
+    || fail "drain failed while preserving a delivered dead-owner claim"
+  assert_not_contains "$drain_out" "$reason" "drain duplicated a delivered dead-owner claim"
+  grep -F "$reason" "$state/.wake-queue" >/dev/null \
+    || fail "drain removed the delivered dead-owner queue row"
+  claimed=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_wake_reconcile_claim_payload
+    fm_wake_reconcile_claim_complete "$FM_WAKE_RECONCILE_CLAIMED_PAYLOAD"
+  ' _ "$ROOT/bin/fm-wake-lib.sh") || fail "replacement owner could not retire delivered claim"
+  [ "$claimed" = "$reason" ] || fail "replacement owner adopted the wrong delivered payload"
+  pass "drains preserve delivered dead-owner claims for idempotent adoption"
+}
+
 test_reconciled_claim_retains_post_submit_receipt_until_completion() {
   local dir state record reason claimed_file delivered
   dir=$(make_supercase reconcile-post-submit-receipt)
@@ -2200,6 +2296,7 @@ test_normal_supervisor_empty_turn_receipt_rearms_activity_once
 test_normal_supervisor_self_handle_ack_preserves_unrelated_wake
 test_normal_supervisor_replays_unaccepted_reconciled_wake
 test_reconciled_queue_claim_excludes_concurrent_drain
+test_watcher_reconciled_exit_dispatches_through_claim
 test_reconciled_escalation_acknowledges_before_immediate_flush
 test_reconciled_claim_retains_post_submit_receipt_until_completion
 test_daemon_self_evicts_when_singleton_ownership_changes
@@ -2213,6 +2310,9 @@ test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
 test_escalation_receipt_makes_post_submit_replay_idempotent
+test_escalation_receipt_precedes_external_submit
+test_delivered_escalation_prefix_is_not_replayed
+test_drain_preserves_delivered_dead_owner_claim
 test_normal_supervisor_deduplicates_one_event_one_wake
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup

@@ -646,6 +646,24 @@ test_container_ensure_reports_partial_workspace_after_ambiguous_create() {
   pass "fm_backend_herdr_container_ensure: reports ambiguous workspace creation"
 }
 
+test_partial_cleanup_absence_probes_fail_closed() {
+  local dir log resp fb status
+  dir="$TMP_ROOT/partial-absence"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"tabs":[]}}\n' > "$resp/1.out"
+  printf '{"error":{"code":"pane_not_found"}}\n' > "$resp/2.out"
+  printf '{}\n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_tab_absent fmtest w1 w1:t9 || exit 1
+    fm_backend_herdr_pane_absent fmtest w1:p9 || exit 1
+    fm_backend_herdr_tab_absent fmtest w1 w1:t9
+  ' "$ROOT"
+  status=$?
+  [ "$status" -eq 2 ] || fail "malformed cleanup verification must return unknown, got $status"
+  pass "partial Herdr cleanup probes distinguish absence from unreadable state"
+}
+
 # --- container_ensure / create_task: --no-focus and per-home label ----------
 
 test_container_ensure_creates_with_no_focus_flag() {
@@ -2164,6 +2182,7 @@ test_create_task_creates_and_parses_ids
 test_create_task_rolls_back_unparseable_created_tab
 test_create_task_reports_partial_ids_on_incomplete_create_response
 test_container_ensure_reports_partial_workspace_after_ambiguous_create
+test_partial_cleanup_absence_probes_fail_closed
 test_create_task_creates_with_no_focus_flag
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only

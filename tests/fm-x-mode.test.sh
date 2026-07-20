@@ -31,7 +31,7 @@ make_fake_curl() {
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-ofile="" method=GET data="" url="" auth=""
+ofile="" method=GET data="" url="" auth="" idempotency=""
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,8 +48,9 @@ while [ $# -gt 0 ]; do
       ;;
     -H)
       case "$2" in
-        @*) while IFS= read -r header; do case "$header" in Authorization:*) auth=$header ;; esac; done < "${2#@}" ;;
+        @*) while IFS= read -r header; do case "$header" in Authorization:*) auth=$header ;; Idempotency-Key:*) idempotency=$header ;; esac; done < "${2#@}" ;;
         Authorization:*) auth=$2 ;;
+        Idempotency-Key:*) idempotency=$2 ;;
       esac
       shift 2
       ;;
@@ -60,7 +61,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -n "${FAKE_CURL_LOG:-}" ]; then
-  { echo "argv=$argv"; echo "method=$method"; echo "url=$url"; echo "auth=$auth"; echo "data=$data"; } >> "$FAKE_CURL_LOG"
+  { echo "argv=$argv"; echo "method=$method"; echo "url=$url"; echo "auth=$auth"; echo "idempotency=$idempotency"; echo "data=$data"; } >> "$FAKE_CURL_LOG"
 fi
 case "$url" in
   */connector/poll)
@@ -72,6 +73,7 @@ case "$url" in
     printf '%s' "${FAKE_ANSWER_CODE:-200}"
     ;;
   */connector/followup)
+    if [ -n "${FAKE_FOLLOWUP_REQUIRE_OP:-}" ] && [ ! -s "$FAKE_FOLLOWUP_REQUIRE_OP" ]; then exit 8; fi
     [ -n "$ofile" ] && printf '%s' "${FAKE_FOLLOWUP_BODY:-${FAKE_ANSWER_BODY:-}}" > "$ofile"
     [ -n "${FAKE_CURL_FOLLOWUP_STARTED:-}" ] && printf '%s\n' "$$" >> "$FAKE_CURL_FOLLOWUP_STARTED"
     if [ -n "${FAKE_CURL_FOLLOWUP_RELEASE:-}" ]; then
@@ -1639,6 +1641,57 @@ test_followup_post_increments_counter_keeps_link() {
   pass "fm-x-followup posts a follow-up, increments the counter, and keeps the link under the cap"
 }
 
+test_followup_prepares_idempotency_before_post() {
+  local home fakebin log meta op out rc key
+  home="$TMP_ROOT/followup-prepared"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  mk_linked_task "$home" task-prepared req-prepared 1700000000 0
+  meta="$home/state/task-prepared.meta"
+  op="$home/state/task-prepared.x-followup-op"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
+    FAKE_FOLLOWUP_REQUIRE_OP="$op" \
+    "$ROOT/bin/fm-x-followup.sh" task-prepared - <<<"prepared update")
+  rc=$?
+  expect_code 0 "$rc" "prepared follow-up post exit"
+  [ "$out" = req-prepared ] || fail "prepared follow-up returned the wrong request id"
+  key=$(grep '^idempotency=Idempotency-Key:' "$log" | tail -1 | cut -d: -f2- | tr -d '[:space:]')
+  [ -n "$key" ] || fail "follow-up post did not carry its durable idempotency key"
+  [ ! -e "$op" ] || fail "committed follow-up retained its completed operation"
+  assert_grep 'x_followups=1' "$meta" "prepared follow-up did not commit its counter"
+  pass "follow-up operations are durable and idempotent before relay submission"
+}
+
+test_delivered_followup_operation_recovers_without_repost() {
+  local home fakebin log meta op generation out rc
+  home="$TMP_ROOT/followup-delivered-recovery"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  mk_linked_task "$home" task-delivered req-delivered 1700000000 0
+  meta="$home/state/task-delivered.meta"
+  op="$home/state/task-delivered.x-followup-op"
+  generation=$(bash -c '. "$1"; fm_reconcile_meta_generation "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$meta")
+  fm_write_meta "$op" \
+    'schema=fm-x-followup-operation.v1' \
+    'state=delivered' \
+    "generation=$generation" \
+    'request_id=req-delivered' \
+    'followup_count=0' \
+    'idempotency_key=delivered-operation-key'
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
+    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
+    "$ROOT/bin/fm-x-followup.sh" task-delivered - <<<"must not repost")
+  rc=$?
+  expect_code 0 "$rc" "delivered follow-up recovery exit"
+  [ "$out" = req-delivered ] || fail "delivered recovery returned the wrong request id"
+  ! grep -F 'url=https://relay.test/connector/followup' "$log" >/dev/null 2>&1 \
+    || fail "delivered follow-up operation posted again during recovery"
+  assert_grep 'x_followups=1' "$meta" "delivered recovery did not commit its counter"
+  [ ! -e "$op" ] || fail "delivered recovery retained its operation record"
+  pass "delivered follow-up operations finalize locally without reposting"
+}
+
 test_concurrent_followups_serialize_link_count() {
   local home fakebin started release meta first_out second_out first_pid second_pid attempts
   home="$TMP_ROOT/fu-post-concurrent"; mkdir -p "$home/state"
@@ -1789,8 +1842,8 @@ test_followup_post_failure_keeps_link() {
   pass "fm-x-followup keeps the link and counter when the post fails"
 }
 
-test_followup_post_record_failure_clears_link() {
-  local home fakebin out rc meta err flag mvflag
+test_followup_post_record_failure_preserves_operation() {
+  local home fakebin out rc meta op err flag mvflag
   home="$TMP_ROOT/fu-post-record-fail"; mkdir -p "$home/state"
   fakebin=$(make_fake_curl "$home")
   flag="$home/fail-followups-write"
@@ -1811,16 +1864,18 @@ SH
   printf 'FMX_PAIRING_TOKEN=tok-fu\n' > "$home/.env"
   mk_linked_task "$home" task-rf req-rf 1700000000
   meta="$home/state/task-rf.meta"
+  op="$home/state/task-rf.x-followup-op"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
     FMX_NOW_OVERRIDE=1700003600 FAKE_FOLLOWUP_CODE=200 FAKE_CURL_TOUCH_AFTER_POST="$flag" \
     FAKE_MV_FAIL_AFTER_FLAG="$flag" FAKE_MV_FAILED_ONCE="$mvflag" \
     "$ROOT/bin/fm-x-followup.sh" task-rf - <<<"posted but local state write fails" 2>"$err"); rc=$?
-  expect_code 0 "$rc" "followup post state-record failure exit"
-  [ "$out" = "req-rf" ] || fail "posted followup with tombstoned state must echo the request_id (got: $out)"
-  assert_no_grep "x_request=" "$meta" "a failed counter write must tombstone the link"
-  assert_no_grep "x_followups=" "$meta" "a failed counter write must remove the stale counter"
-  assert_grep "cleared the link to avoid duplicate follow-ups" "$err" "state-record failure must explain the tombstone"
-  pass "fm-x-followup tombstones the link when a post-success counter write fails"
+  expect_code 1 "$rc" "followup post state-record failure exit"
+  [ -z "$out" ] || fail "uncommitted followup must not report success (got: $out)"
+  assert_grep "x_request=req-rf" "$meta" "a failed delivery-state write must preserve the link"
+  assert_grep "x_followups=0" "$meta" "a failed delivery-state write must preserve the counter"
+  assert_grep "state=prepared" "$op" "a failed delivery-state write must preserve the reusable operation"
+  assert_grep "could not persist the delivered operation" "$err" "state-record failure must explain the retryable operation"
+  pass "fm-x-followup preserves prepared idempotency after delivery-state write failure"
 }
 
 test_followup_post_relay_rejection_degrades_gracefully() {
@@ -1995,13 +2050,15 @@ test_followup_check_states
 test_followup_check_expired_prunes_link
 test_followup_check_cap_reached_prunes_link
 test_followup_post_increments_counter_keeps_link
+test_followup_prepares_idempotency_before_post
+test_delivered_followup_operation_recovers_without_repost
 test_concurrent_followups_serialize_link_count
 test_followup_and_relink_are_one_cas_boundary
 test_followup_post_final_clears_link_immediately
 test_followup_post_cap_reached_clears_link
 test_followup_post_forwards_image_to_reply_client
 test_followup_post_failure_keeps_link
-test_followup_post_record_failure_clears_link
+test_followup_post_record_failure_preserves_operation
 test_followup_post_relay_rejection_degrades_gracefully
 test_followup_post_expired_skips_and_clears
 test_followup_post_not_linked_is_noop
