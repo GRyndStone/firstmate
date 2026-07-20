@@ -20,6 +20,10 @@ assert_contains "$SECTION_ONE" 'decide the real implication and recommended acti
   "AGENTS.md does not require independent implication analysis and recommendation"
 assert_contains "$SECTION_ONE" 'Never adopt or forward a conclusion merely because' \
   "AGENTS.md does not prohibit adopting delegated or tool conclusions on assertion alone"
+assert_contains "$SECTION_ONE" 'use this response shape: `Question (verbatim): <full original question>` followed by `Firstmate analysis: <independent implication analysis>` and `Recommendation: <recommended captain action>`' \
+  "AGENTS.md does not require the verbatim question alongside independent analysis and recommendation"
+assert_contains "$SECTION_ONE" 'Never omit, paraphrase, merge into analysis, or answer the quoted question for the captain' \
+  "AGENTS.md does not protect the captain-owned question from omission or paraphrase"
 assert_grep 'a gate verdict is an input to Firstmate' "$AGENTS" \
   "validation workflow does not apply the evidence-not-authority rule at its highest-risk boundary"
 assert_no_grep 'Relay the findings to the captain' "$AGENTS" \
