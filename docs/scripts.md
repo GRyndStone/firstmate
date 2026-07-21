@@ -75,5 +75,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-x-reply.sh`          | Post or dry-run preview a composed X-mode reply or follow-up                         |
 | `fm-x-dismiss.sh`        | Dismiss a skipped X-mode mention at the relay without replying                       |
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
+| `fm-kuru-organ-lib.sh`   | Goal↔task linkage and evidence-only organ helpers for the KURU orchestration seam  |
+| `fm-kuru-organ.sh`       | Link FM tasks to KURU goals; organ call surface (bind-only spawn, evidence return)   |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
 | `fm-cleanup-stale-test-roots.sh` | Guarded dry-run-first cleanup of leaked test fixture roots under TMPDIR (safety gates + manifest) |
