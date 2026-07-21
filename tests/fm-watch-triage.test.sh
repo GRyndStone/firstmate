@@ -26,6 +26,19 @@ WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 fm_test_tmproot TMP_ROOT fm-watch-triage-tests
+PROJECT="$TMP_ROOT/project"
+mkdir -p "$PROJECT"
+git init -q "$PROJECT"
+
+write_window_meta() {  # <meta> <window> <kind> [<backend>]
+  local meta=$1 window=$2 kind=$3 backend=${4:-}
+  fm_write_meta "$meta" \
+    "window=$window" \
+    "project=$PROJECT" \
+    "worktree=$PROJECT" \
+    "kind=$kind" \
+    ${backend:+"backend=$backend"}
+}
 
 # Common watcher knobs: tight poll/grace, no check or heartbeat cadence unless a
 # test overrides them, so a test only exercises the path it targets. FM_CREW_STATE_BIN
@@ -114,7 +127,7 @@ test_stale_is_terminal_classifier() {
   dir=$(make_case classify-stale); state="$dir/state"
   printf 'done: ready in branch fm/x\n' > "$state/term.status"
   stale_is_terminal "sess:fm-term" "$state" || fail "terminal stale status not classified terminal"
-  fm_write_meta "$state/herdr-term.meta" "window=default:w1:p2" "backend=herdr"
+  write_window_meta "$state/herdr-term.meta" default:w1:p2 ship herdr
   printf 'done: ready in branch fm/herdr\n' > "$state/herdr-term.status"
   stale_is_terminal "default:w1:p2" "$state" || fail "terminal herdr stale status not resolved through metadata"
   printf 'working: compiling\n' > "$state/nonterm.status"
@@ -145,7 +158,7 @@ test_classifier_primitives() {
   status_is_captain_relevant "needs-decision [key=q1]: b" || fail "keyed needs-decision not recognized as captain-relevant"
   status_is_captain_relevant "working: b" && fail "working: wrongly recognized as captain-relevant"
   [ "$(window_to_task "sess:fm-fix-login-k3")" = "fix-login-k3" ] || fail "window_to_task did not strip session+fm- prefix"
-  fm_write_meta "$state/herdr-task.meta" "window=default:w1:p2" "backend=herdr"
+  write_window_meta "$state/herdr-task.meta" default:w1:p2 ship herdr
   [ "$(window_to_task "default:w1:p2" "$state")" = "herdr-task" ] || fail "window_to_task did not resolve opaque backend target through metadata"
   FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "custom-verb: x" || fail "FM_CAPTAIN_RE override not honored"
   FM_CAPTAIN_RE='custom-verb:' status_is_captain_relevant "done: x" && fail "FM_CAPTAIN_RE override did not replace the default verb set"
@@ -406,7 +419,7 @@ test_terminal_stale_surfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-done"
   printf 'finished, awaiting review' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
+  write_window_meta "$state/done.meta" "$window" ship
   printf 'done: PR https://example.test/pr/3\n' > "$state/done.status"
   sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -439,7 +452,7 @@ test_stale_terminal_status_overridden_while_active_run_stays_quiet() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-validating"
   printf 'no-mistakes axi run: validating...' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/validating.meta"
+  write_window_meta "$state/validating.meta" "$window" ship
   # The crew reported done BEFORE firstmate triggered no-mistakes validation;
   # this line never gets superseded by a newer status-log entry while the
   # pipeline itself runs.
@@ -499,7 +512,7 @@ test_nonterminal_stale_positive_busy_stays_quiet_past_threshold() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-quiet"
   printf 'idle building output' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet.meta"
+  write_window_meta "$state/quiet.meta" "$window" ship
   # Non-terminal status, and prime .seen-* so the signal scan does not pre-empt
   # the stale path.
   printf 'working: still compiling\n' > "$state/quiet.status"
@@ -558,7 +571,7 @@ test_nonterminal_stale_not_working_surfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-stopped"
   printf 'idle prompt, finished' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/stopped.meta"
+  write_window_meta "$state/stopped.meta" "$window" ship
   # Non-terminal status (the crew never wrote a captain-relevant verb), .seen-*
   # primed so the signal scan does not pre-empt the stale path.
   printf 'working: implementing\n' > "$state/stopped.status"
@@ -599,7 +612,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-held"
   printf 'idle, holding for upstream' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/held.meta"
+  write_window_meta "$state/held.meta" "$window" ship
   statusf="$state/held.status"
   # A DECLARED pause (not captain-relevant), .seen-* primed so the signal scan does
   # not pre-empt the stale path.
@@ -670,7 +683,7 @@ test_merge_park_stale_absorbed_then_resurfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-merge-park"
   printf 'idle composer, checks green, awaiting merge' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park.meta"
+  write_window_meta "$state/merge-park.meta" "$window" ship
   statusf="$state/merge-park.status"
   printf 'done: PR https://example.test/pr/2 checks green\npaused: PR checks green, awaiting captain merge; nothing to do until merge/close\n' > "$statusf"
   # The merge poll fm-pr-check arms: prints nothing until the PR merges.
@@ -731,7 +744,7 @@ test_merge_park_check_anchor_absorbed() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-check-anchor"
   printf 'idle composer after validation' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/check-anchor.meta"
+  write_window_meta "$state/check-anchor.meta" "$window" ship
   printf 'working: implementing\n' > "$state/check-anchor.status"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$state/check-anchor.check.sh"
   sig=$(seen_sig "$state/check-anchor.status"); printf '%s' "$sig" > "$state/.seen-check-anchor_status"
@@ -765,7 +778,7 @@ test_finished_run_without_park_anchor_surfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-no-anchor"
   printf 'idle prompt, run finished' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/no-anchor.meta"
+  write_window_meta "$state/no-anchor.meta" "$window" ship
   printf 'working: implementing\n' > "$state/no-anchor.status"
   sig=$(seen_sig "$state/no-anchor.status"); printf '%s' "$sig" > "$state/.seen-no-anchor_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -793,7 +806,7 @@ test_merge_park_gone_endpoint_surfaced() {
   dir=$(make_case merge-park-gone); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"
   window="test:fm-merge-park-gone"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park-gone.meta"
+  write_window_meta "$state/merge-park-gone.meta" "$window" ship
   printf 'paused: PR checks green, awaiting captain merge\n' > "$state/merge-park-gone.status"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$state/merge-park-gone.check.sh"
   sig=$(seen_sig "$state/merge-park-gone.status"); printf '%s' "$sig" > "$state/.seen-merge-park-gone_status"
@@ -816,7 +829,7 @@ test_merge_park_dead_agent_surfaced() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-merge-park-dead"
   printf 'bare shell prompt after the agent exited' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/merge-park-dead.meta"
+  write_window_meta "$state/merge-park-dead.meta" "$window" ship
   printf 'working: implementing\n' > "$state/merge-park-dead.status"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$state/merge-park-dead.check.sh"
   sig=$(seen_sig "$state/merge-park-dead.status"); printf '%s' "$sig" > "$state/.seen-merge-park-dead_status"
@@ -844,7 +857,7 @@ test_secondmate_paused_resurfaces_in_normal_mode() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/secondmate-held.status"
   window="test:fm-secondmate-held"
   printf 'idle awaiting external\n' > "$capture_file"
-  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-held.meta"
+  write_window_meta "$state/secondmate-held.meta" "$window" secondmate
   printf 'paused: awaiting the upstream release\n' > "$statusf"
   register_pending_wait "$state" secondmate-held
   back=$(( $(date +%s) - 500 ))
@@ -874,7 +887,7 @@ test_secondmate_nonpaused_stale_remains_suppressed() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/secondmate-working.status"
   window="test:fm-secondmate-working"
   printf 'idle while the parent supervises\n' > "$capture_file"
-  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-working.meta"
+  write_window_meta "$state/secondmate-working.meta" "$window" secondmate
   printf 'working: the parent supervises this secondmate\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-secondmate-working_status"
   key=$(printf '%s' "$window" | tr '.:/' '___')
@@ -896,7 +909,7 @@ test_secondmate_unpause_clears_pause_tracking() {
   local dir state fakebin out statusf window key pid
   dir=$(make_case secondmate-unpause-clears); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; statusf="$state/secondmate-resumed.status"; window="test:fm-secondmate-resumed"
-  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-resumed.meta"
+  write_window_meta "$state/secondmate-resumed.meta" "$window" secondmate
   printf 'working: upstream landed\n' > "$statusf"
   printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-secondmate-resumed_status"
   key=${window//:/_}
@@ -925,7 +938,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
   dir=$(make_case nonterminal-stale-pause-transition); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-transition"
   printf 'idle awaiting external\n' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/transition.meta"
+  write_window_meta "$state/transition.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/transition.status"
   register_pending_wait "$state" transition
   sig=$(seen_sig "$state/transition.status"); printf '%s' "$sig" > "$state/.seen-transition_status"
@@ -974,7 +987,7 @@ test_paused_recheck_surfaces_failed_run() {
   dir=$(make_case nonterminal-paused-recheck); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"; window="test:fm-pause-recheck"
   printf 'idle awaiting external\n' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/pause-recheck.meta"
+  write_window_meta "$state/pause-recheck.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/pause-recheck.status"
   register_pending_wait "$state" pause-recheck
   sig=$(seen_sig "$state/pause-recheck.status"); printf '%s' "$sig" > "$state/.seen-pause-recheck_status"
@@ -1017,7 +1030,7 @@ test_paused_active_run_absorbed_on_pause_cadence() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-paused-run"
   printf 'no-mistakes review fix round 2 in progress' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/paused-run.meta"
+  write_window_meta "$state/paused-run.meta" "$window" ship
   statusf="$state/paused-run.status"
   printf 'working: implementing\npaused: no-mistakes run in progress (review fix round 2, waiting on the pipeline)\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-paused-run_status"
@@ -1101,7 +1114,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-wedged"
   printf 'idle building output' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged.meta"
+  write_window_meta "$state/wedged.meta" "$window" ship
   printf 'working: still monitoring ci\n' > "$state/wedged.status"
   sig=$(seen_sig "$state/wedged.status"); printf '%s' "$sig" > "$state/.seen-wedged_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1157,7 +1170,7 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-wedged-reset"
   printf 'idle building output' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged-reset.meta"
+  write_window_meta "$state/wedged-reset.meta" "$window" ship
   printf 'working: still monitoring ci\n' > "$state/wedged-reset.status"
   sig=$(seen_sig "$state/wedged-reset.status"); printf '%s' "$sig" > "$state/.seen-wedged-reset_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1190,7 +1203,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-quiet-timer"
   printf 'idle building output' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet-timer.meta"
+  write_window_meta "$state/quiet-timer.meta" "$window" ship
   printf 'working: still compiling\n' > "$state/quiet-timer.status"
   sig=$(seen_sig "$state/quiet-timer.status"); printf '%s' "$sig" > "$state/.seen-quiet-timer_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1372,7 +1385,7 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-afk-held"
   printf 'idle, awaiting upstream\n' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-held.meta"
+  write_window_meta "$state/afk-held.meta" "$window" ship
   statusf="$state/afk-held.status"
   printf 'paused: awaiting the upstream tool release\n' > "$statusf"
   register_pending_wait "$state" afk-held
@@ -1416,7 +1429,7 @@ test_paused_crew_gone_endpoint_surfaced_immediately() {
   dir=$(make_case paused-gone-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   window="test:fm-gone"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/gone.meta"
+  write_window_meta "$state/gone.meta" "$window" ship
   # The incident shape: the last status line is a legitimate declared pause.
   printf 'paused: supervising - monitor armed\n' > "$state/gone.status"
   register_pending_wait "$state" gone
@@ -1453,7 +1466,7 @@ test_paused_crew_alive_quiet_endpoint_absorbed() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-held-alive"
   printf 'idle, holding for upstream' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/held-alive.meta"
+  write_window_meta "$state/held-alive.meta" "$window" ship
   printf 'paused: holding for the upstream release\n' > "$state/held-alive.status"
   register_pending_wait "$state" held-alive
   sig=$(seen_sig "$state/held-alive.status"); printf '%s' "$sig" > "$state/.seen-held-alive_status"
@@ -1486,7 +1499,7 @@ test_paused_crew_confident_dead_agent_surfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-dead-agent"
   printf 'bare shell prompt after the agent exited' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-agent.meta"
+  write_window_meta "$state/dead-agent.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/dead-agent.status"
   register_pending_wait "$state" dead-agent
   sig=$(seen_sig "$state/dead-agent.status"); printf '%s' "$sig" > "$state/.seen-dead-agent_status"
@@ -1531,7 +1544,7 @@ test_paused_crew_ambiguous_agent_liveness_absorbed() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-ambiguous"
   printf 'idle, holding for upstream' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/ambiguous.meta"
+  write_window_meta "$state/ambiguous.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/ambiguous.status"
   register_pending_wait "$state" ambiguous
   sig=$(seen_sig "$state/ambiguous.status"); printf '%s' "$sig" > "$state/.seen-ambiguous_status"
@@ -1563,7 +1576,7 @@ test_secondmate_gone_endpoint_surfaced() {
   dir=$(make_case secondmate-gone-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   window="test:fm-2nd-gone"
-  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/2nd-gone.meta"
+  write_window_meta "$state/2nd-gone.meta" "$window" secondmate
   printf 'working: routine domain supervision\n' > "$state/2nd-gone.status"
   sig=$(seen_sig "$state/2nd-gone.status"); printf '%s' "$sig" > "$state/.seen-2nd-gone_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1587,7 +1600,7 @@ test_secondmate_dead_agent_not_probed() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-2nd-shell"
   printf 'idle awaiting external' > "$capture_file"
-  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/2nd-shell.meta"
+  write_window_meta "$state/2nd-shell.meta" "$window" secondmate
   printf 'paused: awaiting the upstream release\n' > "$state/2nd-shell.status"
   register_pending_wait "$state" 2nd-shell
   sig=$(seen_sig "$state/2nd-shell.status"); printf '%s' "$sig" > "$state/.seen-2nd-shell_status"
@@ -1636,7 +1649,7 @@ test_gone_endpoint_with_fresh_tombstone_absorbed() {
   # firing a false death wake.
   window="test:fm-tearing"
   key=$(printf '%s' "$window" | tr ':/.' '___')
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/tearing.meta"
+  write_window_meta "$state/tearing.meta" "$window" ship
   touch "$state/tearing.tearing-down"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" \
     bash -c '. "$1" && handle_gone_endpoint "test:fm-tearing"' _ "$WATCH" \
@@ -1655,7 +1668,7 @@ test_gone_endpoint_with_stale_tombstone_surfaced() {
   # still fires so the original blind spot cannot re-open.
   window="test:fm-crashed-teardown"
   key=$(printf '%s' "$window" | tr ':/.' '___')
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/crashed.meta"
+  write_window_meta "$state/crashed.meta" "$window" ship
   touch "$state/crashed.tearing-down"
   sleep 2
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_GONE=1 FM_TEARDOWN_TOMBSTONE_SECS=1 FM_STATE_OVERRIDE="$state" \
@@ -1675,7 +1688,7 @@ test_dead_agent_marker_survives_pane_redraw() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
   window="test:fm-dead-redraw"
   printf 'bare shell prompt after the agent exited' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-redraw.meta"
+  write_window_meta "$state/dead-redraw.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/dead-redraw.status"
   register_pending_wait "$state" dead-redraw
   sig=$(seen_sig "$state/dead-redraw.status"); printf '%s' "$sig" > "$state/.seen-dead-redraw_status"
@@ -1720,7 +1733,7 @@ test_afk_paused_dead_agent_surfaced_once() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-afk-dead"
   printf 'bare shell prompt after the agent exited' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-dead.meta"
+  write_window_meta "$state/afk-dead.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/afk-dead.status"
   register_pending_wait "$state" afk-dead
   sig=$(seen_sig "$state/afk-dead.status"); printf '%s' "$sig" > "$state/.seen-afk-dead_status"
@@ -1762,7 +1775,7 @@ test_afk_paused_ambiguous_agent_hands_off_plain_stale() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-afk-ambiguous"
   printf 'idle, holding for upstream' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-ambiguous.meta"
+  write_window_meta "$state/afk-ambiguous.meta" "$window" ship
   printf 'paused: awaiting the upstream release\n' > "$state/afk-ambiguous.status"
   register_pending_wait "$state" afk-ambiguous
   sig=$(seen_sig "$state/afk-ambiguous.status"); printf '%s' "$sig" > "$state/.seen-afk-ambiguous_status"

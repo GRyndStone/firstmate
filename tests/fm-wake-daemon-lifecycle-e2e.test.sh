@@ -91,16 +91,27 @@ test_routine_then_terminal_after_restart() {
     || fail "catch-all scan duplicated the already-buffered digest"
 
   # With afk active, the buffered digest flushes to the supervisor pane as ONE
-  # submission (one typed line + one Enter), then the buffer clears.
-  local sent
+  # submission (one typed line + one Enter).  Local submission is not consumer
+  # delivery: the buffer remains until the sink durably acknowledges its key.
+  local sent flush_rc=0 delivery_key
   sent="$dir/sent.log"; : > "$sent"
   : > "$dir/pane.txt"
   afk_enter "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
     FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
-    || fail "escalate_flush failed for the buffered digest"
+    || flush_rc=$?
+  [ "$flush_rc" -eq 3 ] || fail "local submission returned $flush_rc instead of awaiting sink acknowledgement"
   [ "$(grep -c '\[ENTER\]' "$sent")" -eq 1 ] || fail "buffered digest was not submitted exactly once"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a successful flush"
+  [ -s "$state/.subsuper-escalations" ] || fail "unacknowledged digest was retired before consumer delivery"
+  delivery_key=$(sed -n 's/.*\[fm-delivery=\([^]]*\)\].*/\1/p' "$sent" | tail -1)
+  [ -n "$delivery_key" ] || fail "submitted digest omitted its durable delivery key"
+  FM_STATE_OVERRIDE="$state" "$DAEMON" --ack-delivery "$delivery_key" \
+    || fail "consumer delivery acknowledgement could not be persisted"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "sink-acknowledged digest did not retire"
+  [ "$(grep -c '\[ENTER\]' "$sent")" -eq 1 ] || fail "acknowledged digest was replayed"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after consumer delivery acknowledgement"
   pass "lifecycle: routine self-handles, terminal survives a watcher restart, buffers once, no dup, injects once"
 }
 
