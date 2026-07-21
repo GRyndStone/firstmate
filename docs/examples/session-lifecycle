@@ -1,0 +1,9 @@
+# Optional local config: copy to config/session-lifecycle (gitignored).
+# Environment variables with the same names (FM_*) override these values.
+# A threshold of 0 disables that axis.
+
+compact_traffic_bytes=50000000
+compact_turn_cap=80
+rotate_traffic_bytes=100000000
+rotate_max_age_secs=14400
+rotate_forced_continuations=3

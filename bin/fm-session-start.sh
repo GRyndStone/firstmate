@@ -286,6 +286,31 @@ else
   printf 'absent\n'
 fi
 
+# Primary session lifecycle (compact/rotate counters + prior handoff).
+# Model-free evaluation; full contract in bin/fm-session-lifecycle.sh.
+subsection "Primary session lifecycle"
+if [ -x "$SCRIPT_DIR/fm-session-lifecycle.sh" ]; then
+  LIFE_EVAL=$("$SCRIPT_DIR/fm-session-lifecycle.sh" evaluate 2>/dev/null || true)
+  if [ -n "$LIFE_EVAL" ]; then
+    printf '%s\n' "$LIFE_EVAL"
+  else
+    printf '(lifecycle evaluate unavailable)\n'
+  fi
+  if [ -f "$STATE/.session-handoff" ]; then
+    printf 'handoff: present (%s)\n' "$STATE/.session-handoff"
+    if [ -f "$DATA/session-handoff.md" ]; then
+      printf 'handoff summary: %s\n' "$DATA/session-handoff.md"
+      # Bounded: counts section only (avoid dumping full inventory twice).
+      sed -n '/^## Inventory counts$/,/^## /p' "$DATA/session-handoff.md" 2>/dev/null \
+        | sed '$d' || true
+    fi
+  else
+    printf 'handoff: ABSENT\n'
+  fi
+else
+  printf '(fm-session-lifecycle.sh not present)\n'
+fi
+
 # --- 6. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then

@@ -52,8 +52,13 @@ The goal is a session that is safe to reset or destroy because everything durabl
    Graduation moves are limited to exactly three: promote a learning to the shared `AGENTS.md` via PR, fold it into `data/captain.md`, or delete a stale entry.
    Do not invent other graduation paths.
 
-5. **Report to the captain.**
-   Summarize, in plain outcome language (section 9): what was stowed and where, what was filed to the backlog, and whether the session is now safe to reset or destroy - i.e. whether every durable finding from this sweep now lives on disk rather than only in this conversation.
+5. **Write the mechanical session handoff before declaring the session safe to reset or rotate.**
+   After knowledge routing, run `bin/fm-session-lifecycle.sh write-handoff --reason stow` so direct reports, queued wakes, open decisions, and scheduled rechecks are snapshotted into `state/.session-handoff` (and `data/session-handoff.md`).
+   Session start surfaces that handoff; after a compact or rotate restart, `bin/fm-session-lifecycle.sh verify-preservation` proves the inventory still exists.
+   Full thresholds and commands live in `bin/fm-session-lifecycle.sh` and `docs/configuration.md` ("Primary session lifecycle").
+
+6. **Report to the captain.**
+   Summarize, in plain outcome language (section 9): what was stowed and where, what was filed to the backlog, whether the lifecycle handoff was written, and whether the session is now safe to reset or destroy - i.e. whether every durable finding from this sweep now lives on disk rather than only in this conversation.
    If something could not be captured yet (for example, project-intrinsic knowledge waiting on a crewmate to land it), say so explicitly rather than reporting the session fully safe.
 
 ## Scope exclusion: no skill storage
