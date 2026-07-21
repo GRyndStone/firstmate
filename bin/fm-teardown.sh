@@ -92,6 +92,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -99,26 +101,9 @@ FORCE=${2:-}
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
-WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
-T=$(grep '^window=' "$META" | cut -d= -f2-)
-PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
-BACKEND=$(fm_backend_of_meta "$META")
-if [ "$BACKEND" = orca ]; then
-  T_ORCA=$(grep '^terminal=' "$META" | tail -1 | cut -d= -f2- || true)
-  [ -n "$T_ORCA" ] && T=$T_ORCA
-fi
-HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
-PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
-# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
-# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
-TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
+LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$META") \
+  || { echo "error: cannot resolve task lifecycle generation for $ID" >&2; exit 1; }
 ORCA_PATH_MATCH_VERIFIED=0
-
-KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
-[ -n "$KIND" ] || KIND=ship
-MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
-[ -n "$MODE" ] || MODE=no-mistakes
 
 default_branch() {
   local ref branch
@@ -140,6 +125,25 @@ meta_value() {
   local meta=$1 key=$2
   fm_meta_get "$meta" "$key"
 }
+
+load_task_metadata() {
+  WT=$(meta_value "$META" worktree)
+  T=$(meta_value "$META" window)
+  PROJ=$(meta_value "$META" project)
+  BACKEND=$(fm_backend_of_meta "$META")
+  T_ORCA=$(meta_value "$META" terminal)
+  if [ "$BACKEND" = orca ] && [ -n "$T_ORCA" ]; then T=$T_ORCA; fi
+  HOME_PATH=$(meta_value "$META" home)
+  PR_URL=$(meta_value "$META" pr)
+  TASK_TMP=$(meta_value "$META" tasktmp)
+  ORCA_WORKTREE_ID=$(meta_value "$META" orca_worktree_id)
+  KIND=$(meta_value "$META" kind)
+  [ -n "$KIND" ] || KIND=ship
+  MODE=$(meta_value "$META" mode)
+  [ -n "$MODE" ] || MODE=no-mistakes
+}
+
+load_task_metadata
 
 require_orca_worktree_id() {
   local meta=$1 id
@@ -173,6 +177,71 @@ remove_grok_turnend_auth() {
   case "$token" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
   hooks_dir="${GROK_HOME:-$HOME/.grok}/hooks/fm-turn-end.d"
   rm -f "$hooks_dir/$token"
+}
+
+cleanup_recorded_partial_herdr() {  # <meta>
+  local meta=$1 session workspace tab label
+  [ "$(meta_value "$meta" spawn_partial)" = 1 ] || return 0
+  [ "$(fm_backend_of_meta "$meta")" = herdr ] || return 0
+  fm_backend_source herdr || return 1
+  tab=$(meta_value "$meta" herdr_tab_id)
+  session=$(meta_value "$meta" herdr_session)
+  workspace=$(meta_value "$meta" herdr_workspace_id)
+  label=$(meta_value "$meta" spawn_backend_label)
+  if [ -z "$tab" ]; then
+    echo "error: recorded partial herdr resource ${label:-in $workspace} has no tab id whose cleanup can be verified; preserving $meta" >&2
+    return 1
+  fi
+  if [ -z "$session" ]; then
+    session=$(fm_backend_target_of_meta "$meta")
+    session=${session%%:*}
+  fi
+  if [ -z "$workspace" ]; then workspace=${tab%%:*}; fi
+  fm_backend_herdr_cli "$session" tab close "$tab" >/dev/null 2>&1 || true
+  if ! fm_backend_herdr_tab_absent "$session" "$workspace" "$tab"; then
+    echo "error: could not verify cleanup of recorded partial herdr tab $tab in session $session; preserving $meta" >&2
+    return 1
+  fi
+}
+
+verify_recorded_endpoint_absent() {  # <meta> <task-id>
+  local meta=$1 task_id=$2 backend target tab session workspace pane
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  case "$backend" in
+    herdr)
+      if [ "$(meta_value "$meta" spawn_partial)" = 1 ]; then
+        tab=$(meta_value "$meta" herdr_tab_id)
+        session=$(meta_value "$meta" herdr_session)
+        workspace=$(meta_value "$meta" herdr_workspace_id)
+        [ -n "$tab" ] && [ -n "$session" ] && [ -n "$workspace" ] || return 2
+        fm_backend_herdr_tab_absent "$session" "$workspace" "$tab"
+        return
+      fi
+      pane=$(meta_value "$meta" herdr_pane_id)
+      [ -n "$pane" ] || pane=${target#*:}
+      session=$(meta_value "$meta" herdr_session)
+      [ -n "$session" ] || session=${target%%:*}
+      fm_backend_herdr_pane_absent "$session" "$pane"
+      ;;
+    zellij)
+      fm_backend_target_absent zellij "$target" "$(meta_value "$meta" zellij_tab_id)" "fm-$task_id"
+      ;;
+    orca)
+      target=$(meta_value "$meta" terminal)
+      if [ -z "$target" ]; then
+        [ "$(meta_value "$meta" spawn_endpoint_uncertain)" = 0 ] || return 2
+        return 0
+      fi
+      fm_backend_target_absent orca "$target"
+      ;;
+    cmux)
+      fm_backend_target_absent cmux "$target" '' "fm-$task_id"
+      ;;
+    *)
+      fm_backend_target_absent "$backend" "$target" '' "fm-$task_id"
+      ;;
+  esac
 }
 
 # Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
@@ -858,12 +927,33 @@ validate_firstmate_home_children_removal() {
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc remove_rc child_generation
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
     [ -e "$child_meta" ] || continue
     child_id=$(basename "$child_meta" .meta)
+    child_wt=$(meta_value "$child_meta" worktree)
+    child_proj=$(meta_value "$child_meta" project)
+    child_kind=$(meta_value "$child_meta" kind)
+    [ -n "$child_kind" ] || child_kind=ship
+    child_backend=$(fm_backend_of_meta "$child_meta")
+    child_generation=$(fm_reconcile_meta_generation "$child_meta") || return 1
+    if [ "$child_backend" = orca ]; then
+      child_t=$(meta_value "$child_meta" terminal)
+    else
+      child_t=$(fm_backend_target_of_meta "$child_meta")
+    fi
+    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
+      child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
+      if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+      fi
+    fi
+    fm_reconcile_teardown_begin "$sub_state" "$child_id" "$child_generation" || return 1
+    [ -f "$child_meta" ] || return 1
+    child_generation=$(fm_reconcile_meta_generation "$child_meta") || return 1
+    [ "$(fm_reconcile_record_value "$sub_state/$child_id.tearing-down" lifecycle_generation)" = "$child_generation" ] || return 1
     child_wt=$(meta_value "$child_meta" worktree)
     child_proj=$(meta_value "$child_meta" project)
     child_kind=$(meta_value "$child_meta" kind)
@@ -878,12 +968,20 @@ cleanup_firstmate_home_children() {
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+        require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" || return 1
       fi
+    elif [ "$child_kind" = secondmate ]; then
+      child_home=$(meta_value "$child_meta" home)
+      [ -n "$child_home" ] || child_home=$child_wt
+      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
+      validate_firstmate_home_children_removal "$child_home" || return 1
+    elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+      validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
     fi
+    cleanup_recorded_partial_herdr "$child_meta" || return 1
     if [ -n "$child_t" ]; then
       # Tombstone for the child home's own watcher, same contract as the main
       # task path: a mid-teardown gone endpoint is teardown, not a crew death.
-      touch "$sub_state/$child_id.tearing-down"
       if [ "$child_backend" = zellij ]; then
         # Zellij titles are scoped by the owning home tag, so forced secondmate
         # cleanup must verify child tabs as that child home, not the parent.
@@ -892,19 +990,33 @@ cleanup_firstmate_home_children() {
         fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
       fi
     fi
+    if [ "$child_backend" != orca ]; then
+      if [ "$child_backend" = zellij ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home verify_recorded_endpoint_absent "$child_meta" "$child_id" ) \
+          || { echo "error: could not verify cleanup of child $child_id $child_backend endpoint; preserving $child_meta" >&2; return 1; }
+      elif ! verify_recorded_endpoint_absent "$child_meta" "$child_id"; then
+        echo "error: could not verify cleanup of child $child_id $child_backend endpoint; preserving $child_meta" >&2
+        return 1
+      fi
+    fi
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home"
-        remove_firstmate_home "$child_home" "child firstmate home" "$child_id"
+        cleanup_firstmate_home_children "$child_home" || return 1
+        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return 1
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
       fi
-      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" || return 1
+      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" >/dev/null 2>&1 || true
+      if ! fm_backend_worktree_absent "$child_backend" "$child_orca_worktree_id" \
+        || ! verify_recorded_endpoint_absent "$child_meta" "$child_id"; then
+        echo "error: could not verify cleanup of child $child_id Orca resources; preserving $child_meta" >&2
+        return 1
+      fi
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
@@ -916,14 +1028,24 @@ cleanup_firstmate_home_children() {
           if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
             return "$child_return_rc"
           fi
-          safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+          safe_rm_rf_child_worktree "$child_wt" "$child_proj" || return 1
         fi
       else
-        safe_rm_rf_child_worktree "$child_wt" "$child_proj"
+        safe_rm_rf_child_worktree "$child_wt" "$child_proj" || return 1
       fi
     fi
-    remove_grok_turnend_auth "$sub_state" "$child_id"
-    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down"
+    fm_reconcile_lock_acquire "$sub_state" "$child_id"
+    remove_rc=0
+    if fm_reconcile_teardown_matches_locked "$sub_state" "$child_id" "$child_generation"; then
+      remove_grok_turnend_auth "$sub_state" "$child_id"
+      rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.wait-commit" "$sub_state/$child_id.probe-pulse" "$sub_state/$child_id.x-followup-op" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
+    else
+      [ "$(fm_reconcile_record_value "$sub_state/$child_id.tearing-down" lifecycle_generation)" != "$child_generation" ] \
+        || rm -f "$sub_state/$child_id.tearing-down"
+      remove_rc=3
+    fi
+    fm_reconcile_lock_release "$sub_state" "$child_id"
+    [ "$remove_rc" -eq 0 ] || return "$remove_rc"
   done
 }
 
@@ -935,62 +1057,59 @@ remove_secondmate_registry_entry() {
   mv "$tmp" "$SECONDMATE_REG"
 }
 
-if [ "$KIND" = secondmate ]; then
-  [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
-  if [ "$FORCE" = "--force" ]; then
-    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
-  fi
-fi
-
-if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
-  SUB_STATE="$HOME_PATH/state"
-  if [ -d "$SUB_STATE" ]; then
-    for child_meta in "$SUB_STATE"/*.meta; do
-      [ -e "$child_meta" ] || continue
-      echo "REFUSED: secondmate $ID still has in-flight work in $SUB_STATE." >&2
-      echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
-      exit 1
-    done
-  fi
-fi
-
-if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH"
-fi
-
-if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
-  REPORT="$DATA/$ID/report.md"
-  if [ ! -f "$REPORT" ]; then
-    echo "REFUSED: scout task $ID has no report at $REPORT." >&2
-    echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
-    exit 1
-  fi
-fi
-
-if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
-  if ! inspectable_git_worktree "$WT"; then
-    echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
-    echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
-    exit 1
-  fi
-  require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || exit 1
-  ORCA_PATH_MATCH_VERIFIED=1
-fi
-
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
-  if validate_worktree_teardown_safety; then
-    :
-  else
-    safety_rc=$?
-    if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
-      cleanup_stale_lock_for_safety_check "$WT" || exit 1
-      validate_worktree_teardown_safety || exit 1
+validate_current_task_teardown() {
+  local child_meta safety_rc
+  if [ "$KIND" = secondmate ]; then
+    [ -n "$HOME_PATH" ] || HOME_PATH=$WT
+    validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || return 1
+    if [ "$FORCE" = "--force" ]; then
+      validate_firstmate_home_children_removal "$HOME_PATH" || return 1
     else
-      exit 1
+      SUB_STATE="$HOME_PATH/state"
+      if [ -d "$SUB_STATE" ]; then
+        for child_meta in "$SUB_STATE"/*.meta; do
+          [ -e "$child_meta" ] || continue
+          echo "REFUSED: secondmate $ID still has in-flight work in $SUB_STATE." >&2
+          echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
+          return 1
+        done
+      fi
     fi
   fi
-fi
+  if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
+    REPORT="$DATA/$ID/report.md"
+    if [ ! -f "$REPORT" ]; then
+      echo "REFUSED: scout task $ID has no report at $REPORT." >&2
+      echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
+      return 1
+    fi
+  fi
+  if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+    ORCA_WORKTREE_ID=$(require_orca_worktree_id "$META") || return 1
+    if ! inspectable_git_worktree "$WT"; then
+      echo "REFUSED: Orca ship task $ID has no inspectable git worktree at ${WT:-<missing>}." >&2
+      echo "Cannot verify dirty or unlanded work; restore the worktree path or get explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    require_orca_worktree_path_match "$ORCA_WORKTREE_ID" "$WT" || return 1
+    ORCA_PATH_MATCH_VERIFIED=1
+  fi
+  if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+    if validate_worktree_teardown_safety; then
+      :
+    else
+      safety_rc=$?
+      if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
+        cleanup_stale_lock_for_safety_check "$WT" || return 1
+        validate_worktree_teardown_safety || return 1
+      else
+        return 1
+      fi
+    fi
+  fi
+}
+
+validate_current_task_teardown || exit 1
 
 # Tombstone for the watcher: everything from here to the state-file removal can
 # take the task's endpoint down (the treehouse return kills the crew's
@@ -999,7 +1118,33 @@ fi
 # (fm-watch.sh handle_gone_endpoint). Removed with the other state files below;
 # the watcher's absorb is age-bounded, so a crashed teardown cannot suppress a
 # real death past the bound.
-touch "$STATE/$ID.tearing-down"
+if [ "$KIND" != secondmate ]; then
+  fm_task_identity_bind "$STATE" "$ID" "$PROJ" || exit 1
+fi
+fm_reconcile_teardown_begin "$STATE" "$ID" "$LIFECYCLE_GENERATION" || exit 1
+CURRENT_GENERATION=$(fm_reconcile_meta_generation "$META" 2>/dev/null || true)
+if [ "$CURRENT_GENERATION" != "$LIFECYCLE_GENERATION" ]; then
+  echo "error: task $ID lifecycle changed while teardown claimed it" >&2
+  exit 1
+fi
+load_task_metadata
+ORCA_PATH_MATCH_VERIFIED=0
+validate_current_task_teardown || exit 1
+if [ "$KIND" != secondmate ]; then
+  fm_task_identity_bind "$STATE" "$ID" "$PROJ" || exit 1
+fi
+if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
+  cleanup_firstmate_home_children "$HOME_PATH" || exit 1
+fi
+
+if [ "$BACKEND" != orca ]; then
+  cleanup_recorded_partial_herdr "$META" || exit 1
+  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if ! verify_recorded_endpoint_absent "$META" "$ID"; then
+    echo "error: could not verify cleanup of task $ID $BACKEND endpoint; preserving $META" >&2
+    exit 1
+  fi
+fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
@@ -1017,7 +1162,12 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
+  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID" >/dev/null 2>&1 || true
+  if ! fm_backend_worktree_absent "$BACKEND" "$ORCA_WORKTREE_ID" \
+    || ! verify_recorded_endpoint_absent "$META" "$ID"; then
+    echo "error: could not verify cleanup of task $ID Orca resources; preserving $META" >&2
+    exit 1
+  fi
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
@@ -1041,20 +1191,29 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   }
 fi
 
-if [ "$BACKEND" != orca ]; then
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"
-  remove_secondmate_registry_entry "$ID"
+  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit 1
+  remove_secondmate_registry_entry "$ID" || exit 1
 fi
-remove_grok_turnend_auth "$STATE" "$ID"
-fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
-# Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
-[ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down"
+fm_reconcile_lock_acquire "$STATE" "$ID"
+remove_rc=0
+if fm_reconcile_teardown_matches_locked "$STATE" "$ID" "$LIFECYCLE_GENERATION"; then
+  remove_grok_turnend_auth "$STATE" "$ID"
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.wait-commit" "$STATE/$ID.probe-pulse" "$STATE/$ID.x-followup-op" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
+else
+  [ "$(fm_reconcile_record_value "$STATE/$ID.tearing-down" lifecycle_generation)" != "$LIFECYCLE_GENERATION" ] \
+    || rm -f "$STATE/$ID.tearing-down"
+  remove_rc=3
+fi
+fm_reconcile_lock_release "$STATE" "$ID"
+if [ "$remove_rc" -eq 3 ]; then
+  echo "error: task $ID lifecycle changed during teardown; preserved replacement lifecycle state" >&2
+  exit 1
+fi
+[ "$remove_rc" -eq 0 ] || exit "$remove_rc"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

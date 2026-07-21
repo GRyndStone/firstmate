@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Raw AF_UNIX subscriber for herdr's native pane.agent_status_changed stream.
+"""Raw AF_UNIX subscriber for herdr pane status and output streams.
 
 This is the WIRE TRANSPORT half of the herdr push-escalation path
 (bin/backends/herdr.sh fm_backend_herdr_wait_transition). It deliberately does
 NOT know firstmate's supervision policy: it opens ONE connection to a herdr
-session's control socket, subscribes to pane.agent_status_changed for the given
-panes (all statuses, so working/idle/done edges are seen too), and prints one
-projected line per event to stdout, flushing each so the bash caller can react
-sub-second. The bash side normalizes each line through the shared transition
-shape and applies the single-owner policy table (bin/fm-transition-lib.sh); the
-bash side also decides when to stop and kills this reader.
+session's control socket, subscribes to pane.agent_status_changed and
+pane.output_matched for the given panes, and prints one projected line per
+event to stdout, flushing each so the bash caller can react sub-second. The
+bash side normalizes status lines through the shared transition shape, applies
+the single-owner policy table, and classifies output snapshots for durable
+composer observation; it also decides when to stop and kills this reader.
 
 Wire protocol (verified: herdr 0.7.3, protocol 16, newline-delimited JSON):
   request : {"id","method":"events.subscribe","params":{"subscriptions":[
-             {"type":"pane.agent_status_changed","pane_id":P}, ...]}}\n
+             {"type":"pane.agent_status_changed","pane_id":P},
+             {"type":"pane.output_matched","pane_id":P,...}, ...]}}\n
   ack     : {"id",...,"result":{"type":"subscription_started"}}\n
   stream  : {"event":"pane.agent_status_changed",
              "data":{"pane_id","workspace_id","agent_status","agent",...}}\n
 
 Usage: herdr-eventwait.py <socket_path> <timeout_seconds> <pane_id> [<pane_id> ...]
 
-Output (one line per pane.agent_status_changed event, TAB-separated, a raw
-projection - NOT the final normalized record; the bash normalizer adds the
-from_status and builds the canonical shape):
+Output (one TAB-separated raw projection per event):
   @subscribed
   <pane_id>\t<workspace_id>\t<agent_status>\t<agent>
+  @composer\t<pane_id>\t<workspace_id>\t<json-encoded-screen-text>
 
 Exit status:
   0  streamed until the timeout elapsed with no error - a clean bounded wait;
@@ -90,9 +90,18 @@ def main(argv):
     except OSError:
         return 2
 
-    subscriptions = [
-        {"type": "pane.agent_status_changed", "pane_id": pane} for pane in panes
-    ]
+    subscriptions = []
+    for pane in panes:
+        subscriptions.append({"type": "pane.agent_status_changed", "pane_id": pane})
+        subscriptions.append(
+            {
+                "type": "pane.output_matched",
+                "pane_id": pane,
+                "source": "visible",
+                "match": {"type": "regex", "value": "."},
+                "strip_ansi": False,
+            }
+        )
     request = {
         "id": "fm-eventwait",
         "method": "events.subscribe",
@@ -133,9 +142,21 @@ def main(argv):
             message = json.loads(line.decode("utf-8", "replace"))
         except ValueError:
             continue
-        if message.get("event") != "pane.agent_status_changed":
-            continue
+        event = message.get("event")
         data = message.get("data") or {}
+        if event == "pane.output_matched":
+            read = data.get("read") or {}
+            fields = (
+                "@composer",
+                _clean(data.get("pane_id") or ""),
+                _clean(read.get("workspace_id") or ""),
+                json.dumps(read.get("text") or "", ensure_ascii=False),
+            )
+            sys.stdout.write("\t".join(fields) + "\n")
+            sys.stdout.flush()
+            continue
+        if event != "pane.agent_status_changed":
+            continue
         fields = (
             _clean(data.get("pane_id") or ""),
             _clean(data.get("workspace_id") or ""),

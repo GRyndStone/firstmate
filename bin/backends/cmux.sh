@@ -334,6 +334,47 @@ fm_backend_cmux_workspace_id_for_label() {  # <label>
     | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
 }
 
+fm_backend_cmux_workspace_inventory_all() {
+  local wins wid workspaces
+  wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>/dev/null) || return 2
+  printf '%s' "$wins" | jq -e 'type == "array" and all(.[]?; (.id | type) == "string" and (.id | length) > 0)' >/dev/null 2>&1 || return 2
+  while IFS= read -r wid; do
+    [ -n "$wid" ] || continue
+    workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>/dev/null) || return 2
+    printf '%s' "$workspaces" | jq -e '
+      (.workspaces | type) == "array"
+      and all(.workspaces[]?; (.id | type) == "string" and (.id | length) > 0 and (.title | type) == "string")
+    ' >/dev/null 2>&1 || return 2
+    printf '%s' "$workspaces" | jq -c '.workspaces[]?' 2>/dev/null || return 2
+  done < <(printf '%s' "$wins" | jq -r '.[].id' 2>/dev/null)
+}
+
+fm_backend_cmux_workspace_id_for_label_all() {
+  local label=$1 inventory
+  inventory=$(fm_backend_cmux_workspace_inventory_all) || return 2
+  printf '%s\n' "$inventory" | jq -sr --arg want "$label" \
+    '[.[]? | select(.title == $want) | .id][0] // empty' 2>/dev/null
+}
+
+fm_backend_cmux_workspace_absent() {  # <workspace-id> [expected-label]
+  local wsid=${1:-} expected_label=${2:-} title inventory
+  inventory=$(fm_backend_cmux_workspace_inventory_all) || return 2
+  if [ -n "$wsid" ] && printf '%s\n' "$inventory" | jq -se --arg id "$wsid" \
+    '[.[]? | select(.id == $id)] | length > 0' >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ -n "$expected_label" ]; then
+    title=$(fm_backend_cmux_scoped_title "$expected_label")
+    if printf '%s\n' "$inventory" | jq -se --arg title "$title" \
+      '[.[]? | select(.title == $title)] | length > 0' >/dev/null 2>&1; then
+      return 1
+    fi
+    return 0
+  fi
+  [ -n "$wsid" ] || return 2
+  return 0
+}
+
 fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
   local wsid=$1
   fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null \
@@ -357,14 +398,18 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux workspace '$title' already exists" >&2
     return 1
   fi
-  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1) || {
+  if ! out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1); then
+    wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+    sfid=
+    [ -z "$wsid" ] || sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
     echo "error: cmux new-workspace failed for '$title': $out" >&2
-    return 1
-  }
+    printf 'partial\t%s\t%s' "$wsid" "$sfid"
+    return 2
+  fi
   wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
-  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; printf 'partial\t\t'; return 2; }
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
-  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; return 1; }
+  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; printf 'partial\t%s\t' "$wsid"; return 2; }
   printf '%s %s' "$wsid" "$sfid"
 }
 
@@ -419,6 +464,9 @@ fm_backend_cmux_target_ready() {  # <target> [expected-label]
       return 1
     else
       wsid=$(fm_backend_cmux_workspace_id_for_label "$expected_title")
+      if [ -z "$wsid" ]; then
+        wsid=$(fm_backend_cmux_workspace_id_for_label_all "$expected_title") || return 1
+      fi
       [ -n "$wsid" ] || return 1
     fi
     sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")

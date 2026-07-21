@@ -25,8 +25,10 @@ export FM_ROOT_OVERRIDE="$ROOT"
 # Overrides: capture wake reasons and neutralize real sleeps (POLL is 15s).
 WAKE_LOG="$TMP/wakes"
 SLEEP_LOG="$TMP/sleeps"
+INPUT_STATE=empty
 wake() { printf '%s\n' "$1" >> "$WAKE_LOG"; return 0; }
 sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
+fm_backend_composer_state() { printf '%s' "$INPUT_STATE"; }
 
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
@@ -37,6 +39,7 @@ reset_state() {
   _event_cap_key=""
   _event_cap_ok=0
   _event_cap_fails=0
+  INPUT_STATE=empty
 }
 
 mkrec() {  # <pane_id> <status>
@@ -65,18 +68,15 @@ fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind
 [ ! -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "a failed durable enqueue must leave the blocked edge eligible for reconnect reconciliation"
 pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe marker"
 
-# --- handle_push_transition: absorb (no wake, no enqueue) for a declared pause -
+# --- handle_push_transition: paused activity requires explicit probe ownership -
 
 reset_state
 fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tk2.status"
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
-  fail "a declared-pause crew must NOT be fast-escalated: $(cat "$STATE_DIR/.wake-queue")"
-fi
-[ ! -s "$WAKE_LOG" ] || fail "a declared-pause crew must not wake the supervisor from the event fast-path"
-grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the paused absorb should be logged to the triage log"
-pass "handle_push_transition: a declared-pause crew is absorbed (no fast wake), left to the poll loop's long cadence"
+[ -s "$WAKE_LOG" ] || fail "ordinary activity on a declared pause did not wake"
+grep -q 'herdr: agent blocked' "$STATE_DIR/.wake-queue" || fail "ordinary paused activity lost its actionable push evidence"
+pass "handle_push_transition: ordinary paused endpoint activity remains fail-closed and wakes"
 
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 

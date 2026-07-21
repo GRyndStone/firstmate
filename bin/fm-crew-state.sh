@@ -11,12 +11,15 @@
 # full no-mistakes run-step attributed to this crew's branch and current HEAD,
 # or the existing coarse cross-branch status, else a hard-bounded backend read)
 # and reconciles the possibly-stale log against it.
+# Normal readers first consume a fresh endpoint-matched observation persisted
+# by that watcher cycle; the watcher uses a live-only mode to avoid feedback.
 #
-# The determinism lives entirely here - only run-step / pane / log reads plus
-# fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
+# The determinism lives entirely here - only run-step / registered-command /
+# pane / log reads plus fixed mapping logic, no heuristics and no LLM.
+# Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|idle|parked|done|blocked|paused|failed|unknown> · source: <run-step|owned-command|pane|status-log|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -28,8 +31,10 @@
 #      that coarse status to this crew.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
-#      the active step is ci, `axi status` alone cannot tell "still waiting on
+#      passed/checks-passed -> done, failed/cancelled -> failed. A cancelled
+#      validation run is historical when newer positive live evidence proves
+#      the same task is working again; a failed run remains terminal.
+#      While the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
 #      green, so a green PR is never silently read as still-validating.
@@ -38,9 +43,12 @@
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): read the recorded
-#      backend within a hard bound. Native Herdr busy|idle is authoritative, so
-#      live idle supersedes stale working history; an unproved state fails
-#      closed to unknown. Other backends retain the pane-busy/status-log fallback.
+#      task-owned command registration first, then the backend within a hard
+#      bound. An exact registered pid is working only while its task-scoped
+#      descendant tree is observably advancing. Native Herdr busy|idle remains
+#      authoritative when no owned command is active, so live idle supersedes
+#      stale working history; an unproved state fails closed to unknown. Other
+#      backends retain the pane-busy/status-log fallback.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -60,6 +68,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 ID=${1:-}
 [ -n "$ID" ] || { echo "usage: fm-crew-state.sh <id>" >&2; exit 2; }
@@ -160,6 +170,41 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
+META_GENERATION=$(fm_reconcile_meta_generation "$META" 2>/dev/null || true)
+
+# Normal point-in-time readers consume the durable watcher's fresh reconciled
+# observation, which includes the live source that superseded a stale event log.
+# The watcher itself sets FM_CREW_STATE_LIVE_ONLY=1 through fm-reconcile-lib.sh
+# so its classification cycle always reads the underlying run-step/backend and
+# can discover the next transition instead of feeding the persisted state back
+# into itself.
+if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
+  RECONCILED="$STATE/$ID.reconciled"
+  if [ -f "$RECONCILED" ]; then
+    reconciled_endpoint=$(fm_reconcile_record_value "$RECONCILED" endpoint)
+    reconciled_state=$(fm_reconcile_record_value "$RECONCILED" state)
+    reconciled_source=$(fm_reconcile_record_value "$RECONCILED" source)
+    reconciled_generation=$(fm_reconcile_record_value "$RECONCILED" lifecycle_generation)
+    reconciled_detail=$(fm_reconcile_record_value "$RECONCILED" detail)
+    reconciled_observed=$(fm_reconcile_record_value "$RECONCILED" observed_at)
+    case "$reconciled_observed" in ''|*[!0-9]*) reconciled_observed=0 ;; esac
+    reconciled_age=$(( $(date +%s) - reconciled_observed ))
+    [ "$reconciled_age" -ge 0 ] || reconciled_age=0
+    reconciled_fresh_secs=${FM_RECONCILE_FRESH_SECS:-60}
+    case "$reconciled_fresh_secs" in ''|*[!0-9]*|0) reconciled_fresh_secs=60 ;; esac
+    if [ -n "$BACKEND_TARGET" ] \
+      && [ "$reconciled_endpoint" = "$BACKEND_TARGET" ] \
+      && [ -n "$META_GENERATION" ] && [ "$reconciled_generation" = "$META_GENERATION" ] \
+      && [ -n "$reconciled_state" ] \
+      && [ "$reconciled_source" != owned-command ] \
+      && [ "$reconciled_observed" -gt 0 ] \
+      && [ "$reconciled_age" -le "$reconciled_fresh_secs" ]; then
+      emit "$reconciled_state" "${reconciled_source:-none}" \
+        "${reconciled_detail:-reconciled live observation}${SEP}reconciled ${reconciled_age}s ago"
+    fi
+  fi
+fi
+
 backend_busy_state_bounded() {
   # shellcheck disable=SC2016 # Positional parameters expand inside the child bash.
   bounded_run "$BACKEND_TIMEOUT" bash -c \
@@ -223,6 +268,34 @@ herdr_pane_state() {
   else
     HERDR_PANE_STATE=idle
   fi
+}
+
+owned_command_live_override() {
+  local owned_command_detail
+  [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ] || return 0
+  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+  if [ -n "$owned_command_detail" ]; then
+    emit working owned-command "$owned_command_detail${1:+${SEP}$1}"
+  fi
+}
+
+cancelled_run_live_override() {
+  owned_command_live_override 'cancelled validation run superseded'
+  [ -n "$BACKEND_TARGET" ] || return 0
+  case "$TASK_BACKEND" in
+    herdr)
+      herdr_pane_state
+      if [ "$HERDR_PANE_READABLE" -eq 1 ] && [ "$HERDR_PANE_STATE" = busy ]; then
+        emit working pane "harness busy${SEP}cancelled validation run superseded"
+      fi
+      ;;
+    *)
+      pane_readable_bounded || return 0
+      if [ "$KIND" != secondmate ] && crew_pane_is_busy_bounded; then
+        emit working pane "harness busy${SEP}cancelled validation run superseded"
+      fi
+      ;;
+  esac
 }
 
 # --- no-mistakes run lookup (authoritative when a run matches this branch) --
@@ -494,6 +567,7 @@ fi
 if [ "$HAVE_RUN" = 1 ]; then
   RUN_STATE=working
   RUN_DETAIL=""
+  RUN_CANCELLED=0
   CI_STEP_STATUS=""
   CI_LOG_STATE=""
   RUN_STATUS=""
@@ -509,7 +583,7 @@ if [ "$HAVE_RUN" = 1 ]; then
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
       completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
       failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
       *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
     esac
   else
@@ -526,7 +600,7 @@ if [ "$HAVE_RUN" = 1 ]; then
         passed)        RUN_STATE="done"; RUN_DETAIL="run passed: PR merged/closed" ;;
         checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
         failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
-        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;
+        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
         *)             RUN_STATE=unknown; RUN_DETAIL="outcome: $outcome" ;;
       esac
     elif [ -n "$awaiting" ] || [ "$status" = awaiting_approval ] || [ "$status" = fix_review ] || [ -n "$gate_status" ] || [ "$has_gate" = 1 ]; then
@@ -550,7 +624,7 @@ if [ "$HAVE_RUN" = 1 ]; then
         running|fixing) RUN_STATE=working; RUN_DETAIL="validating ($status)" ;;
         completed)      RUN_STATE="done"; RUN_DETAIL="run completed" ;;
         failed)         RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
         "")             RUN_STATE=working; RUN_DETAIL="run active" ;;
         *)              RUN_STATE=working; RUN_DETAIL="run active ($status)" ;;
       esac
@@ -571,6 +645,13 @@ if [ "$HAVE_RUN" = 1 ]; then
       fi
     fi
   fi
+
+  case "$RUN_STATE" in
+    done|failed) ;;
+    *) owned_command_live_override 'run-step superseded by progressing task-owned command' ;;
+  esac
+
+  [ "$RUN_CANCELLED" -eq 0 ] || cancelled_run_live_override
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then
@@ -607,11 +688,19 @@ if [ "$HAVE_RUN" = 1 ]; then
   emit "$RUN_STATE" run-step "$RUN_DETAIL"
 fi
 
+if [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ]; then
+  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+  [ -z "$owned_command_detail" ] || emit working owned-command "$owned_command_detail"
+fi
+
 # --- fallback: no run attributed to this crew ------------------------------
 # The run-step path above already handled any crew with a run, regardless of pane
 # liveness, so a finished-but-pane-closed crew never reaches here. Down here there
-# is no run to consult, so a dead/unreadable target means the crew is gone: report
-# unknown rather than trusting a possibly-stale status log as the current state.
+# is no run to consult.  A validated task-owned background command can outlive
+# an idle foreground harness and remains positive working evidence only while
+# its exact pid/descendant progress is fresh.  Without that evidence, a dead or
+# unreadable target means the crew is gone: report unknown rather than trusting
+# a possibly-stale status log as the current state.
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
 if [ "$TASK_BACKEND" = herdr ]; then
   herdr_pane_state

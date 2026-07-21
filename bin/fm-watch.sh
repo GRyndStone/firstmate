@@ -14,9 +14,10 @@
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
 #                          is not provably working, unless afk is active
-#   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
-#                          timer) regardless of what the status log says - an active
-#                          run-step or busy pane outranks even a captain-relevant log
+#   stale: <window>        a provably-working stale is ALWAYS absorbed regardless
+#                          of what the status log says - an active
+#                          run-step, busy pane, or progressing owned command
+#                          outranks even a captain-relevant log
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
@@ -28,14 +29,15 @@
 #                          that decision). Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
-#                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
-#                          consecutive escalations on the SAME pane, the reason
-#                          also carries a "demand-deep-inspection" marker so the
-#                          wake payload itself, not just repetition, forces a
-#                          closer look instead of another routine supervision
-#                          resume. Unless afk is active. A stale reason carrying
+#                          both surfaced at once. A previously working stale whose
+#                          positive run-step/pane/owned-command evidence disappears at the wedge
+#                          threshold surfaces with an "escalation N" count; at
+#                          FM_WEDGE_DEMAND_INSPECT_COUNT consecutive escalations on
+#                          the SAME pane, the reason also carries a
+#                          "demand-deep-inspection" marker. Current positive busy
+#                          evidence always resets the timer and stays quiet, even
+#                          when the pane hash is unchanged. Unless afk is active.
+#                          A stale reason carrying
 #                          "endpoint-gone" (the recorded endpoint no longer
 #                          exists) or "agent-dead" (the endpoint exists but the
 #                          agent process is confidently dead) means the crew
@@ -80,6 +82,12 @@ mkdir -p "$STATE"
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
 # shellcheck source=bin/fm-transition-lib.sh
 . "$SCRIPT_DIR/fm-transition-lib.sh"
+# Durable reconciled task/endpoint observations.  This is evaluated once for
+# every recorded task at the start of every classification cycle, before sparse
+# status/turn-end events are triaged, so an old status event can never mask a
+# newer positive working -> stopped/parked/terminal transition.
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -111,6 +119,15 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+case "$CHECK_TIMEOUT" in ''|*[!0-9]*|0) CHECK_TIMEOUT=30 ;; esac
+RECONCILE_CREW_READ_TIMEOUT=${FM_RECONCILE_CREW_READ_TIMEOUT:-35}
+case "$RECONCILE_CREW_READ_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_CREW_READ_TIMEOUT=35 ;; esac
+RECONCILE_TASK_TIMEOUT=${FM_RECONCILE_TASK_TIMEOUT:-$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT))}
+case "$RECONCILE_TASK_TIMEOUT" in ''|*[!0-9]*|0) RECONCILE_TASK_TIMEOUT=$((RECONCILE_CREW_READ_TIMEOUT + CHECK_TIMEOUT)) ;; esac
+RECONCILE_MAX_WORKERS=${FM_RECONCILE_MAX_WORKERS:-8}
+case "$RECONCILE_MAX_WORKERS" in ''|*[!0-9]*|0) RECONCILE_MAX_WORKERS=8 ;; esac
+RECONCILE_BATCH_DIR=
+RECONCILE_BATCH_PIDS=
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -127,18 +144,20 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
 # while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
+# no-mistakes step, a busy pane, or a progressing task-owned command, via
+# crew_is_provably_working over
 # fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
 # busy pane is SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
 # signal, a no-verb signal whose crew is not provably working, any check, a stale
-# pane whose crew is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
+# pane whose crew is not provably working, a stale whose positive working evidence
+# disappeared at its recheck threshold, or anything unknown) is written to the
+# durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
-STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a stale hash revalidates positive working evidence
 # A crew that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
@@ -277,10 +296,9 @@ window_key() {  # <target>
 }
 
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
-# (default 3): a pane that keeps re-wedging on the SAME stale hash - each
-# escalation gets absorbed again as "still validating" one poll later, since the
-# hash never changes - can otherwise repeat forever with no signal that this is
-# no longer a one-off. At the threshold, wedge_timer_check appends a
+# (default 3) after its positive working evidence has disappeared. A pane that
+# keeps re-wedging on the SAME stale hash can otherwise repeat forever with no
+# signal that this is no longer a one-off. At the threshold, wedge_timer_check appends a
 # "demand-deep-inspection" marker to the wake payload so the wake reason itself
 # (not just repetition the supervisor has to notice on its own) forces a closer
 # look instead of another routine supervision resume. Reset wherever a window's
@@ -288,16 +306,29 @@ window_key() {  # <target>
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
-# Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
-# absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
-# watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
-# state (the costly check already ran once, at classification time). Shared by
+registered_process_transition_due() {  # <task>
+  local task=$1 record now
+  [ -n "$task" ] || return 1
+  record="$STATE/$task.reconciled"
+  [ -f "$record" ] || return 1
+  fm_reconcile_wait_load "$STATE" "$task"
+  [ "$FM_RECONCILE_WAIT_KIND" = process ] || return 1
+  now=$(date +%s)
+  fm_reconcile_wait_evaluate "$record" "$now"
+  case "$FM_RECONCILE_WAIT_RESULT" in complete|failed) return 0 ;; esac
+  return 1
+}
+
+# Repeat-poll stale-timer bookkeeping for an already-classified hash absorbed as
+# provably-working. It repairs a missing/corrupt timer, then revalidates current
+# working evidence once STALE_ESCALATE_SECS has elapsed. Positive evidence resets
+# the timer and remains quiet even when pane content is unchanged; only loss of
+# that evidence can escalate. Shared by
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
-# line that an active run/busy pane outranked).
+# line that an active run/busy pane/owned command outranked).
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason task
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -307,15 +338,24 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
-        echo "$n" > "$escalation_file"
-        reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
-        if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
-          reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+        task=$(window_to_task "$win" "$STATE")
+        if crew_is_provably_working "$task"; then
+          date +%s > "$since_file"
+          rm -f "$escalation_file"
+          triage_log "absorbed $label after threshold (positive working evidence still current): $win"
+        elif registered_process_transition_due "$task"; then
+          triage_log "deferred $label to authoritative process reconciliation: $win"
+        else
+          n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > "$escalation_file"
+          reason="stale: $win (idle ${age}s, positive working evidence disappeared, possible wedge, escalation $n)"
+          if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
+            reason="stale: $win (idle ${age}s, positive working evidence disappeared, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row)"
+          fi
+          fm_wake_append stale "$win" "$reason" || exit 1
+          rm -f "$since_file"
+          wake "$reason"
         fi
-        fm_wake_append stale "$win" "$reason" || exit 1
-        rm -f "$since_file"
-        wake "$reason"
       fi
       ;;
   esac
@@ -380,7 +420,7 @@ clear_pause_tracking() {  # <window>
 # pause and regardless of afk. docs/architecture.md ("Event-driven supervision")
 # owns the classification rule.
 handle_gone_endpoint() {  # <window>
-  local w=$1 key marker reason meta tomb tomb_mtime tomb_age
+  local w=$1 key marker reason meta tomb tomb_age task
   key=$(window_key "$w")
   marker="$STATE/.endpoint-gone-$key"
   if fm_backend_target_exists "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null; then
@@ -400,10 +440,10 @@ handle_gone_endpoint() {  # <window>
   # unreadable stamp means a crashed teardown, and the death surfaces normally.
   tomb="${meta%.meta}.tearing-down"
   if [ -e "$tomb" ]; then
-    tomb_mtime=$(stat_mtime "$tomb")
-    case "$tomb_mtime" in ''|*[!0-9]*) tomb_mtime=0 ;; esac
-    tomb_age=$(( $(date +%s) - tomb_mtime ))
-    if [ "$tomb_mtime" -gt 0 ] && [ "$tomb_age" -lt "$TEARDOWN_TOMBSTONE_SECS" ]; then
+    task=${meta##*/}
+    task=${task%.meta}
+    tomb_age=$(age_of "$tomb")
+    if fm_reconcile_tombstone_active "$STATE" "$task"; then
       triage_log "absorbed endpoint-gone (teardown in progress, tombstone ${tomb_age}s old): $w"
       return 0
     fi
@@ -539,6 +579,229 @@ scan_signals() {
     fi
   done
   return 0
+}
+
+reconcile_terminate_descendants() {  # <pid>
+  local pid=$1 children descendant
+  children=$(pgrep -P "$pid" 2>/dev/null || true)
+  for descendant in $children; do
+    reconcile_terminate_descendants "$descendant"
+    kill -TERM "$descendant" 2>/dev/null || true
+  done
+}
+
+reconcile_worker_signal_cleanup() {
+  local active
+  for active in ${child:-} $(jobs -pr 2>/dev/null); do
+    reconcile_terminate_descendants "$active"
+    kill -TERM "$active" 2>/dev/null || true
+  done
+  for active in ${child:-} $(jobs -pr 2>/dev/null); do
+    wait "$active" 2>/dev/null || true
+  done
+}
+
+reconcile_worker() {  # <id>
+  local id=$1 child='' worker_rc
+  trap 'reconcile_worker_signal_cleanup; exit 143' TERM INT HUP
+  # shellcheck disable=SC2016
+  fm_reconcile_bounded "$RECONCILE_TASK_TIMEOUT" bash -c '
+    export FM_RECONCILE_CREW_STATE_BIN=$1
+    export FM_EXTERNAL_WAIT_TIMEOUT=$2
+    export FM_LEGACY_CHECK_TIMEOUT=$3
+    . "$4"
+    fm_reconcile_observe "$5" "$6"
+  ' _ "$FM_RECONCILE_CREW_STATE_BIN" "$FM_EXTERNAL_WAIT_TIMEOUT" "$CHECK_TIMEOUT" \
+    "$SCRIPT_DIR/fm-reconcile-lib.sh" "$STATE" "$id" &
+  child=$!
+  if wait "$child"; then worker_rc=0; else worker_rc=$?; fi
+  child=
+  trap - TERM INT HUP
+  return "$worker_rc"
+}
+
+reconcile_batch_cleanup() {
+  local pid file batch_dir=$RECONCILE_BATCH_DIR live_pids
+  live_pids="$RECONCILE_BATCH_PIDS $(jobs -pr 2>/dev/null)"
+  for pid in $live_pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $live_pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  RECONCILE_BATCH_PIDS=
+  case "$batch_dir" in
+    "$STATE"/.reconcile-cycle.*)
+      for file in "$batch_dir"/*.id "$batch_dir"/*.generation "$batch_dir"/*.out "$batch_dir"/*.err "$batch_dir"/*.rc; do
+        [ -e "$file" ] && rm -f "$file"
+      done
+      rmdir "$batch_dir" 2>/dev/null || true
+      ;;
+  esac
+  RECONCILE_BATCH_DIR=
+}
+
+watch_cleanup() {
+  reconcile_batch_cleanup
+  fm_lock_release "$WATCH_LOCK"
+}
+
+enqueue_reconciled_action() {  # <id> <token> <version> <evidence>
+  local selected_id=$1 selected_token=$2 selected_version=$3 selected_evidence=$4
+  local meta pending pending_version notified notified_version record_repository record_generation current_generation
+  local kind identity_failure_delivery target marker reason queue_rc=0
+  FM_RECONCILED_WAKE_REASON=
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_reconcile_lock_acquire "$STATE" "$selected_id"
+  meta="$STATE/$selected_id.meta"
+  if [ ! -f "$meta" ] || fm_reconcile_tombstone_active "$STATE" "$selected_id"; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 3
+  fi
+  pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_version)
+  notified=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_token)
+  notified_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_version)
+  record_repository=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" repository_identity)
+  record_generation=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" lifecycle_generation)
+  current_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  kind=$(fm_reconcile_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  identity_failure_delivery=0
+  case "$selected_token:$selected_evidence" in
+    observer:*:failed:observer-failure\ \(repository\ identity\ cannot\ be\ resolved\ for\ *) identity_failure_delivery=1 ;;
+  esac
+  if [ "$pending" != "$selected_token" ] || [ "$pending_version" != "$selected_version" ] \
+    || { [ "$notified" = "$selected_token" ] && [ "$notified_version" = "$selected_version" ]; } \
+    || [ -z "$record_generation" ] || [ "$record_generation" != "$current_generation" ] \
+    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ] && [ "$identity_failure_delivery" -ne 1 ]; }; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 3
+  fi
+  target=$(fm_backend_target_of_meta "$meta")
+  [ -n "$target" ] || target="fm-$selected_id"
+  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token" "$selected_version")
+  reason="stale: $target $selected_evidence $marker"
+  fm_wake_append_locked stale "$target" "$reason" || queue_rc=$?
+  if [ "$queue_rc" -eq 0 ]; then
+    fm_reconcile_advance_seen "$STATE" "$selected_id" || queue_rc=$?
+  fi
+  if [ "$queue_rc" -eq 0 ]; then
+    mark_surfaced "$STATE/$selected_id.status"
+  fi
+  fm_reconcile_lock_release "$STATE" "$selected_id"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  [ "$queue_rc" -eq 0 ] || return "$queue_rc"
+  FM_RECONCILED_WAKE_REASON=$reason
+}
+
+deliver_reconciled_action() {  # <id> <token> <version> <evidence>
+  local deliver_rc=0
+  if enqueue_reconciled_action "$@"; then
+    wake "$FM_RECONCILED_WAKE_REASON"
+  else
+    deliver_rc=$?
+  fi
+  [ "$deliver_rc" -eq 3 ] && return 0
+  return "$deliver_rc"
+}
+
+# Observe every task's deterministic current state in one bounded parallel batch
+# and surface the first pending transition or external-wait action.
+# fm-reconcile-lib.sh persists each state and pending token before returning.
+# The watcher appends the wake and advances only the represented sparse event
+# signatures; the daemon or queue drain acknowledges the token after durable
+# consumer handoff.
+reconcile_cycle() {
+  local meta id target out tag token version evidence reason marker worker_rc failure_evidence err_tail expected_generation
+  local batch_dir pids='' indexes='' pid worker_index active_count=0 index=0 selected_id='' selected_token='' selected_version='' selected_evidence=''
+  local pending pending_version notified notified_version record_repository record_generation current_generation kind identity_failure_delivery queue_rc=0
+  batch_dir=$(mktemp -d "$STATE/.reconcile-cycle.XXXXXX") || exit 1
+  RECONCILE_BATCH_DIR=$batch_dir
+  RECONCILE_BATCH_PIDS=
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    index=$((index + 1))
+    printf '%s\n' "$id" > "$batch_dir/$index.id" || exit 1
+    expected_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+    printf '%s\n' "$expected_generation" > "$batch_dir/$index.generation" || exit 1
+    reconcile_worker "$id" > "$batch_dir/$index.out" 2> "$batch_dir/$index.err" &
+    pid=$!
+    pids="${pids:+$pids }$pid"
+    indexes="${indexes:+$indexes }$index"
+    active_count=$((active_count + 1))
+    RECONCILE_BATCH_PIDS=$pids
+    if [ "$active_count" -ge "$RECONCILE_MAX_WORKERS" ]; then
+      pid=${pids%% *}
+      worker_index=${indexes%% *}
+      if wait "$pid"; then worker_rc=0; else worker_rc=$?; fi
+      printf '%s\n' "$worker_rc" > "$batch_dir/$worker_index.rc" || exit 1
+      case "$pids" in *' '*) pids=${pids#* }; indexes=${indexes#* } ;; *) pids=; indexes= ;; esac
+      active_count=$((active_count - 1))
+      RECONCILE_BATCH_PIDS=$pids
+    fi
+  done
+  while [ "$active_count" -gt 0 ]; do
+    pid=${pids%% *}
+    worker_index=${indexes%% *}
+    if wait "$pid"; then worker_rc=0; else worker_rc=$?; fi
+    printf '%s\n' "$worker_rc" > "$batch_dir/$worker_index.rc" || exit 1
+    case "$pids" in *' '*) pids=${pids#* }; indexes=${indexes#* } ;; *) pids=; indexes= ;; esac
+    active_count=$((active_count - 1))
+    RECONCILE_BATCH_PIDS=$pids
+  done
+  RECONCILE_BATCH_PIDS=
+  index=1
+  while [ -f "$batch_dir/$index.id" ]; do
+    id=$(cat "$batch_dir/$index.id")
+    expected_generation=$(cat "$batch_dir/$index.generation" 2>/dev/null || true)
+    out=$(cat "$batch_dir/$index.out" 2>/dev/null || true)
+    worker_rc=$(cat "$batch_dir/$index.rc" 2>/dev/null || echo 125)
+    if [ "$worker_rc" -ne 0 ]; then
+      case "$worker_rc" in
+        124) failure_evidence="task state observer timed out after ${RECONCILE_TASK_TIMEOUT}s" ;;
+        125) failure_evidence='task state observer has no bounded runner' ;;
+        *) failure_evidence="task state observer exited with status $worker_rc" ;;
+      esac
+      err_tail=$(tail -1 "$batch_dir/$index.err" 2>/dev/null || true)
+      [ -z "$err_tail" ] || failure_evidence="$failure_evidence: $err_tail"
+      if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" "$failure_evidence" "$expected_generation"); then
+        reconcile_batch_cleanup
+        exit 1
+      fi
+    elif [ -n "$out" ]; then
+      IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+      case "$version" in ''|*[!A-Za-z0-9._:-]*) tag=malformed ;; esac
+      case "$out" in *$'\n'*) tag=malformed ;; esac
+      if [ "$tag" != action ] || [ -z "$token" ]; then
+        if ! out=$(fm_reconcile_observer_failure "$STATE" "$id" 'task state observer returned malformed output' "$expected_generation"); then
+          reconcile_batch_cleanup
+          exit 1
+        fi
+      fi
+    fi
+    index=$((index + 1))
+    [ -n "$out" ] || continue
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || continue
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) continue ;; esac
+    if [ -z "$selected_id" ]; then
+      selected_id=$id
+      selected_token=$token
+      selected_version=$version
+      selected_evidence=$evidence
+    fi
+  done
+  reconcile_batch_cleanup
+  [ -n "$selected_id" ] || return 0
+  deliver_reconciled_action "$selected_id" "$selected_token" "$selected_version" "$selected_evidence" || exit $?
 }
 
 run_check() {
@@ -683,30 +946,111 @@ event_wait_or_sleep() {
 
 # handle_push_transition: act on a fresh actionable (blocked) transition record
 # the backend returned. Maps the pane back to its window and task, applies the
-# declared-pause exemption (a crew waiting on a known external dependency is not
-# a surprise block - absorb it on the poll loop's long pause cadence instead),
-# and otherwise enqueues an immediate `stale` wake and wakes the supervisor. The
+# explicit background-probe exemption, and otherwise enqueues an immediate
+# `stale` wake and wakes the supervisor. The
 # `stale` kind is deliberate: the supervisor's handler for it ("peek the pane to
 # diagnose") is exactly right for a blocked crew, and the drain/dedupe/guard
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task reason
+  local backend=$1 session=$2 record=$3 pane_id to transition_origin window task reason input_state input_state_after
+  local rejection out tag token version evidence enqueue_rc observe_rc
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
+  transition_origin=$(fm_transition_workspace_id "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    triage_log "absorbed push $to (declared pause, awaiting external): $window"
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+  input_state=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state=unknown
+  if [ "$input_state" = empty ] && [ -n "$task" ] \
+    && fm_reconcile_background_probe_active "$STATE" "$task"; then
+    if fm_reconcile_background_probe_observe_composer "$STATE" "$task" "$window" empty >/dev/null; then
+      :
+    else
+      observe_rc=$?
+      [ "$observe_rc" -eq 2 ] || exit 1
+    fi
+  fi
+  if [ "$transition_origin" != @level ] \
+    && [ "$input_state" = empty ] \
+    && [ -n "$task" ] \
+    && fm_reconcile_background_probe_can_absorb "$STATE" "$task" "$window"; then
+    input_state_after=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state_after=unknown
+  else
+    input_state_after=unknown
+  fi
+  if [ "$input_state_after" = empty ]; then
+    triage_log "absorbed push $to (owned background probe returned to identical pause): $window"
     return
+  fi
+  rejection=${FM_RECONCILE_BACKGROUND_PROBE_REJECTION:-}
+  if [ "$input_state" != empty ]; then
+    rejection="composer state was $input_state"
+  elif [ "$transition_origin" = @level ]; then
+    rejection='blocked state came from a reconnect level read'
+  elif [ "$input_state_after" != unknown ] && [ "$input_state_after" != empty ]; then
+    rejection="composer state changed to $input_state_after during pulse validation"
+  fi
+  if [ -n "$task" ] && fm_reconcile_background_probe_active "$STATE" "$task"; then
+    if ! out=$(fm_reconcile_background_probe_invalidate "$STATE" "$task" \
+      "blocked push was not owned by an exact one-shot pulse${rejection:+: $rejection}"); then
+      exit 1
+    fi
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || exit 1
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) exit 1 ;; esac
+    if enqueue_reconciled_action "$task" "$token" "$version" "$evidence"; then
+      :
+    else
+      enqueue_rc=$?
+      [ "$enqueue_rc" -eq 3 ] || exit "$enqueue_rc"
+      return
+    fi
+    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+    wake "$FM_RECONCILED_WAKE_REASON"
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
   mark_surfaced "$STATE/$task.status"
   wake "$reason"
+}
+
+observe_background_probe_composer_inputs() {
+  local meta id backend endpoint composer out observe_rc tag token version evidence enqueue_rc
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=${meta##*/}
+    id=${id%.meta}
+    fm_reconcile_background_probe_active "$STATE" "$id" || continue
+    backend=$(fm_backend_of_meta "$meta")
+    [ "$backend" = herdr ] || continue
+    endpoint=$(fm_backend_target_of_meta "$meta")
+    [ -n "$endpoint" ] || continue
+    composer=$(fm_backend_composer_state "$backend" "$endpoint" 2>/dev/null) || composer=unknown
+    if out=$(fm_reconcile_background_probe_observe_composer "$STATE" "$id" "$endpoint" "$composer"); then
+      [ -n "$out" ] || continue
+    else
+      observe_rc=$?
+      [ "$observe_rc" -eq 2 ] && continue
+      exit "$observe_rc"
+    fi
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || exit 1
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) exit 1 ;; esac
+    if enqueue_reconciled_action "$id" "$token" "$version" "$evidence"; then
+      :
+    else
+      enqueue_rc=$?
+      [ "$enqueue_rc" -eq 3 ] && continue
+      exit "$enqueue_rc"
+    fi
+    wake "$FM_RECONCILED_WAKE_REASON"
+  done
 }
 
 # Accept ownership only from a wrapper that declares its live process identity.
@@ -744,7 +1088,7 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+if ! fm_lock_try_acquire "$WATCH_LOCK" 1; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -763,7 +1107,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'fm_lock_release "$WATCH_LOCK"' EXIT
+trap watch_cleanup EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
@@ -799,6 +1143,12 @@ while :; do
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   touch "$STATE/.last-watcher-beat"
 
+  # Authoritative durable task-state transition classification.  This precedes
+  # check/status/stale cadence paths and therefore does not depend on a heartbeat,
+  # pane hash becoming stale, or a fresh status append.
+  reconcile_cycle
+  observe_background_probe_composer_inputs
+
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed
@@ -808,7 +1158,14 @@ while :; do
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     for c in "$STATE"/*.check.sh; do
+      check_id=
       [ -e "$c" ] || continue
+      check_id=${c##*/}
+      check_id=${check_id%.check.sh}
+      if [ -f "$STATE/$check_id.meta" ] \
+        || fm_reconcile_legacy_check_is_managed "$STATE" "$check_id" "$c"; then
+        continue
+      fi
       out=$(run_check "$c")
       if [ -n "$out" ]; then
         reason="check: $c: $out"
@@ -923,7 +1280,15 @@ EOF
       if [ "$n" -ge 2 ] && ! window_is_busy "$w" "$tail40"; then
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
-        if [ "$kind" = secondmate ]; then
+        if [ "$kind" != secondmate ] && fm_reconcile_is_quiet_notified "$STATE" "$task" "$w"; then
+          # Durable reconciliation already surfaced and acknowledged this exact
+          # task/endpoint's current non-working state.  Pane staleness is
+          # downstream evidence for the same transition, not a second wake.
+          # A later positive working observation removes this exemption.
+          printf '%s' "$h" > "$sf"
+          rm -f "$ssf" "$ewf"
+          triage_log "absorbed stale (reconciled transition already notified): $w"
+        elif [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
             *)      clear_pause_tracking "$w" ;;
@@ -966,7 +1331,7 @@ EOF
           # poll. Root cause of the 2026-07 herdr false-surface incidents: a
           # validating crew was surfaced as stale every few minutes despite an
           # actively-running pipeline, purely because of this stale leftover
-          # line. On a NEW hash, give an active run/busy pane (the same
+          # line. On a NEW hash, give an active run/busy pane/owned command (the same
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
@@ -997,8 +1362,8 @@ EOF
           # on first sight, never every poll) via crew_absorb_class, which returns
           # BOTH absorb reasons from one fm-crew-state.sh read:
           #   - working: an actively-running pipeline legitimately sits on a static
-          #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
-          #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
+          #     pane (e.g. waiting on CI), so absorb and start the bounded revalidation
+          #     timer; unchanged positive evidence remains quiet at every recheck;
           #   - paused: the crew DECLARED an external wait (paused:), or its run
           #     finished green with park-anchor evidence (a declared pause or an
           #     armed check; crew_absorb_class), so absorb on the long

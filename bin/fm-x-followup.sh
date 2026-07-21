@@ -104,35 +104,18 @@ case "${1:-}" in
 esac
 
 FINAL=0
+IMAGE_PATH=
+TS_ARGS=()
+CHECK_ARGC=0
 if [ "${1:-}" = --check ]; then
   MODE=check
   ID=${2:-}
-  if [ -z "$ID" ] || [ "$#" -gt 2 ]; then usage; exit 2; fi
+  CHECK_ARGC=$#
+  if [ -z "$ID" ]; then usage; exit 2; fi
 else
   ID=${1:-}
   if [ -z "$ID" ]; then usage; exit 2; fi
   shift
-  TS_ARGS=()
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --final)
-        FINAL=1
-        ;;
-      --image)
-        TS_ARGS+=("$1")
-        shift
-        if [ "$#" -lt 1 ] || [ -z "$1" ]; then
-          echo "fm-x-followup: missing --image path" >&2
-          usage
-          exit 2
-        fi
-        TS_ARGS+=("$1")
-        ;;
-      *) TS_ARGS+=("$1") ;;
-    esac
-    shift
-  done
-  if [ "${#TS_ARGS[@]}" -lt 1 ]; then usage; exit 2; fi
 fi
 
 case "$ID" in
@@ -140,6 +123,51 @@ case "$ID" in
 esac
 
 META="$STATE/$ID.meta"
+FOLLOWUP_OP="$STATE/$ID.x-followup-op"
+FOLLOWUP_LOCK_HELD=0
+PAYLOAD_TEXT=
+PAYLOAD_IMAGE=
+IMAGE_PAYLOAD_FILE=
+REQUEST_BODY_FILE=
+followup_operation_value() {  # <key>
+  fm_reconcile_record_value "$FOLLOWUP_OP" "$1"
+}
+
+followup_delivery_finalize() {
+  local op_final=$1 new_count
+  new_count=$((COUNT + 1))
+  if [ "$op_final" = 1 ] || [ "$new_count" -ge "$MAX_COUNT" ]; then
+    if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
+      return 1
+    fi
+  elif ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" set "$new_count"; then
+    if ! fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
+      return 1
+    fi
+    echo "fm-x-followup: warning: posted but could not record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
+  fi
+  rm -f "$FOLLOWUP_OP"
+}
+
+# shellcheck disable=SC2329
+followup_lock_release() {
+  [ -z "$PAYLOAD_TEXT" ] || rm -f "$PAYLOAD_TEXT"
+  [ -z "$PAYLOAD_IMAGE" ] || rm -f "$PAYLOAD_IMAGE"
+  [ -z "$IMAGE_PAYLOAD_FILE" ] || rm -f "$IMAGE_PAYLOAD_FILE"
+  [ -z "$REQUEST_BODY_FILE" ] || rm -f "$REQUEST_BODY_FILE"
+  if [ "$FOLLOWUP_LOCK_HELD" -eq 1 ]; then
+    fm_reconcile_lock_release "$STATE" "$ID"
+    FOLLOWUP_LOCK_HELD=0
+  fi
+}
+trap followup_lock_release EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fm_reconcile_lock_acquire "$STATE" "$ID"
+FOLLOWUP_LOCK_HELD=1
+META_GENERATION=$(fm_reconcile_meta_generation "$META" 2>/dev/null || true)
 RID=$(fmx_meta_get "$META" x_request)
 TS=$(fmx_meta_get "$META" x_request_ts)
 COUNT=$(fmx_meta_get "$META" x_followups)
@@ -148,6 +176,62 @@ REQ_REPLY_MAX=$(fmx_meta_get "$META" x_reply_max_chars)
 case "$COUNT" in
   ''|*[!0-9]*) COUNT=0 ;;
 esac
+
+OP_RECOVERY_SCHEMA=$(followup_operation_value schema)
+if [ -n "$RID" ] \
+  && [ -n "$META_GENERATION" ] \
+  && { [ "$OP_RECOVERY_SCHEMA" = fm-x-followup-operation.v2 ] \
+    || [ "$OP_RECOVERY_SCHEMA" = fm-x-followup-operation.v3 ]; } \
+  && [ "$(followup_operation_value state)" = delivered ] \
+  && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
+  && [ "$(followup_operation_value request_id)" = "$RID" ] \
+  && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
+  OP_DIGEST=$(followup_operation_value payload_digest)
+  OP_KEY=$(followup_operation_value idempotency_key)
+  OP_FINAL=$(followup_operation_value final)
+  OP_HASH=${OP_DIGEST#sha256:}
+  if [ "$OP_DIGEST" = "$OP_HASH" ] \
+    || [ "${#OP_HASH}" -ne 64 ] \
+    || [[ "$OP_HASH" == *[!0-9A-Fa-f]* ]] \
+    || [ "$OP_KEY" != "fmx-$OP_HASH" ]; then
+    echo "fm-x-followup: invalid delivered operation for $ID" >&2
+    exit 1
+  fi
+  case "$OP_FINAL" in
+    0|1) ;;
+    *) echo "fm-x-followup: invalid delivered operation for $ID" >&2; exit 1 ;;
+  esac
+  followup_delivery_finalize "$OP_FINAL" || exit 1
+  if [ "$MODE" = check ]; then
+    exit 1
+  fi
+  printf '%s\n' "$RID"
+  exit 0
+fi
+
+if [ "$MODE" = check ]; then
+  if [ "$CHECK_ARGC" -gt 2 ]; then usage; exit 2; fi
+else
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --final)
+        FINAL=1
+        ;;
+      --image)
+        shift
+        if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+          echo "fm-x-followup: missing --image path" >&2
+          usage
+          exit 2
+        fi
+        IMAGE_PATH=$1
+        ;;
+      *) TS_ARGS+=("$1") ;;
+    esac
+    shift
+  done
+  if [ "${#TS_ARGS[@]}" -lt 1 ]; then usage; exit 2; fi
+fi
 
 # Not linked: this task did not originate from an X-mode mention. Detection fails;
 # a post is simply a no-op success (firstmate need not special-case it).
@@ -179,7 +263,8 @@ if [ "$COUNT" -ge "$MAX_COUNT" ]; then
 fi
 
 if [ "$EXPIRED" = 1 ]; then
-  fmx_meta_link_clear "$META" || echo "fm-x-followup: warning: could not clear the elapsed link in state/$ID.meta" >&2
+  fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear \
+    || echo "fm-x-followup: warning: could not clear the elapsed link in state/$ID.meta" >&2
   if [ "$MODE" = check ]; then
     exit 1
   fi
@@ -193,39 +278,198 @@ if [ "$MODE" = check ]; then
   exit 0
 fi
 
+case "${TS_ARGS[0]:-}" in
+  --text-file)
+    if [ "${#TS_ARGS[@]}" -lt 2 ]; then usage; exit 2; fi
+    TEXT=$(cat -- "${TS_ARGS[1]}") || { echo "fm-x-followup: cannot read text file: ${TS_ARGS[1]}" >&2; exit 1; }
+    ;;
+  -) TEXT=$(cat) ;;
+  *) TEXT=${TS_ARGS[0]:-} ;;
+esac
+if [ -z "$TEXT" ]; then
+  echo "fm-x-followup: empty follow-up text" >&2
+  exit 2
+fi
+PAYLOAD_TEXT="$STATE/.$ID.x-followup-text.${BASHPID:-$$}"
+printf '%s' "$TEXT" > "$PAYLOAD_TEXT" || exit 1
+if [ -n "$IMAGE_PATH" ] && { [ ! -f "$IMAGE_PATH" ] || [ ! -r "$IMAGE_PATH" ]; }; then
+  echo "fm-x-followup: cannot read image file: $IMAGE_PATH" >&2
+  exit 1
+fi
+IMAGE_MEDIA_TYPE=
+if [ -n "$IMAGE_PATH" ]; then
+  IMAGE_MEDIA_TYPE=$(fmx_image_media_type_from_path "$IMAGE_PATH") || {
+    echo "fm-x-followup: unsupported image media type for: $IMAGE_PATH" >&2
+    exit 1
+  }
+  case "$IMAGE_MEDIA_TYPE" in
+    image/png) IMAGE_SUFFIX=.png ;;
+    image/jpeg|image/pjpeg) IMAGE_SUFFIX=.jpg ;;
+    image/gif) IMAGE_SUFFIX=.gif ;;
+    image/webp) IMAGE_SUFFIX=.webp ;;
+    image/bmp) IMAGE_SUFFIX=.bmp ;;
+    image/tiff) IMAGE_SUFFIX=.tiff ;;
+    *) exit 1 ;;
+  esac
+  PAYLOAD_IMAGE="$STATE/.$ID.x-followup-image.${BASHPID:-$$}$IMAGE_SUFFIX"
+  cp "$IMAGE_PATH" "$PAYLOAD_IMAGE" || exit 1
+fi
+
+followup_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+command -v jq >/dev/null 2>&1 || { echo "fm-x-followup: jq not found" >&2; exit 1; }
+fmx_load_config
+INBOX_CONTEXT=$(fmx_request_inbox_context "$STATE" "$RID") || {
+  echo "fm-x-followup: failed to inspect request platform context" >&2
+  exit 1
+}
+EFFECTIVE_PLATFORM=$(printf '%s' "$INBOX_CONTEXT" | jq -r '.platform // ""')
+EFFECTIVE_REPLY_MAX_RAW=$(printf '%s' "$INBOX_CONTEXT" | jq -r '.reply_max_chars // ""')
+case "$REQ_PLATFORM" in discord|x) EFFECTIVE_PLATFORM=$REQ_PLATFORM ;; esac
+case "$REQ_REPLY_MAX" in ''|*[!0-9]*) ;; *) EFFECTIVE_REPLY_MAX_RAW=$REQ_REPLY_MAX ;; esac
+case "$EFFECTIVE_PLATFORM" in
+  discord|x|'') ;;
+  twitter) EFFECTIVE_PLATFORM=x ;;
+  *) EFFECTIVE_PLATFORM= ;;
+esac
+EFFECTIVE_REPLY_MAX=$(fmx_reply_limit_for_platform "$EFFECTIVE_PLATFORM" "$EFFECTIVE_REPLY_MAX_RAW")
+CHUNKS=$(printf '%s' "$TEXT" | fmx_split_thread "$EFFECTIVE_REPLY_MAX" "$FMX_THREAD_MAX") || {
+  echo "fm-x-followup: failed to split reply into a thread" >&2
+  exit 1
+}
+CHUNK_COUNT=$(printf '%s' "$CHUNKS" | jq 'length' 2>/dev/null) || CHUNK_COUNT=
+case "$CHUNK_COUNT" in ''|*[!0-9]*) echo "fm-x-followup: failed to split reply into a thread" >&2; exit 1 ;; esac
+[ "$CHUNK_COUNT" -gt 0 ] || { echo "fm-x-followup: empty follow-up text" >&2; exit 2; }
+if [ -n "$PAYLOAD_IMAGE" ]; then
+  IMAGE_PAYLOAD_FILE="$STATE/.$ID.x-followup-image-payload.${BASHPID:-$$}"
+  fmx_image_payload_file "$PAYLOAD_IMAGE" fm-x-followup "$IMAGE_PAYLOAD_FILE" >/dev/null || exit 1
+fi
+REQUEST_BODY_FILE="$STATE/.$ID.x-followup-request-body.${BASHPID:-$$}"
+if [ -n "$IMAGE_PAYLOAD_FILE" ]; then
+  fmx_reply_payload_json "$RID" "$CHUNKS" "$CHUNK_COUNT" "$IMAGE_PAYLOAD_FILE" > "$REQUEST_BODY_FILE" || exit 1
+else
+  fmx_reply_payload_json "$RID" "$CHUNKS" "$CHUNK_COUNT" > "$REQUEST_BODY_FILE" || exit 1
+fi
+REQUEST_BODY_SIZE=$(wc -c < "$REQUEST_BODY_FILE" | tr -d '[:space:]') || exit 1
+PAYLOAD_HASH=$({
+  printf 'schema=fm-x-followup-payload.v2\n'
+  printf 'generation=%s\n' "$META_GENERATION"
+  printf 'request_id=%s\n' "$RID"
+  printf 'followup_count=%s\n' "$COUNT"
+  printf 'final=%s\n' "$FINAL"
+  printf 'endpoint=followup\n'
+  printf 'platform=%s\n' "$EFFECTIVE_PLATFORM"
+  printf 'reply_max_chars=%s\n' "$EFFECTIVE_REPLY_MAX"
+  printf 'thread_max=%s\n' "$FMX_THREAD_MAX"
+  printf 'request_body_bytes=%s\n' "$REQUEST_BODY_SIZE"
+  cat "$REQUEST_BODY_FILE"
+} | followup_sha256) || {
+  echo "fm-x-followup: no SHA-256 implementation available for payload idempotency" >&2
+  exit 1
+}
+PAYLOAD_DIGEST="sha256:$PAYLOAD_HASH"
+EXPECTED_OP_KEY="fmx-$PAYLOAD_HASH"
+
+followup_operation_write() {  # <prepared|delivered> <key>
+  local state=$1 key=$2 tmp
+  tmp="$FOLLOWUP_OP.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-x-followup-operation.v3\n'
+    printf 'state=%s\n' "$state"
+    printf 'generation=%s\n' "$META_GENERATION"
+    printf 'request_id=%s\n' "$RID"
+    printf 'followup_count=%s\n' "$COUNT"
+    printf 'payload_digest=%s\n' "$PAYLOAD_DIGEST"
+    printf 'final=%s\n' "$FINAL"
+    printf 'idempotency_key=%s\n' "$key"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$FOLLOWUP_OP" || { rm -f "$tmp"; return 1; }
+}
+
+OP_STATE=
+OP_KEY=
+OP_FINAL=$FINAL
+if [ -f "$FOLLOWUP_OP" ] \
+  && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
+  && [ "$(followup_operation_value request_id)" = "$RID" ] \
+  && [ "$(followup_operation_value followup_count)" = "$COUNT" ]; then
+  OP_SCHEMA=$(followup_operation_value schema)
+  OP_STATE=$(followup_operation_value state)
+  case "$OP_SCHEMA:$OP_STATE" in
+    fm-x-followup-operation.v3:prepared|fm-x-followup-operation.v3:delivered)
+      if [ "$(followup_operation_value payload_digest)" != "$PAYLOAD_DIGEST" ] \
+        || [ "$(followup_operation_value final)" != "$FINAL" ] \
+        || [ "$(followup_operation_value idempotency_key)" != "$EXPECTED_OP_KEY" ]; then
+        echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
+        exit 1
+      fi
+      OP_KEY=$EXPECTED_OP_KEY
+      ;;
+    *)
+      echo "fm-x-followup: payload differs from the durable operation for $ID; retry the original rendered follow-up context" >&2
+      exit 1
+      ;;
+  esac
+fi
+case "$OP_STATE:$OP_KEY" in
+  prepared:*|delivered:*)
+    case "$OP_KEY" in ''|*[!A-Za-z0-9._:-]*) OP_STATE=; OP_KEY= ;; esac
+    ;;
+  *) OP_STATE=; OP_KEY= ;;
+esac
+if [ -z "$OP_KEY" ]; then
+  rm -f "$FOLLOWUP_OP"
+  OP_KEY=$EXPECTED_OP_KEY
+  followup_operation_write prepared "$OP_KEY" || {
+    echo "fm-x-followup: could not prepare durable follow-up operation for $ID" >&2
+    exit 1
+  }
+  OP_STATE=prepared
+fi
+
 # Post the follow-up. fm-x-reply owns text reading, thread-split, dry-run, the
 # endpoint, and the never-inline safety; we only pass the text source and any
 # recorded reply-platform context through.
 declare -a REPLY_ENV=()
-case "$REQ_PLATFORM" in
-  discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$REQ_PLATFORM") ;;
+declare -a REPLY_ARGS=(--text-file "$PAYLOAD_TEXT")
+[ -z "$PAYLOAD_IMAGE" ] || REPLY_ARGS=(--image "$PAYLOAD_IMAGE" "${REPLY_ARGS[@]}")
+REPLY_ENV+=("FMX_IDEMPOTENCY_KEY=$OP_KEY")
+case "$EFFECTIVE_PLATFORM" in
+  discord|x) REPLY_ENV+=("FMX_REPLY_PLATFORM=$EFFECTIVE_PLATFORM") ;;
 esac
-case "$REQ_REPLY_MAX" in
-  ''|*[!0-9]*) ;;
-  *) REPLY_ENV+=("FMX_REPLY_MAX_CHARS=$REQ_REPLY_MAX") ;;
-esac
-if [ "${#REPLY_ENV[@]}" -gt 0 ]; then
-  env "${REPLY_ENV[@]}" "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+REPLY_ENV+=("FMX_REPLY_MAX_CHARS=$EFFECTIVE_REPLY_MAX")
+REPLY_ENV+=("FMX_X_THREAD_MAX=$FMX_THREAD_MAX")
+if [ "$OP_STATE" = delivered ]; then
+  post_rc=0
+elif [ "${#REPLY_ENV[@]}" -gt 0 ]; then
+  set +e
+  env "${REPLY_ENV[@]}" "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${REPLY_ARGS[@]}" >/dev/null
+  post_rc=$?
+  set -e
 else
-  "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${TS_ARGS[@]}" >/dev/null
+  set +e
+  "$FM_ROOT/bin/fm-x-reply.sh" "$RID" --followup "${REPLY_ARGS[@]}" >/dev/null
+  post_rc=$?
+  set -e
 fi
-post_rc=$?
 
 case "$post_rc" in
   0)
-    NEWCOUNT=$((COUNT + 1))
-    if [ "$FINAL" = 1 ] || [ "$NEWCOUNT" -ge "$MAX_COUNT" ]; then
-      if ! fmx_meta_link_clear "$META"; then
-        echo "fm-x-followup: error: posted but could not clear the link in state/$ID.meta" >&2
+    if [ "$OP_STATE" != delivered ]; then
+      followup_operation_write delivered "$OP_KEY" || {
+        echo "fm-x-followup: posted but could not persist the delivered operation for $ID" >&2
         exit 1
-      fi
-    elif ! fmx_meta_followups_set "$META" "$NEWCOUNT"; then
-      if ! fmx_meta_link_clear "$META"; then
-        echo "fm-x-followup: error: posted but could not record the follow-up count or clear the link in state/$ID.meta" >&2
-        exit 1
-      fi
-      echo "fm-x-followup: warning: posted but could not record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
+      }
     fi
+    followup_delivery_finalize "$OP_FINAL" || exit 1
     printf '%s\n' "$RID"
     exit 0
     ;;
@@ -236,7 +480,11 @@ case "$post_rc" in
     # graceful-degradation path against an old relay that only ever supported
     # one follow-up, or a binding the relay already considers exhausted for any
     # other reason - either way, retrying would never succeed.
-    fmx_meta_link_clear "$META" || echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
+    if fmx_meta_followup_commit_locked "$META" "$META_GENERATION" "$RID" "$COUNT" clear; then
+      rm -f "$FOLLOWUP_OP"
+    else
+      echo "fm-x-followup: warning: could not clear the rejected link in state/$ID.meta" >&2
+    fi
     echo "fm-x-followup: relay rejected the follow-up for $ID (cap or window exhausted); skipped and cleared the link" >&2
     exit 0
     ;;

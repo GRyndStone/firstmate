@@ -5,6 +5,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
@@ -51,10 +53,38 @@ fi
 
 DRAIN_TMP="$STATE/.wake-queue.drain.$(fm_current_pid)"
 rm -f "$DRAIN_TMP"
-mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
-: > "$FM_WAKE_QUEUE" || exit 1
+CLAIMED_MARKER=$(fm_wake_reconcile_claimed_marker_locked 2>/dev/null || true)
+if [ -n "$CLAIMED_MARKER" ]; then
+  DRAIN_KEEP="$STATE/.wake-queue.keep.$(fm_current_pid)"
+  rm -f "$DRAIN_KEEP"
+  awk -F '\t' -v claimed="$CLAIMED_MARKER" -v drain="$DRAIN_TMP" -v keep="$DRAIN_KEEP" '
+    {
+      marker = ""
+      if (NF >= 5 && match($5, /\[fm-reconcile=[^]]+\]/)) marker = substr($5, RSTART, RLENGTH)
+      if (marker == claimed) print > keep
+      else print > drain
+    }
+  ' "$FM_WAKE_QUEUE" || exit 1
+  [ -f "$DRAIN_TMP" ] || : > "$DRAIN_TMP"
+  [ -f "$DRAIN_KEEP" ] || : > "$DRAIN_KEEP"
+  mv -f "$DRAIN_KEEP" "$FM_WAKE_QUEUE" || exit 1
+else
+  mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
+  : > "$FM_WAKE_QUEUE" || exit 1
+fi
+
+if [ ! -s "$DRAIN_TMP" ]; then
+  rm -f "$DRAIN_TMP"
+  DRAIN_TMP=
+  assert_watcher_liveness
+  exit 0
+fi
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+while IFS=$(printf '\t') read -r _epoch _seq _kind _key payload; do
+  [ -n "${payload:-}" ] || continue
+  fm_reconcile_consumer_ack_reason "$STATE" "$payload" || exit 1
+done < "$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness

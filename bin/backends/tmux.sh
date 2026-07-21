@@ -121,6 +121,16 @@ fm_backend_tmux_strict_miss() {  # <target> <expected-label>
   fm_backend_tmux_probe_lenient "$1"
 }
 
+fm_backend_tmux_inventory_match() {  # <windows|panes> <format> <expected-line>
+  local resource=$1 format=$2 expected=$3 inventory
+  case "$resource" in
+    windows) inventory=$(tmux list-windows -a -F "$format" 2>/dev/null) || return 2 ;;
+    panes) inventory=$(tmux list-panes -a -F "$format" 2>/dev/null) || return 2 ;;
+    *) return 2 ;;
+  esac
+  printf '%s\n' "$inventory" | grep -qxF -- "$expected"
+}
+
 # fm_backend_tmux_target_exists: strict existence probe backing
 # fm_backend_target_exists's tmux arm. tmux's own target resolution is
 # LENIENT: `tmux display-message -p -t <target>` exits 0 for a killed window
@@ -151,16 +161,16 @@ fm_backend_tmux_strict_miss() {  # <target> <expected-label>
 # a unique-name-prefix target never false-reads as gone
 # (fm_backend_tmux_strict_miss above). Pane-id and window-id shapes stay
 # strict regardless - they are exact identifiers, never patterns or
-# prefixes. A downed server fails the listing - and the fallback probe - and
-# reads gone, exactly as before.
+# prefixes. A downed server fails the listing and returns unknown; passive
+# existence checks still read non-present while cleanup preserves ownership.
 fm_backend_tmux_target_exists() {  # <target> [expected-label]
-  local target=$1 expected=${2:-} ses='' win='' pane='' pane_fmt=''
+  local target=$1 expected=${2:-} ses='' win='' pane='' pane_fmt='' inventory_rc
   case "$target" in
     %*)
       case "${target#%}" in
         ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
       esac
-      tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF -- "$target"
+      fm_backend_tmux_inventory_match panes '#{pane_id}' "$target"
       return
       ;;
     *:*)
@@ -180,9 +190,9 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
         ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
       esac
       if [ -n "$expected" ]; then
-        tmux list-windows -a -F '#{window_id} #{window_name}' 2>/dev/null | grep -qxF -- "$win $expected"
+        fm_backend_tmux_inventory_match windows '#{window_id} #{window_name}' "$win $expected"
       else
-        tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF -- "$win"
+        fm_backend_tmux_inventory_match windows '#{window_id}' "$win"
       fi
       return
       ;;
@@ -190,21 +200,29 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
       case "${win#%}" in
         ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
       esac
-      tmux list-panes -a -F '#{session_name}:#{pane_id}' 2>/dev/null | grep -qxF -- "$ses:$win"
+      fm_backend_tmux_inventory_match panes '#{session_name}:#{pane_id}' "$ses:$win"
       return
       ;;
     *[*?[]*) fm_backend_tmux_probe_lenient "$target"; return ;;
   esac
   if [ -n "$ses" ]; then
-    tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep -qxF -- "$ses:$win" \
-      && return 0
+    if fm_backend_tmux_inventory_match windows '#{session_name}:#{window_name}' "$ses:$win"; then
+      return 0
+    else
+      inventory_rc=$?
+      [ "$inventory_rc" -ne 2 ] || return 2
+    fi
     # An index-based window part (the daemon's firstmate:0 default) is not a
     # window NAME; retry against the index inventory before reading gone.
     case "$win" in
       *[!0-9]*) ;;
       *)
-        tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null | grep -qxF -- "$ses:$win" \
-          && return 0
+        if fm_backend_tmux_inventory_match windows '#{session_name}:#{window_index}' "$ses:$win"; then
+          return 0
+        else
+          inventory_rc=$?
+          [ "$inventory_rc" -ne 2 ] || return 2
+        fi
         fm_backend_tmux_strict_miss "$target" "$expected"
         return
         ;;
@@ -227,14 +245,23 @@ fm_backend_tmux_target_exists() {  # <target> [expected-label]
       ''|*[!0-9]*) fm_backend_tmux_probe_lenient "$target"; return ;;
       *) pane_fmt='#{pane_index}' ;;
     esac
-    tmux list-panes -a -F "#{session_name}:#{window_name}.$pane_fmt" 2>/dev/null | grep -qxF -- "$ses:$win" \
-      && return 0
+    if fm_backend_tmux_inventory_match panes "#{session_name}:#{window_name}.$pane_fmt" "$ses:$win"; then
+      return 0
+    else
+      inventory_rc=$?
+      [ "$inventory_rc" -ne 2 ] || return 2
+    fi
     case "${win%.*}" in
       *[!0-9]*) return 1 ;;
-      *) tmux list-panes -a -F "#{session_name}:#{window_index}.$pane_fmt" 2>/dev/null | grep -qxF -- "$ses:$win" ;;
+      *) fm_backend_tmux_inventory_match panes "#{session_name}:#{window_index}.$pane_fmt" "$ses:$win" ;;
     esac
   else
-    tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qxF -- "$win" && return 0
+    if fm_backend_tmux_inventory_match windows '#{window_name}' "$win"; then
+      return 0
+    else
+      inventory_rc=$?
+      [ "$inventory_rc" -ne 2 ] || return 2
+    fi
     # A dotted bare name could equally be tmux's window.pane shorthand with no
     # session part; that shape is not modeled strictly, so fail open.
     case "$win" in

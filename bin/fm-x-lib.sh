@@ -27,12 +27,16 @@
 #   fmx_post_json <endpoint> <payload-file> [body-file] - POST JSON to the relay,
 #                                printing HTTP code and writing response body
 #   fmx_meta_get <meta> <key>  - read one key=value line from a task meta file
-#   fmx_meta_link_set <meta> <request_id> <epoch> [followups] [platform] [max]
+#   fmx_meta_link_set <meta> <generation> <request_id> <epoch> [followups] [platform] [max]
 #                                - (re)write the X-request link, defaulting
 #                                followups to 0
-#   fmx_meta_followups_set <meta> <n> - rewrite just the follow-up counter
-#   fmx_meta_link_clear <meta> - remove the X-request link entirely
+#   fmx_meta_followups_set <meta> <generation> <n> - rewrite the follow-up counter
+#   fmx_meta_link_clear <meta> <generation> - remove the X-request link entirely
 # Callers must have FM_HOME set before calling fmx_load_config.
+
+_FM_X_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_X_LIB_DIR=.
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$_FM_X_LIB_DIR/fm-reconcile-lib.sh"
 
 # Read the value of KEY from a .env-style file: last assignment wins; tolerates a
 # leading "export ", surrounding whitespace, and one layer of matching single or
@@ -317,6 +321,10 @@ fmx_auth_header_file() {
   file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-x-auth.XXXXXX") || return 1
   chmod 600 "$file" 2>/dev/null || { rm -f "$file"; return 1; }
   printf 'Authorization: Bearer %s\n' "$FMX_TOKEN" > "$file" || { rm -f "$file"; return 1; }
+  if [ -n "${FMX_IDEMPOTENCY_KEY:-}" ]; then
+    case "$FMX_IDEMPOTENCY_KEY" in *[!A-Za-z0-9._:-]*) rm -f "$file"; return 1 ;; esac
+    printf 'Idempotency-Key: %s\n' "$FMX_IDEMPOTENCY_KEY" >> "$file" || { rm -f "$file"; return 1; }
+  fi
   printf '%s\n' "$file"
 }
 
@@ -498,16 +506,7 @@ fmx_meta_get() {
   printf '%s' "${line#*=}"
 }
 
-fmx_meta_tmp() {
-  local meta=$1 dir base
-  dir=${meta%/*}
-  base=${meta##*/}
-  [ "$dir" != "$meta" ] || dir=.
-  [ -d "$dir" ] || return 1
-  mktemp "$dir/.${base}.fm-x.XXXXXX"
-}
-
-# fmx_meta_link_set <meta> <request_id> <epoch> [followups] [platform] [max]:
+# fmx_meta_link_set <meta> <generation> <request_id> <epoch> [followups] [platform] [max]:
 # atomically (re)write the x_request/x_request_ts/x_followups lines plus optional
 # reply-platform context, dropping any prior link and preserving every other meta
 # line. <followups> defaults to 0 (a fresh link); pass the prior task's count to
@@ -515,49 +514,81 @@ fmx_meta_tmp() {
 # budget against a binding the relay already knows about. Returns non-zero if
 # <meta> is missing or the rewrite fails.
 fmx_meta_link_set() {
-  local meta=$1 rid=$2 ts=$3 followups=${4:-0} platform=${5:-} reply_max=${6:-} tmp
+  local meta=$1 expected_generation=$2 rid=$3 ts=$4 followups=${5:-0} platform=${6:-} reply_max=${7:-} state id
+  local -a update
   [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
-  fi
-  printf 'x_request=%s\n' "$rid" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_request_ts=%s\n' "$ts" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  printf 'x_followups=%s\n' "$followups" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  if [ -n "$platform" ]; then
-    printf 'x_platform=%s\n' "$platform" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  fi
+  state=${meta%/*}
+  [ "$state" != "$meta" ] || state=.
+  id=${meta##*/}
+  id=${id%.meta}
+  update=(
+    --remove x_request --remove x_request_ts --remove x_followups --remove x_platform --remove x_reply_max_chars
+    --set x_request "$rid" --set x_request_ts "$ts" --set x_followups "$followups"
+  )
+  [ -z "$platform" ] || update+=(--set x_platform "$platform")
   case "$reply_max" in
     ''|*[!0-9]*) ;;
-    *) printf 'x_reply_max_chars=%s\n' "$reply_max" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
+    *) update+=(--set x_reply_max_chars "$reply_max") ;;
   esac
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  fm_reconcile_meta_update "$state" "$id" "$expected_generation" "${update[@]}"
 }
 
-# fmx_meta_followups_set <meta> <n>: atomically rewrite just the x_followups
+# fmx_meta_followups_set <meta> <generation> <n>: atomically rewrite just the x_followups
 # line, preserving every other meta line including link and reply context.
 # Returns non-zero if <meta> is missing or the rewrite fails.
 fmx_meta_followups_set() {
-  local meta=$1 n=$2 tmp
+  local meta=$1 expected_generation=$2 n=$3 state id
   [ -f "$meta" ] || return 1
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_followups=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
-  fi
-  printf 'x_followups=%s\n' "$n" >> "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  state=${meta%/*}
+  [ "$state" != "$meta" ] || state=.
+  id=${meta##*/}
+  id=${id%.meta}
+  fm_reconcile_meta_update "$state" "$id" "$expected_generation" --set x_followups "$n"
 }
 
-# fmx_meta_link_clear <meta>: atomically remove the x_request/x_request_ts/
+# fmx_meta_link_clear <meta> <generation>: atomically remove the x_request/x_request_ts/
 # x_followups and reply-platform lines while preserving every other meta line. Idempotent:
 # succeeds whether or not a link is present, and is a no-op when <meta> is
 # missing.
 fmx_meta_link_clear() {
-  local meta=$1 tmp
+  local meta=$1 expected_generation=$2 state id
   [ -f "$meta" ] || return 0
-  tmp=$(fmx_meta_tmp "$meta") || return 1
-  if ! { grep -vE '^x_request=|^x_request_ts=|^x_followups=|^x_platform=|^x_reply_max_chars=' "$meta" || true; } > "$tmp"; then
-    rm -f "$tmp"; return 1
-  fi
-  mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+  state=${meta%/*}
+  [ "$state" != "$meta" ] || state=.
+  id=${meta##*/}
+  id=${id%.meta}
+  fm_reconcile_meta_update "$state" "$id" "$expected_generation" \
+    --remove x_request --remove x_request_ts --remove x_followups --remove x_platform --remove x_reply_max_chars
+}
+
+fmx_meta_link_tuple_matches_locked() {  # <meta> <generation> <request-id> <count>
+  local meta=$1 generation=$2 rid=$3 count=$4 current_count
+  [ "$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ "$(fmx_meta_get "$meta" x_request)" = "$rid" ] || return 1
+  current_count=$(fmx_meta_get "$meta" x_followups)
+  case "$current_count" in ''|*[!0-9]*) current_count=0 ;; esac
+  [ "$current_count" = "$count" ]
+}
+
+fmx_meta_followup_commit_locked() {  # <meta> <generation> <request-id> <count> <set|clear> [new-count]
+  local meta=$1 generation=$2 rid=$3 count=$4 mode=$5 new_count=${6:-} tmp
+  fmx_meta_link_tuple_matches_locked "$meta" "$generation" "$rid" "$count" || return 3
+  tmp="$meta.x-followup.${BASHPID:-$$}"
+  case "$mode" in
+    set)
+      case "$new_count" in ''|*[!0-9]*) return 2 ;; esac
+      awk -v value="$new_count" '
+        BEGIN { wrote = 0 }
+        /^x_followups=/ { if (!wrote) print "x_followups=" value; wrote = 1; next }
+        { print }
+        END { if (!wrote) print "x_followups=" value }
+      ' "$meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+      ;;
+    clear)
+      awk '!/^(x_request|x_request_ts|x_followups|x_platform|x_reply_max_chars)=/' "$meta" > "$tmp" \
+        || { rm -f "$tmp"; return 1; }
+      ;;
+    *) return 2 ;;
+  esac
+  mv -f "$tmp" "$meta"
 }

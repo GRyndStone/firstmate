@@ -190,7 +190,8 @@ test_event_hints_follow_reconciled_current_state() {
     "$home/projects/active-decision" \
     "$home/projects/active-blocked" \
     "$home/projects/stale-decision" \
-    "$home/projects/stale-blocked"
+    "$home/projects/stale-blocked" \
+    "$home/projects/stale-observation"
   fm_write_meta "$home/state/active-decision.meta" \
     "window=firstmate:fm-active-decision" \
     "worktree=$home/projects/active-decision" \
@@ -223,6 +224,24 @@ test_event_hints_follow_reconciled_current_state() {
     "kind=ship" \
     "mode=ship"
   printf 'blocked: old failure\n' > "$home/state/stale-blocked.status"
+  fm_write_meta "$home/state/stale-observation.meta" \
+    "window=firstmate:fm-stale-observation" \
+    "worktree=$home/projects/stale-observation" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship" \
+    "generation=stale-observation-generation"
+  printf 'needs-decision [key=fresh-question]: choose the current API shape\n' > "$home/state/stale-observation.status"
+  fm_write_meta "$home/state/stale-observation.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=stale-observation' \
+    'endpoint=firstmate:fm-stale-observation' \
+    'lifecycle_generation=stale-observation-generation' \
+    'state=working' \
+    'source=pane' \
+    'evidence=state: working · source: pane · old busy evidence' \
+    'observed_at=1'
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -235,6 +254,8 @@ test_event_hints_follow_reconciled_current_state() {
       and task("stale-decision").hints.pending_decision == false
       and task("stale-blocked").current_state.state == "working"
       and task("stale-blocked").hints.blocked_event == false
+      and task("stale-observation").current_state.freshness == "stale"
+      and task("stale-observation").hints.pending_decision == true
   ' >/dev/null || fail "event hints must follow reconciled current state"
   pass "snapshot event hints follow reconciled current state"
 }
@@ -414,6 +435,274 @@ test_view_renders_dead_secondmate_agent_status() {
   pass "fleet view renders secondmate agent liveness"
 }
 
+test_snapshot_separates_reconciled_truth_event_history_and_wait() {
+  local home fakebin now out view bearings
+  home=$(make_home reconciled-separation)
+  mkdir -p "$home/projects/reconciled-wt"
+  fm_write_meta "$home/state/reconciled-task.meta" \
+    'window=firstmate:fm-reconciled-task' \
+    "worktree=$home/projects/reconciled-wt" \
+    'project=alpha' \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship' \
+    'generation=reconciled-generation'
+  printf 'paused: stale OAuth label from before callback completion\n' > "$home/state/reconciled-task.status"
+  fm_write_meta "$home/state/reconciled-task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=xAI OAuth callback' \
+    'predicate=/tmp/oauth-completion-predicate' \
+    'lifecycle_generation=reconciled-generation' \
+    'registered_at=1'
+  now=$(date +%s)
+  fm_write_meta "$home/state/reconciled-task.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=reconciled-task' \
+    'endpoint=firstmate:fm-reconciled-task' \
+    'lifecycle_generation=reconciled-generation' \
+    'state=done' \
+    'source=run-step' \
+    'detail=checks green: PR ready for review' \
+    'evidence=state: done · source: run-step · checks green: PR ready for review' \
+    "observed_at=$now" \
+    'status_sequence=1' \
+    'status_signature=old-event-signature' \
+    'last_status_event=paused: stale OAuth label from before callback completion' \
+    'prior_endpoint=firstmate:fm-reconciled-task' \
+    'prior_state=working' \
+    'prior_source=run-step' \
+    'prior_evidence=state: working · source: run-step · validating' \
+    "prior_observed_at=$((now - 1))" \
+    'transition_sequence=2' \
+    'wait_kind=predicate' \
+    'wait_description=xAI OAuth callback' \
+    'wait_target=/tmp/oauth-completion-predicate' \
+    'wait_signature=old-wait-signature' \
+    'wait_state=complete' \
+    'wait_evidence=OAuth credential stored' \
+    "wait_checked_at=$now" \
+    'wait_sequence=2' \
+    'pending_action_token=wait:2:complete' \
+    'pending_action_reason=external-wait-complete' \
+    'notified_action_token=wait:2:complete'
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "reconciled-task")
+    | .current_state.state == "done"
+      and .current_state.source == "run-step"
+      and .current_state.persisted == true
+      and .current_state.freshness == "fresh"
+      and .prior_observed_state.state == "working"
+      and .last_status_event.sequence == 1
+      and .last_status_event.event.raw == "paused: stale OAuth label from before callback completion"
+      and .last_status_event.supervisor_observation.sequence == 1
+      and .last_status_event.supervisor_observation.event.raw == "paused: stale OAuth label from before callback completion"
+      and .last_status_event.supervisor_observation.freshness == "advanced_or_changed"
+      and .external_wait.registered == true
+      and .external_wait.kind == "predicate"
+      and .external_wait.observation.state == "complete"
+  ' >/dev/null || fail "snapshot did not separate reconciled truth, prior state, event history, and wait registration: $out"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" '| done / run-step |' "fleet view did not render reconciled state as current truth"
+  assert_contains "$view" '| working / run-step | #1 paused: stale OAuth label' "fleet view did not separate prior state from last event"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bearings-snapshot.sh" --json)
+  printf '%s' "$bearings" | jq -e '
+    .in_flight[] | select(.id == "reconciled-task")
+    | .state == "done"
+      and .source == "run-step"
+      and (.evidence | contains("checks green"))
+      and .freshness == "fresh"
+      and (.age_seconds | type) == "number"
+      and (.doing | contains("checks green"))
+      and (.status_event | contains("stale OAuth label"))
+      and .prior_state == "working / run-step"
+      and (.current_wait | contains("predicate:"))
+      and (.current_wait | contains("complete"))
+  ' >/dev/null || fail "captain-facing bearings did not separate current truth, evidence, history, and wait state"
+  pass "snapshot and captain-facing views separate reconciled truth from stale event history"
+}
+
+test_snapshot_rejects_stale_generation_reconciliation() {
+  local home fakebin out now bearings view
+  home=$(make_home stale-generation)
+  mkdir -p "$home/projects/generation-task"
+  fm_write_meta "$home/state/generation-task.meta" \
+    'window=firstmate:fm-generation-task' \
+    "worktree=$home/projects/generation-task" \
+    'project=alpha' \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship' \
+    'generation=current-generation'
+  printf 'working: current lifecycle event\n' > "$home/state/generation-task.status"
+  fm_write_meta "$home/state/generation-task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=old lifecycle wait' \
+    'predicate=/tmp/old-lifecycle-predicate' \
+    'lifecycle_generation=old-generation' \
+    'registered_at=1'
+  now=$(date +%s)
+  fm_write_meta "$home/state/generation-task.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=generation-task' \
+    'endpoint=firstmate:fm-generation-task' \
+    'lifecycle_generation=old-generation' \
+    'state=done' \
+    'source=run-step' \
+    'evidence=state: done · source: run-step · old lifecycle' \
+    "observed_at=$now" \
+    'prior_endpoint=firstmate:fm-generation-task' \
+    'prior_state=working' \
+    'prior_source=pane' \
+    'prior_evidence=state: working · source: pane · old lifecycle' \
+    "prior_observed_at=$((now - 1))" \
+    'status_sequence=1' \
+    'status_signature=old-status-signature' \
+    'last_status_event=done: old lifecycle completion' \
+    'wait_signature=old-wait-signature' \
+    'wait_state=complete' \
+    'wait_evidence=old lifecycle completion' \
+    "wait_checked_at=$now"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "generation-task")
+    | .current_state.persisted == false
+      and .current_state.state != "done"
+      and .prior_observed_state.state == null
+      and .last_status_event.supervisor_observation.observed_at == null
+      and .last_status_event.supervisor_observation.freshness == "unobserved"
+      and .external_wait.lifecycle_current == false
+      and .external_wait.observation.state == "unobserved"
+      and .external_wait.observation.checked_at == null
+  ' >/dev/null || fail "snapshot accepted stale-generation reconciliation data: $out"
+  bearings=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bearings-snapshot.sh" --json)
+  printf '%s' "$bearings" | jq -e '
+    .in_flight[] | select(.id == "generation-task")
+    | .doing == "current lifecycle event"
+      and .current_wait == "-"
+      and (.status_event | contains("current lifecycle event"))
+  ' >/dev/null || fail "bearings promoted a stale-generation wait description to current work: $bearings"
+  assert_not_contains "$bearings" 'old lifecycle wait' "bearings exposed a stale-generation wait as current work"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" 'historical: predicate: old lifecycle wait' \
+    "fleet view rendered a stale-generation wait as active"
+  pass "snapshot rejects stale-generation reconciliation data"
+}
+
+test_snapshot_rejects_unowned_background_probe_pulse() {
+  local home fakebin out now wait_sig status_sig status_signal
+  home=$(make_home background-probe-snapshot)
+  mkdir -p "$home/projects/background-probe"
+  fm_write_meta "$home/state/background-probe.meta" \
+    'window=firstmate:fm-background-probe' \
+    "worktree=$home/projects/background-probe" \
+    'project=alpha' \
+    'harness=grok' \
+    'kind=ship' \
+    'generation=background-probe-generation'
+  printf 'paused: supervising corpus build\n' > "$home/state/background-probe.status"
+  fm_write_meta "$home/state/background-probe.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=background corpus build' \
+    'pid=4242' \
+    'pid_identity=stable child identity' \
+    'role=background-probe' \
+    'predicate=/tmp/corpus-ledger-predicate' \
+    'probe_initial_evidence=ledger revision 4 pending' \
+    "owner_worktree=$home/projects/background-probe" \
+    'owner_tasktmp=' \
+    'registration_id=background-probe-registration' \
+    'lifecycle_generation=background-probe-generation' \
+    'registered_at=1'
+  wait_sig=$(bash -c '. "$1"; fm_reconcile_file_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.wait")
+  status_sig=$(bash -c '. "$1"; fm_reconcile_file_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.status")
+  status_signal=$(bash -c '. "$1"; fm_reconcile_signal_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.status")
+  now=$(date +%s)
+  fm_write_meta "$home/state/background-probe.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=background-probe' \
+    'lifecycle_generation=background-probe-generation' \
+    'endpoint=firstmate:fm-background-probe' \
+    'state=paused' \
+    'source=status-log' \
+    'evidence=state: paused · source: status-log · supervising corpus build' \
+    "observed_at=$now" \
+    'status_sequence=1' \
+    "status_signature=$status_sig" \
+    "status_signal_signature=$status_signal" \
+    'last_status_event=paused: supervising corpus build' \
+    'wait_kind=process' \
+    "wait_signature=$wait_sig" \
+    'wait_state=pending' \
+    'wait_evidence=ledger revision 4 pending' \
+    "wait_checked_at=$now" \
+    'background_probe_armed=1' \
+    "background_probe_wait_signature=$wait_sig" \
+    'background_probe_endpoint=firstmate:fm-background-probe' \
+    'background_probe_status_sequence=1' \
+    "background_probe_status_signature=$status_sig" \
+    "background_probe_status_signal_signature=$status_signal" \
+    'background_probe_wait_evidence=ledger revision 4 pending' \
+    "background_probe_observed_at=$now"
+  fm_write_meta "$home/state/background-probe.probe-pulse" \
+    'schema=fm-background-probe-pulse.v1' \
+    'state=armed' \
+    'pulse_id=background-probe-pulse' \
+    'registration_id=background-probe-registration' \
+    'endpoint=firstmate:fm-background-probe' \
+    "issued_at=$now" \
+    "expires_at=$((now + 120))"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "background-probe")
+    | .external_wait.role == "background-probe"
+      and .external_wait.predicate == "/tmp/corpus-ledger-predicate"
+      and .external_wait.probe_initial_evidence == "ledger revision 4 pending"
+      and .external_wait.background_probe.armed == true
+      and .external_wait.background_probe.endpoint == "firstmate:fm-background-probe"
+      and .external_wait.background_probe.status_sequence == 1
+      and .external_wait.background_probe.wait_evidence == "ledger revision 4 pending"
+      and .external_wait.background_probe.pulse.current == false
+      and .external_wait.background_probe.pulse.state == null
+      and .external_wait.background_probe.pulse.raw_state == "armed"
+      and .external_wait.background_probe.pulse.id == null
+      and .external_wait.background_probe.pulse.registration_id == null
+  ' >/dev/null || fail "snapshot promoted an unowned raw pulse to reconciled truth: $out"
+  pass "snapshot exposes raw stale pulse state without promoting it as current"
+}
+
+test_snapshot_reports_unmanaged_check_as_lifecycle_current() {
+  local home fakebin out
+  home=$(make_home unmanaged-check-generation)
+  mkdir -p "$home/projects/unmanaged-check"
+  fm_write_meta "$home/state/unmanaged-check.meta" \
+    'generation=current-generation' \
+    'window=firstmate:fm-unmanaged-check' \
+    "worktree=$home/projects/unmanaged-check" \
+    "project=$home/projects/unmanaged-check" \
+    'harness=codex' \
+    'kind=ship' \
+    'mode=ship'
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$home/state/unmanaged-check.check.sh"
+  chmod +x "$home/state/unmanaged-check.check.sh"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "unmanaged-check")
+    | .external_wait.registered == true
+      and .external_wait.kind == "legacy-check"
+      and .external_wait.lifecycle_generation == "current-generation"
+      and .external_wait.lifecycle_current == true
+  ' >/dev/null || fail "snapshot reported the controlling unmanaged check as historical: $out"
+  pass "snapshot lifecycle-binds unmanaged task checks"
+}
+
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
 # append-only stream. This is the fmdev masking bug: last-event-wins read the trailing
 # `done` and reported pending_decision=false while a needs-decision was still open. The
@@ -574,3 +863,7 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_snapshot_separates_reconciled_truth_event_history_and_wait
+test_snapshot_rejects_stale_generation_reconciliation
+test_snapshot_rejects_unowned_background_probe_pulse
+test_snapshot_reports_unmanaged_check_as_lifecycle_current

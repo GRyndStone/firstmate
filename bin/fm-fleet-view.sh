@@ -50,8 +50,21 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def action_of($t):
     if $t.kind == "secondmate" then "\($t.actions.send) - \($t.actions.watch)"
     else $t.actions.watch end;
+  def freshness_of($t):
+    "\($t.current_state.freshness) / \($t.current_state.age_seconds)s";
+  def prior_of($t):
+    if $t.prior_observed_state.state == null then "-"
+    else "\($t.prior_observed_state.state) / \($t.prior_observed_state.source)" end;
+  def event_of($t):
+    "#\($t.last_status_event.sequence) \(dash($t.last_status_event.event.raw))";
+  def wait_of($t):
+    if $t.external_wait.registered and $t.external_wait.lifecycle_current then
+      "\($t.external_wait.kind): \(dash($t.external_wait.description)) / \($t.external_wait.observation.state)"
+    elif $t.external_wait.registered then
+      "historical: \($t.external_wait.kind): \(dash($t.external_wait.description))"
+    else "-" end;
   def task_row($t):
-    "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) |";
+    "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) | \(freshness_of($t)) | \(prior_of($t)) | \(event_of($t)) | \(wait_of($t)) |";
   def blocker($r):
     if ($r.blocked_by // "") == "" then "-"
     elif ($r.blocked_reason // "") == "" then $r.blocked_by
@@ -68,8 +81,8 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   (if (.tasks | length) == 0 then
     "No live task metadata found."
    else
-    "| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel | Evidence freshness | Prior observed | Last status event | External wait |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     (.tasks[] | task_row(.))
    end),
   "",

@@ -496,6 +496,24 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
 }
 
+test_create_task_reports_partial_workspace_after_cli_failure() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-task-partial"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-partial)
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  printf '1\n' > "$dir/responses/2.exit"
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  cmux_panes_response "$dir" 4 "cccccccc-2222-2222-2222-222222222222"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-partial /tmp/proj' "$ROOT" 2>/dev/null )
+  status=$?
+  [ "$status" -eq 2 ] || fail "create_task must distinguish a possibly-created cmux workspace (got $status)"
+  [ "$out" = $'partial\tbbbbbbbb-1111-1111-1111-111111111111\tcccccccc-2222-2222-2222-222222222222' ] \
+    || fail "create_task must return recovered partial cmux ids, got '$out'"
+  pass "fm_backend_cmux_create_task: reports recoverable partial workspace creation"
+}
+
 # --- target_ready / capture ---------------------------------------------------
 
 test_target_ready_fails_when_target_absent() {
@@ -941,6 +959,74 @@ test_kill_is_best_effort_when_close_workspace_fails() {
   pass "fm_backend_cmux_kill: never fails even when close-workspace fails"
 }
 
+test_workspace_absence_requires_parseable_inventory() {
+  local dir fb title status
+  title=$(cmux_expected_scoped_title fm-task)
+  dir="$TMP_ROOT/workspace-absence-id"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 1
+  cmux_workspace_list_response "$dir" 2 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 3 aaaaaaaa-0000-0000-0000-000000000000 renamed-task
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "recorded cmux workspace id in another window must be reported present after a rename"
+  dir="$TMP_ROOT/workspace-absence-label"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 1
+  cmux_workspace_list_response "$dir" 2 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 3 bbbbbbbb-0000-0000-0000-000000000000 "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "matching cmux task label in another window must be reported present under a replacement id"
+  dir="$TMP_ROOT/workspace-absence-malformed"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 1
+  printf '{}\n' > "$dir/responses/2.out"
+  fb=$(make_cmux_fakebin "$dir")
+  set +e
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "malformed cmux inventory must remain unknown"
+  dir="$TMP_ROOT/workspace-absence-empty"; mkdir -p "$dir/responses"
+  cmux_windows_response "$dir" 1 11111111-0000-0000-0000-000000000000 0
+  cmux_workspace_list_response "$dir" 2
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_workspace_absent aaaaaaaa-0000-0000-0000-000000000000 fm-task' "$ROOT" \
+    || fail "empty parseable cmux inventory was not recognized as absent"
+  set +e
+  pass "cmux absence distinguishes empty inventories from failed reads"
+}
+
+test_kill_recovers_stale_target_across_windows() {
+  local dir fb title
+  dir="$TMP_ROOT/kill-stale-target-cross-window"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-label)
+  cmux_workspace_list_response "$dir" 1
+  cmux_workspace_list_response "$dir" 2
+  cmux_windows_response "$dir" 3 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 2
+  cmux_workspace_list_response "$dir" 4 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 5 cccccccc-2222-2222-2222-222222222222 "$title" ffffffff-0000-0000-0000-000000000000 sibling
+  cmux_panes_response "$dir" 6 dddddddd-3333-3333-3333-333333333333
+  cmux_windows_response "$dir" 7 11111111-0000-0000-0000-000000000000 1 22222222-0000-0000-0000-000000000000 2
+  cmux_workspace_list_response "$dir" 8 cccccccc-0000-0000-0000-000000000000 other
+  cmux_workspace_list_response "$dir" 9 cccccccc-2222-2222-2222-222222222222 "$title" ffffffff-0000-0000-0000-000000000000 sibling
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_kill "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111" "" fm-label' "$ROOT"
+  expect_code 0 $? "kill should recover a stale cmux target from another window"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f''cccccccc-2222-2222-2222-222222222222' \
+    "kill did not close the refreshed cmux workspace in its owning window"
+  pass "fm_backend_cmux_kill: recovers stale targets across windows"
+}
+
 test_kill_recovers_stale_target_by_label() {
   local dir fb title
   dir="$TMP_ROOT/kill-stale-target"; mkdir -p "$dir/responses"
@@ -991,6 +1077,47 @@ test_list_live_filters_by_title_prefix() {
 
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
+test_spawn_empty_partial_never_targets_same_label_workspace() {
+  local dir proj data state config fb log id out status title
+  dir="$TMP_ROOT/spawn-empty-partial"
+  proj="$dir/project"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/cmux.log"
+  id=cmuxpartialz8
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config" "$dir/responses"
+  printf 'brief\n' > "$data/$id/brief.md"
+  title=$(cmux_expected_scoped_title "fm-$id")
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  printf '1\n' > "$dir/responses/2.exit"
+  printf '{"workspaces":[]}' > "$dir/responses/3.out"
+  cmux_panes_empty_response "$dir" 4
+  cmux_workspace_list_response "$dir" 5 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  cmux_panes_response "$dir" 6 "cccccccc-2222-2222-2222-222222222222"
+  cmux_windows_response "$dir" 7 "dddddddd-3333-3333-3333-333333333333" 2
+  cmux_workspace_list_response "$dir" 8 \
+    "bbbbbbbb-1111-1111-1111-111111111111" "$title" \
+    "eeeeeeee-4444-4444-4444-444444444444" other
+  fb=$(make_cmux_fakebin "$dir")
+  fm_fake_exit0 "$fb" treehouse
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$dir/projects" FM_SPAWN_NO_GUARD=1 \
+    FM_CMUX_LOG="$log" FM_CMUX_RESPONSES="$dir/responses" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend cmux 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "cmux empty-partial creation unexpectedly spawned"
+  assert_not_contains "$(cat "$log")" $'\x1f''close-workspace' \
+    "cmux empty-partial rollback targeted a same-label workspace without a returned UUID"
+  assert_grep 'creation_phase=backend-creation' "$state/$id.spawn-claim" \
+    "cmux empty-partial creation did not retain uncertain ownership"
+  assert_contains "$out" 'retained spawn ownership' \
+    "cmux empty-partial creation did not report retained ownership"
+  pass "fm-spawn: empty cmux partials never roll back a same-label workspace"
+}
+
 test_secondmate_spawn_refuses_cmux_backend() {
   local dir state data config projects out status
   dir="$TMP_ROOT/secondmate-refuse"; state="$dir/state"; data="$dir/data"; config="$dir/config"; projects="$dir/projects"
@@ -1033,6 +1160,7 @@ test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
+test_create_task_reports_partial_workspace_after_cli_failure
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
@@ -1058,6 +1186,9 @@ test_window_of_workspace_empty_when_not_found
 test_kill_closes_workspace_directly_when_not_last
 test_kill_adds_sibling_when_last_in_window
 test_kill_is_best_effort_when_close_workspace_fails
+test_workspace_absence_requires_parseable_inventory
 test_kill_recovers_stale_target_by_label
+test_kill_recovers_stale_target_across_windows
 test_list_live_filters_by_title_prefix
+test_spawn_empty_partial_never_targets_same_label_workspace
 test_secondmate_spawn_refuses_cmux_backend

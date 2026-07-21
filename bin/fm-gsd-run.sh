@@ -131,24 +131,92 @@ gsd_run_server_identity() {
 
 RUN_STAMP="$(date +%s)-$$-$RANDOM"
 LABEL="gsd-$ID-r$RUN_STAMP"
+OWNED_RUN_DIR=0
+RUN_DIR=
+EXIT_FILE=
+PARTIAL_FILE=
+
+gsd_run_setup_state() {
+  [ -z "$RUN_DIR" ] || return 0
+  if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
+    mkdir -p "$FM_GSD_RUN_STATE_DIR" || return 1
+    RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P) || return 1
+  else
+    RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX") || return 1
+    OWNED_RUN_DIR=1
+  fi
+  EXIT_FILE="$RUN_DIR/$LABEL.exit"
+  PARTIAL_FILE="$RUN_DIR/$LABEL.partial"
+}
+
+gsd_run_parse_partial() {
+  local raw=$1 rest
+  case "$raw" in partial$'\t'*) ;; *) return 1 ;; esac
+  rest=${raw#partial$'\t'}
+  PARTIAL_FIRST=${rest%%$'\t'*}
+  if [ "$rest" = "$PARTIAL_FIRST" ]; then
+    PARTIAL_SECOND=
+  else
+    PARTIAL_SECOND=${rest#*$'\t'}
+  fi
+}
+
+gsd_run_record_partial() {  # <phase> <session> <workspace> <tab> <pane>
+  local phase=$1 session=$2 workspace=$3 tab=$4 pane=$5 tmp
+  gsd_run_setup_state || return 1
+  tmp="$PARTIAL_FILE.tmp.${BASHPID:-$$}"
+  {
+    printf 'schema=fm-gsd-run-partial.v1\n'
+    printf 'phase=%s\n' "$phase"
+    printf 'label=%s\n' "$LABEL"
+    printf 'session=%s\n' "$session"
+    printf 'workspace_id=%s\n' "$workspace"
+    printf 'tab_id=%s\n' "$tab"
+    printf 'pane_id=%s\n' "$pane"
+    printf 'recorded_at=%s\n' "$(date +%s)"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$PARTIAL_FILE"
+}
+
+gsd_run_preserve_partial() {  # <phase> <session> <workspace> <tab> <pane>
+  gsd_run_record_partial "$@" || {
+    echo "error: could not persist partial herdr launch metadata${PARTIAL_FILE:+ at $PARTIAL_FILE}" >&2
+    return 1
+  }
+  echo "error: partial herdr launch could not be verified clean; rescue metadata recorded at $PARTIAL_FILE" >&2
+}
 
 # Container ensure first so missing-herdr / refused-container preflight never
-# leaves an unused mktemp root behind.
+# leaves an unused run-state root behind. A partial container is preserved in
+# lazily-created rescue state because its ownership is ambiguous.
 # Container ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>";
 # the seeded tab id threads through to create_task untouched, which is the
 # only function allowed to prune it (see bin/backends/herdr.sh).
-CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$GSD_DIR_ABS") || exit 1
+set +e
+CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$GSD_DIR_ABS")
+CREATE_RC=$?
+set -e
+if [ "$CREATE_RC" -ne 0 ]; then
+  if [ "$CREATE_RC" -eq 2 ] && gsd_run_parse_partial "$CONTAINER_RAW"; then
+    CONTAINER=$PARTIAL_FIRST
+    SEEDED_DEFAULT_TAB_ID=$PARTIAL_SECOND
+    SES=${CONTAINER%%:*}
+    WSID=${CONTAINER#*:}
+    gsd_run_preserve_partial container "$SES" "$WSID" "$SEEDED_DEFAULT_TAB_ID" "" || true
+  fi
+  exit 1
+fi
 CONTAINER=${CONTAINER_RAW%%$'\t'*}
 SEEDED_DEFAULT_TAB_ID=${CONTAINER_RAW#*$'\t'}
 SES=${CONTAINER%%:*}
 WSID=${CONTAINER#*:}
 TAB_ID=
 PANE_ID=
-OWNED_RUN_DIR=0
-RUN_DIR=
 
 # Arm unstarted-run rollback BEFORE create_task so a create that commits a tab
-# then fails/interrupts before IDs return still cleans via label-aware rollback.
+# then fails/interrupts before IDs return still cleans via label-aware,
+# last-tab-safe rollback. A return-2 partial has already exhausted that safe
+# rollback path, so preserve its IDs instead of attempting a less-safe close.
 # shellcheck disable=SC2329
 cleanup_unstarted_run() {
   if [ "$OWNED_RUN_DIR" -eq 1 ] && [ -n "${RUN_DIR:-}" ]; then
@@ -158,7 +226,20 @@ cleanup_unstarted_run() {
 }
 trap cleanup_unstarted_run EXIT
 
-TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LABEL" "$GSD_DIR_ABS" "$SEEDED_DEFAULT_TAB_ID") || exit 1
+set +e
+TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$LABEL" "$GSD_DIR_ABS" "$SEEDED_DEFAULT_TAB_ID")
+CREATE_RC=$?
+set -e
+if [ "$CREATE_RC" -ne 0 ]; then
+  if [ "$CREATE_RC" -eq 2 ] && gsd_run_parse_partial "$TASK_IDS"; then
+    TAB_ID=$PARTIAL_FIRST
+    PANE_ID=$PARTIAL_SECOND
+    if gsd_run_preserve_partial task "$SES" "$WSID" "$TAB_ID" "$PANE_ID"; then
+      trap - EXIT
+    fi
+  fi
+  exit 1
+fi
 read -r TAB_ID PANE_ID <<EOF
 $TASK_IDS
 EOF
@@ -171,14 +252,7 @@ TARGET="$SES:$PANE_ID"
 # Exit-file dir only after the run tab exists. Default is a fresh mktemp root
 # per run (override with FM_GSD_RUN_STATE_DIR); owned roots are removed if
 # setup fails before the pane command starts.
-if [ -n "${FM_GSD_RUN_STATE_DIR:-}" ]; then
-  mkdir -p "$FM_GSD_RUN_STATE_DIR"
-  RUN_DIR=$(cd "$FM_GSD_RUN_STATE_DIR" && pwd -P)
-else
-  RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-gsd-run-$ID.XXXXXX")
-  OWNED_RUN_DIR=1
-fi
-EXIT_FILE="$RUN_DIR/$LABEL.exit"
+gsd_run_setup_state || exit 1
 
 # The pane command: run the gsd invocation through `env` (so quoted leading
 # NAME=value assignments still apply as environment), then record its exit

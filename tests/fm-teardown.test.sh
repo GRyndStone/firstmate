@@ -59,7 +59,8 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 fm_test_tmproot TMP_ROOT fm-teardown-tests
 REAL_GIT_FOR_TEST=$(command -v git)
-export REAL_GIT_FOR_TEST
+REAL_STAT_FOR_TEST=$(command -v stat)
+export REAL_GIT_FOR_TEST REAL_STAT_FOR_TEST
 
 # Build a fresh sandbox for one test case. Sets up:
 #   $CASE/state/        - firstmate state dir (with a fresh watcher beacon)
@@ -445,8 +446,13 @@ add_stat_error() {
   local case_dir=$1
   cat > "$case_dir/fakebin/stat" <<'SH'
 #!/usr/bin/env bash
-echo "stat: simulated failure" >&2
-exit 1
+case "${2:-}" in
+  %m|%Y)
+    echo "stat: simulated failure" >&2
+    exit 1
+    ;;
+esac
+exec "${REAL_STAT_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/stat"
 }
@@ -1251,6 +1257,9 @@ test_herdr_teardown_clears_escalation_marker() {
   printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "pane get" ]; then
+  printf '{"error":{"code":"pane_not_found"}}\n'
+fi
 exit 0
 SH
   chmod +x "$case_dir/fakebin/herdr"
@@ -1263,6 +1272,70 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+test_partial_herdr_teardown_closes_recorded_tab_before_metadata() {
+  local case_dir log rc
+  case_dir=$(make_case herdr-partial-tab)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:partial-task-x1/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  fm_write_meta "$case_dir/state/task-x1.meta.extra" \
+    'backend=herdr' 'spawn_partial=1' 'herdr_session=default' \
+    'herdr_workspace_id=w1' 'herdr_tab_id=w1:t9'
+  cat "$case_dir/state/task-x1.meta.extra" >> "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.extra"
+  log="$case_dir/herdr.log"
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HERDR_LOG"
+case "${1:-} ${2:-}" in
+  "tab list")
+    if [ "${FM_HERDR_VERIFY_MALFORMED:-0}" = 1 ]; then printf '{}\n'; else printf '{"result":{"tabs":[]}}\n'; fi
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+  FM_HERDR_LOG="$log" run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "recorded partial Herdr tab teardown failed"
+  assert_grep 'tab close w1:t9' "$log" "teardown did not close the recorded partial Herdr tab"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "verified partial tab cleanup retained rescue metadata"
+
+  case_dir=$(make_case herdr-partial-unverified)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:partial-task-x1/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=herdr' 'spawn_partial=1' 'herdr_session=default' \
+    'herdr_workspace_id=w1' 'herdr_tab_id=w1:t9' >> "$case_dir/state/task-x1.meta"
+  log="$case_dir/herdr.log"
+  cp "$TMP_ROOT/herdr-partial-tab/fakebin/herdr" "$case_dir/fakebin/herdr"
+  set +e
+  FM_HERDR_LOG="$log" FM_HERDR_VERIFY_MALFORMED=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unverifiable partial Herdr cleanup must fail closed"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "unverifiable partial cleanup deleted rescue metadata"
+  assert_grep 'could not verify cleanup' "$case_dir/stderr" "unverifiable partial cleanup failed silently"
+
+  case_dir=$(make_case herdr-partial-no-tab)
+  write_meta "$case_dir" local-only ship
+  sed -i.bak 's/^window=.*/window=default:partial-task-x1/' "$case_dir/state/task-x1.meta"
+  rm -f "$case_dir/state/task-x1.meta.bak"
+  printf '%s\n' 'backend=herdr' 'spawn_partial=1' 'herdr_session=default' \
+    'herdr_workspace_id=w1' 'spawn_backend_label=fm-task-x1' >> "$case_dir/state/task-x1.meta"
+  cp "$TMP_ROOT/herdr-partial-tab/fakebin/herdr" "$case_dir/fakebin/herdr"
+  set +e
+  FM_HERDR_LOG="$case_dir/herdr.log" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "non-tab partial Herdr cleanup must fail closed"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "non-tab partial cleanup deleted rescue metadata"
+  assert_grep 'has no tab id' "$case_dir/stderr" "non-tab partial cleanup did not explain why rescue metadata was preserved"
+  set +e
+  pass "partial Herdr teardown closes recorded tabs and preserves unverifiable rescue state"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1272,6 +1345,7 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
+test_partial_herdr_teardown_closes_recorded_tab_before_metadata
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

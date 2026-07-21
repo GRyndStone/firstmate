@@ -12,7 +12,8 @@
 #   (a) active run-step is authoritative                          -> run-step
 #   (b) needs-decision/blocked log + resumed run = SUPERSEDED     -> run-step
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
-#   (d) terminal run-step (passed/failed) is authoritative        -> run-step
+#   (d) terminal run-step (passed/failed) is authoritative, while a cancelled
+#       run is historical only after positive live working evidence
 #   (e) cross-branch attribution: this branch's own run found via list lookup
 #   (f) no run + busy pane                                        -> pane
 #   (g) no run + idle pane supersedes stale working history, while declared
@@ -32,6 +33,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$ROOT/bin/fm-reconcile-lib.sh"
 
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
 fm_test_tmproot TMP_ROOT fm-crew-state
@@ -127,7 +130,7 @@ SH
 make_no_timeout_toolbin() {  # <dir> -> echoes toolbin path
   local dir=$1 tb="$1/notimeoutbin" tool real
   mkdir -p "$tb"
-  for tool in bash git grep sed head cut tail dirname perl; do
+  for tool in bash git grep sed head cut tail dirname perl mkdir uname stat date; do
     real=$(command -v "$tool" || true)
     [ -n "$real" ] || fail "missing tool for no-timeout path: $tool"
     ln -s "$real" "$tb/$tool"
@@ -288,6 +291,20 @@ run:
   pr: ""
   findings: none
 outcome: failed
+EOF
+}
+
+run_cancelled() {  # <branch> [head]
+  local head=${2:-abc1234}
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: cancelled
+  head: "$head"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+outcome: cancelled
 EOF
 }
 
@@ -684,6 +701,51 @@ test_terminal_failed() {
   pass "terminal failed run is authoritative"
 }
 
+test_cancelled_run_is_superseded_by_live_herdr_turn() {
+  command -v jq >/dev/null 2>&1 || { pass "cancelled Herdr supersession skipped without jq"; return; }
+  reset_fakes
+  local d out
+  d=$(new_case cancelled-live-herdr)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-live.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: exact-head repair and focused validation\n' > "$d/state/feat-cancelled-live.status"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-live)"
+  FM_FAKE_HERDR_AGENT_STATUS=working
+  out=$(run_crew_state "$d" feat-cancelled-live)
+  assert_contains "$out" 'state: working' "live Herdr turn did not supersede a cancelled validation run"
+  assert_contains "$out" 'source: pane' "live Herdr turn was not the reconciled current-state source"
+  assert_contains "$out" 'cancelled validation run superseded' "cancelled run was not labeled historical"
+  assert_not_contains "$out" 'state: failed' "cancelled run masked the newer live Herdr turn"
+  pass "live Herdr work supersedes an intentionally cancelled validation run"
+}
+
+test_cancelled_run_remains_terminal_without_positive_live_evidence() {
+  command -v jq >/dev/null 2>&1 || { pass "cancelled Herdr idle guard skipped without jq"; return; }
+  reset_fakes
+  local d out
+  d=$(new_case cancelled-idle-herdr)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-idle
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-idle.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: stale event must not mask a stopped task\n' > "$d/state/feat-cancelled-idle.status"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-idle)"
+  FM_FAKE_HERDR_AGENT_STATUS=idle
+  out=$(run_crew_state "$d" feat-cancelled-idle)
+  assert_contains "$out" 'state: failed' "idle cancelled run lost its terminal state"
+  assert_contains "$out" 'source: run-step' "idle cancelled run lost its run-step evidence"
+  assert_not_contains "$out" 'state: working' "stale working event masked an idle cancelled task"
+  pass "cancelled run stays terminal when no positive live work supersedes it"
+}
+
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
 # routine case once more than one crew validates the same underlying repo
 # concurrently - they share ONE no-mistakes repo registration), so the helper
@@ -883,6 +945,52 @@ test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle() {
   assert_contains "$out" "source: pane" "herdr idle agent_status is the current-state source"
   assert_contains "$out" "status-log working superseded" "stale working history is labeled superseded"
   pass "herdr native idle state supersedes stale working status history"
+}
+
+# A foreground Grok/Herdr turn may be idle while a shell it launched continues
+# the task's full suite.  Only an explicit task-scoped command registration with
+# fresh exact-pid descendant progress can override native harness idle.
+test_idle_herdr_with_progressing_owned_command_is_working() {
+  command -v jq >/dev/null 2>&1 || { pass "owned-command Herdr case skipped without jq"; return; }
+  reset_fakes
+  local d pid out live_only_out cwd physical_wt i=0
+  d=$(new_case herdr-idle-owned-command)
+  make_repo_on_branch "$d/wt" fm/feat-owned-command
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-owned-command.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: full suite is still advancing in the task worktree\n' > "$d/state/feat-owned-command.status"
+  physical_wt=$(cd "$d/wt" && pwd -P)
+  sh -c 'cd "$1" || exit 1; end=$(( $(date +%s) + 30 )); while [ "$(date +%s)" -lt "$end" ]; do sleep 0.1; done' _ "$d/wt" &
+  pid=$!
+  while [ "$i" -lt 100 ]; do
+    cwd=$(fm_reconcile_process_cwd "$pid" 2>/dev/null || true)
+    fm_reconcile_path_is_within "$cwd" "$physical_wt" && break
+    sleep 0.02
+    i=$((i + 1))
+  done
+  [ "$i" -lt 100 ] || { kill "$pid" 2>/dev/null || true; fail "owned command did not enter the task worktree"; }
+  FM_OWNED_COMMAND_PROGRESS_GRACE=2 FM_STATE_OVERRIDE="$d/state" \
+    "$ROOT/bin/fm-external-wait.sh" register-command feat-owned-command "$pid" 'background full suite' >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "could not register task-owned full suite"; }
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-owned-command)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_TMUX_MISSING=1
+  FM_FAKE_HERDR_AGENT_STATUS=idle
+  FM_FAKE_HERDR_BUSY=0
+  live_only_out=$(FM_CREW_STATE_LIVE_ONLY=1 run_crew_state "$d" feat-owned-command)
+  out=$(run_crew_state "$d" feat-owned-command)
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" 'state: working' "progressing task-owned command did not override idle harness"
+  assert_contains "$out" 'source: owned-command' "owned command was not exposed as a distinct current-state source"
+  assert_contains "$out" 'descendant progress observed' "owned command current state omitted progress freshness"
+  assert_contains "$live_only_out" 'state: parked' "live-only read did not expose the underlying historical run state"
+  assert_not_contains "$live_only_out" 'source: owned-command' "live-only read double-observed the owned command"
+  pass "progressing owned commands override historical runs without double observation"
 }
 
 # (g) no run + idle pane -> the status-log verb, as-is
@@ -1151,6 +1259,8 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_cancelled_run_is_superseded_by_live_herdr_turn
+test_cancelled_run_remains_terminal_without_positive_live_evidence
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_full_run_attribution_rejects_stale_head
@@ -1160,6 +1270,7 @@ test_no_run_busy_pane
 test_no_run_herdr_unknown_uses_backend_capture
 test_no_run_herdr_idle_agent_status_overrides_busy_pane
 test_no_run_herdr_idle_agent_status_and_idle_pane_stays_idle
+test_idle_herdr_with_progressing_owned_command_is_working
 test_no_run_idle_pane_uses_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused

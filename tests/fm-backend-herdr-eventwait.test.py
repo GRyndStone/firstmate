@@ -36,7 +36,7 @@ class ClosingStreamSocket:
         pass
 
     def sendall(self, _request):
-        pass
+        self.request = _request
 
     def recv(self, _size):
         return self.chunks.pop(0)
@@ -45,6 +45,18 @@ class ClosingStreamSocket:
 class RejectedSubscriptionSocket(ClosingStreamSocket):
     def __init__(self):
         self.chunks = [b'{"result":{"type":"not_started"}}\n']
+
+
+class OutputEventSocket(ClosingStreamSocket):
+    def __init__(self):
+        self.chunks = [
+            b'{"result":{"type":"subscription_started"}}\n',
+            (
+                b'{"event":"pane.output_matched","data":{"pane_id":"pane",'
+                b'"read":{"workspace_id":"ws","text":"\\u2502 draft \\u2502"}}}\n'
+            ),
+            b"",
+        ]
 
 
 class EventWaitReadLineTest(unittest.TestCase):
@@ -83,12 +95,28 @@ class EventWaitReadLineTest(unittest.TestCase):
 
     def test_main_reports_early_stream_closure(self):
         stdout = io.StringIO()
-        with mock.patch.object(READER.socket, "socket", return_value=ClosingStreamSocket()):
+        stream = ClosingStreamSocket()
+        with mock.patch.object(READER.socket, "socket", return_value=stream):
             with mock.patch.object(READER.sys, "stdout", stdout):
                 result = READER.main(["herdr-eventwait.py", "socket", "1", "pane"])
 
         self.assertEqual(result, 4)
         self.assertEqual(stdout.getvalue(), "@subscribed\n")
+        request = stream.request.decode("utf-8")
+        self.assertIn('"type": "pane.agent_status_changed"', request)
+        self.assertIn('"type": "pane.output_matched"', request)
+
+    def test_main_projects_output_snapshot_for_durable_composer_observation(self):
+        stdout = io.StringIO()
+        with mock.patch.object(READER.socket, "socket", return_value=OutputEventSocket()):
+            with mock.patch.object(READER.sys, "stdout", stdout):
+                result = READER.main(["herdr-eventwait.py", "socket", "1", "pane"])
+
+        self.assertEqual(result, 4)
+        self.assertEqual(
+            stdout.getvalue(),
+            '@subscribed\n@composer\tpane\tws\t"│ draft │"\n',
+        )
 
     def test_main_does_not_signal_readiness_before_valid_ack(self):
         stdout = io.StringIO()

@@ -553,6 +553,313 @@ fm_backend_remove_worktree() {  # <backend> <worktree-id>
   esac
 }
 
+fm_backend_target_absent() {  # <backend> <target> [resource-id] [expected-label]
+  local backend=$1 target=$2 resource_id=${3:-} expected_label=${4:-} session pane workspace probe_rc
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    tmux)
+      [ -n "$target" ] || return 2
+      if fm_backend_tmux_target_exists "$target" "$expected_label"; then
+        return 1
+      else
+        probe_rc=$?
+      fi
+      [ "$probe_rc" -eq 1 ] && return 0
+      return 2
+      ;;
+    herdr)
+      session=${target%%:*}
+      pane=${target#*:}
+      fm_backend_herdr_pane_absent "$session" "$pane"
+      ;;
+    zellij)
+      fm_backend_zellij_parse_target "$target" || return 2
+      fm_backend_zellij_tab_absent "$FM_BACKEND_ZELLIJ_SESSION" "$resource_id" "$expected_label" "$FM_BACKEND_ZELLIJ_PANE"
+      ;;
+    orca)
+      fm_backend_orca_terminal_absent "$target"
+      ;;
+    cmux)
+      workspace=${target%%:*}
+      fm_backend_cmux_workspace_absent "$workspace" "$expected_label"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+fm_backend_worktree_absent() {  # <backend> <worktree-id>
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    orca) fm_backend_orca_worktree_absent "$@" ;;
+    *) return 2 ;;
+  esac
+}
+
+fm_backend_spawn_label_absent() {  # <backend> <label> <scope>
+  local backend=$1 label=$2 scope=${3:-}
+  [ -n "$label" ] || return 2
+  fm_backend_source "$backend" || return 2
+  case "$backend" in
+    tmux)
+      [ -n "$scope" ] || return 2
+      fm_backend_target_absent tmux "$scope:$label" '' "$label"
+      ;;
+    herdr)
+      [ -n "$scope" ] || return 2
+      fm_backend_herdr_task_label_absent "$scope" "$label"
+      ;;
+    zellij)
+      [ -n "$scope" ] || return 2
+      fm_backend_zellij_tab_absent "$scope" '' "$label"
+      ;;
+    orca)
+      [ -n "$scope" ] || return 2
+      fm_backend_orca_worktree_name_absent "$scope" "$label"
+      ;;
+    cmux)
+      fm_backend_cmux_workspace_absent '' "$label"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+fm_backend_treehouse_inventory() {
+  local project=${1:-} output line status path holder suffix tilde='~'
+  [ -n "$project" ] || return 2
+  if command -v fm_reconcile_bounded >/dev/null 2>&1; then
+    output=$(cd "$project" && fm_reconcile_bounded "${FM_SPAWN_CLAIM_PROBE_TIMEOUT:-5}" \
+      env NO_COLOR=1 TREEHOUSE_NO_UPDATE_CHECK=1 treehouse status 2>/dev/null) || return 2
+  else
+    output=$(cd "$project" && NO_COLOR=1 TREEHOUSE_NO_UPDATE_CHECK=1 treehouse status 2>/dev/null) || return 2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      ' '*) continue ;;
+      *'  available '*) status=available ;;
+      *'  in-use '*) status=in-use ;;
+      *'  dirty '*) status=dirty ;;
+      *'  leased '*) status=leased ;;
+      *'  you'\''re here '*) status="you're here" ;;
+      *) return 2 ;;
+    esac
+    path=$(printf '%s\n' "$line" | awk -v state="$status" '
+      {
+        pattern = "  " state " +"
+        if (!match($0, pattern)) exit 2
+        print substr($0, RSTART + RLENGTH)
+      }
+    ') || return 2
+    holder=
+    if [ "$status" = leased ]; then
+      holder=$(printf '%s\n' "$path" | sed -n 's/^.*  (held by \(.*\))$/\1/p')
+      if [ -n "$holder" ]; then
+        suffix="  (held by $holder)"
+        path=${path%"$suffix"}
+      fi
+    fi
+    case "$path" in
+      "$tilde") path=$HOME ;;
+      "$tilde/"*) path="$HOME/${path#*/}" ;;
+    esac
+    printf '%s\t%s\t%s\n' "$status" "$path" "$holder"
+  done <<EOF
+$output
+EOF
+}
+
+fm_backend_treehouse_lease_path() {
+  local project=${1:-} holder=${2:-} inventory status path candidate found=
+  [ -n "$holder" ] || return 2
+  inventory=$(fm_backend_treehouse_inventory "$project") || return 2
+  while IFS=$'\t' read -r status path candidate; do
+    [ "$status" = leased ] && [ "$candidate" = "$holder" ] || continue
+    [ -z "$found" ] || return 2
+    found=$path
+  done <<EOF
+$inventory
+EOF
+  [ -n "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+fm_backend_treehouse_lease_absent() {
+  local rc
+  if fm_backend_treehouse_lease_path "$1" "$2" >/dev/null; then
+    return 1
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] && return 0
+  return 2
+}
+
+fm_backend_treehouse_worktree_absent() {
+  local project=${1:-} target=${2:-} inventory status path target_real path_real listed line
+  [ -n "$project" ] && [ -n "$target" ] || return 2
+  if target_real=$(cd "$target" 2>/dev/null && pwd -P); then :; else target_real=$target; fi
+  inventory=$(fm_backend_treehouse_inventory "$project") || return 2
+  while IFS=$'\t' read -r status path _; do
+    if path_real=$(cd "$path" 2>/dev/null && pwd -P); then :; else path_real=$path; fi
+    [ "$path_real" = "$target_real" ] || continue
+    [ "$status" = available ] && return 0
+    return 1
+  done <<EOF
+$inventory
+EOF
+  listed=$(git -C "$project" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      'worktree '*)
+        path=${line#worktree }
+        if path_real=$(cd "$path" 2>/dev/null && pwd -P); then :; else path_real=$path; fi
+        [ "$path_real" != "$target_real" ] || return 2
+        ;;
+    esac
+  done <<EOF
+$listed
+EOF
+  return 0
+}
+
+fm_backend_spawn_claim_endpoint_absent() {  # <backend> <label> <scope> [rescue-meta]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-}
+  local endpoint_uncertain target resource_id endpoint_rc=2
+  if [ ! -f "$rescue" ]; then
+    fm_backend_spawn_label_absent "$backend" "$label" "$scope"
+    return $?
+  fi
+  endpoint_uncertain=$(fm_meta_get "$rescue" spawn_endpoint_uncertain)
+  case "$endpoint_uncertain" in
+    0) endpoint_rc=0 ;;
+    1)
+      if [ "$backend" = orca ]; then
+        target=$(fm_meta_get "$rescue" terminal)
+      else
+        target=$(fm_meta_get "$rescue" window)
+      fi
+      case "$backend" in
+        herdr)
+          resource_id=$(fm_meta_get "$rescue" herdr_tab_id)
+          if [ -n "$resource_id" ] && [ -n "$(fm_meta_get "$rescue" herdr_session)" ]; then
+            fm_backend_source herdr || return 2
+            if fm_backend_herdr_tab_absent \
+              "$(fm_meta_get "$rescue" herdr_session)" \
+              "$(fm_meta_get "$rescue" herdr_workspace_id)" "$resource_id"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          elif fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+            endpoint_rc=0
+          else
+            endpoint_rc=$?
+          fi
+          ;;
+        zellij)
+          resource_id=$(fm_meta_get "$rescue" zellij_tab_id)
+          if [ -n "$scope" ]; then
+            fm_backend_source zellij || return 2
+            if fm_backend_zellij_tab_absent "$scope" "$resource_id" "$label" \
+              "$(fm_meta_get "$rescue" zellij_pane_id)"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          fi
+          ;;
+        *)
+          if [ -n "$target" ]; then
+            if fm_backend_target_absent "$backend" "$target" "$resource_id" "$label"; then
+              endpoint_rc=0
+            else
+              endpoint_rc=$?
+            fi
+          elif fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+            endpoint_rc=0
+          else
+            endpoint_rc=$?
+          fi
+          ;;
+      esac
+      ;;
+    *)
+      if fm_backend_spawn_label_absent "$backend" "$label" "$scope"; then
+        endpoint_rc=0
+      else
+        endpoint_rc=$?
+      fi
+      ;;
+  esac
+  return "$endpoint_rc"
+}
+
+fm_backend_spawn_claim_absent() {  # <backend> <label> <scope> [rescue-meta] [treehouse-project] [treehouse-holder]
+  local backend=$1 label=$2 scope=${3:-} rescue=${4:-} claim_treehouse_project=${5:-} claim_treehouse_holder=${6:-}
+  local worktree_uncertain worktree_id project holder endpoint_rc=2 worktree_rc=0
+  if fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"; then
+    endpoint_rc=0
+  else
+    endpoint_rc=$?
+  fi
+  if [ ! -f "$rescue" ]; then
+    if [ -z "$claim_treehouse_holder" ]; then
+      return "$endpoint_rc"
+    fi
+    if fm_backend_treehouse_lease_absent "$claim_treehouse_project" "$claim_treehouse_holder"; then
+      worktree_rc=0
+    else
+      worktree_rc=$?
+    fi
+    [ "$endpoint_rc" -ne 1 ] || return 1
+    [ "$worktree_rc" -ne 1 ] || return 1
+    [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] || return 2
+    fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"
+    return $?
+  fi
+  worktree_uncertain=$(fm_meta_get "$rescue" spawn_worktree_uncertain)
+  case "$worktree_uncertain" in
+    ''|0) worktree_rc=0 ;;
+    1)
+      if [ "$backend" = orca ]; then
+        worktree_id=$(fm_meta_get "$rescue" orca_worktree_id)
+        if [ -n "$worktree_id" ] && fm_backend_worktree_absent orca "$worktree_id"; then
+          worktree_rc=0
+        else
+          worktree_rc=$?
+          [ -n "$worktree_id" ] || worktree_rc=2
+        fi
+      else
+        project=$(fm_meta_get "$rescue" project)
+        holder=$(fm_meta_get "$rescue" spawn_treehouse_holder)
+        worktree_id=$(fm_meta_get "$rescue" worktree)
+        if [ -n "$holder" ]; then
+          if fm_backend_treehouse_lease_absent "$project" "$holder"; then
+            worktree_rc=0
+          else
+            worktree_rc=$?
+          fi
+        elif [ -n "$worktree_id" ]; then
+          if fm_backend_treehouse_worktree_absent "$project" "$worktree_id"; then
+            worktree_rc=0
+          else
+            worktree_rc=$?
+          fi
+        else
+          worktree_rc=2
+        fi
+      fi
+      ;;
+    *) worktree_rc=2 ;;
+  esac
+  [ "$endpoint_rc" -ne 1 ] || return 1
+  [ "$worktree_rc" -ne 1 ] || return 1
+  [ "$endpoint_rc" -eq 0 ] && [ "$worktree_rc" -eq 0 ] || return 2
+  fm_backend_spawn_claim_endpoint_absent "$backend" "$label" "$scope" "$rescue"
+}
+
 fm_backend_worktree_path() {  # <backend> <worktree-id>
   local backend=$1
   shift

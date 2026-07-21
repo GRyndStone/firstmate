@@ -598,6 +598,43 @@ test_backend_of_selector_matches_explicit_target_meta() {
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
 }
 
+test_tmux_absence_probe_is_fail_closed_on_inventory_errors() {
+  fm_backend_source tmux || fail "could not load tmux backend adapter"
+  (
+    local status
+    fm_backend_tmux_target_exists() { return 0; }
+    if fm_backend_target_absent tmux firstmate:fm-task '' fm-task; then
+      fail "a live tmux target was reported absent"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 1 ] || fail "a live tmux target did not return the present verdict"
+
+    fm_backend_tmux_target_exists() { return 1; }
+    fm_backend_target_absent tmux firstmate:fm-task '' fm-task \
+      || fail "a confirmed tmux inventory miss was not reported absent"
+
+    fm_backend_tmux_target_exists() { return 2; }
+    if fm_backend_target_absent tmux firstmate:fm-task '' fm-task; then
+      fail "a failed tmux inventory query was reported absent"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 2 ] || fail "a failed tmux inventory query did not propagate unknown"
+  )
+  (
+    local status
+    tmux() { return 73; }
+    if fm_backend_tmux_target_exists firstmate:fm-task fm-task; then
+      fail "a failed tmux inventory query reported the target present"
+    else
+      status=$?
+    fi
+    [ "$status" -eq 2 ] || fail "tmux inventory failures collapsed into confirmed misses"
+  )
+  pass "tmux absence verification propagates inventory failures"
+}
+
 # --- old vs new: fm-send.sh --------------------------------------------------
 
 make_send_fakebin() {  # <dir> -> echoes fakebin dir; logs every tmux call to $FM_TMUX_LOG
@@ -867,6 +904,8 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
   assert_contains "$out" "worktree=$wt" \
     "fm-spawn.sh did not resolve a symlinked-prefix project to its real worktree when the backend reports $first_reply cwd"
+  assert_contains "$(cat "$log")" "treehouse get --lease --lease-holder '$id-" \
+    "fm-spawn.sh did not bind an uncertain treehouse allocation to its task id"
 
   rm -rf "/tmp/fm-$id"
 }
@@ -875,6 +914,110 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
   run_spawn_symlink_case physical physical
   run_spawn_symlink_case logical logical
   pass "fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal"
+}
+
+test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
+  local dir proj invalid data state config log fb out status id kill_line return_line lease_recheck_line
+  dir="$TMP_ROOT/spawn-invalid-treehouse"
+  proj="$dir/project"
+  invalid="$dir/not-a-worktree"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/log"
+  id=invalidtreehousez7
+  fm_git_init_commit "$proj"
+  mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
+  printf 'brief\n' > "$data/$id/brief.md"
+  fb="$dir/fakebin"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
+    printf 'firstmate\\n'
+    ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  status) printf '1  available  %s\\n' "$invalid" ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux" "$fb/treehouse"
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "non-worktree treehouse path unexpectedly passed spawn validation"
+  assert_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force'$'\x1f'"$invalid" \
+    "spawn validation failure did not clean its uncertain treehouse worktree"
+  kill_line=$(grep -nF $'tmux\x1f''kill-window' "$log" | tail -1 | cut -d: -f1)
+  return_line=$(grep -nF $'treehouse\x1f''return'$'\x1f''--force' "$log" | tail -1 | cut -d: -f1)
+  lease_recheck_line=$(grep -nF $'treehouse\x1f''status' "$log" | tail -1 | cut -d: -f1)
+  [ -n "$kill_line" ] && [ -n "$return_line" ] && [ -n "$lease_recheck_line" ] \
+    && [ "$kill_line" -lt "$return_line" ] && [ "$return_line" -lt "$lease_recheck_line" ] \
+    || fail "spawn cleanup did not verify endpoint cleanup before returning and rechecking its treehouse lease"
+  [ ! -e "$state/$id.spawn-claim" ] \
+    || fail "verified treehouse cleanup retained spawn ownership"
+  assert_contains "$out" 'did not yield an isolated worktree' \
+    "spawn validation failure did not report the invalid treehouse path"
+  pass "fm-spawn cleans treehouse worktrees when validation fails"
+}
+
+test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed() {
+  local dir proj invalid data state config log fb out status id
+  dir="$TMP_ROOT/spawn-unconfirmed-endpoint"
+  proj="$dir/project"
+  invalid="$dir/not-a-worktree"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/log"
+  id=unconfirmedendpointz8
+  fm_git_init_commit "$proj"
+  mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
+  printf 'brief\n' > "$data/$id/brief.md"
+  fb="$dir/fakebin"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
+    printf 'firstmate\\n'
+    ;;
+  new-window) printf '@9\\n' ;;
+  list-windows)
+    case " \$* " in *' -a '*) printf 'firstmate:fm-$id\\n' ;; esac
+    ;;
+esac
+exit 0
+SH
+  cat > "$fb/treehouse" <<'SH'
+#!/usr/bin/env bash
+{ printf 'treehouse'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
+exit 0
+SH
+  chmod +x "$fb/tmux" "$fb/treehouse"
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "unconfirmed endpoint cleanup fixture unexpectedly spawned"
+  assert_not_contains "$(cat "$log")" $'treehouse\x1f''return'$'\x1f''--force' \
+    "unconfirmed endpoint cleanup returned its treehouse worktree"
+  assert_grep 'spawn_endpoint_uncertain=1' "$state/$id.meta" \
+    "unconfirmed endpoint cleanup did not preserve endpoint uncertainty"
+  assert_grep 'spawn_worktree_uncertain=1' "$state/$id.meta" \
+    "unconfirmed endpoint cleanup released treehouse ownership"
+  assert_grep "spawn_treehouse_holder=$id-" "$state/$id.meta" \
+    "unconfirmed endpoint cleanup omitted its treehouse lease holder"
+  assert_contains "$out" 'did not yield an isolated worktree' \
+    "unconfirmed endpoint cleanup fixture did not reach abort cleanup"
+  pass "fm-spawn retains treehouse ownership until endpoint cleanup is proven"
 }
 
 # --- old vs new: fm-teardown.sh ----------------------------------------------
@@ -913,10 +1056,8 @@ run_teardown_case() {
     "$script" "$id"
 }
 
-test_teardown_conformance_old_vs_new() {
-  local old_bin fb proj wt id
-  local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new
-  old_bin=$(build_old_bin teardown-old)
+test_teardown_quiesces_endpoint_before_treehouse_return() {
+  local fb proj wt id state config data log out rc absence_probe kill_line absence_line return_line
   proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
   id="teardownconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
@@ -926,32 +1067,31 @@ test_teardown_conformance_old_vs_new() {
   mkdir -p "$data/$id"
   printf 'scout findings\n' > "$data/$id/report.md"
 
-  state_old="$TMP_ROOT/teardown-state-old"; state_new="$TMP_ROOT/teardown-state-new"
-  config_old="$TMP_ROOT/teardown-config-old"; config_new="$TMP_ROOT/teardown-config-new"
-  mkdir -p "$state_old" "$state_new" "$config_old" "$config_new"
-
-  fm_write_meta "$state_old/$id.meta" \
+  state="$TMP_ROOT/teardown-state"; config="$TMP_ROOT/teardown-config"
+  mkdir -p "$state" "$config"
+  fm_write_meta "$state/$id.meta" \
     "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off"
-  fm_write_meta "$state_new/$id.meta" \
-    "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off"
-  touch "$state_old/.last-watcher-beat" "$state_new/.last-watcher-beat"
+  touch "$state/.last-watcher-beat"
 
-  log_old="$TMP_ROOT/teardown-old.log"; log_new="$TMP_ROOT/teardown-new.log"
-  out_old=$(run_teardown_case "$old_bin/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_old" "$state_old" "$data" "$config_old" "$id" 2>&1)
-  rc_old=$?
-  out_new=$(run_teardown_case "$ROOT/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_new" "$state_new" "$data" "$config_new" "$id" 2>&1)
-  rc_new=$?
+  log="$TMP_ROOT/teardown.log"
+  out=$(run_teardown_case "$ROOT/bin/fm-teardown.sh" "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$id" 2>&1)
+  rc=$?
 
-  expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
-  expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
-  diff -u "$log_old" "$log_new" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
-    || fail "fm-teardown.sh: tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
-  assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
+  expect_code 0 "$rc" "fm-teardown.sh (scout, report present) should succeed"$'\n'"$out"
+  absence_probe="tmux"$'\x1f'"list-windows"$'\x1f'"-a"$'\x1f'"-F"$'\x1f'"#{session_name}:#{window_name}"
+  assert_contains "$(cat "$log")" "$absence_probe" \
+    "teardown did not inventory tmux windows before releasing cleanup ownership"
+  assert_contains "$(cat "$log")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
-  assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
+  assert_contains "$(cat "$log")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
     "teardown did not call tmux kill-window -t <window>"
+  kill_line=$(grep -nF "tmux"$'\x1f''kill-window' "$log" | head -1 | cut -d: -f1)
+  absence_line=$(grep -nF "$absence_probe" "$log" | head -1 | cut -d: -f1)
+  return_line=$(grep -nF "treehouse"$'\x1f''return' "$log" | head -1 | cut -d: -f1)
+  [ "$kill_line" -lt "$absence_line" ] && [ "$absence_line" -lt "$return_line" ] \
+    || fail "teardown did not quiesce and verify its endpoint before returning the worktree"
 
-  pass "fm-teardown.sh: treehouse return + tmux kill-window command log is byte-identical old vs new for a scout task"
+  pass "fm-teardown.sh quiesces and verifies endpoints before returning worktrees"
 }
 
 # --- backend selection loudly refuses an unknown backend --------------------
@@ -1068,6 +1208,48 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
 
+test_spawn_failure_without_handles_retains_creation_claim() {
+  local dir proj data state config fake log id out status
+  dir="$TMP_ROOT/no-handle-create"
+  proj="$dir/project"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  fake="$dir/fakebin"
+  log="$dir/tmux.log"
+  id=failcreatez6
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config" "$fake"
+  printf 'brief\n' > "$data/$id/brief.md"
+  cat > "$fake/tmux" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  new-window) exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$fake/tmux"
+  fm_fake_exit0 "$fake" treehouse
+  out=$(PATH="$fake:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_TMUX_LOG="$log" "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "handle-less backend creation failure unexpectedly spawned"
+  assert_grep 'creation_phase=backend-creation' "$state/$id.spawn-claim" \
+    "handle-less backend creation failure released its uncertain ownership"
+  assert_grep 'treehouse_project=' "$state/$id.spawn-claim" \
+    "handle-less backend creation failure omitted its treehouse project scope"
+  assert_grep "treehouse_holder=$id-" "$state/$id.spawn-claim" \
+    "handle-less backend creation failure omitted its lifecycle-scoped treehouse holder"
+  assert_contains "$out" 'retained spawn ownership' \
+    "handle-less backend creation failure did not report retained ownership"
+  [ ! -e "$state/$id.meta" ] || fail "handle-less backend creation failure published ordinary metadata"
+  pass "fm-spawn retains uncertain creation ownership without returned handles"
+}
+
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
@@ -1085,13 +1267,17 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_tmux_absence_probe_is_fail_closed_on_inventory_errors
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
-test_teardown_conformance_old_vs_new
+test_spawn_validation_failure_cleans_uncertain_treehouse_worktree
+test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed
+test_teardown_quiesces_endpoint_before_treehouse_return
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag
 test_spawn_refuses_unknown_fm_backend_env
 test_spawn_default_backend_writes_no_meta_field
 test_spawn_explicit_backend_flag_beats_autodetect_herdr_env
 test_spawn_autodetect_nesting_resolves_tmux_silently
+test_spawn_failure_without_handles_retains_creation_claim

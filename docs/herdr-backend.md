@@ -271,6 +271,11 @@ The 2026-07-18 supervision incident established the opposite fail-closed rule fo
 The backend read and capture are hard-bounded; timeout or unreadable state returns `unknown` instead of hanging supervision or trusting status history.
 This current-state rule is specific to `bin/fm-crew-state.sh`; injection safety and other callers retain their documented backend-specific corroboration policies.
 
+The 2026-07-20 `default:w0:p1F` incident established a distinct signal that does not weaken that native-state rule: Grok's foreground turn was truly idle while an explicitly task-owned full-suite shell continued advancing in the task worktree.
+Such work must be registered with `bin/fm-external-wait.sh register-command` against its exact pid.
+The registration boundary verifies the process cwd against that task's recorded physical worktree/tasktmp, and reconciliation follows only that pid's descendants without process-name matching or cross-home discovery.
+Fresh descendant lifecycle/CPU progress becomes the separate `owned-command` working source; unchanged progress ages out after the registered grace, and exact process completion wakes immediately.
+
 ## Slash/`$` autocomplete popup hazard (confirmed, same mitigation as tmux)
 
 Typing `/mem` into a live `claude` composer inside a herdr pane and reading the pane back within 0.1 seconds already shows the full autocomplete popup.
@@ -703,8 +708,13 @@ This is the follow-up the former "No `events.subscribe` native push" gap note de
 
 **Mechanism (one owner per contract).**
 `bin/fm-transition-lib.sh` owns the backend-neutral normalized-transition record shape and the single-owner status->action policy table (`fm_transition_policy`: `blocked`=actionable, `working`=absorb-and-clear-dedupe, `idle`/`done`=defer, anything else=fall back to polling).
-`bin/backends/herdr.sh` (`fm_backend_herdr_wait_transition`) subscribes to `pane.agent_status_changed` for this home's herdr panes over ONE raw `AF_UNIX` connection via `bin/backends/herdr-eventwait.py`, subscribing to ALL statuses (so `working` edges clear the per-pane dedupe marker) and returning the first fresh `blocked` edge; after the subscription acknowledgement it level-reconciles each pane's current state while the stream remains live, so a pane that went blocked during the gap is caught once and transitions during reconciliation are buffered.
-`bin/fm-watch.sh` splices this in as the watcher's terminal wait (`event_wait_or_sleep`, replacing the blind `sleep POLL` for push-capable homes): on a returned `blocked` it maps `pane_id -> <session>:<pane_id> -> task`, exempts `kind=secondmate` endpoints and declared `paused:` waits, and enqueues an immediate `stale` wake.
+`bin/backends/herdr.sh` (`fm_backend_herdr_wait_transition`) subscribes to `pane.agent_status_changed` and snapshot-bearing `pane.output_matched` events for this home's herdr panes over ONE raw `AF_UNIX` connection via `bin/backends/herdr-eventwait.py`, subscribing to ALL statuses and returning the first fresh `blocked` edge.
+Streamed `working` edges clear the per-pane dedupe marker and create pulse correlation, while reconnect level reads may clear obsolete dedupe state but never create working-edge correlation.
+Reconnect `blocked` level reads are tagged as level observations and fail closed instead of consuming a pulse; only the poll reconciler may consume an identical-pause return without a streamed blocked edge, and it persists the corresponding blocked acknowledgement first.
+Output events durably classify the composer from the event's exact screen revision whenever it is non-empty or unreadable.
+After the subscription acknowledgement the adapter level-reconciles each pane's current state while the stream remains live, so a pane that went blocked during the gap is caught once and transitions during reconciliation are buffered.
+`bin/fm-watch.sh` splices this in as the watcher's terminal wait (`event_wait_or_sleep`, replacing the blind `sleep POLL` for push-capable homes): on a returned `blocked` it maps `pane_id -> <session>:<pane_id> -> task`, exempts `kind=secondmate` endpoints, and enqueues an immediate `stale` wake unless the state-reconciliation contract validates and consumes an exact one-shot background-probe pulse.
+The watcher commits the Herdr transition only after durable enqueue and before the wake path exits.
 There is no second watcher process: the reader is a short-lived subprocess of the single watcher, so the "exactly one live supervision cycle" invariant and every guard/beacon/arm/turn-end mechanism are unchanged.
 
 **Polling is the permanent fail-closed backstop.**
@@ -737,7 +747,8 @@ ok - real herdr: the watcher fast-path enqueues a stale wake naming the task win
 ```
 
 The subscriber returned the `blocked` transition in **0.129s** and the watcher fast-path enqueued a durable `stale` wake naming the task window - versus up to `FM_POLL` (15s) plus `FM_STALE_ESCALATE_SECS` (240s) on the poll path this shortcuts.
-Dedupe (one wake per `->blocked` edge, marker cleared when the pane returns to `working`), subscribe-then-reconcile ordering (an already-blocked pane enqueued exactly once while newer edges buffer in the active stream), the `kind=secondmate`/`paused:` exemptions, and the three fail-closed fallbacks are covered by the fake-CLI unit tests in `tests/fm-backend-herdr.test.sh` (the `wait_transition`/`apply_transition` cases), `tests/fm-transition-lib.test.sh`, and `tests/fm-supervision-events.test.sh`.
+Dedupe (one wake per `->blocked` edge, marker cleared when the pane returns to `working`), subscribe-then-reconcile ordering (an already-blocked pane enqueued exactly once while newer edges buffer in the active stream), the `kind=secondmate` exemption, and the three fail-closed fallbacks are covered by the fake-CLI unit tests in `tests/fm-backend-herdr.test.sh` (the `wait_transition`/`apply_transition` cases), `tests/fm-transition-lib.test.sh`, and `tests/fm-supervision-events.test.sh`.
+The controlled watcher canary in `tests/fm-reconcile-watch-e2e.test.sh` owns the end-to-end ordinary-pause and one-shot background-probe assertions across watcher restart.
 
 ## Known gaps and follow-up notes
 
@@ -758,7 +769,8 @@ Dedupe (one wake per `->blocked` edge, marker cleared when the pane returns to `
   Herdr 0.7.3 preserves the harness's own de-emphasis style (dim/faint and truecolor foreground) in `pane read --format ansi`, and `fm_backend_herdr_composer_state` extracts real typed content with the shared `fm_composer_strip_ghost` (`bin/fm-composer-lib.sh`), which drops dim/faint AND dark-truecolor runs to distinguish ghost suggestions/placeholders from real typed text.
   If a future herdr build strips ANSI style from `--format ansi`, the classifier loses its ghost signal and falls back to reading the suggestion text as `pending` - the fail-safe direction (it defers rather than risks overwriting a human draft), which the max-defer alarm then surfaces.
 - **RESOLVED: a "paused / awaiting-external" crew state for the stale-wedge escalation.** Raised alongside the 2026-07-07 incident: an in-flight crew intentionally idling on a known external wait (a vendor rate limit, say) still tripped `bin/fm-supervise-daemon.sh`'s "stale persisted ... (possible wedge)" escalation exactly like a genuinely wedged crew, with no way to mark the wait as expected.
-  Fixed by the `paused:` external-wait verb: a crew declares a deliberate wait, and both `bin/fm-watch.sh` and `bin/fm-supervise-daemon.sh` absorb its idle pane through the shared `bin/fm-classify-lib.sh` vocabulary (`status_is_paused`, `crew_absorb_class`, `FM_PAUSE_RESURFACE_SECS`), re-surfacing it for a recheck on a long cadence instead of a wedge escalation.
+  Fixed by the `paused:` external-wait verb for cadence classification: a crew declares a deliberate wait, and `bin/fm-watch.sh` plus `bin/fm-supervise-daemon.sh` re-surface its idle pane for a recheck on a long cadence instead of a wedge escalation.
+  A `paused:` line never exempts direct endpoint activity; only a lifecycle-bound registration plus an exact durable one-shot pulse may absorb the correlated busy-to-identical-pause Herdr edge under [`state-reconciliation.md`](state-reconciliation.md).
   See `AGENTS.md` section 8 and the crew-facing brief contract in `bin/fm-brief.sh`.
 - **Partially implemented since 2026-07-12: mid-session secondmate liveness.** The `fm_backend_agent_alive`-driven respawn sweep (`bin/fm-bootstrap.sh`, see "Agent liveness probe reuses the husk classifier" above) still only runs at session start.
   The watcher now closes the gone-endpoint half of the gap: a recorded secondmate endpoint that no longer exists surfaces an immediately actionable `endpoint-gone` stale wake within one poll, telling the primary to run that recovery now instead of waiting for the next session start.

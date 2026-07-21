@@ -283,6 +283,44 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
+test_external_wait_registration_renders_all_brief_scaffolds() {
+  local home kind id brief
+  home="$TMP_ROOT/external-wait-home"
+  mkdir -p "$home/data"
+  for kind in ship scout secondmate gsd; do
+    id="brief-external-wait-$kind"
+    case "$kind" in
+      ship) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1 ;;
+      scout) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1 ;;
+      secondmate) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1 ;;
+      gsd) FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --gsd >/dev/null 2>&1 ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    assert_grep "FM_STATE_OVERRIDE='$home/state' '$ROOT/bin/fm-external-wait.sh' register-predicate $id" "$brief" \
+      "$kind brief did not bind the model-free wait observer to the task's authoritative state home"
+    assert_grep 'register-process' "$brief" \
+      "$kind brief omitted tracked background-process completion registration"
+    assert_grep 'register-command' "$brief" \
+      "$kind brief omitted task-owned background-command progress registration"
+    assert_grep 'register-background-probe' "$brief" \
+      "$kind brief omitted explicit paused background-probe ownership"
+    assert_grep 'arm-background-probe-pulse' "$brief" \
+      "$kind brief omitted per-pulse background-probe ownership"
+    assert_grep 'ordinary paused activity remains actionable' "$brief" \
+      "$kind brief weakened generic paused endpoint activity"
+    assert_grep 'unobservable parked task wakes as a runtime failure' "$brief" \
+      "$kind brief did not state the fail-loud parking contract"
+    if [ "$kind" != secondmate ]; then
+      assert_grep 'state-owned wait helper' "$brief" \
+        "$kind brief did not exempt state-owned wait registration from its worktree boundary"
+      # shellcheck disable=SC2016 # Backticks are literal brief prose.
+      assert_grep 'supplied `FM_STATE_OVERRIDE`' "$brief" \
+        "$kind brief did not scope its wait-helper boundary exception"
+    fi
+  done
+  pass "fm-brief.sh: every scaffold binds observable waits to the authoritative task state"
+}
+
 # --gsd scaffolds the standing GSD-manager contract: drive an external GSD.Pi
 # project headless, never hand-edit its .gsd/ state, route NEEDS-HUMAN gates as
 # needs-decision, work around the 1.9.0 headless process leak, and finish only
@@ -377,5 +415,6 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
+test_external_wait_registration_renders_all_brief_scaffolds
 test_gsd_brief_contract
 test_gsd_rejects_secondmate_and_scout

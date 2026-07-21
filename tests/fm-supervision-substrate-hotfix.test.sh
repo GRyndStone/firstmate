@@ -203,7 +203,8 @@ case "$slow_state" in
 esac
 
 rm -f "$PRIMARY/state/incident.meta" "$PRIMARY/state/incident.status"
-: > "$PRIMARY/state/ownership.meta"
+printf 'project=%s\nworktree=%s\nkind=ship\n' "$PRIMARY" "$PRIMARY" \
+  > "$PRIMARY/state/ownership.meta"
 orphan_arm_out="$TMP_ROOT/orphan-arm.out"
 ARM_PID=$(FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
   bash -c '"$1" >"$2" 2>&1 & child=$!; i=0; while [ "$i" -lt 100 ] && [ ! -s "$3/.watch.lock/owner-tracker-identity" ]; do sleep 0.1; i=$((i + 1)); done; printf "%s\n" "$child"' _ \
@@ -224,7 +225,8 @@ wait_for_absent "$PRIMARY/state/.watch.lock" || fail "shell-backgrounded arm did
 ARM_PID=
 rm -f "$PRIMARY/state/ownership.meta"
 
-: > "$PRIMARY/state/checkpoint.meta"
+printf 'project=%s\nworktree=%s\nkind=ship\n' "$PRIMARY" "$PRIMARY" \
+  > "$PRIMARY/state/checkpoint.meta"
 checkpoint_out="$TMP_ROOT/checkpoint.out"
 checkpoint_err="$TMP_ROOT/checkpoint.err"
 FM_HOME="$PRIMARY" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \

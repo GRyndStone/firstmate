@@ -129,6 +129,10 @@ if [ ! -f "$META" ]; then
   echo "fm-x-link: no such task: state/$ID.meta" >&2
   exit 1
 fi
+META_GENERATION=$(fm_reconcile_meta_generation "$META") || {
+  echo "fm-x-link: cannot resolve task lifecycle generation for $ID" >&2
+  exit 1
+}
 
 command -v jq >/dev/null 2>&1 || { echo "fm-x-link: jq not found" >&2; exit 1; }
 fmx_load_config
@@ -194,7 +198,7 @@ else
   esac
 fi
 
-if ! fmx_meta_link_set "$META" "$RID" "$LINK_TS" "$FOLLOWUPS" "$REQ_PLATFORM" "$REQ_REPLY_MAX"; then
+if ! fmx_meta_link_set "$META" "$META_GENERATION" "$RID" "$LINK_TS" "$FOLLOWUPS" "$REQ_PLATFORM" "$REQ_REPLY_MAX"; then
   echo "fm-x-link: failed to record the link in state/$ID.meta" >&2
   exit 1
 fi

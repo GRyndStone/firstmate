@@ -117,6 +117,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-nm-generation-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$SCRIPT_DIR/fm-reconcile-lib.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -195,9 +197,21 @@ fi
 if [ "$BACKEND" = orca ]; then
   fm_backend_orca_runtime_check || exit 1
 fi
-ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+SPAWN_CLAIMED=0
+SPAWN_META_PUBLISHED=0
+SPAWN_ENDPOINT_CREATED=0
+SPAWN_WORKTREE_CREATED=0
+SPAWN_PARTIAL_ENDPOINT=0
+SPAWN_CREATION_STARTED=0
+SPAWN_TASK_TMP_CREATED=0
+SPAWN_CLAUDE_HOOK_CREATED=0
+SPAWN_OPENCODE_HOOK_CREATED=0
+SPAWN_PI_EXT_CREATED=0
+SPAWN_GROK_POINTER_CREATED=0
+SPAWN_GROK_TOKEN_CREATED=0
+SPAWN_GROK_AUTH_TOKEN=
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -216,38 +230,196 @@ parse_orca_worktree_result() {
   fi
 }
 
-orca_spawn_abort_cleanup() {
-  local status=$?
-  [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
-  ORCA_ABORT_CLEANUP=0
-  if [ -n "${ORCA_TERMINAL:-}" ]; then
-    fm_backend_kill orca "$ORCA_TERMINAL" 2>/dev/null || true
+spawn_abort_cleanup() {
+  local status=$? cleanup_failed=0 endpoint_cleanup_failed=0 rescue token creation_uncertain=0
+  [ "$SPAWN_META_PUBLISHED" -eq 0 ] || return "$status"
+  if [ "$SPAWN_CREATION_STARTED" -eq 1 ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 0 ]; then
+    cleanup_failed=1
+    creation_uncertain=1
   fi
-  if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
-    if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        {
-          echo "window=$W"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          echo "mode=${MODE:-no-mistakes}"
-          echo "yolo=${YOLO:-off}"
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=orca"
-          echo "orca_worktree_id=$ORCA_WORKTREE_ID"
-          [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
+  if [ "${BACKEND:-}" = orca ]; then
+    if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ -n "${T:-${ORCA_TERMINAL:-}}" ]; then
+      fm_backend_kill orca "${T:-$ORCA_TERMINAL}" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+      fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ]; then
+      if [ -n "${T:-${ORCA_TERMINAL:-}}" ] \
+        && fm_backend_target_absent orca "${T:-$ORCA_TERMINAL}"; then
+        SPAWN_ENDPOINT_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
+      if [ -n "${ORCA_WORKTREE_ID:-}" ] \
+        && fm_backend_worktree_absent orca "$ORCA_WORKTREE_ID"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
       fi
     fi
   fi
+  if [ "$SPAWN_ENDPOINT_CREATED" -eq 1 ] && [ "${BACKEND:-}" != orca ]; then
+    case "${BACKEND:-tmux}" in
+      herdr)
+        if [ -n "${HERDR_TAB_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
+          fm_backend_herdr_cli "$HERDR_SES" tab close "$HERDR_TAB_ID" >/dev/null 2>&1 || true
+          fm_backend_herdr_tab_absent "$HERDR_SES" "${HERDR_WORKSPACE_ID:-}" "$HERDR_TAB_ID" \
+            || endpoint_cleanup_failed=1
+        elif [ -n "${HERDR_PANE_ID:-}" ] && [ -n "${HERDR_SES:-}" ]; then
+          fm_backend_kill herdr "$HERDR_SES:$HERDR_PANE_ID" 2>/dev/null || true
+          fm_backend_herdr_pane_absent "$HERDR_SES" "$HERDR_PANE_ID" || true
+          endpoint_cleanup_failed=1
+        else
+          endpoint_cleanup_failed=1
+        fi
+        ;;
+      zellij)
+        if [ -n "${ZELLIJ_SES:-}" ] && { [ -n "${ZELLIJ_TAB_ID:-}" ] || [ -n "${ZELLIJ_PANE_ID:-}" ]; }; then
+          fm_backend_kill zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+          if ! fm_backend_target_absent zellij "$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial}" \
+            "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}"; then
+            endpoint_cleanup_failed=1
+          fi
+        else
+          endpoint_cleanup_failed=1
+        fi
+        ;;
+      cmux)
+        if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+          fm_backend_kill cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" '' "${W:-fm-${ID:-}}" 2>/dev/null || true
+          fm_backend_target_absent cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" \
+            '' "${W:-fm-${ID:-}}" || endpoint_cleanup_failed=1
+        else
+          endpoint_cleanup_failed=1
+        fi
+        ;;
+      *)
+        if [ -n "${T:-}" ]; then
+          fm_backend_kill "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" 2>/dev/null || true
+          fm_backend_target_absent "${BACKEND:-tmux}" "$T" "${ZELLIJ_TAB_ID:-}" "${W:-fm-${ID:-}}" || endpoint_cleanup_failed=1
+        else
+          endpoint_cleanup_failed=1
+        fi
+        ;;
+    esac
+    if [ "$endpoint_cleanup_failed" -eq 1 ]; then
+      cleanup_failed=1
+    else
+      SPAWN_ENDPOINT_CREATED=0
+    fi
+  fi
+  if [ "${BACKEND:-}" != orca ] && [ "${KIND:-}" != secondmate ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] \
+    && [ -n "${PROJ_ABS:-}" ]; then
+    if [ -z "${WT:-}" ]; then
+      if WT=$(fm_backend_treehouse_lease_path "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"); then
+        :
+      elif fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${WT:-}" ]; then
+      # shellcheck disable=SC2016 # Positional parameters expand in the bounded child shell.
+      if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" bash -c \
+        'cd "$1" && treehouse return --force "$2"' fm-treehouse-return "$PROJ_ABS" "$WT" >/dev/null 2>&1 \
+        && fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+        SPAWN_WORKTREE_CREATED=0
+      else
+        cleanup_failed=1
+      fi
+    fi
+  fi
+  if [ "${BACKEND:-}" != orca ] && [ "${KIND:-}" != secondmate ] \
+    && [ "$SPAWN_ENDPOINT_CREATED" -eq 0 ] && [ "$SPAWN_WORKTREE_CREATED" -eq 0 ] \
+    && [ -n "${PROJ_ABS:-}" ] \
+    && ! fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then
+    SPAWN_WORKTREE_CREATED=1
+    cleanup_failed=1
+  fi
+  if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    if [ "$SPAWN_CLAUDE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.claude/settings.local.json" 2>/dev/null || true; fi
+    if [ "$SPAWN_OPENCODE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.opencode/plugins/fm-turn-end.js" 2>/dev/null || true; fi
+    if [ "$SPAWN_GROK_POINTER_CREATED" -eq 1 ]; then rm -f "$WT/.fm-grok-turnend" 2>/dev/null || true; fi
+  fi
+  if [ "$SPAWN_TASK_TMP_CREATED" -eq 1 ] && [ -n "${TASK_TMP:-}" ]; then rm -rf "$TASK_TMP" 2>/dev/null || true; fi
+  if [ -n "${STATE:-}" ] && [ -n "${ID:-}" ]; then
+    if [ "$SPAWN_GROK_TOKEN_CREATED" -eq 1 ]; then
+      token=$SPAWN_GROK_AUTH_TOKEN
+      case "$token" in ''|*[!A-Za-z0-9._-]*) ;; *) rm -f "${GROK_AUTH_DIR:-/nonexistent}/$token" 2>/dev/null || true ;; esac
+      rm -f "$STATE/$ID.grok-turnend-token" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_PI_EXT_CREATED" -eq 1 ]; then rm -f "$STATE/$ID.pi-ext.ts" 2>/dev/null || true; fi
+  fi
+  if [ "$cleanup_failed" -eq 1 ] && [ "$SPAWN_CLAIMED" -eq 1 ]; then
+    if [ "$creation_uncertain" -eq 1 ]; then
+      echo "error: $BACKEND spawn $ID exited after backend creation began without recoverable handles; retained spawn ownership" >&2
+    else
+      rescue="$STATE/$ID.meta.rescue.${BASHPID:-$$}"
+      fm_reconcile_spawn_claim_mark_rescue_pending "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue" 2>/dev/null || true
+      if {
+        if [ "${BACKEND:-tmux}" = orca ]; then echo "window=${W:-fm-$ID}"; else echo "window=${T:-${W:-fm-$ID}}"; fi
+        echo "generation=$LIFECYCLE_GENERATION"
+        echo "worktree=${WT:-}"
+        echo "project=${PROJ_ABS:-}"
+        echo "harness=${HARNESS:-}"
+        echo "kind=${KIND:-ship}"
+        echo "mode=${MODE:-no-mistakes}"
+        echo "yolo=${YOLO:-off}"
+        echo "tasktmp=${TASK_TMP:-}"
+        echo "model=${MODEL:-default}"
+        echo "effort=${EFFORT:-default}"
+        echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
+        echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
+        echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
+        if [ "${BACKEND:-tmux}" != orca ] && [ "$SPAWN_WORKTREE_CREATED" -eq 1 ]; then
+          echo "spawn_treehouse_holder=$TREEHOUSE_LEASE_HOLDER"
+        fi
+        echo "spawn_backend_label=${W:-fm-$ID}"
+        [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+        [ -z "${ORCA_WORKTREE_ID:-}" ] || echo "orca_worktree_id=$ORCA_WORKTREE_ID"
+        [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
+        [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
+        [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
+        [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
+        [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
+        [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
+        [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
+        [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
+        [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
+        [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
+      } > "$rescue" 2>/dev/null \
+        && fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$rescue"; then
+        SPAWN_META_PUBLISHED=1
+        SPAWN_CLAIMED=0
+      else
+        echo "error: cleanup of partial $BACKEND spawn $ID could not be verified and rescue metadata was not published; retained spawn ownership" >&2
+      fi
+    fi
+  fi
+  if [ "$SPAWN_CLAIMED" -eq 1 ] && [ "$cleanup_failed" -eq 0 ]; then
+    fm_reconcile_spawn_claim_release "$STATE" "$ID" "$LIFECYCLE_GENERATION" 2>/dev/null || true
+    SPAWN_CLAIMED=0
+  fi
   return "$status"
 }
-trap orca_spawn_abort_cleanup EXIT
+
+parse_partial_create_result() {
+  local raw=$1 rest
+  case "$raw" in partial$'\t'*) ;; *) return 1 ;; esac
+  rest=${raw#partial$'\t'}
+  PARTIAL_CREATE_FIRST=${rest%%$'\t'*}
+  if [ "$rest" = "$PARTIAL_CREATE_FIRST" ]; then
+    PARTIAL_CREATE_SECOND=
+  else
+    PARTIAL_CREATE_SECOND=${rest#*$'\t'}
+  fi
+}
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -285,7 +457,15 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   done
   exit "$rc"
 fi
-ID=${POS[0]}
+ID=${POS[0]:-}
+if ! fm_reconcile_task_id_valid "$ID"; then
+  echo "error: invalid task id '$ID'" >&2
+  exit 2
+fi
+LIFECYCLE_GENERATION=$(fm_task_identity_new_token) \
+  || { echo "error: cannot create lifecycle generation for task $ID" >&2; exit 1; }
+TREEHOUSE_LEASE_HOLDER="$ID-$LIFECYCLE_GENERATION"
+trap spawn_abort_cleanup EXIT
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -673,6 +853,24 @@ fi
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 
+# Ship/scout task identity is repository-scoped at the spawn/respawn lifecycle
+# boundary.  Validate before any backend endpoint or worktree creation so a
+# follow-up can never silently overwrite an existing id's metadata with an
+# unrelated project.  Same-repository recovery (including another linked
+# worktree) remains valid.  A secondmate is instead bound to its configured
+# persistent home through the existing home/registry validators above; its meta
+# deliberately has no project= field, so repository identity validation here
+# would break legitimate dead-endpoint recovery.
+mkdir -p "$STATE"
+if [ "$KIND" != secondmate ]; then
+  fm_task_identity_bind "$STATE" "$ID" "$PROJ_ABS_REAL" || exit 1
+fi
+if ! fm_reconcile_spawn_claim "$STATE" "$ID" "$LIFECYCLE_GENERATION"; then
+  echo "error: task $ID already has an active spawn lifecycle or teardown; refusing resource creation" >&2
+  exit 1
+fi
+SPAWN_CLAIMED=1
+
 real_path_or_raw() {  # <path>
   local path=$1 real
   if real=$(cd "$path" 2>/dev/null && pwd -P); then
@@ -709,6 +907,40 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 }
 
 W="fm-$ID"
+HERDR_LABEL_HOME=$FM_HOME
+if [ "$BACKEND" = herdr ] && [ "$KIND" = secondmate ]; then
+  HERDR_LABEL_HOME=$PROJ_ABS
+fi
+SPAWN_BACKEND_HOME=$FM_HOME
+SPAWN_BACKEND_SCOPE=
+SPAWN_TREEHOUSE_PROJECT=
+SPAWN_TREEHOUSE_HOLDER=
+case "$BACKEND" in
+  tmux)
+    if [ -n "${TMUX:-}" ]; then
+      SPAWN_BACKEND_SCOPE=$(tmux display-message -p '#S' 2>/dev/null || true)
+    else
+      SPAWN_BACKEND_SCOPE=firstmate
+    fi
+    ;;
+  herdr)
+    SPAWN_BACKEND_SCOPE=$(fm_backend_herdr_session)
+    SPAWN_BACKEND_HOME=$HERDR_LABEL_HOME
+    ;;
+  zellij) SPAWN_BACKEND_SCOPE=$(fm_backend_zellij_session) ;;
+  orca) SPAWN_BACKEND_SCOPE=$PROJ_ABS_REAL ;;
+esac
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  SPAWN_TREEHOUSE_PROJECT=$PROJ_ABS
+  SPAWN_TREEHOUSE_HOLDER=$TREEHOUSE_LEASE_HOLDER
+fi
+if ! fm_reconcile_spawn_claim_mark_creation_started "$STATE" "$ID" "$LIFECYCLE_GENERATION" \
+  "$BACKEND" "$W" "$SPAWN_BACKEND_SCOPE" "$SPAWN_BACKEND_HOME" \
+  "$SPAWN_TREEHOUSE_PROJECT" "$SPAWN_TREEHOUSE_HOLDER"; then
+  echo "error: task $ID lifecycle ownership changed before backend creation; refusing resource creation" >&2
+  exit 1
+fi
+SPAWN_CREATION_STARTED=1
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -721,6 +953,7 @@ case "$BACKEND" in
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
     WT_TARGET="$WID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   herdr)
     # fm_backend_herdr_workspace_label resolves the target workspace from
@@ -734,11 +967,22 @@ case "$BACKEND" in
     # to PROJ_ABS for just these two calls (bash restores it automatically
     # after each prefixed simple-command call) so the secondmate's tab lands
     # in the secondmate's own workspace, not the primary's "firstmate" one.
-    HERDR_LABEL_HOME=$FM_HOME
-    if [ "$KIND" = secondmate ]; then
-      HERDR_LABEL_HOME=$PROJ_ABS
+    set +e
+    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$HERDR_CONTAINER_RAW"; then
+        CONTAINER=$PARTIAL_CREATE_FIRST
+        HERDR_SEEDED_DEFAULT_TAB_ID=$PARTIAL_CREATE_SECOND
+        HERDR_SES=${CONTAINER%%:*}
+        HERDR_WORKSPACE_ID=${CONTAINER#*:}
+        T="$HERDR_SES:partial-$ID"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
     fi
-    HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
     # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
     # (the second field empty when this call ADOPTED a pre-existing workspace
     # rather than creating a fresh one). Split on the guaranteed single tab
@@ -749,7 +993,20 @@ case "$BACKEND" in
     HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
     HERDR_SES=${CONTAINER%%:*}
     HERDR_WORKSPACE_ID=${CONTAINER#*:}
-    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+    set +e
+    HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$HERDR_TASK_IDS"; then
+        HERDR_TAB_ID=$PARTIAL_CREATE_FIRST
+        HERDR_PANE_ID=$PARTIAL_CREATE_SECOND
+        T="$HERDR_SES:${HERDR_PANE_ID:-partial-$ID}"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -758,10 +1015,24 @@ EOF
       exit 1
     fi
     T="$HERDR_SES:$HERDR_PANE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    set +e
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$ZELLIJ_TASK_IDS"; then
+        ZELLIJ_TAB_ID=$PARTIAL_CREATE_FIRST
+        ZELLIJ_PANE_ID=$PARTIAL_CREATE_SECOND
+        T="$ZELLIJ_SES:${ZELLIJ_PANE_ID:-partial-$ID}"
+        SPAWN_ENDPOINT_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+      fi
+      exit 1
+    fi
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -770,10 +1041,26 @@ EOF
       exit 1
     fi
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    set +e
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS")
+    CREATE_RC=$?
+    set -e
+    if [ "$CREATE_RC" -ne 0 ]; then
+      if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$CMUX_TASK_IDS"; then
+        CMUX_WORKSPACE_ID=$PARTIAL_CREATE_FIRST
+        CMUX_SURFACE_ID=$PARTIAL_CREATE_SECOND
+        if [ -n "$CMUX_WORKSPACE_ID" ]; then
+          T="$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial-$ID}"
+          SPAWN_ENDPOINT_CREATED=1
+          SPAWN_PARTIAL_ENDPOINT=1
+        fi
+      fi
+      exit 1
+    fi
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -782,6 +1069,7 @@ EOF
       exit 1
     fi
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
   orca)
     set +e
@@ -789,24 +1077,42 @@ EOF
     ORCA_WT_STATUS=$?
     set -e
     if [ "$ORCA_WT_STATUS" -ne 0 ]; then
-      if [ "$ORCA_WT_STATUS" -eq 2 ] && [ -n "$ORCA_WT_RAW" ]; then
-        if parse_orca_worktree_result "$ORCA_WT_RAW" && [ -n "$ORCA_WORKTREE_ID" ]; then
-          ORCA_ABORT_CLEANUP=1
+      if [ "$ORCA_WT_STATUS" -eq 2 ]; then
+        SPAWN_WORKTREE_CREATED=1
+        SPAWN_PARTIAL_ENDPOINT=1
+        if [ -n "$ORCA_WT_RAW" ] && parse_orca_worktree_result "$ORCA_WT_RAW"; then
+          [ -z "$ORCA_TERMINAL" ] || SPAWN_ENDPOINT_CREATED=1
         fi
       fi
       exit 1
     fi
     parse_orca_worktree_result "$ORCA_WT_RAW" || true
-    ORCA_ABORT_CLEANUP=1
+    [ -z "$ORCA_WORKTREE_ID" ] || SPAWN_WORKTREE_CREATED=1
+    [ -z "$ORCA_TERMINAL" ] || SPAWN_ENDPOINT_CREATED=1
     if [ -z "$ORCA_WORKTREE_ID" ] || [ -z "$WT" ]; then
       echo "error: orca did not return a worktree id/path for $W" >&2
       exit 1
     fi
     validate_spawn_worktree "orca worktree create" "$W"
     if [ -z "$ORCA_TERMINAL" ]; then
-      ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
+      set +e
+      ORCA_TERMINAL_RAW=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W")
+      ORCA_TERMINAL_STATUS=$?
+      set -e
+      if [ "$ORCA_TERMINAL_STATUS" -ne 0 ]; then
+        if [ "$ORCA_TERMINAL_STATUS" -eq 2 ]; then
+          SPAWN_ENDPOINT_CREATED=1
+          SPAWN_PARTIAL_ENDPOINT=1
+          case "$ORCA_TERMINAL_RAW" in
+            partial$'\t'*) ORCA_TERMINAL=${ORCA_TERMINAL_RAW#partial$'\t'} ;;
+          esac
+        fi
+        exit 1
+      fi
+      ORCA_TERMINAL=$ORCA_TERMINAL_RAW
     fi
     T="$ORCA_TERMINAL"
+    SPAWN_ENDPOINT_CREATED=1
     ;;
 esac
 # #134 robustness: only tmux needs a worktree-detection target distinct from $T -
@@ -851,9 +1157,10 @@ spawn_send_key() {  # <target> <key>
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  SPAWN_WORKTREE_CREATED=1
+  spawn_send_text_line "$WT_TARGET" "fm_treehouse_worktree=\$(treehouse get --lease --lease-holder $(shell_quote "$TREEHOUSE_LEASE_HOLDER")) && cd -- \"\$fm_treehouse_worktree\""
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the shell's explicit cd after treehouse returns the leased worktree path.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -883,6 +1190,7 @@ fi
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 TASK_TMP="/tmp/fm-$ID"
+if [ ! -e "$TASK_TMP" ]; then SPAWN_TASK_TMP_CREATED=1; fi
 mkdir -p "$TASK_TMP/gotmp"
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the
@@ -902,6 +1210,9 @@ if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
+      [ ! -e "$WT/.claude/settings.local.json" ] \
+        || { echo "error: refusing to replace existing Claude hook in $WT" >&2; exit 1; }
+      SPAWN_CLAUDE_HOOK_CREATED=1
       cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
@@ -909,6 +1220,9 @@ EOF
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
+      [ ! -e "$WT/.opencode/plugins/fm-turn-end.js" ] \
+        || { echo "error: refusing to replace existing OpenCode hook in $WT" >&2; exit 1; }
+      SPAWN_OPENCODE_HOOK_CREATED=1
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
 export const FmTurnEnd = async ({ \$ }) => ({
   event: async ({ event }) => {
@@ -922,6 +1236,9 @@ EOF
       # Written OUTSIDE the worktree: pi's project-trust gate fires on any extension
       # loaded from inside the project (verified live), but an explicit -e path
       # elsewhere loads without a dialog. Lives in state/, cleaned by teardown.
+      [ ! -e "$STATE/$ID.pi-ext.ts" ] \
+        || { echo "error: refusing to replace existing pi hook for $ID" >&2; exit 1; }
+      SPAWN_PI_EXT_CREATED=1
       cat > "$STATE/$ID.pi-ext.ts" <<EOF
 // Firstmate turn-end signal; written by fm-spawn.
 // Use "turn_end" (fires after each turn the agent finishes), not "agent_end"
@@ -953,11 +1270,17 @@ EOF
       # touches grok's managed config - only firstmate-owned files.
       GROK_HOOKS_DIR="${GROK_HOME:-$HOME/.grok}/hooks"
       GROK_AUTH_DIR="$GROK_HOOKS_DIR/fm-turn-end.d"
+      [ ! -e "$STATE/$ID.grok-turnend-token" ] \
+        || { echo "error: refusing to replace existing Grok token for $ID" >&2; exit 1; }
+      [ ! -e "$WT/.fm-grok-turnend" ] \
+        || { echo "error: refusing to replace existing Grok hook pointer in $WT" >&2; exit 1; }
       mkdir -p "$GROK_AUTH_DIR"
       old_umask=$(umask)
       umask 077
       auth_file=$(mktemp "$GROK_AUTH_DIR/fm.XXXXXXXXXXXX")
       umask "$old_umask"
+      SPAWN_GROK_AUTH_TOKEN=${auth_file##*/}
+      SPAWN_GROK_TOKEN_CREATED=1
       printf '%s\n' "$TURNEND" > "$auth_file"
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.grok-turnend-token"
       sq_grok_auth_dir=$(shell_quote "$GROK_AUTH_DIR")
@@ -982,6 +1305,7 @@ EOF
       chmod +x "$GROK_HOOKS_DIR/fm-turn-end.sh"
       hook_command=$(json_escape "bash $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
       printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$hook_command" > "$GROK_HOOKS_DIR/fm-turn-end.json"
+      SPAWN_GROK_POINTER_CREATED=1
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
       exclude_path '.fm-grok-turnend'
       ;;
@@ -1018,8 +1342,10 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
 {
   echo "window=$META_WINDOW"
+  echo "generation=$LIFECYCLE_GENERATION"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
@@ -1058,8 +1384,14 @@ META_WINDOW=$T
   fi
   # Task-pinned no-mistakes generation (explicit no-mistakes ship only).
   fm_nm_generation_meta_lines
-} > "$STATE/$ID.meta"
-[ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+} > "$META_TMP"
+if ! fm_reconcile_spawn_publish "$STATE" "$ID" "$LIFECYCLE_GENERATION" "$META_TMP"; then
+  rm -f "$META_TMP"
+  echo "error: task $ID lifecycle ownership changed before metadata publication; rolling back spawn resources" >&2
+  exit 1
+fi
+SPAWN_CLAIMED=0
+SPAWN_META_PUBLISHED=1
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
