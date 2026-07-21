@@ -13,10 +13,10 @@
 # refuses the default session and verifies the fleet-state tripwire.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
@@ -29,10 +29,9 @@ SESSION="fm-lab-eventwait-smoke-$$"
 export HERDR_SESSION="$SESSION"
 SCRATCH=
 cleanup_all() {
-  [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
   herdr_safe_stop_and_delete "$SESSION"
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 fm_herdr_lab_prepare "$SESSION" || fail "could not prepare the isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
@@ -45,8 +44,6 @@ HERDR_VERSION=$(herdr --version 2>/dev/null | head -1)
 
 if ! fm_backend_herdr_events_capable "$SESSION"; then
   echo "skip: this herdr build is below the events.subscribe capability (protocol < 16 or events surface absent)"
-  cleanup_all
-  trap - EXIT
   exit 0
 fi
 pass "real herdr ($HERDR_VERSION): events.subscribe capability gate passes (protocol >= 16, events surface present in api schema)"
@@ -64,7 +61,7 @@ EOF
 TARGET="$SESSION:$PANE_ID"
 
 # scratch firstmate state so window_to_task and the wake queue resolve
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-evwait.XXXXXX")
+fm_test_tmproot SCRATCH fm-evwait
 STATE="$SCRATCH/state"; mkdir -p "$STATE"
 cat > "$STATE/evwait1.meta" <<EOF
 window=$TARGET
@@ -125,5 +122,4 @@ grep -q "$TARGET" "$STATE/.wake-queue" || fail "the stale record must name the t
 grep -q 'herdr: agent blocked' "$STATE/.wake-queue" || fail "the stale payload must name the herdr-blocked cause"
 pass "real herdr: the watcher fast-path enqueues a stale wake naming the task window from the live blocked transition"
 
-cleanup_all
-trap - EXIT
+# EXIT trap tears down the lab session and SCRATCH.

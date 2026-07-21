@@ -32,7 +32,8 @@
 # agent_not_found forever and never confirm a submission.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
@@ -41,8 +42,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
 SESSION="fm-lab-afk-herdr-e2e-$$"
 export HERDR_SESSION="$SESSION"
@@ -61,10 +61,8 @@ cleanup_all() {
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
   herdr_safe_stop_and_delete "$SESSION" 2>/dev/null || true
-  rm -rf "${HERDR_SHIM_DIR:-}" 2>/dev/null || true
-  rm -rf "${STATE_DIR:-}" 2>/dev/null || true
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # --- source the daemon (for afk_enter/afk_exit/FM_INJECT_MARK) + the backend -
@@ -76,7 +74,7 @@ fm_backend_source herdr || fail "fm_backend_source herdr failed"
 
 fm_backend_herdr_version_check || fail "version_check failed against the real installed herdr"
 
-STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-e2e.XXXXXX")
+fm_test_tmproot STATE_DIR fm-afk-herdr-e2e
 mkdir -p "$STATE_DIR"
 LOG_FILE="$STATE_DIR/submitted.log"
 : > "$LOG_FILE"
@@ -205,7 +203,7 @@ sleep 1  # let the loop start and settle
 
 # --- herdr shim: forwards to the real binary, optionally swallows one Enter --
 REAL_HERDR=$(command -v herdr)
-HERDR_SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-shim.XXXXXX")
+fm_test_tmproot HERDR_SHIM_DIR fm-herdr-shim
 cat > "$HERDR_SHIM_DIR/herdr" <<SHIM
 #!/usr/bin/env bash
 if [ "\${1:-}" = "pane" ] && [ "\${2:-}" = "send-keys" ] && [ -f "$STATE_DIR/.swallow-enter" ]; then
@@ -509,5 +507,4 @@ echo "all real-herdr afk injection e2e tests passed"
 
 fm_backend_herdr_kill "$SUPERVISOR_TARGET" 2>/dev/null || true
 fm_backend_herdr_kill "$SESSION:$FAKE_CREW_PANE_ID" 2>/dev/null || true
-cleanup_all
-trap - EXIT
+# EXIT trap tears down daemon, lab session, and registered temp roots.

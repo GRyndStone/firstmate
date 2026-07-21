@@ -257,6 +257,198 @@ test_local_varname_assignment() {
   pass "printf -v assigns into caller-local variables"
 }
 
+test_trap_reinstall_after_trap_clear() {
+  # Historical gap: trap was installed only when the array was empty, so
+  # `trap - EXIT` then another registration stranded every subsequent root.
+  local out
+  out=$(
+    bash -c '
+      set -u
+      . "$1/tests/lib.sh"
+      export TMPDIR="$2"
+      fm_test_tmproot A fm-tmproot-retrap
+      mkdir -p "$A/x"
+      trap - EXIT
+      fm_test_tmproot B fm-tmproot-retrap
+      mkdir -p "$B/y"
+      case "$(trap -p EXIT 2>/dev/null || true)" in
+        *fm_test_cleanup*) : ;;
+        *) echo "no trap after re-register"; exit 1 ;;
+      esac
+      printf "%s\n%s\n" "$A" "$B"
+    ' _ "$REPO_ROOT" "$TMPDIR"
+  ) || fail "trap-reinstall subprocess failed: $out"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ ! -e "$p" ] || fail "retrap root survived EXIT: $p"
+  done <<< "$out"
+  [ "$(count_prefix_roots fm-tmproot-retrap)" = "0" ] || fail "retrap left prefix entries"
+  pass "registration reinstalls EXIT trap after trap - EXIT"
+}
+
+test_add_cleanup_hook_runs_before_dir_removal() {
+  local out hook_marker root_path
+  out=$(
+    bash -c '
+      set -u
+      . "$1/tests/lib.sh"
+      export TMPDIR="$2"
+      fm_test_tmproot ROOT fm-tmproot-hook
+      mkdir -p "$ROOT/child"
+      marker="$2/hook-marker-$$"
+      saw_root_alive="$2/hook-saw-root-$$"
+      hook() {
+        if [ -d "$ROOT" ]; then
+          : > "$saw_root_alive"
+        fi
+        : > "$marker"
+      }
+      fm_test_add_cleanup hook
+      printf "%s\n%s\n%s\n" "$ROOT" "$marker" "$saw_root_alive"
+    ' _ "$REPO_ROOT" "$TMPDIR"
+  ) || fail "add_cleanup subprocess failed"
+  root_path=$(printf '%s\n' "$out" | sed -n '1p')
+  hook_marker=$(printf '%s\n' "$out" | sed -n '2p')
+  saw=$(printf '%s\n' "$out" | sed -n '3p')
+  [ ! -e "$root_path" ] || fail "hook suite left root: $root_path"
+  [ -f "$hook_marker" ] || fail "exit hook did not run"
+  [ -f "$saw" ] || fail "exit hook ran after dir removal (root already gone)"
+  rm -f "$hook_marker" "$saw"
+  pass "fm_test_add_cleanup runs hooks before registered dir removal"
+}
+
+test_register_tmp_and_physical_path() {
+  local out
+  out=$(
+    bash -c '
+      set -u
+      . "$1/tests/lib.sh"
+      export TMPDIR="$2"
+      fm_test_tmproot ROOT fm-tmproot-phys
+      case "$ROOT" in
+        /*) : ;;
+        *) echo "not absolute: $ROOT"; exit 1 ;;
+      esac
+      # Physical: no intermediate symlink components when TMPDIR itself is linked.
+      resolved=$(cd "$ROOT" && pwd -P)
+      [ "$ROOT" = "$resolved" ] || { echo "not physical: $ROOT vs $resolved"; exit 1; }
+      extra="$2/fm-tmproot-regextra.$$"
+      mkdir -p "$extra/nested"
+      fm_test_register_tmp "$extra"
+      printf "%s\n%s\n" "$ROOT" "$extra"
+    ' _ "$REPO_ROOT" "$TMPDIR"
+  ) || fail "physical/register subprocess failed: $out"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ ! -e "$p" ] || fail "register/phys root survived EXIT: $p"
+  done <<< "$out"
+  pass "physical path assignment and fm_test_register_tmp cleanup"
+}
+
+test_raw_mktemp_fm_prefix_static_rejected() {
+  local hits scan_status fixture
+  scan_raw_fm_mktemp() {
+    local scan_root=$1 scan_output status
+    if ! command -v perl >/dev/null 2>&1; then
+      printf 'perl is required for the raw mktemp static scan\n' >&2
+      return 127
+    fi
+    scan_output=$(perl -MFile::Find -e '
+      use strict;
+      use warnings;
+      my $root = shift;
+      my $failed = 0;
+      find(
+        {
+          no_chdir => 1,
+          wanted => sub {
+            return unless -f $_ && /[.]sh\z/;
+            my $file = $File::Find::name;
+            # lib.sh owns the only sanctioned mktemp -d implementation;
+            # this regression file embeds fixture strings that look like call sites.
+            return if $file =~ m{/tests/lib\.sh\z};
+            return if $file =~ m{/tests/fm-test-tmproot\.test\.sh\z};
+            open my $fh, "<", $file or do {
+              warn "$file: $!\n";
+              $failed = 1;
+              return;
+            };
+            local $/;
+            my $source = <$fh> // "";
+            close $fh or do {
+              warn "$file: $!\n";
+              $failed = 1;
+              return;
+            };
+            # Skip an allow comment immediately above a mktemp -d line; flag
+            # every other mktemp -d that targets an fm-* prefix.
+            while ($source =~ /(?m:^[ \t]*# fm-tmproot-static-allow:[^\n]*\n[^\n]*\bmktemp[ \t]+-d[^\n]*\bfm-[A-Za-z0-9._-]*)(*SKIP)(*F)|(?m:^[^\n]*\bmktemp[ \t]+-d[^\n]*\bfm-[A-Za-z0-9._-]*)/g) {
+              my $prefix = substr($source, 0, $-[0]);
+              my $line = 1 + ($prefix =~ tr/\n//);
+              my $line_start = rindex($source, "\n", $-[0] - 1) + 1;
+              my $line_end = index($source, "\n", $+[0]);
+              $line_end = length($source) if $line_end < 0;
+              my $matching_lines = substr($source, $line_start, $line_end - $line_start);
+              # Comment-only documentation lines are not call sites.
+              next if $matching_lines =~ /^[ \t]*#/;
+              print "$file:$line:$matching_lines\n";
+            }
+          },
+        },
+        $root
+      );
+      exit $failed;
+    ' "$scan_root" 2>&1)
+    status=$?
+    case "$status" in
+      0|1) printf '%s' "$scan_output" ;;
+      *) printf '%s\n' "$scan_output" >&2; return "$status" ;;
+    esac
+  }
+
+  fixture="$TMPDIR/raw-mktemp-fixture"
+  mkdir -p "$fixture/bad" "$fixture/ok"
+  # Literal fixture source for the static scanner (not meant to expand here).
+  # shellcheck disable=SC2016
+  printf 'x=$(mktemp -d "${TMPDIR:-/tmp}/fm-leaky.XXXXXX")\n' > "$fixture/bad/bad.sh"
+  hits=$(scan_raw_fm_mktemp "$fixture/bad")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "raw mktemp fixture scan failed with $scan_status"
+  assert_contains "$hits" "fm-leaky" "raw mktemp -d of fm-* prefix bypassed scanner"
+
+  # shellcheck disable=SC2016
+  printf '# fm-tmproot-static-allow: documented exception\nx=$(mktemp -d "${TMPDIR:-/tmp}/fm-allowed.XXXXXX")\n' > "$fixture/ok/ok.sh"
+  hits=$(scan_raw_fm_mktemp "$fixture/ok")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "allowlisted raw mktemp scan failed with $scan_status"
+  [ -z "$hits" ] || fail "allowlisted raw mktemp still flagged"$'\n'"$hits"
+
+  hits=$(scan_raw_fm_mktemp "$REPO_ROOT/tests")
+  scan_status=$?
+  [ "$scan_status" -eq 0 ] || fail "tests/ raw mktemp scan failed with $scan_status"
+  [ -z "$hits" ] || fail "static: raw mktemp -d of fm-* prefix remains in tests/"$'\n'"$hits"
+  pass "raw mktemp -d of fm-* prefixes rejected (fixture + tests/)"
+}
+
+test_focused_suite_leaves_no_known_leak_prefixes() {
+  # Run a representative suite that historically leaked under an isolated
+  # TMPDIR and assert known prefixes are gone afterward.
+  local isolate rc=0 leak
+  fm_test_tmproot isolate fm-tmproot-leakproof
+  (
+    export TMPDIR="$isolate"
+    bash "$REPO_ROOT/tests/fm-gotmp.test.sh" >/dev/null
+    bash "$REPO_ROOT/tests/fm-cd-pretool-check.test.sh" >/dev/null
+  ) || rc=$?
+  [ "$rc" -eq 0 ] || fail "focused suites failed under isolated TMPDIR (rc=$rc)"
+  # Suites must remove every fm-* child they create. The isolate root itself is
+  # registered with the parent suite trap and is not a leak.
+  leak=$(find "$isolate" -mindepth 1 \( -type d -o -type f \) \
+    \( -name 'fm-*' -o -path '*/fm-*' \) 2>/dev/null | head -50)
+  [ -z "$leak" ] || fail "focused suites left fm-* paths under isolated TMPDIR"$'\n'"$leak"
+  pass "focused suites leave no fm-* leak prefixes under isolated TMPDIR"
+}
+
 test_single_root_parent_registration
 test_multi_root_cleanup
 test_helper_sourced_registration
@@ -264,5 +456,10 @@ test_failing_test_still_cleans
 test_custom_exit_trap_composition
 test_command_substitution_is_unsafe_and_static_rejected
 test_local_varname_assignment
+test_trap_reinstall_after_trap_clear
+test_add_cleanup_hook_runs_before_dir_removal
+test_register_tmp_and_physical_path
+test_raw_mktemp_fm_prefix_static_rejected
+test_focused_suite_leaves_no_known_leak_prefixes
 
 pass "fm_test_tmproot regression suite complete"

@@ -17,10 +17,10 @@
 # (docs/cmux-backend.md "Setup"), are unaffected.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the cmux adapter)"; exit 0; }
 
@@ -42,7 +42,7 @@ cleanup_all() {
   [ -z "$WS1" ] || cmux_safe_close_workspace "$WS1" "fm-test-smoke1"
   [ -z "$WS2" ] || cmux_safe_close_workspace "$WS2" "fm-test-smoke2"
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 
 # --- create_task + duplicate refusal -----------------------------------------
 
@@ -184,5 +184,4 @@ case "$live" in
 esac
 pass "real cmux: list_live discovers a live task workspace by fm-<id> title"
 
-cleanup_all
-trap - EXIT
+# EXIT trap closes only the workspaces this suite created.

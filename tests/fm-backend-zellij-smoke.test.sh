@@ -15,10 +15,10 @@
 # for herdr.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
 command -v zellij >/dev/null 2>&1 || { echo "skip: zellij not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the zellij adapter)"; exit 0; }
@@ -28,17 +28,17 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the zel
 
 SESSION="fm-backend-smoke-$$"
 export FM_ZELLIJ_SESSION="$SESSION"
-trap cleanup_all EXIT
 
 cleanup_all() {
   zellij_safe_delete "$SESSION"
 }
+fm_test_add_cleanup cleanup_all
 
-TMP_CWD="${TMPDIR:-/tmp}"
-[ -d "$TMP_CWD" ] || fail "temporary directory does not exist: $TMP_CWD"
-TMP_CWD=$(cd "$TMP_CWD" && pwd -P) || fail "could not resolve temporary directory: $TMP_CWD"
+TMP_ROOT=
+fm_test_tmproot TMP_ROOT fm-zellij-wrap
+TMP_CWD="$TMP_ROOT"
 printf -v TMP_CWD_Q '%q' "$TMP_CWD"
-LONG_CWD="$TMP_CWD/fm-zellij-wrap-$$/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddddddddddd"
+LONG_CWD="$TMP_CWD/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddddddddddd"
 mkdir -p "$LONG_CWD" || fail "could not create long cwd fixture: $LONG_CWD"
 LONG_CWD=$(cd "$LONG_CWD" && pwd -P) || fail "could not resolve long cwd fixture: $LONG_CWD"
 printf -v LONG_CWD_Q '%q' "$LONG_CWD"
@@ -201,5 +201,4 @@ pass "real zellij: list_live discovers a live task tab by fm-<id> name"
 
 fm_backend_zellij_kill "$SESSION:$PANE_ID2"
 
-cleanup_all
-trap - EXIT
+# EXIT trap tears down the private zellij session and TMP_ROOT.
