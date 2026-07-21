@@ -279,8 +279,9 @@ test_sweep_respawns_confirmed_dead_secondmate() {
     "the stale endpoint must be killed before respawn (tmux refuses a same-named window over a live one)"
   assert_contains "$(cat "$log")" "new-window" \
     "a confirmed-dead secondmate should actually be relaunched"
-  assert_contains "$(cat "$log")" "export NO_MISTAKES_RUN_AGENTS='codex'" \
-    "the recovery respawn did not reconstruct the resolved codex validation assignment"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$log"; then
+    fail "secondmate recovery must not export NO_MISTAKES_RUN_AGENTS from harness: $(cat "$log")"
+  fi
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
 }
 

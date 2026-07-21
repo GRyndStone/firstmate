@@ -32,11 +32,12 @@ test_help_includes_entire_header() {
 }
 
 # Registry with one project per delivery mode, so each ship-mode DOD branch is
-# exercised. A project absent from the registry defaults to no-mistakes.
+# exercised. A project absent from the registry defaults to direct-PR.
 write_registry() {
   local home=$1
   mkdir -p "$home/data"
   cat > "$home/data/projects.md" <<'EOF'
+- nm-proj [no-mistakes] - fixture for explicit no-mistakes mode (added 2026-07-01)
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 EOF
@@ -52,7 +53,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:nm-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj" "brief-unknown-a4:no-registry-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -63,7 +64,12 @@ test_ship_modes_generate_clean_briefs() {
     assert_grep "{TASK}" "$brief" "$id: brief missing the {TASK} placeholder"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
   done
-  pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
+  assert_grep "ships **no-mistakes**" "$home/data/brief-nomistakes-a1/brief.md" "explicit no-mistakes brief missing mode label"
+  assert_grep "ships **direct-PR**" "$home/data/brief-directpr-a2/brief.md" "direct-PR brief missing mode label"
+  assert_grep "focused tests and lint" "$home/data/brief-directpr-a2/brief.md" "direct-PR brief missing focused tests/lint"
+  assert_grep "ships **local-only**" "$home/data/brief-localonly-a3/brief.md" "local-only brief missing mode label"
+  assert_grep "ships **direct-PR**" "$home/data/brief-unknown-a4/brief.md" "unknown project must default to direct-PR brief"
+  pass "fm-brief.sh: no-mistakes/direct-PR/local-only/unknown briefs generate cleanly"
 }
 
 # Pin the specific line the bug lived on: the no-mistakes DOD's no-mistakes
@@ -72,6 +78,7 @@ test_no_mistakes_dod_wording() {
   local home id brief
   home="$TMP_ROOT/wording-home"
   mkdir -p "$home/data"
+  printf '%s\n' '- some-proj [no-mistakes] - explicit nm fixture (added 2026-07-01)' > "$home/data/projects.md"
   id="brief-wording-b1"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"

@@ -143,7 +143,7 @@ The full cmux home label also includes a short hash of the resolved `FM_ROOT` pa
 claude, codex, opencode, pi, and grok are all empirically verified; new harnesses get verified through a supervised trial task before joining the set.
 The verified adapter knowledge - busy signatures, interrupt and exit commands, skill-invocation syntax, and per-harness quirks - lives in [`.agents/skills/harness-adapters/SKILL.md`](../.agents/skills/harness-adapters/SKILL.md).
 Launch mechanics, including the verified command templates, live in [`bin/fm-spawn.sh`](../bin/fm-spawn.sh).
-The worker validation-agent inheritance contract and private-runner compatibility evidence live in [`docs/no-mistakes-agent-handoff.md`](no-mistakes-agent-handoff.md).
+No-mistakes generation routing (which binary and state root a task validates against) and the separation from validation-agent selection live in "No-mistakes generation" below and in [`docs/no-mistakes-agent-handoff.md`](no-mistakes-agent-handoff.md).
 Primary-session turn-end guard integrations for verified harnesses are tracked as repo-level hook files and documented in [`docs/turnend-guard.md`](turnend-guard.md).
 Primary-session watcher wake protocols are rendered at session start by [`bin/fm-supervision-instructions.sh`](../bin/fm-supervision-instructions.sh) from [`docs/supervision-protocols/`](supervision-protocols/).
 Claude and Grok use background-notify cycles, Codex uses the identity-bound local supervisor daemon, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.
@@ -157,10 +157,61 @@ When the harness token is absent or `default`, secondmate launch falls back thro
 An explicit harness argument to `fm-spawn.sh` still overrides either config file for that spawn only.
 An explicit `--model` or `--effort` overrides the matching token from `config/secondmate-harness`; an explicit harness or raw launch command starts with clean model and effort defaults unless those flags are also passed.
 When `config/crew-dispatch.json` exists, crewmate and scout spawns require an explicit resolved harness instead of automatically falling back to `config/crew-harness`.
-The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, and `config/backlog-backend` into secondmate homes at secondmate spawn, during the locked session-start bootstrap secondmate sweep, and during explicit `bin/fm-config-push.sh` runs, so a secondmate's own crewmates, dispatch profiles, and backlog backend use the primary values.
+The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, `config/backlog-backend`, and `config/no-mistakes-generation` into secondmate homes at secondmate spawn, during the locked session-start bootstrap secondmate sweep, and during explicit `bin/fm-config-push.sh` runs, so a secondmate's own crewmates, dispatch profiles, backlog backend, and no-mistakes generation selection use the primary values.
 `config/secondmate-harness` is not inherited because secondmates do not launch secondmates.
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
 For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
+
+## Delivery mode defaults (data/projects.md)
+
+[`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the single owner of delivery-mode resolution from `data/projects.md`.
+`direct-PR` is the default for omitted mode brackets, unknown modes, missing registry, and unknown projects.
+`no-mistakes` is explicit opt-in only (`[no-mistakes]` on the registry line).
+`AGENTS.md` section 6 keeps the operator-facing mode list and points here for the fallback rule.
+
+Firstmate's own GitHub PR check for this repo is separate: [`.github/workflows/no-mistakes-required.yml`](../.github/workflows/no-mistakes-required.yml) runs [`bin/fm-pr-delivery-check.sh`](../bin/fm-pr-delivery-check.sh), which accepts direct-PR by default and fails closed only for explicit no-mistakes (label `no-mistakes` and/or body line `delivery: no-mistakes`) without the pipeline signature.
+`CONTRIBUTING.md` documents both human paths.
+
+## No-mistakes generation (config/no-mistakes-generation)
+
+`config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned **explicit `no-mistakes` ship** tasks use for validation.
+It is ignored for `direct-PR`, `local-only`, scout, and secondmate launches.
+This section is the single owner of the operator-facing generation contract; script headers and [`docs/no-mistakes-agent-handoff.md`](no-mistakes-agent-handoff.md) point here instead of restating it.
+
+Format (key=value lines; comments and blanks ignored):
+
+```text
+id=<short-label>
+binary=<absolute-path-to-no-mistakes-cli>
+home=<absolute-state-root>
+```
+
+`binary` and `home` are required when the file is present; both must be absolute paths.
+`id` is optional and defaults to the basename of `home`.
+See [`docs/examples/no-mistakes-generation`](examples/no-mistakes-generation) for a copy-paste template.
+
+Resolution and pinning (ship + `mode=no-mistakes` only):
+
+1. Prefer an existing task meta pin (`nm_generation=`, `nm_binary=`, `nm_home=`) so recovery keeps the original generation.
+2. Otherwise read `config/no-mistakes-generation` when present.
+3. Validate executable binary, existing home directory, and a healthy daemon for that home (`NM_HOME=<home> <binary> daemon status` reports running).
+4. Snapshot the pin into the new task's meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into that worker pane only.
+5. Absent file on an opted-in no-mistakes task: ambient PATH `no-mistakes` and default `NM_HOME`.
+6. Present but incomplete, invalid, or unhealthy on an opted-in no-mistakes task: fail closed at spawn with an actionable diagnostic; never silently route to the ambient/default installation.
+7. Non-no-mistakes tasks never read this file: a bad or absent generation config cannot break direct-PR or local-only launches.
+
+A later edit to the config file affects only future spawns.
+It must not rewrite live task metadata or force-restart a process.
+[`bin/fm-crew-state.sh`](../bin/fm-crew-state.sh) uses the task pin when present so status reads hit the same generation.
+
+Firstmate chooses the generation only.
+No-mistakes chooses validation agents from fresh quota evidence inside that generation.
+Firstmate does not derive `NO_MISTAKES_RUN_AGENTS` from the crewmate harness or model.
+
+The file is inherited into secondmate homes with the other declared inheritable config items so secondmate-spawned crewmates resolve the same selection.
+Secondmate agent launches themselves do not pin a generation.
+
+Bootstrap prints a detect-only `NM_GENERATION:` line when the file is present (active, invalid, or unhealthy).
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -229,7 +280,7 @@ It emits `SECONDMATE_SYNC:` only when a home was skipped for an actionable sync 
 `NUDGE_SECONDMATES:` lists stable `fm-<id>` task selectors; the `bootstrap-diagnostics` skill owns the send procedure.
 The same bootstrap run also emits `SECONDMATE_LIVENESS:` for live secondmate endpoints: `already-live` and `respawned` are handled states, while `skipped` or `respawn failed` means the secondmate still needs attention.
 For a mid-session inherited config edit where tracked-file sync and reread nudges are not needed, run `bin/fm-config-push.sh`.
-It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, and `backlog-backend` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero only for real propagation errors.
+It uses the same live secondmate discovery and propagation helper as bootstrap, prints each live home's `crew-dispatch.json`, `crew-harness`, `backlog-backend`, and `no-mistakes-generation` result as `pushed`, `unchanged`, `skipped`, or `error`, and exits non-zero only for real propagation errors.
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 

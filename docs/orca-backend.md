@@ -72,7 +72,7 @@ Spawn:
 2. Create an independent Orca worktree with `orca worktree create --repo id:<repo> --name fm-<id> --no-parent --setup skip`.
 3. Reuse the terminal returned by Orca worktree creation only when it appears in the verified `result.terminal.handle` shape, or create a titled terminal in that worktree when Orca returns only the worktree.
 4. Install firstmate's per-harness turn-end hooks in the Orca worktree.
-5. Write metadata, then send the `GOTMPDIR` and `NO_MISTAKES_RUN_AGENTS` exports and the selected harness launch through the recorded Orca terminal.
+5. Write metadata, then send the `GOTMPDIR` export, any task-pinned no-mistakes generation exports (`NM_HOME` / `PATH` from `config/no-mistakes-generation`), and the selected harness launch through the recorded Orca terminal.
 
 Operation routing:
 
