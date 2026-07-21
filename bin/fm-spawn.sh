@@ -73,10 +73,15 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
-#   The resolved HARNESS is also exported into the worker pane as the one-item
-#   NO_MISTAKES_RUN_AGENTS order before launch. claude, codex, opencode, and pi
-#   are supported by the private runner. Any other literal value is exported
-#   unchanged so validation fails closed instead of selecting an `auto` agent.
+#   For ordinary ship/scout tasks, the no-mistakes generation pin is resolved
+#   from config/no-mistakes-generation (or preserved from existing task meta on
+#   recovery), snapshotted into meta as nm_generation=/nm_binary=/nm_home=, and
+#   exported into the worker pane as NM_HOME plus a PATH prefix for that binary.
+#   Absent config keeps ambient PATH/NM_HOME. Invalid or unhealthy configured
+#   generations fail closed and never fall back to the ambient install.
+#   Firstmate does not export NO_MISTAKES_RUN_AGENTS from the crewmate harness;
+#   no-mistakes selects validation agents from its own quota evidence.
+#   See bin/fm-nm-generation-lib.sh and docs/configuration.md.
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -106,6 +111,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-nm-generation-lib.sh
+. "$SCRIPT_DIR/fm-nm-generation-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
@@ -384,12 +391,22 @@ case "$ARG3" in
     ;;
 esac
 
-[ -n "$HARNESS" ] || { echo "error: could not derive a harness from the raw launch command; refusing an empty no-mistakes assignment" >&2; exit 1; }
-NM_RUN_AGENTS=$HARNESS
-case "$HARNESS" in
-  claude|codex|opencode|pi) : ;;
-  *) echo "warning: harness '$HARNESS' is not supported by private no-mistakes run agents; exporting it literally so validation fails closed instead of selecting another agent" >&2 ;;
-esac
+[ -n "$HARNESS" ] || { echo "error: could not derive a harness from the raw launch command; refusing an empty harness" >&2; exit 1; }
+
+# No-mistakes generation pin for ordinary ship/scout tasks only. Secondmates do
+# not validate their own home through no-mistakes; their crewmates resolve the
+# pin when spawned inside the secondmate home (inherited config when set).
+FM_NM_GEN_ID=
+FM_NM_GEN_BINARY=
+FM_NM_GEN_HOME=
+FM_NM_GEN_ERR=
+if [ "$KIND" != secondmate ]; then
+  if ! fm_nm_generation_resolve_for_spawn "$CONFIG" "$STATE/$ID.meta"; then
+    echo "error: no-mistakes generation routing failed: ${FM_NM_GEN_ERR:-unknown error}" >&2
+    echo "error: fix or remove config/no-mistakes-generation; refusing ambient fallback for validation work" >&2
+    exit 1
+  fi
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -1033,6 +1050,10 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
+  # Task-pinned no-mistakes generation (ordinary ship/scout only). Written only
+  # when a generation is selected; ambient tasks omit these keys so existing
+  # meta readers stay compatible.
+  fm_nm_generation_meta_lines
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
@@ -1041,7 +1062,6 @@ sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
-sq_nm_run_agents=$(shell_quote "$NM_RUN_AGENTS")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
@@ -1058,11 +1078,20 @@ fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
+# When a no-mistakes generation is pinned, export NM_HOME and PATH so the
+# worker's validation work hits that generation only - never the ambient default.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
-spawn_send_text_line "$T" "export NO_MISTAKES_RUN_AGENTS=$sq_nm_run_agents"
+while IFS= read -r nm_export_line; do
+  [ -n "$nm_export_line" ] || continue
+  spawn_send_text_line "$T" "$nm_export_line"
+done < <(fm_nm_generation_export_lines)
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
 
-echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+if [ -n "${FM_NM_GEN_BINARY:-}" ]; then
+  echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT nm_generation=${FM_NM_GEN_ID:-}"
+else
+  echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+fi

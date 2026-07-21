@@ -127,8 +127,9 @@ test_no_profile_keeps_claude_launch_unchanged() {
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$HOME_DIR/data/$id/brief.md')\""
   [ "$launch" = "$expected" ] || fail "no-profile claude launch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='claude'" "$shelllog" \
-    "static crew-harness resolution did not export claude to no-mistakes"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
+    fail "must not export NO_MISTAKES_RUN_AGENTS from harness: $(cat "$shelllog")"
+  fi
   pass "no --model/--effort records defaults and keeps the claude launch byte-identical"
 }
 
@@ -181,8 +182,9 @@ test_active_dispatch_profile_allows_explicit_harness() {
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
     "explicit harness launch did not thread model and effort"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='codex'" "$shelllog" \
-    "dispatch-resolved harness did not export codex to no-mistakes"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
+    fail "must not export NO_MISTAKES_RUN_AGENTS from dispatch harness: $(cat "$shelllog")"
+  fi
   pass "active crew-dispatch profile allows an explicit resolved harness"
 }
 
@@ -218,10 +220,9 @@ test_active_dispatch_profile_allows_raw_launch_command() {
   launch=$(cat "$LAUNCH_LOG")
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   [ "$launch" = "custom-agent --flag" ] || fail "raw launch command changed"$'\n'"actual: $launch"
-  assert_contains "$out" "harness 'custom-agent' is not supported by private no-mistakes run agents" \
-    "raw unsupported harness did not warn that validation will fail closed"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='custom-agent'" "$shelllog" \
-    "raw unsupported harness was not exported literally for fail-closed validation"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
+    fail "raw harness must not export NO_MISTAKES_RUN_AGENTS: $(cat "$shelllog")"
+  fi
   pass "active crew-dispatch profile allows the raw launch-command escape hatch"
 }
 
@@ -289,10 +290,9 @@ test_grok_threads_model_and_reasoning_effort() {
   assert_contains "$launch" "grok --always-approve --model 'grok-4' --reasoning-effort 'high'" \
     "grok launch did not thread model and reasoning-effort flags"
   assert_not_contains "$launch" "--effort" "grok launch must use --reasoning-effort, not --effort"
-  assert_contains "$out" "harness 'grok' is not supported by private no-mistakes run agents" \
-    "grok did not warn that no-mistakes validation will fail closed"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='grok'" "$shelllog" \
-    "grok was not exported literally for fail-closed validation"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
+    fail "grok must not export NO_MISTAKES_RUN_AGENTS from harness: $(cat "$shelllog")"
+  fi
   pass "grok receives --model and --reasoning-effort profile flags"
 }
 
@@ -350,7 +350,7 @@ test_pi_omits_invalid_max_effort() {
 }
 
 test_batch_forwards_shared_profile_flags() {
-  local rec id1 id2 out status shelllog count
+  local rec id1 id2 out status shelllog
   id1=profile-batch-a-z9
   id2=profile-batch-b-z10
   rec=$(make_spawn_case profile-batch claude "$id1" "$id2")
@@ -366,8 +366,9 @@ test_batch_forwards_shared_profile_flags() {
   assert_meta_profile "$HOME_DIR/state/$id1.meta" codex gpt-5 high
   assert_meta_profile "$HOME_DIR/state/$id2.meta" codex gpt-5 high
   shelllog="${LAUNCH_LOG%.log}.shell.log"
-  count=$(grep -cFx "export NO_MISTAKES_RUN_AGENTS='codex'" "$shelllog" || true)
-  [ "$count" -eq 2 ] || fail "batch exported codex validation assignment $count times, want 2"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
+    fail "batch must not export NO_MISTAKES_RUN_AGENTS from harness: $(cat "$shelllog")"
+  fi
   pass "batch dispatch forwards shared --harness, --model, and --effort to every pair"
 }
 
@@ -399,15 +400,12 @@ test_concurrent_static_and_dispatch_assignments_do_not_cross_talk() {
 
   sshell="${slog%.log}.shell.log"
   dshell="${dlog%.log}.shell.log"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='claude'" "$sshell" \
-    "concurrent static worker did not receive claude"
-  assert_not_contains "$(cat "$sshell")" "NO_MISTAKES_RUN_AGENTS='codex'" \
-    "dispatch worker assignment crossed into the static worker pane"
-  assert_grep "export NO_MISTAKES_RUN_AGENTS='codex'" "$dshell" \
-    "concurrent dispatch worker did not receive codex"
-  assert_not_contains "$(cat "$dshell")" "NO_MISTAKES_RUN_AGENTS='claude'" \
-    "static worker assignment crossed into the dispatch worker pane"
-  pass "concurrent static and dispatch workers receive distinct no-mistakes assignments without cross-talk"
+  assert_grep "export GOTMPDIR=" "$sshell" "concurrent static worker missing GOTMPDIR"
+  assert_grep "export GOTMPDIR=" "$dshell" "concurrent dispatch worker missing GOTMPDIR"
+  if grep -q 'NO_MISTAKES_RUN_AGENTS' "$sshell" "$dshell"; then
+    fail "concurrent workers must not export harness NO_MISTAKES_RUN_AGENTS"
+  fi
+  pass "concurrent static and dispatch workers launch without harness-parity agent export"
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {

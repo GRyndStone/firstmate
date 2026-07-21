@@ -1,58 +1,53 @@
-# No-mistakes worker agent handoff
+# No-mistakes generation routing and agent selection
 
-## Contract
+## Two separate axes
 
-[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the single owner of the concrete harness assigned to a worker and its validation-agent handoff.
-After static crew-harness resolution, an explicit captain or dispatch override, batch re-execution, or secondmate recovery resolution has produced `HARNESS`, the script exports `NO_MISTAKES_RUN_AGENTS` into that worker's pane before launching the harness.
-The value is an explicit one-element order containing the exact assigned harness, so no fallback can silently precede or replace it.
-Firstmate never rewrites shared no-mistakes configuration for a task.
-Each worker receives its own pane-local export, so concurrent workers with different assignments do not share mutable selection state.
-Batch launches re-enter the same single-task spawn path for every pair, and secondmate recovery re-enters that path after re-resolving its configured harness.
+| Axis | Owner | Mechanism |
+| --- | --- | --- |
+| Runtime generation (binary + state root / daemon) | Firstmate | `config/no-mistakes-generation` resolved at spawn, snapshotted into task meta, exported into the worker pane |
+| Validation agents for a run | no-mistakes | Fresh quota evidence inside that generation (`axi select-agents` / generation-local policy) |
 
-The private no-mistakes registry supports Firstmate's `claude`, `codex`, `opencode`, and `pi` harnesses directly.
-For an unsupported Firstmate harness such as `grok`, or an unverified raw launch command, `fm-spawn.sh` exports the literal assigned name and warns that validation will fail closed.
-The private runner rejects that unsupported value instead of falling back to `auto` or selecting another first agent.
+Firstmate must not derive or export `NO_MISTAKES_RUN_AGENTS` from the crewmate harness or model.
+Those are unrelated axes: a worker may run on grok while no-mistakes still scores codex/claude/grok for review agents from quota.
 
-## Required private runner
+## Generation contract
 
-This handoff requires the private no-mistakes capability at commit `e8d7e4ae9ace7f6b4322b7fe03fe33138dfb44f3`, based on upstream tag `v1.37.0` at commit `78e4dcb234274199717acafa90abca5cf7013993`.
-The private capability captures `NO_MISTAKES_RUN_AGENTS` from the invoking process, transports it with the run request, persists it with the run, reapplies it after trusted configuration merge, and preserves it across daemon recovery.
-The private source and its update procedure are maintained outside this repository, and no public upstream push or contact is part of this contract.
+[`bin/fm-nm-generation-lib.sh`](../bin/fm-nm-generation-lib.sh) owns parse, health, resolve, meta lines, and export lines.
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the single owner of applying that pin to ordinary ship/scout tasks.
+Canonical operator docs live in [`docs/configuration.md`](configuration.md) ("No-mistakes generation").
 
-## Incident evidence
+On each ordinary spawn:
 
-The failure was reproduced on 2026-07-16 with an installed Codex worker assignment and global no-mistakes auto-selection.
+1. Prefer an existing task meta pin (`nm_generation=`, `nm_binary=`, `nm_home=`) for recovery continuity.
+2. Otherwise resolve `config/no-mistakes-generation` when present.
+3. Validate absolute paths, executable binary, existing home directory, and a running daemon for that home.
+4. Snapshot the pin into meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into the worker pane only.
+5. Absent config keeps ambient PATH/`NM_HOME` (backward compatible).
+6. Invalid or unhealthy configured generations fail closed with an actionable diagnostic and never fall back to the ambient install.
 
-```text
-$ rg '^harness=' /Users/cal/firstmate/state/forex-engine-fix-v5.meta
-harness=codex
-$ rg '^agent:' ~/.no-mistakes/config.yaml
-agent: auto
-$ no-mistakes --version
-no-mistakes version v1.34.0 (dc5a800) 2026-07-07T06:29:57Z
-```
+A configuration change affects only future tasks.
+Live task metadata is never rewritten by a config edit, and no process is force-restarted to pick up a new generation.
 
-The exact failed review log command showed Claude selected before Codex and then stopped on Claude's session limit.
+[`bin/fm-crew-state.sh`](../bin/fm-crew-state.sh) reads `nm_binary=` / `nm_home=` from meta when present so run-step status queries the same generation the worker uses.
 
-```text
-$ no-mistakes axi logs --run 01KXPJZTW29K0X2JCD1CWEZ48Z --step review --full
-claude started pid=50683
-You've hit your session limit · resets 5pm (America/Los_Angeles)
-claude exited pid=50683 error=claude exited: exit status 1:
-```
+Secondmate launches do not pin a generation for the secondmate agent itself.
+The generation config is inherited into secondmate homes so their crewmates resolve the same selection.
 
-The inspected upstream and private commits were verified with these commands.
+## Agent selection
 
-```text
-$ git -C private-no-mistakes describe --tags --exact-match 78e4dcb234274199717acafa90abca5cf7013993
-v1.37.0
-$ git -C private-no-mistakes show -s --format='%H %s' 78e4dcb234274199717acafa90abca5cf7013993
-78e4dcb234274199717acafa90abca5cf7013993 chore(main): release 1.37.0 (#458)
-$ git -C private-no-mistakes show -s --format='%H %s' e8d7e4ae9ace7f6b4322b7fe03fe33138dfb44f3
-e8d7e4ae9ace7f6b4322b7fe03fe33138dfb44f3 feat: add run-scoped agent override
-```
+No-mistakes chooses validation agents from its own evidence inside the pinned generation.
+Quota trouble follows no-mistakes' documented degradation contract; Firstmate does not recreate a quota selector for pipeline agents.
+
+An explicit `NO_MISTAKES_RUN_AGENTS` override is not a Firstmate spawn contract.
+Do not reintroduce harness-parity exports.
+
+## Historical incident (why the axes split)
+
+On 2026-07-16 a Codex-assigned worker still hit Claude-first auto selection under a shared no-mistakes home because agent selection was not generation-local and Firstmate coupled it to the crew harness.
+That coupling is retired.
+Generation routing and in-generation agent scoring are independent.
 
 ## Regression coverage
 
-`tests/fm-spawn-dispatch-profile.test.sh` covers static resolution, explicit dispatch axes, batch re-execution, unsupported-harness behavior, and concurrent workers with distinct pane-local values.
-`tests/fm-secondmate-liveness.test.sh` proves a bootstrap recovery respawn reconstructs the resolved validation assignment through the same spawn owner.
+`tests/fm-nm-generation.test.sh` covers absent-config compatibility, exact env/meta pinning, invalid config rejection, old/new generation coexistence, recovery continuity, and the absence of implicit harness-parity export.
+`tests/fm-spawn-dispatch-profile.test.sh` covers harness/model/effort launch construction without no-mistakes agent export.
