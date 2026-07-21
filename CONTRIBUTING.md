@@ -1,18 +1,30 @@
 # Contributing
 
 Thanks for wanting to contribute.
-One rule up front:
 
-**Human-authored pull requests targeting `main` must be raised through [`no-mistakes`](https://github.com/GRyndStone/no-mistakes).**
-We require this to reduce the maintainer's burden of reviewing and merging contributions.
+**Default delivery is direct-PR.**
+Ordinary pull requests targeting `main` run focused tests and lint locally, push the feature branch, and open a PR with `gh-axi` (or the GitHub UI).
+They do **not** need a no-mistakes pipeline signature.
 
-`no-mistakes` puts a local git proxy in front of your real remote.
-Pushing through it runs an AI-driven review/test/lint pipeline in an isolated worktree, forwards the push upstream only after every check passes, and opens a clean PR automatically.
+**`no-mistakes` is explicit opt-in.**
+Use it when you want the full AI review/test/lint gate before the PR lands, or when a project/task is registered as `[no-mistakes]`.
+A GitHub Actions check (`PR delivery gate`, implemented by [`bin/fm-pr-delivery-check.sh`](bin/fm-pr-delivery-check.sh)) enforces that split:
 
-A GitHub Actions check (`Require no-mistakes`) runs on PRs targeting `main` and fails if the body is missing the deterministic signature that no-mistakes writes.
-Dependency bots are exempt so their automation keeps working, but regular contributor PRs without the signature will not be reviewed or merged.
+- Direct-PR (default): accepted without a no-mistakes signature.
+- Explicit no-mistakes: if the PR has the `no-mistakes` label and/or a body line `delivery: no-mistakes`, the body **must** contain the deterministic signature no-mistakes writes:
+  `Updates from [git push no-mistakes](https://github.com/GRyndStone/no-mistakes)`.
+  Missing that signature fails the check.
 
-## Workflow
+Dependency bots are exempt so their automation keeps working.
+
+## Workflow (direct-PR, default)
+
+1. Fork or clone, create a branch, and make your changes.
+2. Run focused checks: `bin/fm-lint.sh` and the relevant `tests/*.test.sh` scripts (or the full suite).
+3. Push the branch to your fork/`origin` and open a PR with `gh-axi pr create` (or the GitHub UI).
+4. Do **not** add the `no-mistakes` label or a `delivery: no-mistakes` line unless you are intentionally using the pipeline.
+
+## Workflow (no-mistakes, opt-in)
 
 1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent (`git@github.com:kunchenguid/firstmate.git`).
 2. Create a branch and make your changes.
@@ -27,6 +39,7 @@ Dependency bots are exempt so their automation keeps working, but regular contri
 6. Run `no-mistakes` to attach to the pipeline, watch findings, authorize auto-fixes, and review ask-user findings as needed.
    Follow the installed no-mistakes version's SKILL.md and live `axi` help for gate mechanics.
 7. Once the pipeline passes, it pushes the branch to your fork and opens the PR against the parent repo for you.
+   Keep the signature in the PR body; add the `no-mistakes` label or `delivery: no-mistakes` if you want the gate to treat the PR as explicit no-mistakes even when re-edited.
 
 See the private [`GRyndStone/no-mistakes`](https://github.com/GRyndStone/no-mistakes) repository for installation and usage guidance.
 
@@ -54,7 +67,7 @@ See the private [`GRyndStone/no-mistakes`](https://github.com/GRyndStone/no-mist
 
 ## Development
 
-Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/` - ship through the `no-mistakes` pipeline on a feature branch and require an explicit merge approval.
+Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/` - ship on a feature branch via the default direct-PR path (or explicit no-mistakes when opted in) and require an explicit merge approval.
 Before making any such change, load the agent-only `firstmate-coding-guidelines` skill (`.agents/skills/firstmate-coding-guidelines/SKILL.md`).
 It has the knowledge-placement rules that keep `AGENTS.md` from regrowing after each diet pass.
 There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task's repo is firstmate itself, so firstmate adds this skill's load line to firstmate-repo briefs by hand.

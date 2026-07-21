@@ -169,6 +169,9 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 `no-mistakes` is explicit opt-in only (`[no-mistakes]` on the registry line).
 `AGENTS.md` section 6 keeps the operator-facing mode list and points here for the fallback rule.
 
+Firstmate's own GitHub PR check for this repo is separate: [`.github/workflows/no-mistakes-required.yml`](../.github/workflows/no-mistakes-required.yml) runs [`bin/fm-pr-delivery-check.sh`](../bin/fm-pr-delivery-check.sh), which accepts direct-PR by default and fails closed only for explicit no-mistakes (label `no-mistakes` and/or body line `delivery: no-mistakes`) without the pipeline signature.
+`CONTRIBUTING.md` documents both human paths.
+
 ## No-mistakes generation (config/no-mistakes-generation)
 
 `config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned **explicit `no-mistakes` ship** tasks use for validation.
