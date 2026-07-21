@@ -677,14 +677,36 @@ EOF
 }
 
 fm_backend_herdr_tab_absent() {  # <session> <workspace-id> <tab-id>
-  local session=$1 wsid=$2 tab_id=$3 list
+  local session=$1 wsid=$2 tab_id=$3 list workspace_status
   [ -n "$session" ] && [ -n "$wsid" ] && [ -n "$tab_id" ] || return 2
-  list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null) || return 2
+  if ! list=$(fm_backend_herdr_cli "$session" tab list --workspace "$wsid" 2>/dev/null); then
+    if fm_backend_herdr_workspace_absent "$session" "$wsid"; then
+      workspace_status=0
+    else
+      workspace_status=$?
+    fi
+    [ "$workspace_status" -eq 0 ] && return 0
+    return 2
+  fi
   printf '%s' "$list" | jq -e '
     (.result.tabs | type) == "array"
     and all(.result.tabs[]; type == "object" and (.tab_id | type) == "string" and (.tab_id | length) > 0)
   ' >/dev/null 2>&1 || return 2
   if printf '%s' "$list" | jq -e --arg id "$tab_id" '.result.tabs[]? | select(.tab_id == $id)' >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+fm_backend_herdr_workspace_absent() {  # <session> <workspace-id>
+  local session=$1 wsid=$2 list
+  [ -n "$session" ] && [ -n "$wsid" ] || return 2
+  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 2
+  printf '%s' "$list" | jq -e '
+    (.result.workspaces | type) == "array"
+    and all(.result.workspaces[]; type == "object" and (.workspace_id | type) == "string" and (.workspace_id | length) > 0)
+  ' >/dev/null 2>&1 || return 2
+  if printf '%s' "$list" | jq -e --arg id "$wsid" '.result.workspaces[]? | select(.workspace_id == $id)' >/dev/null 2>&1; then
     return 1
   fi
   return 0

@@ -1684,17 +1684,18 @@ test_delivered_followup_operation_recovers_without_repost() {
   sed 's/^state=prepared$/state=delivered/' "$op" > "$op.tmp"
   mv "$op.tmp" "$op"
   : > "$log"
-  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1700000100 \
-    FMX_PAIRING_TOKEN=tok FMX_RELAY_URL=https://relay.test FAKE_CURL_LOG="$log" \
-    "$ROOT/bin/fm-x-followup.sh" task-delivered - <<<"must not repost")
+  set +e
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_NOW_OVERRIDE=1800000000 \
+    FAKE_CURL_LOG="$log" "$ROOT/bin/fm-x-followup.sh" --check task-delivered)
   rc=$?
-  expect_code 0 "$rc" "delivered follow-up recovery exit"
-  [ "$out" = req-delivered ] || fail "delivered recovery returned the wrong request id"
+  set -e
+  expect_code 1 "$rc" "delivered follow-up check recovery exit"
+  [ -z "$out" ] || fail "delivered check recovery should be silent"
   ! grep -F 'url=https://relay.test/connector/followup' "$log" >/dev/null 2>&1 \
     || fail "delivered follow-up operation posted again during recovery"
   assert_grep 'x_followups=1' "$meta" "delivered recovery did not commit its counter"
   [ ! -e "$op" ] || fail "delivered recovery retained its operation record"
-  pass "delivered follow-up operations finalize locally without reposting"
+  pass "delivered v3 follow-up operations finalize from payload-free startup checks without reposting"
 }
 
 test_delivered_v2_followup_operation_migrates_without_repost() {

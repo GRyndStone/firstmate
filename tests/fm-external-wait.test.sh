@@ -51,6 +51,17 @@ SH
     || fail "valid predicate registration failed"
   [ -z "$(observe)" ] || fail "new pending predicate should establish a quiet baseline"
   [ -z "$(observe)" ] || fail "unchanged pending predicate should remain quiet"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'callback ledger advanced but remains pending\n'
+exit 1
+SH
+  chmod +x "$predicate"
+  out=$(observe)
+  assert_contains "$out" 'external-wait-changed' "changed pending predicate evidence did not wake"
+  token=$(printf '%s' "$out" | cut -f2)
+  fm_reconcile_ack "$state" task "$token" "$(printf '%s' "$out" | cut -f3)" || fail "could not acknowledge changed predicate evidence"
+  [ -z "$(observe)" ] || fail "unchanged advanced predicate evidence emitted a duplicate"
   rm -f "$predicate"
   out=$(observe)
   assert_contains "$out" 'external-wait-failed' "a registered predicate disappearing did not fail loudly"
@@ -172,6 +183,67 @@ test_stalled_owned_command_ages_out() {
   pass "a live but non-progressing registered command ages out instead of masking a wedge indefinitely"
 }
 
+test_background_probe_is_durable_and_fail_closed() {
+  local pid predicate registration out token version restarted
+  predicate="$TMP_ROOT/background-probe.sh"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'ledger revision 1 pending\n'
+exit 1
+SH
+  chmod +x "$predicate"
+  predicate="$(cd "$(dirname "$predicate")" && pwd -P)/$(basename "$predicate")"
+  sh -c 'cd "$1" || exit 1; exec sleep 30' _ "$wt" &
+  pid=$!
+  wait_for_process_cwd "$pid" "$wt" || { kill "$pid" 2>/dev/null || true; fail "background-probe child did not enter task worktree"; }
+  printf 'paused: supervising a background ledger probe\n' > "$state/task.status"
+  printf 'state: paused · source: status-log · supervising a background ledger probe\n' > "$live"
+  FM_STATE_OVERRIDE="$state" "$WAIT" register-background-probe task "$pid" "$predicate" 'background corpus build' >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "valid background-probe registration failed"; }
+  registration=$(fm_reconcile_wait_registration "$state" task)
+  printf '%s' "$registration" | jq -e \
+    --arg predicate "$predicate" \
+    '.kind == "process" and .role == "background-probe" and .predicate == $predicate and .probe_initial_evidence == "ledger revision 1 pending"' >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "background-probe ownership was not exposed structurally"; }
+  [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "background-probe paused baseline was not quiet"; }
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" background_probe_armed)" = 1 ] \
+    || { kill "$pid" 2>/dev/null || true; fail "background-probe paused baseline was not armed durably"; }
+  fm_reconcile_background_probe_can_absorb "$state" task session:fm-task \
+    || { kill "$pid" 2>/dev/null || true; fail "unchanged background-probe baseline was not absorbable"; }
+
+  printf 'state: working · source: pane · one-shot progress probe\n' > "$live"
+  [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "background-probe pulse start unexpectedly woke"; }
+  printf 'state: paused · source: status-log · supervising a background ledger probe\n' > "$live"
+  restarted=$(FM_RECONCILE_CREW_STATE_BIN="$fake" FM_FAKE_RECONCILED_STATE_FILE="$live" \
+    bash -c '. "$1"; fm_reconcile_observe "$2" task' _ "$RECONCILE" "$state")
+  [ -z "$restarted" ] || { kill "$pid" 2>/dev/null || true; fail "identical background-probe return woke after restart: $restarted"; }
+  printf 'state: working · source: pane · repeated progress probe\n' > "$live"
+  [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "repeated background-probe pulse start unexpectedly woke"; }
+  printf 'state: idle · source: pane · returned to the paused endpoint\n' > "$live"
+  [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "repeated background-probe return emitted a wake"; }
+
+  sed 's/revision 1/revision 2/' "$predicate" > "$predicate.tmp"
+  mv "$predicate.tmp" "$predicate"
+  chmod +x "$predicate"
+  out=$(observe)
+  assert_contains "$out" 'external-wait-changed' "changed still-pending background-probe evidence did not wake"
+  token=$(printf '%s' "$out" | cut -f2)
+  version=$(printf '%s' "$out" | cut -f3)
+  fm_reconcile_ack "$state" task "$token" "$version" || fail "could not acknowledge changed background-probe evidence"
+  [ -z "$(observe)" ] || fail "acknowledged background-probe evidence change duplicated"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  out=$(observe)
+  assert_contains "$out" 'external-wait-failed' "background-probe child exit did not fail loudly"
+  assert_contains "$out" 'child' "background-probe child failure lost its ownership evidence"
+  token=$(printf '%s' "$out" | cut -f2)
+  version=$(printf '%s' "$out" | cut -f3)
+  fm_reconcile_ack "$state" task "$token" "$version" || fail "could not acknowledge background-probe child failure"
+  [ -z "$(observe)" ] || fail "acknowledged background-probe child failure duplicated"
+  pass "owned background probes absorb identical pause returns and surface evidence or child failure once"
+}
+
 test_registration_and_clear_revalidate_serialized_lifecycle() {
   local predicate register_pid clear_pid i err trace
   predicate="$TMP_ROOT/serialized-predicate.sh"
@@ -245,6 +317,7 @@ test_predicate_registration_and_missing_failure
 test_process_completion_signal
 test_owned_command_progress_and_scope
 test_stalled_owned_command_ages_out
+test_background_probe_is_durable_and_fail_closed
 test_registration_and_clear_revalidate_serialized_lifecycle
 test_help_without_task_id
 

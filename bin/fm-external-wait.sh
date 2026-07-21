@@ -5,6 +5,7 @@
 #   fm-external-wait.sh register-predicate <task-id> <executable> [description]
 #   fm-external-wait.sh register-process   <task-id> <pid>        [description]
 #   fm-external-wait.sh register-command   <task-id> <pid>        [description]
+#   fm-external-wait.sh register-background-probe <task-id> <pid> <predicate> [description]
 #   fm-external-wait.sh clear              <task-id>
 #
 # The validated registration is written atomically to state/<id>.wait using the
@@ -17,7 +18,9 @@
 # while the same live process remains pending.
 # A command registration additionally verifies the process cwd belongs to the
 # task's recorded worktree/tasktmp and treats exact-pid descendant CPU/lifecycle
-# progress as positive working evidence for a bounded grace window.
+# progress as positive working evidence for a bounded grace window.  A background
+# probe binds an exact task-owned child to a still-pending predicate so an
+# unchanged return to an explicitly paused baseline can be observed durably.
 #
 # Register the observer BEFORE appending paused:/blocked:/parked wait state and
 # parking the foreground agent.  The watcher fails loudly on an unobservable
@@ -67,7 +70,7 @@ registration_still_valid() {
     fm_reconcile_pid_alive "$registration_pid" || return 1
     current_identity=$(fm_reconcile_process_identity "$registration_pid") || return 1
     [ "$current_identity" = "$registration_identity" ] || return 1
-    if [ "$command" = register-command ]; then
+    if [ "$command" = register-command ] || [ "$command" = register-background-probe ]; then
       current_cwd=$(fm_reconcile_process_cwd "$registration_pid") || return 1
       fm_reconcile_path_is_within "$current_cwd" "$worktree" \
         || fm_reconcile_path_is_within "$current_cwd" "$tasktmp" \
@@ -176,6 +179,50 @@ case "$command" in
       owner_worktree "$worktree" \
       owner_tasktmp "$tasktmp"
     echo "registered task-owned working command for $id: process $pid (progress grace ${grace}s)"
+    ;;
+  register-background-probe)
+    pid=${3:-}
+    predicate=${4:-}
+    description=${5:-supervisor-owned background progress probe}
+    case "$pid" in ''|*[!0-9]*) echo "error: background-probe pid must be decimal" >&2; exit 2 ;; esac
+    [ -n "$predicate" ] || { usage >&2; exit 2; }
+    [ -f "$predicate" ] && [ -x "$predicate" ] \
+      || { echo "error: background-probe predicate must be an existing executable file: $predicate" >&2; exit 1; }
+    predicate_dir=$(cd "$(dirname "$predicate")" && pwd -P)
+    predicate="$predicate_dir/$(basename "$predicate")"
+    fm_reconcile_pid_alive "$pid" \
+      || { echo "error: background-probe child $pid is not alive; refusing an already-stale registration" >&2; exit 1; }
+    identity=$(fm_reconcile_process_identity "$pid") \
+      || { echo "error: could not capture a stable identity for background-probe child $pid" >&2; exit 1; }
+    process_cwd=$(fm_reconcile_process_cwd "$pid") \
+      || { echo "error: could not read cwd for background-probe child $pid; task ownership is not provable" >&2; exit 1; }
+    worktree=$(fm_reconcile_meta_value "$meta" worktree)
+    tasktmp=$(fm_reconcile_meta_value "$meta" tasktmp)
+    if [ -n "$worktree" ] && [ -d "$worktree" ]; then worktree=$(cd "$worktree" && pwd -P); else worktree=''; fi
+    if [ -n "$tasktmp" ] && [ -d "$tasktmp" ]; then tasktmp=$(cd "$tasktmp" && pwd -P); else tasktmp=''; fi
+    if ! fm_reconcile_path_is_within "$process_cwd" "$worktree" \
+      && ! fm_reconcile_path_is_within "$process_cwd" "$tasktmp"; then
+      echo "error: background-probe child $pid cwd $process_cwd is outside task $id worktree/tasktmp; launch it inside the task workspace or create a linked task" >&2
+      exit 1
+    fi
+    FM_RECONCILE_WAIT_FILE="$wait_file.registration"
+    fm_reconcile_predicate_evaluate "$predicate"
+    if [ "$FM_RECONCILE_WAIT_RESULT" != pending ]; then
+      echo "error: background-probe predicate must be pending at registration: $FM_RECONCILE_WAIT_EVIDENCE" >&2
+      exit 1
+    fi
+    registration_pid=$pid
+    registration_identity=$identity
+    registration_predicate=$predicate
+    write_wait process "$description" \
+      pid "$pid" \
+      pid_identity "$identity" \
+      role background-probe \
+      predicate "$predicate" \
+      probe_initial_evidence "$FM_RECONCILE_WAIT_EVIDENCE" \
+      owner_worktree "$worktree" \
+      owner_tasktmp "$tasktmp"
+    echo "registered supervisor-owned background probe for $id: child $pid, predicate $predicate"
     ;;
   clear)
     [ "$#" -eq 2 ] || { usage >&2; exit 2; }

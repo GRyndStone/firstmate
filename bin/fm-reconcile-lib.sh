@@ -28,6 +28,9 @@
 #   progress_grace=<seconds>             # required for working-command
 #   owner_worktree=<physical path>       # required for working-command
 #   owner_tasktmp=<physical path>        # optional task-scoped alternate root
+#   role=background-probe
+#   predicate=<absolute executable path>
+#   probe_initial_evidence=<pending predicate evidence at registration>
 #
 # Predicate exit 0 plus non-empty stdout means complete; exit 0 with empty stdout
 # or exit 1 means still pending; every other exit or timeout means failed.  Stderr
@@ -69,6 +72,9 @@
 #   fm_reconcile_owned_command_observe <state-dir> <id>
 #     Succeed and print detail only while an identity-bound registered command
 #     is live, task-scoped, and within its persisted progress grace.
+#   fm_reconcile_background_probe_can_absorb <state-dir> <id> [endpoint]
+#     Succeed only while an armed background probe still matches its paused
+#     status, endpoint, child identity, and pending-predicate evidence baseline.
 
 _FM_RECONCILE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_RECONCILE_LIB_DIR="."
 # shellcheck source=bin/fm-task-identity-lib.sh
@@ -295,6 +301,8 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
   FM_RECONCILE_WAIT_PROGRESS_GRACE=0
   FM_RECONCILE_WAIT_OWNER_WORKTREE=
   FM_RECONCILE_WAIT_OWNER_TASKTMP=
+  FM_RECONCILE_WAIT_PREDICATE=
+  FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE=
   FM_RECONCILE_WAIT_REGISTRATION_ID=
   FM_RECONCILE_WAIT_LIFECYCLE_GENERATION=
   FM_RECONCILE_WAIT_CURRENT_LIFECYCLE_GENERATION=$(fm_reconcile_meta_generation "$state/$id.meta" 2>/dev/null || true)
@@ -323,6 +331,8 @@ fm_reconcile_wait_load() {  # <state-dir> <id>; populates FM_RECONCILE_WAIT_*
         case "$FM_RECONCILE_WAIT_PROGRESS_GRACE" in ''|*[!0-9]*) FM_RECONCILE_WAIT_PROGRESS_GRACE=0 ;; esac
         FM_RECONCILE_WAIT_OWNER_WORKTREE=$(fm_reconcile_record_value "$wait_file" owner_worktree)
         FM_RECONCILE_WAIT_OWNER_TASKTMP=$(fm_reconcile_record_value "$wait_file" owner_tasktmp)
+        FM_RECONCILE_WAIT_PREDICATE=$(fm_reconcile_record_value "$wait_file" predicate)
+        FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE=$(fm_reconcile_record_value "$wait_file" probe_initial_evidence)
         FM_RECONCILE_WAIT_TARGET="pid:$FM_RECONCILE_WAIT_PID"
         ;;
     esac
@@ -365,6 +375,57 @@ fm_reconcile_legacy_check_registration_valid() {  # <state-dir> <id>
     && [ "$(fm_reconcile_record_value "$commit" lifecycle_generation)" = "$generation" ] \
     && [ "$(fm_reconcile_record_value "$commit" check_signature)" = "$(fm_reconcile_file_signature "$check")" ] \
     && [ "$(fm_reconcile_record_value "$commit" wait_signature)" = "$(fm_reconcile_file_signature "$wait_file")" ]
+}
+
+fm_reconcile_predicate_evaluate() {  # <executable>; populates WAIT_RESULT/EVIDENCE
+  local predicate=$1 out='' stderr='' diagnostic='' rc=0 rc_file stderr_file
+  if [ -z "$predicate" ] || [ ! -f "$predicate" ] || [ ! -x "$predicate" ]; then
+    FM_RECONCILE_WAIT_RESULT=failed
+    FM_RECONCILE_WAIT_EVIDENCE="predicate missing or not executable: ${predicate:-<empty>}"
+    return
+  fi
+  rc_file="$FM_RECONCILE_WAIT_FILE.predicate-rc.${BASHPID:-$$}"
+  stderr_file="$FM_RECONCILE_WAIT_FILE.predicate-stderr.${BASHPID:-$$}"
+  out=$(
+    fm_reconcile_bounded "$FM_EXTERNAL_WAIT_TIMEOUT" "$predicate" \
+      2> >(fm_reconcile_capture_stream "$stderr_file") | {
+      head -c "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES"
+      cat >/dev/null
+    }
+    printf '%s\n' "${PIPESTATUS[0]}" > "$rc_file"
+    wait || true
+  )
+  rc=$(cat "$rc_file" 2>/dev/null || printf '125')
+  stderr=$(cat "$stderr_file" 2>/dev/null || true)
+  rm -f "$rc_file" "$stderr_file"
+  case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
+  out=$(fm_reconcile_clean_value "$out")
+  stderr=$(fm_reconcile_clean_value "$stderr")
+  diagnostic=$out
+  [ -z "$stderr" ] || diagnostic="${diagnostic:+$diagnostic; }$stderr"
+  case "$rc" in
+    0)
+      if [ -n "$out" ]; then
+        FM_RECONCILE_WAIT_RESULT=complete
+        FM_RECONCILE_WAIT_EVIDENCE=$out
+      else
+        FM_RECONCILE_WAIT_RESULT=pending
+        FM_RECONCILE_WAIT_EVIDENCE="predicate pending${stderr:+; stderr: $stderr}"
+      fi
+      ;;
+    1)
+      FM_RECONCILE_WAIT_RESULT=pending
+      FM_RECONCILE_WAIT_EVIDENCE=${diagnostic:-predicate pending}
+      ;;
+    124|125)
+      FM_RECONCILE_WAIT_RESULT=failed
+      FM_RECONCILE_WAIT_EVIDENCE="predicate timeout or no bounded runner${diagnostic:+: $diagnostic}"
+      ;;
+    *)
+      FM_RECONCILE_WAIT_RESULT=failed
+      FM_RECONCILE_WAIT_EVIDENCE="predicate exited $rc${diagnostic:+: $diagnostic}"
+      ;;
+  esac
 }
 
 fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/EVIDENCE/progress
@@ -411,57 +472,11 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
   fi
   case "$FM_RECONCILE_WAIT_KIND" in
     predicate)
-      if [ -z "$FM_RECONCILE_WAIT_TARGET" ] || [ ! -f "$FM_RECONCILE_WAIT_TARGET" ] || [ ! -x "$FM_RECONCILE_WAIT_TARGET" ]; then
-        FM_RECONCILE_WAIT_RESULT=failed
-        FM_RECONCILE_WAIT_EVIDENCE="predicate missing or not executable: ${FM_RECONCILE_WAIT_TARGET:-<empty>}"
-        return
-      fi
-      rc_file="$FM_RECONCILE_WAIT_FILE.predicate-rc.${BASHPID:-$$}"
-      stderr_file="$FM_RECONCILE_WAIT_FILE.predicate-stderr.${BASHPID:-$$}"
-      out=$(
-        fm_reconcile_bounded "$FM_EXTERNAL_WAIT_TIMEOUT" "$FM_RECONCILE_WAIT_TARGET" \
-          2> >(fm_reconcile_capture_stream "$stderr_file") | {
-          head -c "$FM_EXTERNAL_WAIT_OUTPUT_MAX_BYTES"
-          cat >/dev/null
-        }
-        printf '%s\n' "${PIPESTATUS[0]}" > "$rc_file"
-        wait || true
-      )
-      rc=$(cat "$rc_file" 2>/dev/null || printf '125')
-      stderr=$(cat "$stderr_file" 2>/dev/null || true)
-      rm -f "$rc_file" "$stderr_file"
-      case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
-      out=$(fm_reconcile_clean_value "$out")
-      stderr=$(fm_reconcile_clean_value "$stderr")
-      diagnostic=$out
-      [ -z "$stderr" ] || diagnostic="${diagnostic:+$diagnostic; }$stderr"
-      case "$rc" in
-        0)
-          if [ -n "$out" ]; then
-            FM_RECONCILE_WAIT_RESULT=complete
-            FM_RECONCILE_WAIT_EVIDENCE=$out
-          else
-            FM_RECONCILE_WAIT_RESULT=pending
-            FM_RECONCILE_WAIT_EVIDENCE="predicate pending${stderr:+; stderr: $stderr}"
-          fi
-          ;;
-        1)
-          FM_RECONCILE_WAIT_RESULT=pending
-          FM_RECONCILE_WAIT_EVIDENCE=${diagnostic:-predicate pending}
-          ;;
-        124|125)
-          FM_RECONCILE_WAIT_RESULT=failed
-          FM_RECONCILE_WAIT_EVIDENCE="predicate timeout or no bounded runner${diagnostic:+: $diagnostic}"
-          ;;
-        *)
-          FM_RECONCILE_WAIT_RESULT=failed
-          FM_RECONCILE_WAIT_EVIDENCE="predicate exited $rc${diagnostic:+: $diagnostic}"
-          ;;
-      esac
+      fm_reconcile_predicate_evaluate "$FM_RECONCILE_WAIT_TARGET"
       ;;
     process)
       case "$FM_RECONCILE_WAIT_ROLE" in
-        external-wait|working-command) : ;;
+        external-wait|working-command|background-probe) : ;;
         *)
           FM_RECONCILE_WAIT_RESULT=failed
           FM_RECONCILE_WAIT_EVIDENCE="unsupported registered process role: ${FM_RECONCILE_WAIT_ROLE:-<empty>}"
@@ -475,12 +490,22 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
           ;;
         *)
           if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
-            FM_RECONCILE_WAIT_RESULT=complete
-            FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
-          elif ! current_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID"); then
-            if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+            if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ]; then
+              FM_RECONCILE_WAIT_RESULT=failed
+              FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID exited while its predicate was pending"
+            else
               FM_RECONCILE_WAIT_RESULT=complete
               FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
+            fi
+          elif ! current_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID"); then
+            if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+              if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ]; then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID exited while its predicate was pending"
+              else
+                FM_RECONCILE_WAIT_RESULT=complete
+                FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID exited"
+              fi
             else
               FM_RECONCILE_WAIT_RESULT=failed
               FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID identity is unreadable"
@@ -491,7 +516,39 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
           elif [ "$current_identity" = "$FM_RECONCILE_WAIT_PID_IDENTITY" ]; then
             FM_RECONCILE_WAIT_RESULT=pending
             FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID is still running"
-            if [ "$FM_RECONCILE_WAIT_ROLE" = working-command ]; then
+            if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ]; then
+              if [ -z "$FM_RECONCILE_WAIT_PREDICATE" ] || [ -z "$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE" ]; then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE='background-probe registration is missing its predicate baseline'
+              elif ! current_cwd=$(fm_reconcile_process_cwd "$FM_RECONCILE_WAIT_PID"); then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID cwd is unreadable"
+              elif ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
+                && ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_TASKTMP"; then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID left its task-scoped roots (cwd ${current_cwd:-unreadable})"
+              elif ! post_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID"); then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID post-observation identity is unreadable"
+              elif [ "$post_identity" != "$FM_RECONCILE_WAIT_PID_IDENTITY" ]; then
+                FM_RECONCILE_WAIT_RESULT=failed
+                FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID identity changed"
+              else
+                fm_reconcile_predicate_evaluate "$FM_RECONCILE_WAIT_PREDICATE"
+                if [ "$FM_RECONCILE_WAIT_RESULT" = pending ]; then
+                  if ! fm_reconcile_pid_alive "$FM_RECONCILE_WAIT_PID"; then
+                    FM_RECONCILE_WAIT_RESULT=failed
+                    FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID exited while its predicate was pending"
+                  elif ! post_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID"); then
+                    FM_RECONCILE_WAIT_RESULT=failed
+                    FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID post-predicate identity is unreadable"
+                  elif [ "$post_identity" != "$FM_RECONCILE_WAIT_PID_IDENTITY" ]; then
+                    FM_RECONCILE_WAIT_RESULT=failed
+                    FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID identity changed"
+                  fi
+                fi
+              fi
+            elif [ "$FM_RECONCILE_WAIT_ROLE" = working-command ]; then
               case "$FM_RECONCILE_WAIT_PROGRESS_GRACE" in
                 ''|*[!0-9]*|0)
                   FM_RECONCILE_WAIT_RESULT=failed
@@ -551,8 +608,13 @@ fm_reconcile_wait_evaluate() {  # [record] [now]; uses WAIT_*; populates RESULT/
             FM_RECONCILE_WAIT_RESULT=failed
             FM_RECONCILE_WAIT_EVIDENCE='registered process identity is missing'
           else
-            FM_RECONCILE_WAIT_RESULT=complete
-            FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID identity changed or exited"
+            if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ]; then
+              FM_RECONCILE_WAIT_RESULT=failed
+              FM_RECONCILE_WAIT_EVIDENCE="registered background-probe child $FM_RECONCILE_WAIT_PID identity changed"
+            else
+              FM_RECONCILE_WAIT_RESULT=complete
+              FM_RECONCILE_WAIT_EVIDENCE="registered process $FM_RECONCILE_WAIT_PID identity changed or exited"
+            fi
           fi
           ;;
       esac
@@ -642,6 +704,53 @@ fm_reconcile_owned_command_observe() {  # <state-dir> <id>
   printf '%s' "$FM_RECONCILE_WAIT_EVIDENCE"
 }
 
+fm_reconcile_background_probe_can_absorb() {  # <state-dir> <id> [endpoint]
+  local state=$1 id=$2 endpoint=${3:-} record meta generation status_file status_before status_after
+  local pending pending_version notified notified_version record_signature
+  record="$state/$id.reconciled"
+  meta="$state/$id.meta"
+  status_file="$state/$id.status"
+  [ -f "$record" ] && [ -f "$meta" ] || return 1
+  record_signature=$(fm_reconcile_file_signature "$record")
+  case "$record_signature" in absent|unreadable) return 1 ;; esac
+  generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  [ -n "$generation" ] \
+    && [ "$(fm_reconcile_record_value "$record" lifecycle_generation)" = "$generation" ] \
+    || return 1
+  [ "$(fm_reconcile_record_value "$record" background_probe_armed)" = 1 ] || return 1
+  [ -n "$endpoint" ] || endpoint=$(fm_reconcile_endpoint "$meta")
+  [ "$(fm_reconcile_endpoint "$meta")" = "$endpoint" ] || return 1
+  [ "$(fm_reconcile_record_value "$record" background_probe_endpoint)" = "$endpoint" ] || return 1
+  pending=$(fm_reconcile_record_value "$record" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
+  notified=$(fm_reconcile_record_value "$record" notified_action_token)
+  notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
+  if [ -n "$pending" ] \
+    && { [ "$pending" != "$notified" ] || [ "$pending_version" != "$notified_version" ]; }; then
+    return 1
+  fi
+  status_before=$(fm_reconcile_signal_signature "$status_file")
+  [ "$(fm_reconcile_status_sequence "$status_file")" = "$(fm_reconcile_record_value "$record" background_probe_status_sequence)" ] \
+    && [ "$(fm_reconcile_file_signature "$status_file")" = "$(fm_reconcile_record_value "$record" background_probe_status_signature)" ] \
+    && [ "$(fm_reconcile_status_verb "$(fm_reconcile_last_status_event "$status_file" || true)")" = paused ] \
+    || return 1
+  status_after=$(fm_reconcile_signal_signature "$status_file")
+  [ "$status_before" = "$status_after" ] \
+    && [ "$status_after" = "$(fm_reconcile_record_value "$record" background_probe_status_signal_signature)" ] \
+    || return 1
+  fm_reconcile_wait_load "$state" "$id"
+  [ "$FM_RECONCILE_WAIT_KIND" = process ] \
+    && [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ] \
+    && [ "$FM_RECONCILE_WAIT_SIGNATURE" = "$(fm_reconcile_record_value "$record" background_probe_wait_signature)" ] \
+    || return 1
+  fm_reconcile_wait_evaluate "$record" "$(date +%s)"
+  [ "$FM_RECONCILE_WAIT_RESULT" = pending ] \
+    && [ "$FM_RECONCILE_WAIT_EVIDENCE" = "$(fm_reconcile_record_value "$record" background_probe_wait_evidence)" ] \
+    && [ "$(fm_reconcile_file_signature "$FM_RECONCILE_WAIT_FILE")" = "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    && [ "$(fm_reconcile_file_signature "$record")" = "$record_signature" ] \
+    && [ "$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)" = "$generation" ]
+}
+
 fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
   local record=$1 tmp
   tmp="$record.tmp.${BASHPID:-$$}"
@@ -679,6 +788,14 @@ fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
     printf 'wait_progress_signature=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_WAIT_PROGRESS_SIGNATURE")"
     printf 'wait_progress_at=%s\n' "$FM_RECONCILE_WRITE_WAIT_PROGRESS_AT"
     printf 'wait_lifecycle_generation=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_WAIT_LIFECYCLE_GENERATION")"
+    printf 'background_probe_armed=%s\n' "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_ARMED"
+    printf 'background_probe_wait_signature=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_WAIT_SIGNATURE")"
+    printf 'background_probe_endpoint=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_ENDPOINT")"
+    printf 'background_probe_status_sequence=%s\n' "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SEQUENCE"
+    printf 'background_probe_status_signature=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SIGNATURE")"
+    printf 'background_probe_status_signal_signature=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SIGNAL_SIGNATURE")"
+    printf 'background_probe_wait_evidence=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_WAIT_EVIDENCE")"
+    printf 'background_probe_observed_at=%s\n' "$FM_RECONCILE_WRITE_BACKGROUND_PROBE_OBSERVED_AT"
     printf 'pending_action_token=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_TOKEN")"
     printf 'pending_action_version=%s\n' "$FM_RECONCILE_WRITE_PENDING_VERSION"
     printf 'pending_action_reason=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WRITE_PENDING_REASON")"
@@ -1131,9 +1248,12 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   local state=$1 id=$2 meta_signature=$3 lifecycle_generation=$4 raw=$5 meta record status_file project kind repository_identity identity_error endpoint now
   local old_repository_identity old_endpoint old_state old_source old_evidence old_observed old_transition_seq
   local old_prior_endpoint old_prior_state old_prior_source old_prior_evidence old_prior_observed
-  local old_wait_kind old_wait_sig old_wait_state old_wait_seq old_pending old_reason old_notified
+  local old_wait_kind old_wait_sig old_wait_state old_wait_evidence old_wait_seq old_pending old_reason old_notified
   local old_pending_version old_notified_version old_pending_observation old_notified_observation
   local old_status_signal old_turn_signal old_observer_seq
+  local old_probe_armed old_probe_wait_sig old_probe_endpoint old_probe_status_seq old_probe_status_sig old_probe_status_signal
+  local old_probe_wait_evidence old_probe_observed probe_armed probe_wait_sig probe_endpoint probe_status_seq probe_status_sig
+  local probe_status_signal probe_wait_evidence probe_observed background_probe_return=0 pending_evidence_changed=0
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
   local wait_seq pending pending_version reason observation_key pending_observation candidate_token='' candidate_reason='' event_note=''
@@ -1191,6 +1311,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   old_wait_kind=$(fm_reconcile_record_value "$record" wait_kind)
   old_wait_sig=$(fm_reconcile_record_value "$record" wait_signature)
   old_wait_state=$(fm_reconcile_record_value "$record" wait_state)
+  old_wait_evidence=$(fm_reconcile_record_value "$record" wait_evidence)
   old_wait_seq=$(fm_reconcile_record_value "$record" wait_sequence)
   old_pending=$(fm_reconcile_record_value "$record" pending_action_token)
   old_pending_version=$(fm_reconcile_record_value "$record" pending_action_version)
@@ -1202,9 +1323,20 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   old_status_signal=$(fm_reconcile_record_value "$record" status_signal_signature)
   old_turn_signal=$(fm_reconcile_record_value "$record" turn_signal_signature)
   old_observer_seq=$(fm_reconcile_record_value "$record" observer_sequence)
+  old_probe_armed=$(fm_reconcile_record_value "$record" background_probe_armed)
+  old_probe_wait_sig=$(fm_reconcile_record_value "$record" background_probe_wait_signature)
+  old_probe_endpoint=$(fm_reconcile_record_value "$record" background_probe_endpoint)
+  old_probe_status_seq=$(fm_reconcile_record_value "$record" background_probe_status_sequence)
+  old_probe_status_sig=$(fm_reconcile_record_value "$record" background_probe_status_signature)
+  old_probe_status_signal=$(fm_reconcile_record_value "$record" background_probe_status_signal_signature)
+  old_probe_wait_evidence=$(fm_reconcile_record_value "$record" background_probe_wait_evidence)
+  old_probe_observed=$(fm_reconcile_record_value "$record" background_probe_observed_at)
   case "$old_transition_seq" in ''|*[!0-9]*) old_transition_seq=0 ;; esac
   case "$old_wait_seq" in ''|*[!0-9]*) old_wait_seq=0 ;; esac
   case "$old_observer_seq" in ''|*[!0-9]*) old_observer_seq=0 ;; esac
+  case "$old_probe_armed" in 1) ;; *) old_probe_armed=0 ;; esac
+  case "$old_probe_status_seq" in ''|*[!0-9]*) old_probe_status_seq=0 ;; esac
+  case "$old_probe_observed" in ''|*[!0-9]*) old_probe_observed=0 ;; esac
   case "$old_pending_version" in *[!A-Za-z0-9._:-]*) old_pending_version= ;; esac
   case "$old_notified_version" in *[!A-Za-z0-9._:-]*) old_notified_version= ;; esac
 
@@ -1218,6 +1350,14 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   pending_version=$old_pending_version
   reason=$old_reason
   pending_observation=$old_pending_observation
+  probe_armed=$old_probe_armed
+  probe_wait_sig=$old_probe_wait_sig
+  probe_endpoint=$old_probe_endpoint
+  probe_status_seq=$old_probe_status_seq
+  probe_status_sig=$old_probe_status_sig
+  probe_status_signal=$old_probe_status_signal
+  probe_wait_evidence=$old_probe_wait_evidence
+  probe_observed=$old_probe_observed
   if [ -n "$old_pending" ] \
     && { [ "$old_pending" != "$old_notified" ] || [ "$old_pending_version" != "$old_notified_version" ]; }; then
     pending_unacked=1
@@ -1236,6 +1376,13 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     || [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
     || [ "$old_wait_state" != "$FM_RECONCILE_WAIT_RESULT" ]; then
     wait_seq=$((old_wait_seq + 1))
+  elif [ "$FM_RECONCILE_WAIT_RESULT" = pending ] \
+    && [ "$old_wait_evidence" != "$FM_RECONCILE_WAIT_EVIDENCE" ] \
+    && { [ "$FM_RECONCILE_WAIT_KIND" = predicate ] \
+      || [ "$FM_RECONCILE_WAIT_KIND" = legacy-check ] \
+      || [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ]; }; then
+    wait_seq=$((old_wait_seq + 1))
+    pending_evidence_changed=1
   fi
   if [ "$FM_RECONCILE_WAIT_RESULT" = pending ] && [ "$FM_RECONCILE_WAIT_WORKING" -eq 1 ] \
     && { [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ] \
@@ -1245,6 +1392,36 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     current_source=owned-command
     current_detail=$FM_RECONCILE_WAIT_EVIDENCE
     raw="state: working · source: owned-command · $current_detail"
+  fi
+
+  if [ "$FM_RECONCILE_WAIT_ROLE" != background-probe ] \
+    || [ "$FM_RECONCILE_WAIT_RESULT" != pending ] \
+    || [ "$FM_RECONCILE_WAIT_EVIDENCE" != "$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE" ] \
+    || [ "$probe_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    || [ "$probe_endpoint" != "$endpoint" ] \
+    || [ "$probe_status_seq" -ne "$status_seq" ] \
+    || [ "$probe_status_sig" != "$status_sig" ] \
+    || [ "$probe_status_signal" != "$status_signal_sig" ] \
+    || { [ "$current_state" != working ] && [ "$current_state" != paused ] && [ "$current_state" != idle ]; }; then
+    probe_armed=0
+  fi
+  if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ] \
+    && [ "$FM_RECONCILE_WAIT_RESULT" = pending ] \
+    && [ "$FM_RECONCILE_WAIT_EVIDENCE" = "$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE" ] \
+    && [ "$probe_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    && { [ "$current_state" = paused ] || [ "$current_state" = idle ]; } \
+    && [ "$(fm_reconcile_status_verb "$last_status")" = paused ] \
+    && [ "$status_sig" != unreadable ] \
+    && [ "$status_signal_sig" != unreadable ] \
+    && [ "$status_signal_sig" != unstable ]; then
+    probe_armed=1
+    probe_wait_sig=$FM_RECONCILE_WAIT_SIGNATURE
+    probe_endpoint=$endpoint
+    probe_status_seq=$status_seq
+    probe_status_sig=$status_sig
+    probe_status_signal=$status_signal_sig
+    probe_wait_evidence=$FM_RECONCILE_WAIT_EVIDENCE
+    probe_observed=$now
   fi
 
   if [ -n "$old_state" ]; then
@@ -1269,6 +1446,18 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   if [ "$current_state" = working ]; then
     case "$current_source" in run-step|pane|owned-command) current_positive_working=1 ;; esac
   fi
+  if [ "$positive_working" -eq 1 ] \
+    && [ "$old_source" = pane ] \
+    && { [ "$current_state" = paused ] || [ "$current_state" = idle ]; } \
+    && [ "$probe_armed" -eq 1 ] \
+    && [ "$probe_wait_sig" = "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    && [ "$probe_endpoint" = "$endpoint" ] \
+    && [ "$probe_status_seq" -eq "$status_seq" ] \
+    && [ "$probe_status_sig" = "$status_sig" ] \
+    && [ "$probe_status_signal" = "$status_signal_sig" ] \
+    && [ "$probe_wait_evidence" = "$FM_RECONCILE_WAIT_EVIDENCE" ]; then
+    background_probe_return=1
+  fi
 
   case "$current_state" in
     paused|blocked|parked)
@@ -1280,13 +1469,13 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
           candidate_token="wait:$wait_seq:unobservable"
           candidate_reason="external-wait-unobservable ($current_state task has no state/$id.wait predicate/process registration or legacy check; non-working waits require immediate intervention unless an observable external wait is registered; last status event sequence $status_seq: ${last_status:-none})"
         fi
-      elif [ "$positive_working" -eq 1 ]; then
+      elif [ "$positive_working" -eq 1 ] && [ "$background_probe_return" -ne 1 ]; then
         candidate_token="transition:$transition_seq"
         candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
       fi
       ;;
     *)
-      if [ "$positive_working" -eq 1 ] \
+      if [ "$positive_working" -eq 1 ] && [ "$background_probe_return" -ne 1 ] \
         && { [ "$current_state" != working ] || [ "$current_positive_working" -eq 0 ]; }; then
         candidate_token="transition:$transition_seq"
         candidate_reason="reconciled-transition ($old_state -> $current_state from positive $old_source evidence; source now $current_source; status event sequence $status_seq, last event: ${last_status:-none}; ${current_detail:-no detail})"
@@ -1295,6 +1484,15 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   esac
 
   case "$FM_RECONCILE_WAIT_RESULT" in
+    pending)
+      if [ "$pending_evidence_changed" -eq 1 ] \
+        || { [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ] \
+          && [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+          && [ "$FM_RECONCILE_WAIT_EVIDENCE" != "$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE" ]; }; then
+        candidate_token="wait:$wait_seq:changed"
+        candidate_reason="external-wait-changed ($FM_RECONCILE_WAIT_DESCRIPTION; pending evidence changed from ${old_wait_evidence:-$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE} to $FM_RECONCILE_WAIT_EVIDENCE; last status event sequence $status_seq: ${last_status:-none})"
+      fi
+      ;;
     complete)
       if [ "$old_wait_sig" != "$FM_RECONCILE_WAIT_SIGNATURE" ] || [ "$old_wait_state" != complete ]; then
         candidate_token="wait:$wait_seq:complete"
@@ -1382,6 +1580,14 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   FM_RECONCILE_WRITE_WAIT_PROGRESS_SIGNATURE=$FM_RECONCILE_WAIT_PROGRESS_SIGNATURE
   FM_RECONCILE_WRITE_WAIT_PROGRESS_AT=$FM_RECONCILE_WAIT_PROGRESS_AT
   FM_RECONCILE_WRITE_WAIT_LIFECYCLE_GENERATION=$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_ARMED=$probe_armed
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_WAIT_SIGNATURE=$probe_wait_sig
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_ENDPOINT=$probe_endpoint
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SEQUENCE=$probe_status_seq
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SIGNATURE=$probe_status_sig
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_STATUS_SIGNAL_SIGNATURE=$probe_status_signal
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_WAIT_EVIDENCE=$probe_wait_evidence
+  FM_RECONCILE_WRITE_BACKGROUND_PROBE_OBSERVED_AT=$probe_observed
   FM_RECONCILE_WRITE_PENDING_TOKEN=$pending
   FM_RECONCILE_WRITE_PENDING_VERSION=$pending_version
   FM_RECONCILE_WRITE_PENDING_REASON=$reason
@@ -1795,6 +2001,8 @@ fm_reconcile_wait_registration() {  # <state-dir> <id> -> JSON
     --arg lifecycle_generation "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" \
     --arg owner_worktree "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
     --arg owner_tasktmp "$FM_RECONCILE_WAIT_OWNER_TASKTMP" \
+    --arg predicate "$FM_RECONCILE_WAIT_PREDICATE" \
+    --arg probe_initial_evidence "$FM_RECONCILE_WAIT_PROBE_INITIAL_EVIDENCE" \
     --argjson progress_grace "${FM_RECONCILE_WAIT_PROGRESS_GRACE:-0}" \
-    '{registered:($registered == 1),path:$path,kind:$kind,role:$role,description:$description,target:$target,signature:$signature,registration_id:($registration_id | if . == "" then null else . end),lifecycle_generation:($lifecycle_generation | if . == "" then null else . end),owner_worktree:($owner_worktree | if . == "" then null else . end),owner_tasktmp:($owner_tasktmp | if . == "" then null else . end),progress_grace_seconds:($progress_grace | if . == 0 then null else . end)}'
+    '{registered:($registered == 1),path:$path,kind:$kind,role:$role,description:$description,target:$target,signature:$signature,registration_id:($registration_id | if . == "" then null else . end),lifecycle_generation:($lifecycle_generation | if . == "" then null else . end),owner_worktree:($owner_worktree | if . == "" then null else . end),owner_tasktmp:($owner_tasktmp | if . == "" then null else . end),predicate:($predicate | if . == "" then null else . end),probe_initial_evidence:($probe_initial_evidence | if . == "" then null else . end),progress_grace_seconds:($progress_grace | if . == 0 then null else . end)}'
 }

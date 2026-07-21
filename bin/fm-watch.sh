@@ -912,22 +912,29 @@ event_wait_or_sleep() {
 
 # handle_push_transition: act on a fresh actionable (blocked) transition record
 # the backend returned. Maps the pane back to its window and task, applies the
-# declared-pause exemption (a crew waiting on a known external dependency is not
-# a surprise block - absorb it on the poll loop's long pause cadence instead),
-# and otherwise enqueues an immediate `stale` wake and wakes the supervisor. The
+# explicit background-probe exemption, and otherwise enqueues an immediate
+# `stale` wake and wakes the supervisor. The
 # `stale` kind is deliberate: the supervisor's handler for it ("peek the pane to
 # diagnose") is exactly right for a blocked crew, and the drain/dedupe/guard
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task reason
+  local backend=$1 session=$2 record=$3 pane_id to window task reason input_state input_state_after
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    triage_log "absorbed push $to (declared pause, awaiting external): $window"
+  input_state=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state=unknown
+  if [ "$input_state" = empty ] \
+    && [ -n "$task" ] \
+    && fm_reconcile_background_probe_can_absorb "$STATE" "$task" "$window"; then
+    input_state_after=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state_after=unknown
+  else
+    input_state_after=unknown
+  fi
+  if [ "$input_state_after" = empty ]; then
+    triage_log "absorbed push $to (owned background probe returned to identical pause): $window"
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     return
   fi

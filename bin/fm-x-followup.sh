@@ -177,9 +177,11 @@ case "$COUNT" in
   ''|*[!0-9]*) COUNT=0 ;;
 esac
 
+OP_RECOVERY_SCHEMA=$(followup_operation_value schema)
 if [ -n "$RID" ] \
   && [ -n "$META_GENERATION" ] \
-  && [ "$(followup_operation_value schema)" = fm-x-followup-operation.v2 ] \
+  && { [ "$OP_RECOVERY_SCHEMA" = fm-x-followup-operation.v2 ] \
+    || [ "$OP_RECOVERY_SCHEMA" = fm-x-followup-operation.v3 ]; } \
   && [ "$(followup_operation_value state)" = delivered ] \
   && [ "$(followup_operation_value generation)" = "$META_GENERATION" ] \
   && [ "$(followup_operation_value request_id)" = "$RID" ] \
@@ -192,12 +194,12 @@ if [ -n "$RID" ] \
     || [ "${#OP_HASH}" -ne 64 ] \
     || [[ "$OP_HASH" == *[!0-9A-Fa-f]* ]] \
     || [ "$OP_KEY" != "fmx-$OP_HASH" ]; then
-    echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2
+    echo "fm-x-followup: invalid delivered operation for $ID" >&2
     exit 1
   fi
   case "$OP_FINAL" in
     0|1) ;;
-    *) echo "fm-x-followup: invalid delivered legacy operation for $ID" >&2; exit 1 ;;
+    *) echo "fm-x-followup: invalid delivered operation for $ID" >&2; exit 1 ;;
   esac
   followup_delivery_finalize "$OP_FINAL" || exit 1
   if [ "$MODE" = check ]; then

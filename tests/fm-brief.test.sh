@@ -295,6 +295,10 @@ test_external_wait_registration_renders_all_brief_scaffolds() {
       "$kind brief omitted tracked background-process completion registration"
     assert_grep 'register-command' "$brief" \
       "$kind brief omitted task-owned background-command progress registration"
+    assert_grep 'register-background-probe' "$brief" \
+      "$kind brief omitted explicit paused background-probe ownership"
+    assert_grep 'ordinary paused activity remains actionable' "$brief" \
+      "$kind brief weakened generic paused endpoint activity"
     assert_grep 'unobservable parked task wakes as a runtime failure' "$brief" \
       "$kind brief did not state the fail-loud parking contract"
     if [ "$kind" != secondmate ]; then

@@ -593,6 +593,77 @@ test_snapshot_rejects_stale_generation_reconciliation() {
   pass "snapshot rejects stale-generation reconciliation data"
 }
 
+test_snapshot_exposes_background_probe_ownership() {
+  local home fakebin out now wait_sig status_sig status_signal
+  home=$(make_home background-probe-snapshot)
+  mkdir -p "$home/projects/background-probe"
+  fm_write_meta "$home/state/background-probe.meta" \
+    'window=firstmate:fm-background-probe' \
+    "worktree=$home/projects/background-probe" \
+    'project=alpha' \
+    'harness=grok' \
+    'kind=ship' \
+    'generation=background-probe-generation'
+  printf 'paused: supervising corpus build\n' > "$home/state/background-probe.status"
+  fm_write_meta "$home/state/background-probe.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=background corpus build' \
+    'pid=4242' \
+    'pid_identity=stable child identity' \
+    'role=background-probe' \
+    'predicate=/tmp/corpus-ledger-predicate' \
+    'probe_initial_evidence=ledger revision 4 pending' \
+    "owner_worktree=$home/projects/background-probe" \
+    'owner_tasktmp=' \
+    'registration_id=background-probe-registration' \
+    'lifecycle_generation=background-probe-generation' \
+    'registered_at=1'
+  wait_sig=$(bash -c '. "$1"; fm_reconcile_file_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.wait")
+  status_sig=$(bash -c '. "$1"; fm_reconcile_file_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.status")
+  status_signal=$(bash -c '. "$1"; fm_reconcile_signal_signature "$2"' _ "$ROOT/bin/fm-reconcile-lib.sh" "$home/state/background-probe.status")
+  now=$(date +%s)
+  fm_write_meta "$home/state/background-probe.reconciled" \
+    'schema=fm-reconciled.v1' \
+    'task=background-probe' \
+    'lifecycle_generation=background-probe-generation' \
+    'endpoint=firstmate:fm-background-probe' \
+    'state=paused' \
+    'source=status-log' \
+    'evidence=state: paused · source: status-log · supervising corpus build' \
+    "observed_at=$now" \
+    'status_sequence=1' \
+    "status_signature=$status_sig" \
+    "status_signal_signature=$status_signal" \
+    'last_status_event=paused: supervising corpus build' \
+    'wait_kind=process' \
+    "wait_signature=$wait_sig" \
+    'wait_state=pending' \
+    'wait_evidence=ledger revision 4 pending' \
+    "wait_checked_at=$now" \
+    'background_probe_armed=1' \
+    "background_probe_wait_signature=$wait_sig" \
+    'background_probe_endpoint=firstmate:fm-background-probe' \
+    'background_probe_status_sequence=1' \
+    "background_probe_status_signature=$status_sig" \
+    "background_probe_status_signal_signature=$status_signal" \
+    'background_probe_wait_evidence=ledger revision 4 pending' \
+    "background_probe_observed_at=$now"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "background-probe")
+    | .external_wait.role == "background-probe"
+      and .external_wait.predicate == "/tmp/corpus-ledger-predicate"
+      and .external_wait.probe_initial_evidence == "ledger revision 4 pending"
+      and .external_wait.background_probe.armed == true
+      and .external_wait.background_probe.endpoint == "firstmate:fm-background-probe"
+      and .external_wait.background_probe.status_sequence == 1
+      and .external_wait.background_probe.wait_evidence == "ledger revision 4 pending"
+  ' >/dev/null || fail "snapshot omitted durable background-probe ownership: $out"
+  pass "snapshot exposes lifecycle-bound background-probe ownership and its paused baseline"
+}
+
 test_snapshot_reports_unmanaged_check_as_lifecycle_current() {
   local home fakebin out
   home=$(make_home unmanaged-check-generation)
@@ -781,4 +852,5 @@ test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
 test_snapshot_separates_reconciled_truth_event_history_and_wait
 test_snapshot_rejects_stale_generation_reconciliation
+test_snapshot_exposes_background_probe_ownership
 test_snapshot_reports_unmanaged_check_as_lifecycle_current
