@@ -172,6 +172,33 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 Firstmate's own GitHub PR check for this repo is separate: [`.github/workflows/no-mistakes-required.yml`](../.github/workflows/no-mistakes-required.yml) runs [`bin/fm-pr-delivery-check.sh`](../bin/fm-pr-delivery-check.sh), which accepts direct-PR by default and fails closed only for explicit no-mistakes (label `no-mistakes` and/or body line `delivery: no-mistakes`) without the pipeline signature.
 `CONTRIBUTING.md` documents both human paths.
 
+## Primary session lifecycle (config/session-lifecycle)
+
+Primary compact and rotate controls live in [`bin/fm-session-lifecycle.sh`](../bin/fm-session-lifecycle.sh).
+This section is the operator-facing overview; the script header owns commands, state schemas, and evaluation order.
+
+Measurable defaults (usage-burn Layer 4):
+
+| Axis | Default | Action |
+| --- | --- | --- |
+| Compact raw traffic since last compact | 50_000_000 bytes (~50M) | `action=compact` |
+| Compact turn cap since last compact | 80 turns | `action=compact` |
+| Rotate total session traffic | 100_000_000 bytes (~100M) | `action=rotate` |
+| Rotate session age | 14_400 seconds (four hours) | `action=rotate` |
+| Rotate forced continuations | 3 | `action=rotate` |
+
+Rotate wins when both compact and rotate thresholds would apply.
+A threshold of `0` disables that axis.
+Override via environment (`FM_COMPACT_TRAFFIC_BYTES`, `FM_COMPACT_TURN_CAP`, `FM_ROTATE_TRAFFIC_BYTES`, `FM_ROTATE_MAX_AGE_SECS`, `FM_ROTATE_FORCED_CONTINUATIONS`) or local gitignored `config/session-lifecycle` key=value lines; environment wins.
+See [`docs/examples/session-lifecycle`](examples/session-lifecycle).
+
+Counters and recommendations are model-free shell state under `state/.primary-session`.
+`evaluate --queue-wake` enqueues at most one durable `check` wake per distinct `compact` or `rotate` recommendation (deduped by action), so quiet under-threshold monitoring produces zero model wakes.
+Before compact or rotate, `/stow` (and any explicit rotate path) runs `write-handoff` to snapshot direct reports, queued wakes, open decisions, and scheduled rechecks into `state/.session-handoff` plus `data/session-handoff.md`.
+`fm-session-start.sh` prints the current evaluate line and handoff presence.
+After restart, `verify-preservation` proves the inventory still exists on disk.
+Forced continuations are recorded best-effort from the primary turn-end guard when `stop_hook_active` is true (does not change the guard's block contract).
+
 ## No-mistakes generation (config/no-mistakes-generation)
 
 `config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned **explicit `no-mistakes` ship** tasks use for validation.
