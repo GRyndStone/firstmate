@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--provider <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--quota-posture <normal|conserve|protect|unknown>] [--quota-used <percent>] [--backend <name>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--provider <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--quota-posture <normal|conserve|protect|unknown>] [--quota-used <percent>] [--backend <name>] [--parent <task-id>] [--lane-kind <name>] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --provider <name> is the quota provider identity selected at admission. It is
 #   distinct from --harness (the launch adapter) and is recorded with the concrete
 #   profile in task metadata. When omitted and no crew-dispatch profile is active,
 #   provider defaults to harness for pin continuity.
+#   --parent <task-id> inherits the admitted provider/model/effort pin plus
+#   budget_depth / budget_concurrency / budget_max_turns from that parent's meta
+#   via bin/fm-workflow-bound.sh inherit-budget (GSD children and other bounded
+#   child spawns). Explicit --provider/--harness/--model/--effort still win.
+#   Parent depth 0 refuses the child. Root spawns without --parent get default
+#   budget fields from fm-workflow-bound.sh default-budget.
+#   --lane-kind <name> records lane_kind= on meta (e.g. analyst, gsd, impl).
 #   --quota-posture and --quota-used may carry the caller's selector observation;
 #   when config/crew-dispatch.json is active, spawn always re-admits the exact
 #   profile through bin/fm-dispatch-select.sh --admit and records that current
@@ -140,6 +147,12 @@ PROVIDER=
 QUOTA_POSTURE=
 QUOTA_USED=
 BACKEND_ARG=
+PARENT_ID=
+LANE_KIND=
+BUDGET_DEPTH=
+BUDGET_CONCURRENCY=
+BUDGET_MAX_TURNS=
+BUDGET_TURNS_USED=0
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -147,6 +160,8 @@ PROVIDER_SET=0
 QUOTA_POSTURE_SET=0
 QUOTA_USED_SET=0
 BACKEND_SET=0
+PARENT_SET=0
+LANE_KIND_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -162,6 +177,8 @@ for a in "$@"; do
       quota-posture) QUOTA_POSTURE=$a; QUOTA_POSTURE_SET=1 ;;
       quota-used) QUOTA_USED=$a; QUOTA_USED_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
+      parent) PARENT_ID=$a; PARENT_SET=1 ;;
+      lane-kind) LANE_KIND=$a; LANE_KIND_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -184,6 +201,10 @@ for a in "$@"; do
     --quota-used=*) QUOTA_USED=${a#--quota-used=}; QUOTA_USED_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
+    --parent) want_value=parent ;;
+    --parent=*) PARENT_ID=${a#--parent=}; PARENT_SET=1 ;;
+    --lane-kind) want_value=lane-kind ;;
+    --lane-kind=*) LANE_KIND=${a#--lane-kind=}; LANE_KIND_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -195,6 +216,12 @@ done
 [ "$QUOTA_POSTURE_SET" -eq 0 ] || [ -n "$QUOTA_POSTURE" ] || { echo "error: --quota-posture requires a non-empty value" >&2; exit 1; }
 [ "$QUOTA_USED_SET" -eq 0 ] || [ -n "$QUOTA_USED" ] || { echo "error: --quota-used requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
+[ "$PARENT_SET" -eq 0 ] || [ -n "$PARENT_ID" ] || { echo "error: --parent requires a non-empty value" >&2; exit 1; }
+[ "$LANE_KIND_SET" -eq 0 ] || [ -n "$LANE_KIND" ] || { echo "error: --lane-kind requires a non-empty value" >&2; exit 1; }
+if [ "$PARENT_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  echo "error: --parent cannot be combined with --secondmate" >&2
+  exit 1
+fi
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
@@ -209,7 +236,9 @@ if [ -n "$QUOTA_USED" ] && ! awk -v value="$QUOTA_USED" \
   echo "error: --quota-used must be a number from 0 through 100" >&2
   exit 1
 fi
-if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ] && [ -z "$PROVIDER" ]; then
+# Provider presence under crew-dispatch is re-checked after --parent budget
+# inheritance may fill the pin from the admitted parent.
+if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ] && [ -z "$PROVIDER" ] && [ -z "$PARENT_ID" ]; then
   echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
   exit 1
 fi
@@ -488,6 +517,8 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$QUOTA_POSTURE" ] || shared_args+=(--quota-posture "$QUOTA_POSTURE")
   [ -z "$QUOTA_USED" ] || shared_args+=(--quota-used "$QUOTA_USED")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ -z "$PARENT_ID" ] || shared_args+=(--parent "$PARENT_ID")
+  [ -z "$LANE_KIND" ] || shared_args+=(--lane-kind "$LANE_KIND")
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -541,6 +572,78 @@ else
   ARG3=${POS[2]:-}
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
+
+# Finite-workflow budget: inherit from an admitted parent (GSD children, etc.)
+# or stamp root defaults. bin/fm-workflow-bound.sh owns the field contract.
+if [ "$KIND" != secondmate ]; then
+  if [ -n "$PARENT_ID" ]; then
+    parent_meta="$STATE/$PARENT_ID.meta"
+    [ -f "$parent_meta" ] || {
+      echo "error: --parent $PARENT_ID has no state meta at $parent_meta; cannot inherit budget" >&2
+      exit 1
+    }
+    inherit_args=(--parent-meta "$parent_meta" --parent-id "$PARENT_ID")
+    [ "$PROVIDER_SET" -eq 0 ] || inherit_args+=(--provider "$PROVIDER")
+    [ -z "$HARNESS_ARG" ] && [ -z "$ARG3" ] || inherit_args+=(--harness "${HARNESS_ARG:-$ARG3}")
+    [ "$MODEL_SET" -eq 0 ] || inherit_args+=(--model "$MODEL")
+    [ "$EFFORT_SET" -eq 0 ] || inherit_args+=(--effort "$EFFORT")
+    [ "$LANE_KIND_SET" -eq 0 ] || inherit_args+=(--lane-kind "$LANE_KIND")
+    budget_blob=$("$SCRIPT_DIR/fm-workflow-bound.sh" inherit-budget "${inherit_args[@]}") || {
+      echo "error: budget inheritance from parent $PARENT_ID failed" >&2
+      exit 1
+    }
+  else
+    default_args=()
+    [ -z "$PROVIDER" ] || default_args+=(--provider "$PROVIDER")
+    [ -z "${HARNESS_ARG:-$ARG3}" ] || default_args+=(--harness "${HARNESS_ARG:-$ARG3}")
+    [ -z "$MODEL" ] || default_args+=(--model "$MODEL")
+    [ -z "$EFFORT" ] || default_args+=(--effort "$EFFORT")
+    [ "$LANE_KIND_SET" -eq 0 ] || default_args+=(--lane-kind "$LANE_KIND")
+    if [ "${#default_args[@]}" -gt 0 ]; then
+      budget_blob=$("$SCRIPT_DIR/fm-workflow-bound.sh" default-budget "${default_args[@]}") || {
+        echo "error: default budget resolution failed" >&2
+        exit 1
+      }
+    else
+      budget_blob=$("$SCRIPT_DIR/fm-workflow-bound.sh" default-budget) || {
+        echo "error: default budget resolution failed" >&2
+        exit 1
+      }
+    fi
+  fi
+  while IFS= read -r budget_line || [ -n "$budget_line" ]; do
+    case "$budget_line" in
+      provider=*)
+        [ "$PROVIDER_SET" -eq 0 ] && PROVIDER=${budget_line#provider=}
+        ;;
+      harness=*)
+        if [ -z "$HARNESS_ARG" ] && [ -z "$ARG3" ]; then
+          HARNESS_ARG=${budget_line#harness=}
+          ARG3=$HARNESS_ARG
+          HARNESS_SET=1
+        fi
+        ;;
+      model=*)
+        [ "$MODEL_SET" -eq 0 ] && MODEL=${budget_line#model=}
+        ;;
+      effort=*)
+        [ "$EFFORT_SET" -eq 0 ] && EFFORT=${budget_line#effort=}
+        ;;
+      budget_depth=*) BUDGET_DEPTH=${budget_line#budget_depth=} ;;
+      budget_concurrency=*) BUDGET_CONCURRENCY=${budget_line#budget_concurrency=} ;;
+      budget_max_turns=*) BUDGET_MAX_TURNS=${budget_line#budget_max_turns=} ;;
+      budget_turns_used=*) BUDGET_TURNS_USED=${budget_line#budget_turns_used=} ;;
+      parent_id=*) PARENT_ID=${budget_line#parent_id=} ;;
+      lane_kind=*)
+        [ "$LANE_KIND_SET" -eq 0 ] && LANE_KIND=${budget_line#lane_kind=}
+        ;;
+    esac
+  done <<< "$budget_blob"
+  if [ -f "$CONFIG/crew-dispatch.json" ] && { [ -z "$PROVIDER" ] || [ -z "${HARNESS_ARG:-$ARG3}" ]; }; then
+    echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (or inherit both from --parent); the consultation backstop refuses launch without them." >&2
+    exit 1
+  fi
+fi
 
 # The verified launch command per adapter. The knowledge half of each adapter
 # (busy signature, exit command, dialogs, quirks) lives in the harness-adapters skill.
@@ -1458,6 +1561,16 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
   echo "effort=${EFFORT:-default}"
   [ -z "$QUOTA_POSTURE" ] || echo "quota_posture=$QUOTA_POSTURE"
   [ -z "$QUOTA_USED" ] || echo "quota_percent_used=$QUOTA_USED"
+  # Finite-workflow budget fields (bin/fm-workflow-bound.sh). Secondmates are
+  # persistent supervisors and do not carry a child budget pin.
+  if [ "$KIND" != secondmate ]; then
+    [ -z "$PARENT_ID" ] || echo "parent_id=$PARENT_ID"
+    [ -z "$BUDGET_DEPTH" ] || echo "budget_depth=$BUDGET_DEPTH"
+    [ -z "$BUDGET_CONCURRENCY" ] || echo "budget_concurrency=$BUDGET_CONCURRENCY"
+    [ -z "$BUDGET_MAX_TURNS" ] || echo "budget_max_turns=$BUDGET_MAX_TURNS"
+    [ -z "$BUDGET_TURNS_USED" ] || echo "budget_turns_used=$BUDGET_TURNS_USED"
+    [ -z "$LANE_KIND" ] || echo "lane_kind=$LANE_KIND"
+  fi
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
