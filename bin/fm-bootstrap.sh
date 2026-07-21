@@ -53,8 +53,9 @@
 #          reports MISSING like no-mistakes. When
 #          config/backlog-backend is not manual and tasks-axi is compatible,
 #          bootstrap prints TASKS_AXI: available. quota-axi is required because
-#          crew-dispatch quota-balanced may call it; fm-dispatch-select.sh still
-#          degrades at runtime when quota data is unavailable.
+#          crew-dispatch admission and quota-balanced may call it; when quota
+#          data is unusable, fm-dispatch-select.sh retains the selected profile
+#          with quota_posture=unknown rather than silently switching profiles.
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.

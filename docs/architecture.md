@@ -119,10 +119,10 @@ A GSD-driving brief variant (`fm-brief.sh --gsd`) rides the scout shape at runti
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.
-The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule directly or through a supported selector, and passes only concrete `--harness`, `--model`, and `--effort` axes to `fm-spawn.sh`.
-The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns deterministic selector behavior, but they do not parse task intent or match the natural-language rules.
+The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule, resolves that rule through `fm-dispatch-select.sh` (including `--admit`), and passes concrete provider/harness/model/effort plus quota observation fields to `fm-spawn.sh`.
+The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns deterministic selection and fail-closed provider admission, but they do not parse task intent or match the natural-language rules.
 The session-start bootstrap step surfaces either the active rule block or a concise invalid-config line at startup.
-When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit harness, so `config/crew-harness` is only automatic when no dispatch profile file is active.
+When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit provider and harness, re-admits that exact profile before creating resources, and pins the admitted profile in task meta so later failure cannot silently substitute another harness or model.
 Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.

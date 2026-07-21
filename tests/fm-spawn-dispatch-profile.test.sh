@@ -45,6 +45,41 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/quota-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${FM_FAKE_QUOTA_EXIT:-0}" -eq 0 ] || exit "$FM_FAKE_QUOTA_EXIT"
+cat <<JSON
+{
+  "providers": [
+    {
+      "provider": "claude",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": ${FM_FAKE_CLAUDE_REMAINING:-100} },
+        { "id": "seven_day", "kind": "weekly", "percentRemaining": 100 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": ${FM_FAKE_CODEX_REMAINING:-100} },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 100 }
+      ]
+    },
+    {
+      "provider": "grok",
+      "state": { "status": "fresh" },
+      "windows": [
+        { "id": "credits", "kind": "credits", "percentRemaining": ${FM_FAKE_GROK_REMAINING:-100} }
+      ]
+    }
+  ]
+}
+JSON
+SH
+  chmod +x "$fakebin/quota-axi"
   fm_fake_exit0 "$fakebin" treehouse
   printf '%s\n' "$fakebin"
 }
@@ -94,6 +129,11 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_SHELL_LOG="$shelllog" \
+    FM_FAKE_CLAUDE_REMAINING="${FM_FAKE_CLAUDE_REMAINING:-100}" \
+    FM_FAKE_CODEX_REMAINING="${FM_FAKE_CODEX_REMAINING:-100}" \
+    FM_FAKE_GROK_REMAINING="${FM_FAKE_GROK_REMAINING:-100}" \
+    FM_FAKE_QUOTA_EXIT="${FM_FAKE_QUOTA_EXIT:-0}" \
+    FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -143,7 +183,7 @@ test_active_dispatch_profile_requires_explicit_harness_for_ship() {
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
   status=$?
   expect_code 1 "$status" "ship spawn without explicit harness should fail when dispatch profiles are active"
-  assert_contains "$out" "config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules" \
+  assert_contains "$out" "config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission" \
     "spawn did not explain the dispatch-profile backstop"
   assert_absent "$HOME_DIR/state/$id.meta" "ship refusal should happen before meta is written"
   pass "active crew-dispatch profile requires an explicit harness for ship spawns"
@@ -159,13 +199,30 @@ test_active_dispatch_profile_requires_explicit_harness_for_scout() {
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --scout)
   status=$?
   expect_code 1 "$status" "scout spawn without explicit harness should fail when dispatch profiles are active"
-  assert_contains "$out" "config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules" \
+  assert_contains "$out" "config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission" \
     "scout refusal did not explain the dispatch-profile backstop"
   assert_absent "$HOME_DIR/state/$id.meta" "scout refusal should happen before meta is written"
   pass "active crew-dispatch profile requires an explicit harness for scout spawns"
 }
 
-test_active_dispatch_profile_allows_explicit_harness() {
+test_active_dispatch_profile_requires_provider_with_explicit_harness() {
+  local rec id out status
+  id=profile-provider-required-z13
+  rec=$(make_spawn_case profile-provider-required claude "$id")
+  read_case_record "$rec"
+  enable_dispatch_profile "$HOME_DIR"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --harness codex --model gpt-5 --effort high)
+  status=$?
+  expect_code 1 "$status" "explicit harness without provider should not bypass admission"
+  assert_contains "$out" "pass the explicit provider and harness returned by dispatch admission" \
+    "spawn did not explain the provider admission backstop"
+  assert_absent "$HOME_DIR/state/$id.meta" "provider refusal should happen before meta is written"
+  pass "active crew-dispatch profile requires provider identity with the explicit harness"
+}
+
+test_active_dispatch_profile_allows_admitted_profile() {
   local rec id out status launch shelllog
   id=profile-explicit-z13
   rec=$(make_spawn_case profile-explicit claude "$id")
@@ -173,11 +230,13 @@ test_active_dispatch_profile_allows_explicit_harness() {
   enable_dispatch_profile "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-    "$id" "$PROJ_DIR" --harness codex --model gpt-5 --effort high)
+    "$id" "$PROJ_DIR" --provider codex --harness codex --model gpt-5 --effort high)
   status=$?
-  expect_code 0 "$status" "explicit harness should satisfy active dispatch-profile requirement"
+  expect_code 0 "$status" "admitted provider/harness should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report explicit codex harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 high
+  assert_grep "provider=codex" "$HOME_DIR/state/$id.meta" "meta missing provider pin"
+  assert_grep "quota_posture=normal" "$HOME_DIR/state/$id.meta" "meta missing quota posture"
   launch=$(cat "$LAUNCH_LOG")
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   assert_contains "$launch" "codex --model 'gpt-5' -c 'model_reasoning_effort=\"high\"' --dangerously-bypass-approvals-and-sandbox" \
@@ -185,7 +244,51 @@ test_active_dispatch_profile_allows_explicit_harness() {
   if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
     fail "must not export NO_MISTAKES_RUN_AGENTS from dispatch harness: $(cat "$shelllog")"
   fi
-  pass "active crew-dispatch profile allows an explicit resolved harness"
+  pass "active crew-dispatch profile re-admits and records the current mechanical posture"
+}
+
+test_active_dispatch_profile_cannot_bypass_freeze() {
+  local rec id out status
+  id=profile-freeze-z21
+  rec=$(make_spawn_case profile-freeze claude "$id")
+  read_case_record "$rec"
+  enable_dispatch_profile "$HOME_DIR"
+
+  out=$(FM_FAKE_CODEX_REMAINING=5 run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider codex --harness codex \
+    --quota-posture normal --quota-used 10)
+  status=$?
+  expect_code 75 "$status" "caller-supplied quota fields must not bypass current freeze"
+  assert_contains "$out" "admission refused: provider 'codex' is freeze at 95% used" \
+    "spawn did not surface the mechanically rechecked freeze"
+  assert_absent "$HOME_DIR/state/$id.meta" "frozen new work must not receive an admitted profile pin"
+  pass "spawn mechanically rechecks admission and refuses caller attempts to bypass freeze"
+}
+
+test_existing_task_profile_is_immutable() {
+  local rec id out status meta before
+  id=profile-pinned-z20
+  rec=$(make_spawn_case profile-pinned claude "$id")
+  read_case_record "$rec"
+  enable_dispatch_profile "$HOME_DIR"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider claude --harness opencode \
+    --model anthropic/claude-sonnet-4-5)
+  status=$?
+  expect_code 0 "$status" "initial admitted pin should spawn"
+  meta="$HOME_DIR/state/$id.meta"
+  before=$(cat "$meta")
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider codex --harness codex --model gpt-5)
+  status=$?
+  expect_code 1 "$status" "replacement profile must be refused"
+  assert_contains "$out" "already has a pinned profile provider=claude harness=opencode model=anthropic/claude-sonnet-4-5 effort=default" \
+    "replacement refusal did not surface the recorded pin"
+  assert_contains "$out" "resume that recorded task/profile" "replacement refusal was not actionable"
+  [ "$(cat "$meta")" = "$before" ] || fail "replacement attempt modified the pinned metadata"
+  pass "recorded task profile pin is immutable"
 }
 
 test_active_dispatch_profile_allows_positional_harness() {
@@ -196,7 +299,7 @@ test_active_dispatch_profile_allows_positional_harness() {
   enable_dispatch_profile "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-    "$id" "$PROJ_DIR" codex --model gpt-5 --effort high)
+    "$id" "$PROJ_DIR" codex --provider codex --model gpt-5 --effort high)
   status=$?
   expect_code 0 "$status" "positional harness should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=codex" "spawn did not report positional codex harness"
@@ -212,11 +315,13 @@ test_active_dispatch_profile_allows_raw_launch_command() {
   enable_dispatch_profile "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-    "$id" "$PROJ_DIR" "custom-agent --flag")
+    "$id" "$PROJ_DIR" "custom-agent --flag" --provider custom-provider)
   status=$?
   expect_code 0 "$status" "raw launch command should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=custom-agent" "spawn did not report raw command harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" custom-agent default default
+  assert_grep "provider=custom-provider" "$HOME_DIR/state/$id.meta" "meta missing custom provider pin"
+  assert_grep "quota_posture=unknown" "$HOME_DIR/state/$id.meta" "unknown provider should admit with unknown posture"
   launch=$(cat "$LAUNCH_LOG")
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   [ "$launch" = "custom-agent --flag" ] || fail "raw launch command changed"$'\n'"actual: $launch"
@@ -224,6 +329,27 @@ test_active_dispatch_profile_allows_raw_launch_command() {
     fail "raw harness must not export NO_MISTAKES_RUN_AGENTS: $(cat "$shelllog")"
   fi
   pass "active crew-dispatch profile allows the raw launch-command escape hatch"
+}
+
+test_grok_default_dispatch_admits_without_silent_substitution() {
+  local rec id out status
+  id=profile-grok-default-z22
+  rec=$(make_spawn_case profile-grok-default claude "$id")
+  read_case_record "$rec"
+  printf '%s\n' '{"rules":[],"default":{"harness":"grok","model":"grok-4.5","effort":"high"}}' \
+    > "$HOME_DIR/config/crew-dispatch.json"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider grok --harness grok --model grok-4.5 --effort high)
+  status=$?
+  expect_code 0 "$status" "temporary Grok-default dispatch should still admit"
+  assert_contains "$out" "spawned $id harness=grok" "spawn did not keep the Grok pin"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4.5 high
+  assert_grep "provider=grok" "$HOME_DIR/state/$id.meta" "meta missing grok provider pin"
+  # Grok has no general session windows in quota-axi; posture stays unknown rather
+  # than inventing a substitute provider or blocking the temporary Grok-default policy.
+  assert_grep "quota_posture=unknown" "$HOME_DIR/state/$id.meta" "grok without general windows should keep unknown posture"
+  pass "Grok-default temporary policy admits without silent harness substitution"
 }
 
 test_claude_threads_model_and_effort() {
@@ -358,18 +484,20 @@ test_batch_forwards_shared_profile_flags() {
   enable_dispatch_profile "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-    "$id1=$PROJ_DIR" "$id2=$PROJ_DIR" --harness codex --model gpt-5 --effort high)
+    "$id1=$PROJ_DIR" "$id2=$PROJ_DIR" --provider codex --harness codex --model gpt-5 --effort high)
   status=$?
   expect_code 0 "$status" "batch spawn with shared profile flags should succeed"
   assert_contains "$out" "spawned $id1 harness=codex" "first batch task did not use shared harness"
   assert_contains "$out" "spawned $id2 harness=codex" "second batch task did not use shared harness"
   assert_meta_profile "$HOME_DIR/state/$id1.meta" codex gpt-5 high
   assert_meta_profile "$HOME_DIR/state/$id2.meta" codex gpt-5 high
+  assert_grep "provider=codex" "$HOME_DIR/state/$id1.meta" "batch first task missing provider pin"
+  assert_grep "provider=codex" "$HOME_DIR/state/$id2.meta" "batch second task missing provider pin"
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   if grep -q 'NO_MISTAKES_RUN_AGENTS' "$shelllog"; then
     fail "batch must not export NO_MISTAKES_RUN_AGENTS from harness: $(cat "$shelllog")"
   fi
-  pass "batch dispatch forwards shared --harness, --model, and --effort to every pair"
+  pass "batch dispatch forwards the admitted profile and observation to every pair"
 }
 
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk() {
@@ -391,7 +519,7 @@ test_concurrent_static_and_dispatch_assignments_do_not_cross_talk() {
   dout="$TMP_ROOT/dispatch.out"
   run_spawn "$shome" "$swt" "$sfake" "$slog" "$sid" "$shome/../project" > "$sout" &
   spid=$!
-  run_spawn "$dhome" "$dwt" "$dfake" "$dlog" "$did" "$dhome/../project" --harness codex > "$dout" &
+  run_spawn "$dhome" "$dwt" "$dfake" "$dlog" "$did" "$dhome/../project" --provider codex --harness codex > "$dout" &
   dpid=$!
   wait "$spid" || src=$?
   wait "$dpid" || drc=$?
@@ -429,9 +557,13 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
 test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
-test_active_dispatch_profile_allows_explicit_harness
+test_active_dispatch_profile_requires_provider_with_explicit_harness
+test_active_dispatch_profile_allows_admitted_profile
+test_active_dispatch_profile_cannot_bypass_freeze
+test_existing_task_profile_is_immutable
 test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
+test_grok_default_dispatch_admits_without_silent_substitution
 test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort

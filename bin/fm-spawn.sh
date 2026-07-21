@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--provider <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--quota-posture <normal|conserve|protect|unknown>] [--quota-used <percent>] [--backend <name>] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+#   --provider <name> is the quota provider identity selected at admission. It is
+#   distinct from --harness (the launch adapter) and is recorded with the concrete
+#   profile in task metadata. When omitted and no crew-dispatch profile is active,
+#   provider defaults to harness for pin continuity.
+#   --quota-posture and --quota-used may carry the caller's selector observation;
+#   when config/crew-dispatch.json is active, spawn always re-admits the exact
+#   profile through bin/fm-dispatch-select.sh --admit and records that current
+#   result before any endpoint or worktree mutation. Freeze (exit 75) blocks
+#   launch and never substitutes another provider or harness.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -29,9 +38,10 @@
 #   callers must surface it instead of silently retrying another backend.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
-#   spawns require an explicit harness so firstmate cannot silently skip dispatch
-#   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
-#   harness (config/secondmate-harness -> config/crew-harness -> own), so the
+#   spawns require an explicit provider and harness so firstmate cannot silently
+#   skip dispatch consultation or admission, then re-admit that exact profile.
+#   A --secondmate spawn is exempt and resolves the SECONDMATE harness
+#   (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
 #   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
 #   overrides it for this spawn (either kind). A non-flag string containing
@@ -60,11 +70,11 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend applies to every pair.
-#   If config/crew-dispatch.json exists, shared --harness is required for crewmate
-#   and scout batches. The loop lives here, in bash, so callers never hand-write a
-#   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
-#   $vars and silently breaks ad-hoc `for ... in $pairs` loops).
+#   source of truth; shared profile and backend flags apply to every pair.
+#   If config/crew-dispatch.json exists, shared --provider and --harness are required
+#   for crewmate and scout batches. The loop lives here, in bash, so callers never
+#   hand-write a multi-task shell loop (the tool shell is zsh, which does not
+#   word-split unquoted $vars and silently breaks ad-hoc `for ... in $pairs` loops).
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
 #     __BRIEF__    absolute path to data/<task-id>/brief.md
 #     __TURNEND__  absolute path to state/<task-id>.turn-ended (for harnesses whose
@@ -95,7 +105,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -126,10 +136,16 @@ KIND=ship
 HARNESS_ARG=
 MODEL=
 EFFORT=
+PROVIDER=
+QUOTA_POSTURE=
+QUOTA_USED=
 BACKEND_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+PROVIDER_SET=0
+QUOTA_POSTURE_SET=0
+QUOTA_USED_SET=0
 BACKEND_SET=0
 POS=()
 want_value=
@@ -139,9 +155,12 @@ for a in "$@"; do
       --*) echo "error: --$want_value requires a value" >&2; exit 1 ;;
     esac
     case "$want_value" in
+      provider) PROVIDER=$a; PROVIDER_SET=1 ;;
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
+      quota-posture) QUOTA_POSTURE=$a; QUOTA_POSTURE_SET=1 ;;
+      quota-used) QUOTA_USED=$a; QUOTA_USED_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
@@ -151,26 +170,49 @@ for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --provider) want_value=provider ;;
+    --provider=*) PROVIDER=${a#--provider=}; PROVIDER_SET=1 ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
     --model) want_value=model ;;
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --quota-posture) want_value=quota-posture ;;
+    --quota-posture=*) QUOTA_POSTURE=${a#--quota-posture=}; QUOTA_POSTURE_SET=1 ;;
+    --quota-used) want_value=quota-used ;;
+    --quota-used=*) QUOTA_USED=${a#--quota-used=}; QUOTA_USED_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
+[ "$PROVIDER_SET" -eq 0 ] || [ -n "$PROVIDER" ] || { echo "error: --provider requires a non-empty value" >&2; exit 1; }
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
+[ "$QUOTA_POSTURE_SET" -eq 0 ] || [ -n "$QUOTA_POSTURE" ] || { echo "error: --quota-posture requires a non-empty value" >&2; exit 1; }
+[ "$QUOTA_USED_SET" -eq 0 ] || [ -n "$QUOTA_USED" ] || { echo "error: --quota-used requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
+case "$QUOTA_POSTURE" in
+  ''|normal|conserve|protect|unknown) ;;
+  freeze) echo "error: quota posture freeze cannot be spawned; wait for the selected provider quota to clear" >&2; exit 1 ;;
+  *) echo "error: --quota-posture must be one of normal, conserve, protect, unknown" >&2; exit 1 ;;
+esac
+if [ -n "$QUOTA_USED" ] && ! awk -v value="$QUOTA_USED" \
+  'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value + 0 >= 0 && value + 0 <= 100) }'; then
+  echo "error: --quota-used must be a number from 0 through 100" >&2
+  exit 1
+fi
+if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ] && [ -z "$PROVIDER" ]; then
+  echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
+  exit 1
+fi
 
 # Backend selection (data/fm-backend-design-d7): explicit --backend, else
 # FM_BACKEND env, else config/backend, else runtime auto-detection, else
@@ -374,6 +416,9 @@ spawn_abort_cleanup() {
         echo "tasktmp=${TASK_TMP:-}"
         echo "model=${MODEL:-default}"
         echo "effort=${EFFORT:-default}"
+        [ -z "${PROVIDER:-}" ] || echo "provider=$PROVIDER"
+        [ -z "${QUOTA_POSTURE:-}" ] || echo "quota_posture=$QUOTA_POSTURE"
+        [ -z "${QUOTA_USED:-}" ] || echo "quota_percent_used=$QUOTA_USED"
         echo "spawn_partial=$SPAWN_PARTIAL_ENDPOINT"
         echo "spawn_endpoint_uncertain=$SPAWN_ENDPOINT_CREATED"
         echo "spawn_worktree_uncertain=$SPAWN_WORKTREE_CREATED"
@@ -430,15 +475,18 @@ parse_partial_create_result() {
 idpart=${POS[0]:-}
 idpart=${idpart%%=*}
 if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in */*) false ;; *) true ;; esac; then
-  if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
-    echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
+  if [ "$KIND" != secondmate ] && { [ -z "$HARNESS_ARG" ] || [ -z "$PROVIDER" ]; } && [ -f "$CONFIG/crew-dispatch.json" ]; then
+    echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
     exit 1
   fi
   rc=0
   shared_args=()
+  [ -z "$PROVIDER" ] || shared_args+=(--provider "$PROVIDER")
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ -z "$QUOTA_POSTURE" ] || shared_args+=(--quota-posture "$QUOTA_POSTURE")
+  [ -z "$QUOTA_USED" ] || shared_args+=(--quota-used "$QUOTA_USED")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   for pair in "${POS[@]}"; do
     case "$pair" in
@@ -559,7 +607,7 @@ case "$ARG3" in
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
     else
       if [ -f "$CONFIG/crew-dispatch.json" ]; then
-        echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
+        echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
         exit 1
       fi
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" crew)
@@ -574,6 +622,9 @@ case "$ARG3" in
 esac
 
 [ -n "$HARNESS" ] || { echo "error: could not derive a harness from the raw launch command; refusing an empty harness" >&2; exit 1; }
+# Provider defaults to harness when the caller did not separate quota identity
+# from the launch adapter (compatibility for non-dispatch and simple pins).
+[ -n "$PROVIDER" ] || PROVIDER=$HARNESS
 
 # Generation pin is resolved later, only for ship tasks with mode=no-mistakes
 # (after delivery mode is known). See the MODE block near meta write.
@@ -602,6 +653,55 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
       esac
     fi
   fi
+fi
+
+spawn_meta_value() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
+}
+
+# Pinned profile is immutable once recorded. Recovery may re-launch the same
+# provider/harness/model/effort; a different profile must never silently replace it.
+if [ "$KIND" != secondmate ] && [ -f "$STATE/$ID.meta" ]; then
+  pinned_provider=$(spawn_meta_value "$STATE/$ID.meta" provider)
+  pinned_harness=$(spawn_meta_value "$STATE/$ID.meta" harness)
+  pinned_model=$(spawn_meta_value "$STATE/$ID.meta" model)
+  pinned_effort=$(spawn_meta_value "$STATE/$ID.meta" effort)
+  [ -n "$pinned_provider" ] || pinned_provider=${pinned_harness:-}
+  if [ -n "$pinned_harness" ]; then
+    if [ "$pinned_provider" != "$PROVIDER" ] || [ "$pinned_harness" != "$HARNESS" ] \
+      || [ "${pinned_model:-default}" != "${MODEL:-default}" ] \
+      || [ "${pinned_effort:-default}" != "${EFFORT:-default}" ]; then
+      echo "error: task $ID already has a pinned profile provider=$pinned_provider harness=$pinned_harness model=${pinned_model:-default} effort=${pinned_effort:-default}; resume that recorded task/profile instead of spawning a replacement" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# When crew-dispatch is active, re-admit the exact selected profile before any
+# endpoint or worktree mutation. bin/fm-dispatch-select.sh owns freeze and
+# posture boundaries; spawn never substitutes another provider/harness.
+if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
+  command -v jq >/dev/null 2>&1 || { echo "error: jq is required for dispatch admission" >&2; exit 1; }
+  admission_spec=$(jq -cn \
+    --arg provider "$PROVIDER" \
+    --arg harness "$HARNESS" \
+    --arg model "${MODEL:-default}" \
+    --arg effort "${EFFORT:-default}" \
+    '{provider:$provider,harness:$harness,model:$model,effort:$effort}') || exit 1
+  admission_status=0
+  admission_json=$("$SCRIPT_DIR/fm-dispatch-select.sh" --admit "$admission_spec") || admission_status=$?
+  [ "$admission_status" -eq 0 ] || exit "$admission_status"
+  admitted_provider=$(jq -er '.provider | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
+  admitted_harness=$(jq -er '.harness | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
+  admitted_model=$(jq -er '(.model // "default") | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
+  admitted_effort=$(jq -er '(.effort // "default") | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
+  if [ "$admitted_provider" != "$PROVIDER" ] || [ "$admitted_harness" != "$HARNESS" ] \
+    || [ "$admitted_model" != "${MODEL:-default}" ] || [ "$admitted_effort" != "${EFFORT:-default}" ]; then
+    echo "error: dispatch admission changed the selected provider/profile; refusing launch" >&2
+    exit 1
+  fi
+  QUOTA_POSTURE=$(jq -er '.quota_posture | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
+  QUOTA_USED=$(jq -r 'if (.quota_percent_used? | type) == "number" then (.quota_percent_used | tostring) else "" end' <<< "$admission_json") || exit 1
 fi
 
 secondmate_registry_value() {
@@ -1348,6 +1448,7 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
   echo "generation=$LIFECYCLE_GENERATION"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
+  echo "provider=$PROVIDER"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
   echo "mode=$MODE"
@@ -1355,6 +1456,8 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  [ -z "$QUOTA_POSTURE" ] || echo "quota_posture=$QUOTA_POSTURE"
+  [ -z "$QUOTA_USED" ] || echo "quota_percent_used=$QUOTA_USED"
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
