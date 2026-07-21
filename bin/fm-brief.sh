@@ -56,6 +56,11 @@
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Ship briefs also carry a compact Acceptance-evidence contract: concrete
+# criteria in {TASK} use stable AC-N ids; the crewmate writes
+# data/<id>/acceptance.md before done; firstmate runs bin/fm-acceptance-check.sh
+# before validation/PR-ready/merge recommendation. Full contract:
+# docs/acceptance-evidence.md. Scout/GSD/secondmate scaffolds omit this gate.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -482,6 +487,15 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+# Acceptance evidence
+Concrete acceptance criteria written into the Task section above must carry stable ids (\`AC-1\`, \`AC-2\`, ...).
+Before any \`done:\` line, write \`$DATA/$ID/acceptance.md\` mapping each id to direct same-surface evidence fields: \`surface\`, \`class\`, \`command\` (or interaction), \`result\`, and \`head\` (git sha or observation timestamp) when the criterion is live/UI.
+Status prose and worker authority are claims, not evidence; a bare \`done:\` cannot advance the task.
+Reject proxy substitutions across evidence classes: config/catalog/API does not satisfy a UI/menu criterion; unit tests do not satisfy a required live-server check; current selection does not prove alternatives remain selectable.
+Firstmate independently runs \`$FM_ROOT/bin/fm-acceptance-check.sh $ID\` before validation, PR-ready, or merge recommendation and returns incomplete mappings to you with precise repair direction.
+For small tasks with no concrete acceptance criteria, write a single line in the handoff: \`none: no concrete acceptance criteria\`.
+Do not invent hand-written schema boilerplate beyond that map; the check owns the contract (\`docs/acceptance-evidence.md\`).
 
 $DOD
 EOF

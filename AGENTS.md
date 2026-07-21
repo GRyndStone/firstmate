@@ -459,6 +459,13 @@ Its charter retargets escalation to the main firstmate's status file, so routine
 Because `fm-send` to a `kind=secondmate` target marks the request as from-firstmate (section 7 intake), the secondmate's answer comes back on that status/doc path too, not in its chat; read the response there as an ordinary status signal and do not peek its chat for it.
 A secondmate-reported merged PR is exactly the case the fleet-sync-on-merge wake rule (section 8) exists for, since the secondmate's own teardown never touches this home's separate project clone.
 
+### Acceptance evidence (before Validate / PR ready)
+
+When a ship task reports `done`, run `bin/fm-acceptance-check.sh <id>` before validation, PR-ready, merge recommendation, or captain-facing completion.
+Exit non-zero means return the script's repair lines to the existing worker; do not advance on a bare `done:` claim.
+Concrete criteria in ship briefs use stable `AC-N` ids; the handoff is `data/<id>/acceptance.md`.
+Full contract (class matrix, proxy rejection, proportional `none:` line, Gryndstone regression): `docs/acceptance-evidence.md` and `bin/fm-acceptance-check.sh`.
+
 ### Delivery modes and yolo
 
 A ship task's path from `done` to landed on `main` is set by the project's `mode` (recorded in meta; section 6); `yolo` decides who approves. The Validate / PR ready / Ship teardown stages below are written for the `no-mistakes` path; the other modes diverge:
@@ -767,7 +774,8 @@ Preserve the requests-from-main-firstmate contract in the charter: marked reques
 Before seeding, launching, recovering, or handing backlog to a secondmate home, load `secondmate-provisioning`.
 The status-reporting protocol is intentionally sparse: crewmates append status only for supervisor-actionable phase changes, `needs-decision`/`blocked`/`paused`/`done`/`failed`, or the `resolved` line that closes a previously reported decision or blocker, because every append wakes firstmate.
 `bin/fm-classify-lib.sh` owns the keyed open/resolved status contract.
-For any generated brief that still contains `{TASK}`, replace it with a clear task description, acceptance criteria, and any constraints or context the crewmate needs before spawning or seeding.
+For any generated brief that still contains `{TASK}`, replace it with a clear task description, acceptance criteria with stable `AC-N` ids when criteria are concrete, and any constraints or context the crewmate needs before spawning or seeding.
+Ship briefs already carry the Acceptance-evidence handoff contract; see `docs/acceptance-evidence.md`.
 Adjust the other sections only when the task genuinely deviates from the standard ship-a-new-PR shape (e.g. fixing an existing external PR); the scaffold is the contract, not a suggestion.
 
 ## 12. Self-update
