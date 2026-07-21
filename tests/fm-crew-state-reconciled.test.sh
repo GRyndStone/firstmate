@@ -5,9 +5,11 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# shellcheck source=bin/fm-reconcile-lib.sh
+. "$ROOT/bin/fm-reconcile-lib.sh"
 
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
-TMP_ROOT=$(fm_test_tmproot fm-crew-state-reconciled)
+fm_test_tmproot TMP_ROOT fm-crew-state-reconciled
 dir=$(make_case reconciled)
 state="$dir/state"
 fakebin="$dir/fakebin"
@@ -19,12 +21,14 @@ fm_write_meta "$state/task.meta" \
   "worktree=$wt" \
   "project=$dir/project" \
   'kind=ship'
+generation=$(fm_reconcile_meta_generation "$state/task.meta")
 printf 'paused: stale old-head event\n' > "$state/task.status"
 printf 'idle pane\n' > "$dir/pane.txt"
 now=$(date +%s)
 fm_write_meta "$state/task.reconciled" \
   'schema=fm-reconciled.v1' \
   'task=task' \
+  "lifecycle_generation=$generation" \
   "endpoint=$window" \
   'state=unknown' \
   'source=none' \

@@ -661,11 +661,46 @@ test_owned_command_does_not_override_first_terminal_observation() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   [ -z "$out" ] || fail "first terminal observation unexpectedly woke: $out"
-  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = done ] \
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = "done" ] \
     || fail "progressing owned command masked the first terminal observation"
   [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = run-step ] \
     || fail "owned command replaced the first authoritative terminal source"
   pass "progressing owned commands do not mask terminal truth on first observation"
+}
+
+test_owned_command_supersedes_cancelled_run() {
+  local dir state live pid identity physical_wt
+  command -v pgrep >/dev/null 2>&1 || { pass "owned-command cancelled-run override skipped without pgrep"; return; }
+  dir=$(make_reconcile_case owned-command-cancelled-run)
+  state="$dir/state"
+  live="$dir/live"
+  physical_wt=$(cd "$dir/worktree" && pwd -P)
+  sh -c 'cd "$1" || exit 1; while :; do sleep 0.1; done' _ "$physical_wt" &
+  pid=$!
+  sleep 0.1
+  identity=$(fm_reconcile_process_identity "$pid") \
+    || { kill "$pid" 2>/dev/null || true; fail "could not identify owned command"; }
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=process' \
+    'description=focused validation after cancelled pipeline' \
+    "pid=$pid" \
+    "pid_identity=$identity" \
+    'role=working-command' \
+    'progress_grace=30' \
+    "owner_worktree=$physical_wt" \
+    'owner_tasktmp=' \
+    'registered_at=1'
+  printf 'working: focused validation continues\n' > "$state/task.status"
+  printf 'state: failed · source: run-step · run cancelled\n' > "$live"
+  observe "$state" "$live" >/dev/null
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" state)" = working ] \
+    || fail "progressing owned command did not supersede the cancelled run"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" source)" = owned-command ] \
+    || fail "cancelled-run supersession did not retain exact command ownership"
+  pass "progressing owned command supersedes an intentionally cancelled run"
 }
 
 test_owned_command_overrides_older_persisted_idle() {
@@ -1037,7 +1072,7 @@ test_owned_command_observation_races_classify_exit_as_complete() {
       FM_RECONCILE_WAIT_SIGNATURE="process-$seam-race"
       FM_RECONCILE_WAIT_PID=4242
       FM_RECONCILE_WAIT_PID_IDENTITY='recorded identity'
-      FM_RECONCILE_WAIT_ROLE=working-command
+      FM_RECONCILE_WAIT_ROLE='working-command'
       FM_RECONCILE_WAIT_PROGRESS_GRACE=30
       FM_RECONCILE_WAIT_OWNER_WORKTREE=/tmp/fm-owned-command-race
       FM_RECONCILE_WAIT_OWNER_TASKTMP=
@@ -1077,7 +1112,7 @@ test_owned_command_revalidates_identity_after_progress_observation() {
     FM_RECONCILE_WAIT_SIGNATURE=process-post-identity-race
     FM_RECONCILE_WAIT_PID=4242
     FM_RECONCILE_WAIT_PID_IDENTITY='recorded identity'
-    FM_RECONCILE_WAIT_ROLE=working-command
+    FM_RECONCILE_WAIT_ROLE='working-command'
     FM_RECONCILE_WAIT_PROGRESS_GRACE=30
     FM_RECONCILE_WAIT_OWNER_WORKTREE=/tmp/fm-owned-command-reuse
     FM_RECONCILE_WAIT_OWNER_TASKTMP=
@@ -1384,6 +1419,7 @@ test_stale_teardown_tombstone_stops_suppressing_observation
 test_predicate_output_is_capped_with_exit_status_preserved
 test_malformed_live_state_values_are_rejected
 test_owned_command_does_not_override_first_terminal_observation
+test_owned_command_supersedes_cancelled_run
 test_owned_command_overrides_older_persisted_idle
 test_owned_command_overrides_historical_wait_events
 test_registered_legacy_check_completes_once_in_reconciliation

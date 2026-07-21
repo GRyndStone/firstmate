@@ -772,6 +772,7 @@ test_escalation_requires_durable_sink_acknowledgement() {
   escalate_add "$state" 'terminal outcome awaiting sink acknowledgement'
   (
     inject_msg() { printf '%s\n' "$1" > "$delivered"; return 0; }
+    # shellcheck disable=SC2329 # Called indirectly by escalate_flush.
     fm_backend_capture() { fail "delivery verification read pane or composer content"; }
     escalate_flush "$state"
   )
@@ -796,6 +797,7 @@ test_escalation_requires_durable_sink_acknowledgement() {
     'submitted_at=1'
   before=$(wc -l < "$delivered" | tr -d '[:space:]')
   (
+    # shellcheck disable=SC2329 # Called indirectly by escalate_flush.
     fm_backend_capture() { printf 'unsubmitted composer [fm-delivery=%s]\n' "$key"; }
     inject_msg() { printf 'unexpected replay\n' >> "$delivered"; return 0; }
     if escalate_flush "$state"; then
@@ -810,6 +812,7 @@ test_escalation_requires_durable_sink_acknowledgement() {
   FM_STATE_OVERRIDE="$state" "$DAEMON" --ack-delivery "$key" \
     || fail "sink could not persist its delivery acknowledgement"
   (
+    # shellcheck disable=SC2329 # Called indirectly by escalate_flush.
     fm_backend_capture() { return 1; }
     inject_msg() { fail "durably acknowledged delivery was replayed"; }
     escalate_flush "$state"
@@ -821,10 +824,13 @@ test_escalation_requires_durable_sink_acknowledgement() {
 
 test_afk_contract_distinguishes_receipt_restart_states() {
   local skill="$ROOT/.agents/skills/afk/SKILL.md"
+  # shellcheck disable=SC2016 # Backticks are literal skill prose.
   assert_grep 'A restart with a `prepared` receipt retries' "$skill" \
     "AFK contract omitted prepared-receipt restart semantics"
+  # shellcheck disable=SC2016 # Backticks are literal skill prose.
   assert_grep 'A restart with a `submitted` receipt does not replay it' "$skill" \
     "AFK contract omitted submitted-receipt restart semantics"
+  # shellcheck disable=SC2016 # Backticks are literal skill prose.
   assert_grep 'durable `acknowledged` state without replaying' "$skill" \
     "AFK contract omitted acknowledged-receipt restart semantics"
   assert_grep 'absolute, state-scoped `FM_STATE_OVERRIDE=<state>' "$skill" \

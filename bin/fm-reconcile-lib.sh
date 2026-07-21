@@ -1571,6 +1571,7 @@ fm_reconcile_spawn_claim_recover_locked() {  # <state-dir> <id> <claim>
   [ -n "$backend" ] && [ -n "$backend_label" ] || return 1
   [ -n "$backend_home" ] || backend_home=${FM_HOME:-${FM_ROOT_OVERRIDE:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}}
   probe_root=${FM_ROOT:-$(cd "$_FM_RECONCILE_LIB_DIR/.." && pwd)}
+  # shellcheck disable=SC2016 # Positional parameters expand in the bounded child shell.
   if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" env \
     FM_HOME="$backend_home" FM_ROOT="$probe_root" FM_ROOT_OVERRIDE="${FM_ROOT_OVERRIDE:-}" \
     bash -c '. "$1/fm-backend.sh"; fm_backend_spawn_claim_absent "$2" "$3" "$4" "$5" "$6" "$7"' \
@@ -1646,7 +1647,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
   local wait_seq pending pending_version reason observation_key pending_observation candidate_token='' candidate_reason='' event_note=''
-  local pending_unacked=0 positive_working=0 current_positive_working=0
+  local pending_unacked=0 positive_working=0 current_positive_working=0 cancelled_run_step=0
   local endpoint_changed=0 state_changed=0 source_changed=0 same_repository=0
 
   meta="$state/$id.meta"
@@ -1673,6 +1674,11 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   current_state=$FM_RECONCILE_CURRENT_STATE
   current_source=$FM_RECONCILE_CURRENT_SOURCE
   current_detail=$FM_RECONCILE_CURRENT_DETAIL
+  if [ "$current_state" = failed ] && [ "$current_source" = run-step ]; then
+    case "$current_detail" in
+      run\ cancelled*) cancelled_run_step=1 ;;
+    esac
+  fi
   now=$(date +%s)
   status_signal_before=$(fm_reconcile_signal_signature "$status_file")
   status_seq=$(fm_reconcile_status_sequence "$status_file")
@@ -1785,6 +1791,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   fi
   if [ "$FM_RECONCILE_WAIT_RESULT" = pending ] && [ "$FM_RECONCILE_WAIT_WORKING" -eq 1 ] \
     && { [ "$current_state" = working ] || [ "$current_state" = idle ] || [ "$current_state" = unknown ] \
+      || [ "$cancelled_run_step" -eq 1 ] \
       || { [ "$current_source" = status-log ] \
         && { [ "$current_state" = paused ] || [ "$current_state" = blocked ] || [ "$current_state" = parked ]; }; }; }; then
     current_state=working

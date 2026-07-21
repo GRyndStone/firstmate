@@ -306,6 +306,7 @@ test_external_wait_registration_renders_all_brief_scaffolds() {
     if [ "$kind" != secondmate ]; then
       assert_grep 'state-owned wait helper' "$brief" \
         "$kind brief did not exempt state-owned wait registration from its worktree boundary"
+      # shellcheck disable=SC2016 # Backticks are literal brief prose.
       assert_grep 'supplied `FM_STATE_OVERRIDE`' "$brief" \
         "$kind brief did not scope its wait-helper boundary exception"
     fi

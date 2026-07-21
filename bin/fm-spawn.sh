@@ -316,6 +316,7 @@ spawn_abort_cleanup() {
       fi
     fi
     if [ "$SPAWN_WORKTREE_CREATED" -eq 1 ] && [ -n "${WT:-}" ]; then
+      # shellcheck disable=SC2016 # Positional parameters expand in the bounded child shell.
       if fm_reconcile_bounded "$FM_SPAWN_CLAIM_PROBE_TIMEOUT" bash -c \
         'cd "$1" && treehouse return --force "$2"' fm-treehouse-return "$PROJ_ABS" "$WT" >/dev/null 2>&1 \
         && fm_backend_treehouse_lease_absent "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER"; then

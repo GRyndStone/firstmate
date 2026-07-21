@@ -31,8 +31,10 @@
 #      that coarse status to this crew.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
-#      the active step is ci, `axi status` alone cannot tell "still waiting on
+#      passed/checks-passed -> done, failed/cancelled -> failed. A cancelled
+#      validation run is historical when newer positive live evidence proves
+#      the same task is working again; a failed run remains terminal.
+#      While the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
 #      green, so a green PR is never silently read as still-validating.
@@ -266,6 +268,34 @@ herdr_pane_state() {
   else
     HERDR_PANE_STATE=idle
   fi
+}
+
+owned_command_live_override() {
+  local owned_command_detail
+  [ "${FM_CREW_STATE_LIVE_ONLY:-0}" != 1 ] || return 0
+  owned_command_detail=$(fm_reconcile_owned_command_observe "$STATE" "$ID" 2>/dev/null || true)
+  if [ -n "$owned_command_detail" ]; then
+    emit working owned-command "$owned_command_detail${1:+${SEP}$1}"
+  fi
+}
+
+cancelled_run_live_override() {
+  owned_command_live_override 'cancelled validation run superseded'
+  [ -n "$BACKEND_TARGET" ] || return 0
+  case "$TASK_BACKEND" in
+    herdr)
+      herdr_pane_state
+      if [ "$HERDR_PANE_READABLE" -eq 1 ] && [ "$HERDR_PANE_STATE" = busy ]; then
+        emit working pane "harness busy${SEP}cancelled validation run superseded"
+      fi
+      ;;
+    *)
+      pane_readable_bounded || return 0
+      if [ "$KIND" != secondmate ] && crew_pane_is_busy_bounded; then
+        emit working pane "harness busy${SEP}cancelled validation run superseded"
+      fi
+      ;;
+  esac
 }
 
 # --- no-mistakes run lookup (authoritative when a run matches this branch) --
@@ -516,6 +546,7 @@ fi
 if [ "$HAVE_RUN" = 1 ]; then
   RUN_STATE=working
   RUN_DETAIL=""
+  RUN_CANCELLED=0
   CI_STEP_STATUS=""
   CI_LOG_STATE=""
   RUN_STATUS=""
@@ -531,7 +562,7 @@ if [ "$HAVE_RUN" = 1 ]; then
       running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
       completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
       failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
       *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
     esac
   else
@@ -548,7 +579,7 @@ if [ "$HAVE_RUN" = 1 ]; then
         passed)        RUN_STATE="done"; RUN_DETAIL="run passed: PR merged/closed" ;;
         checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
         failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
-        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;
+        cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
         *)             RUN_STATE=unknown; RUN_DETAIL="outcome: $outcome" ;;
       esac
     elif [ -n "$awaiting" ] || [ "$status" = awaiting_approval ] || [ "$status" = fix_review ] || [ -n "$gate_status" ] || [ "$has_gate" = 1 ]; then
@@ -572,7 +603,7 @@ if [ "$HAVE_RUN" = 1 ]; then
         running|fixing) RUN_STATE=working; RUN_DETAIL="validating ($status)" ;;
         completed)      RUN_STATE="done"; RUN_DETAIL="run completed" ;;
         failed)         RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
+        cancelled)      RUN_STATE=failed;  RUN_DETAIL="run cancelled"; RUN_CANCELLED=1 ;;
         "")             RUN_STATE=working; RUN_DETAIL="run active" ;;
         *)              RUN_STATE=working; RUN_DETAIL="run active ($status)" ;;
       esac
@@ -593,6 +624,13 @@ if [ "$HAVE_RUN" = 1 ]; then
       fi
     fi
   fi
+
+  case "$RUN_STATE" in
+    done|failed) ;;
+    *) owned_command_live_override 'run-step superseded by progressing task-owned command' ;;
+  esac
+
+  [ "$RUN_CANCELLED" -eq 0 ] || cancelled_run_live_override
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then
     if [ "$RUN_SOURCE" = coarse ]; then

@@ -12,7 +12,8 @@
 #   (a) active run-step is authoritative                          -> run-step
 #   (b) needs-decision/blocked log + resumed run = SUPERSEDED     -> run-step
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
-#   (d) terminal run-step (passed/failed) is authoritative        -> run-step
+#   (d) terminal run-step (passed/failed) is authoritative, while a cancelled
+#       run is historical only after positive live working evidence
 #   (e) cross-branch attribution: this branch's own run found via list lookup
 #   (f) no run + busy pane                                        -> pane
 #   (g) no run + idle pane supersedes stale working history, while declared
@@ -290,6 +291,20 @@ run:
   pr: ""
   findings: none
 outcome: failed
+EOF
+}
+
+run_cancelled() {  # <branch> [head]
+  local head=${2:-abc1234}
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: cancelled
+  head: "$head"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+outcome: cancelled
 EOF
 }
 
@@ -684,6 +699,51 @@ test_terminal_failed() {
   assert_contains "$out" "state: failed" "failed run -> failed"
   assert_contains "$out" "source: run-step" "failed -> run-step source"
   pass "terminal failed run is authoritative"
+}
+
+test_cancelled_run_is_superseded_by_live_herdr_turn() {
+  command -v jq >/dev/null 2>&1 || { pass "cancelled Herdr supersession skipped without jq"; return; }
+  reset_fakes
+  local d out
+  d=$(new_case cancelled-live-herdr)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-live.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: exact-head repair and focused validation\n' > "$d/state/feat-cancelled-live.status"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-live)"
+  FM_FAKE_HERDR_AGENT_STATUS=working
+  out=$(run_crew_state "$d" feat-cancelled-live)
+  assert_contains "$out" 'state: working' "live Herdr turn did not supersede a cancelled validation run"
+  assert_contains "$out" 'source: pane' "live Herdr turn was not the reconciled current-state source"
+  assert_contains "$out" 'cancelled validation run superseded' "cancelled run was not labeled historical"
+  assert_not_contains "$out" 'state: failed' "cancelled run masked the newer live Herdr turn"
+  pass "live Herdr work supersedes an intentionally cancelled validation run"
+}
+
+test_cancelled_run_remains_terminal_without_positive_live_evidence() {
+  command -v jq >/dev/null 2>&1 || { pass "cancelled Herdr idle guard skipped without jq"; return; }
+  reset_fakes
+  local d out
+  d=$(new_case cancelled-idle-herdr)
+  make_repo_on_branch "$d/wt" fm/feat-cancelled-idle
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cancelled-idle.meta" \
+    'window=default:w0:p1F' \
+    "worktree=$d/wt" \
+    'kind=ship' \
+    'backend=herdr'
+  printf 'working: stale event must not mask a stopped task\n' > "$d/state/feat-cancelled-idle.status"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-cancelled-idle)"
+  FM_FAKE_HERDR_AGENT_STATUS=idle
+  out=$(run_crew_state "$d" feat-cancelled-idle)
+  assert_contains "$out" 'state: failed' "idle cancelled run lost its terminal state"
+  assert_contains "$out" 'source: run-step' "idle cancelled run lost its run-step evidence"
+  assert_not_contains "$out" 'state: working' "stale working event masked an idle cancelled task"
+  pass "cancelled run stays terminal when no positive live work supersedes it"
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
@@ -1199,6 +1259,8 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_cancelled_run_is_superseded_by_live_herdr_turn
+test_cancelled_run_remains_terminal_without_positive_live_evidence
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_full_run_attribution_rejects_stale_head
