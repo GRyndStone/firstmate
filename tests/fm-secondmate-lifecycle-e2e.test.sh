@@ -51,7 +51,7 @@ setup_world() {
   cat > "$HOME_DIR/data/projects.md" <<EOF
 - alpha [direct-PR +yolo] - alpha project (added 2026-06-22)
 - beta [direct-PR] - beta project (added 2026-06-22)
-- gamma - gamma project (added 2026-06-22)
+- gamma [no-mistakes] - gamma project (added 2026-06-22)
 EOF
   ALPHA_ORIGIN=$(git -C "$HOME_DIR/projects/alpha" remote get-url origin)
   BETA_ORIGIN=$(git -C "$HOME_DIR/projects/beta" remote get-url origin)
@@ -105,6 +105,8 @@ phase_seed() {
     || fail "alpha delivery mode not preserved in the subhome"
   [ "$(FM_HOME="$SUB" "$ROOT/bin/fm-project-mode.sh" beta)" = "direct-PR off" ] \
     || fail "beta delivery mode not preserved in the subhome"
+  [ "$(FM_HOME="$SUB" "$ROOT/bin/fm-project-mode.sh" gamma)" = "no-mistakes off" ] \
+    || fail "gamma no-mistakes mode not preserved in the subhome"
   FM_HOME="$HOME_DIR" "$ROOT/bin/fm-home-seed.sh" validate >/dev/null || fail "registry validation failed after seed"
 
   pass "seed: registry scope+projects, charter copied, clones+origins, no-mistakes init in subhome only"

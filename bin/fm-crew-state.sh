@@ -315,9 +315,30 @@ strip_quotes() {
   trim "$s"
 }
 
+# Prefer the task-pinned generation (nm_binary + nm_home in meta) so status reads
+# hit the same daemon the worker was launched against. Fall back to ambient
+# PATH no-mistakes only when the task was spawned without a pin.
+nm_binary_for_task() {
+  local bin
+  bin=$(meta_value nm_binary)
+  if [ -n "$bin" ] && [ -x "$bin" ]; then
+    printf '%s' "$bin"
+    return 0
+  fi
+  command -v no-mistakes 2>/dev/null
+}
+
 # Bounded no-mistakes call in the worktree; stdout only, never fails the script.
 nm_run() {  # <args...>
-  ( cd "$WT" && bounded_run "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true
+  local bin nm_home
+  bin=$(nm_binary_for_task) || return 0
+  [ -n "$bin" ] || return 0
+  nm_home=$(meta_value nm_home)
+  if [ -n "$nm_home" ]; then
+    ( cd "$WT" && NM_HOME="$nm_home" bounded_run "$NM_TIMEOUT" "$bin" "$@" ) 2>/dev/null || true
+  else
+    ( cd "$WT" && bounded_run "$NM_TIMEOUT" "$bin" "$@" ) 2>/dev/null || true
+  fi
 }
 
 # Scalar value of a TOON key in the captured run output ($RUN_OUT).
@@ -516,7 +537,7 @@ RUN_SOURCE=full
 COARSE_STATUS=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
-if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
+if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && [ -n "$(nm_binary_for_task || true)" ]; then
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")

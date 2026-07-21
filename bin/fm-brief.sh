@@ -41,8 +41,8 @@
 # For ship tasks, the definition of done is shaped by the project's delivery mode
 # (data/projects.md via fm-project-mode.sh; see AGENTS.md project management
 # and task lifecycle):
-#   no-mistakes  implement -> /no-mistakes pipeline -> PR -> captain merge (default)
-#   direct-PR    implement -> push + open PR via gh-axi (no pipeline) -> captain merge
+#   direct-PR    implement -> focused tests/lint -> push + open PR via gh-axi (default)
+#   no-mistakes  implement -> /no-mistakes pipeline -> PR -> captain merge (explicit opt-in)
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                firstmate reviews, captain approves, firstmate merges to local main
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
@@ -382,37 +382,13 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 
 case "$MODE" in
-  direct-PR)
-    SETUP2=""
-    RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
-    DOD=$(cat <<EOF
-# Definition of done
-This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
-The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
-Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
-EOF
-)
-    ;;
-  local-only)
-    SETUP2=""
-    RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
-    DOD=$(cat <<EOF
-# Definition of done
-This project ships **local-only**: no remote, no PR, no pipeline.
-The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
-Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
-When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
-Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
-EOF
-)
-    ;;
-  *)  # no-mistakes (default)
+  no-mistakes)
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
     DOD=$(cat <<EOF
 # Definition of done
+This project ships **no-mistakes** (explicit opt-in): full validation pipeline before PR.
 The task is complete only when committed on your branch.
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
@@ -427,6 +403,31 @@ Two firstmate-specific rules layer on top of that guidance:
 - Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+EOF
+)
+    ;;
+  local-only)
+    SETUP2=""
+    RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
+    DOD=$(cat <<EOF
+# Definition of done
+This project ships **local-only**: no remote, no PR, no pipeline.
+The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
+Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
+When it is implemented and committed, run the project focused tests and lint (or the repo documented check commands), then append \`done: ready in branch fm/$ID\` to the status file and stop.
+Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
+EOF
+)
+    ;;
+  *)  # direct-PR (default for omitted mode, unknown project, and explicit [direct-PR])
+    SETUP2=""
+    RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
+    DOD=$(cat <<EOF
+# Definition of done
+This project ships **direct-PR**: focused tests and lint, then you raise the PR yourself without the no-mistakes pipeline.
+The task is complete only when committed on your branch.
+When it is implemented and committed, run the project focused tests and lint (or the repo documented check commands), push your branch, and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
 )
     ;;

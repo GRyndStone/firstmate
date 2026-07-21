@@ -1,0 +1,26 @@
+# config/no-mistakes-generation - local selection of the no-mistakes runtime
+# generation for newly spawned ship tasks whose project mode is explicitly
+# [no-mistakes]. Ignored for direct-PR, local-only, scout, and secondmate.
+# Copy this into a local, gitignored config/no-mistakes-generation and edit.
+# Do not commit captain-specific paths.
+#
+# Firstmate chooses the generation (binary + state root). No-mistakes chooses
+# its own validation agents from fresh quota evidence inside that generation.
+# Firstmate does not derive NO_MISTAKES_RUN_AGENTS from the crewmate harness.
+#
+# Format: key=value on non-empty, non-comment lines.
+#   id=<short-label>              optional; defaults to the home basename
+#   binary=<absolute-cli-path>    required
+#   home=<absolute-state-root>    required (exported as NM_HOME)
+#
+# Absent file: ambient PATH no-mistakes and default NM_HOME (backward compatible).
+# Present but invalid or unhealthy: fail closed at spawn with a diagnostic.
+# Never silently routes to the ambient/default installation once selected.
+#
+# The resolved id/binary/home are snapshotted into each new task's meta and
+# launch environment. A later config change affects only future tasks.
+#
+# Example (replace with the generation you stand up locally):
+id=example-gen
+binary=/absolute/path/to/versions/no-mistakes/example-gen/no-mistakes
+home=/absolute/path/to/no-mistakes-gen-example

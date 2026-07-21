@@ -158,6 +158,7 @@ An explicit per-spawn harness or raw launch command does not inherit model or ef
 `config/crew-harness` remains the crewmate harness and is inherited into secondmate homes.
 `config/crew-dispatch.json` is inherited too; secondmates use the same natural-language dispatch profiles when spawning their own crewmates.
 `config/backlog-backend` is inherited too; absent or `tasks-axi` selects the default tasks-axi backlog backend, while `manual` forces routine backlog updates to hand-editing across the fleet without disabling validated handoff delegation.
+`config/no-mistakes-generation` is inherited too so secondmate-spawned crewmates pin the same no-mistakes runtime generation (`docs/configuration.md` "No-mistakes generation").
 
 The `data/secondmates.md` line schema and the secondmate environment variables are documented in [configuration.md](configuration.md).
 

@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, NM_GENERATION, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -28,6 +28,10 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; continue with the normal fallback chain, resolve and pass the chosen fallback harness explicitly while the file remains present, fix the malformed schema, unverified harness name, unknown selector, or invalid harness/effort pair when convenient, and do not select a bad profile.
 - `CREW_DISPATCH: active config/crew-dispatch.json` - bootstrap validated the optional dispatch profile file and printed its active rules and `default:` when present.
   Keep this block top-of-mind during intake; it is the reminder that every crewmate or scout dispatch must consult the rules before spawning (`AGENTS.md` section 4).
+- `NM_GENERATION: active id=... binary=... home=...` - optional no-mistakes generation config is present and healthy; new ordinary tasks will pin that generation (`docs/configuration.md` "No-mistakes generation").
+  Record silently unless the captain asks.
+- `NM_GENERATION: invalid|unhealthy config/no-mistakes-generation - <reason>` - the selected generation cannot be used; fix the config or restore the generation before dispatching validation work.
+  Spawn fails closed rather than falling back to the ambient install.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (offline, no origin, local-only); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.
 - `FLEET_SYNC: <repo>: recovered: <detail>` - the clone had drifted onto a clean detached HEAD holding no unique commits and the sync self-healed it (re-attached the default branch and fast-forwarded); no action needed, it is reported only so the self-heal is visible.
