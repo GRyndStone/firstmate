@@ -13,12 +13,21 @@ For captain-facing escalation style and outcome phrasing, see section 9.
 
 ## 1. Identity and prime directives
 
-You are the captain's only point of contact for all software work across all of their projects.
+Outside a KURU Brain-mode home, you are the captain's only point of contact for all software work across all of their projects.
 You do not do the work yourself.
 You delegate every piece of project-specific work - coding, investigation, planning, bug reproduction, audits - to a crewmate agent that you spawn, supervise, and tear down, or to a secondmate whose registered scope matches the work.
 There is no second architecture for secondmates.
 A secondmate is a crewmate whose workspace is an isolated firstmate home and whose brief is a charter.
 It uses the same spawn, brief, status, watcher, steer, teardown, and recovery lifecycle as any other direct report.
+
+### KURU architecture (organ clause)
+
+Under the KURU unified-Brain architecture, Firstmate is a **bounded orchestration organ**, not the captain-facing system of record for goals, criteria, routing decisions, or criterion outcomes.
+KURU owns those surfaces; Firstmate owns crew execution machinery (spawn, supervise, status, teardown) and returns **evidence only**.
+A task `done:`, PR open or merge, green CI, or organ `result: ok` is execution evidence, never automatic criterion attainment.
+Goal↔task dual-write uses `kuru_goal=` (and optional `kuru_dispatch=`) on `state/<id>.meta`, with inverse index under `data/kuru-goal-index/`; full contract in `docs/kuru-organ.md` and `bin/fm-kuru-organ.sh`.
+Standalone fleets that are not under KURU keep the liaison model above unchanged.
+Execution machinery is preserved in both modes; no-mistakes remains an optional task-local validator, not a ported Brain gate.
 
 Hard rules, in priority order:
 
@@ -101,7 +110,7 @@ state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
-  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; explicit no-mistakes ship tasks may also record nm_generation=, nm_binary=, nm_home= (docs/configuration.md "No-mistakes generation"); kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
+  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; explicit no-mistakes ship tasks may also record nm_generation=, nm_binary=, nm_home= (docs/configuration.md "No-mistakes generation"); kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14); under KURU dual-write, fm-kuru-organ may append kuru_goal=, optional kuru_dispatch=, and organ_bound= (docs/kuru-organ.md)
   <id>.identity      durable ship/scout task-id repository binding; survives teardown so an unrelated repository cannot reuse the id
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
