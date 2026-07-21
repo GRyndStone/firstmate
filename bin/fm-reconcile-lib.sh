@@ -2117,6 +2117,7 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   local old_state old_evidence old_sequence old_pending old_reason old_notified old_pending_version old_notified_version pending pending_version reason token
   local old_pending_observation observation_key pending_observation
   local old_probe_armed old_probe_invalidation_sequence probe_invalidation_sequence probe_invalidation_reason probe_invalidated_at=0
+  local pre_probe_armed pre_pulse_state
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
   ! fm_reconcile_tombstone_active "$state" "$id" || return 0
@@ -2125,8 +2126,16 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   [ -n "$lifecycle_generation" ] || return 0
   [ -z "$expected_generation" ] || [ "$expected_generation" = "$lifecycle_generation" ] || return 0
   fm_reconcile_reset_stale_lifecycle_locked "$state" "$id" "$lifecycle_generation" || return 1
-  fm_reconcile_background_probe_recover_pulse_locked "$state" "$id" || return 1
+  # Snapshot probe liveness before recover: recover may mark an armed pulse
+  # consumed (identical-pause recovery) or already invalidate it. Observer
+  # failure must still force a durable invalidated secondary pulse whenever a
+  # probe was live at entry; otherwise a consumed pulse fails the armed-pulse
+  # gate below and leaves the one-shot pulse non-invalidated.
   record="$state/$id.reconciled"
+  pre_probe_armed=$(fm_reconcile_record_value "$record" background_probe_armed)
+  fm_reconcile_background_probe_pulse_load "$state" "$id"
+  pre_pulse_state=$FM_RECONCILE_PROBE_PULSE_STATE
+  fm_reconcile_background_probe_recover_pulse_locked "$state" "$id" || return 1
   project=$(fm_reconcile_meta_value "$meta" project)
   kind=$(fm_reconcile_meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
@@ -2154,12 +2163,15 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   case "$old_pending_version" in *[!A-Za-z0-9._:-]*) old_pending_version= ;; esac
   case "$old_notified_version" in *[!A-Za-z0-9._:-]*) old_notified_version= ;; esac
   case "$old_probe_armed" in 1) ;; *) old_probe_armed=0 ;; esac
+  case "$pre_probe_armed" in 1) ;; *) pre_probe_armed=0 ;; esac
   case "$old_probe_invalidation_sequence" in ''|*[!0-9]*) old_probe_invalidation_sequence=0 ;; esac
   evidence=$(fm_reconcile_clean_value "$evidence")
   probe_invalidation_sequence=$old_probe_invalidation_sequence
   probe_invalidation_reason=$(fm_reconcile_record_value "$record" background_probe_invalidation_reason)
   fm_reconcile_background_probe_pulse_load "$state" "$id"
-  if [ "$old_probe_armed" -eq 1 ] || [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
+  if [ "$pre_probe_armed" -eq 1 ] || [ "$old_probe_armed" -eq 1 ] \
+    || [ "$pre_pulse_state" = armed ] || [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ] \
+    || [ "$pre_pulse_state" = consumed ] || [ "$FM_RECONCILE_PROBE_PULSE_STATE" = consumed ]; then
     probe_invalidation_sequence=$((old_probe_invalidation_sequence + 1))
     probe_invalidation_reason="observer failure while pulse was armed: $evidence"
     probe_invalidated_at=$(date +%s)
@@ -2305,9 +2317,18 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || { rm -f "$tmp"; return 0; }
   mv -f "$tmp" "$record" || return 1
   if [ "$probe_invalidated_at" -ne 0 ]; then
+    # Force the secondary pulse to invalidated for any non-invalidated state
+    # (armed or consumed-by-recover). Leaving consumed here is what made the
+    # herdr canary flake: watcher woke on observer-failure while pulse stayed
+    # non-invalidated.
     fm_reconcile_background_probe_pulse_load "$state" "$id"
-    if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
-      fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
+    if [ -f "${FM_RECONCILE_PROBE_PULSE_FILE:-}" ]; then
+      case "$FM_RECONCILE_PROBE_PULSE_STATE" in
+        invalidated) ;;
+        *)
+          fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
+          ;;
+      esac
     fi
   fi
   if [ -n "$pending" ] \

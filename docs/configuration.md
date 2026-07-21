@@ -256,6 +256,19 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved provider and harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Finite workflow bounds
+
+Provider admission pins who may run; finite workflow bounds stop expensive paths from burning unbounded turns after that pin.
+`bin/fm-workflow-bound.sh` is the single owner of:
+
+- **Budget inheritance** - child spawns via `fm-spawn.sh --parent <id>` copy the parent's provider/model/effort pin and inherit `budget_depth` (parent minus one), `budget_concurrency`, and remaining `budget_max_turns`. Parent depth 0 refuses the child. Root spawns get defaults (`FM_BUDGET_DEFAULT_DEPTH`, `FM_BUDGET_DEFAULT_CONCURRENCY`, `FM_BUDGET_DEFAULT_MAX_TURNS`).
+- **Two-attempt obstacle cap** - `note-obstacle` allows two free attempts per normalized key, then exits 3 with a needs-decision line so a third try is never a silent infinite retry.
+- **Auth preflight** - deterministic provider/GitHub credential checks with no model loop (`auth-preflight`; overridable command hooks for tests).
+- **Analyst lanes** - `analyst-checkpoint` writes finite artifacts under `data/<id>/checkpoints/`; `analyst-idle` parks model-free between checkpoints; `assert-no-analyst-dependency` refuses implementation/validation `blocked-by` edges onto `lane_kind=analyst` tasks.
+
+Standing analysts remain additive research capacity, never blockers or dependencies of implementation or validation lanes.
+The script header owns flags, defaults, and exit codes.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old (tmux, node, git, gh with GitHub auth via `gh auth login`, treehouse with durable lease support, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi), lists it with the exact install commands, and installs only after you say go.

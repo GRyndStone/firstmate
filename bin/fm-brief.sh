@@ -283,6 +283,8 @@ The report is the only thing that survives, so anything worth keeping must be in
    If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
    If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+   A third attempt on the same obstacle requires a captain decision path: never silently retry forever.
+   Prefer \`$FM_ROOT/bin/fm-workflow-bound.sh note-obstacle $ID <obstacle-key>\` so the two-attempt cap is recorded; exit 3 means surface \`needs-decision:\` for that obstacle.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
@@ -332,6 +334,8 @@ If the task names a machine profile or operating guide for \`gsd\`, read it befo
    After every headless invocation completes, check for leftover \`gsd\` processes from it and kill them, so leaked processes never accumulate or hold locks.
    For pure inspection whose headless form is known to leak (e.g. \`gsd headless extensions list\`), prefer the interactive form.
 7. If GSD errors, debug and fix the root cause; if genuinely blocked twice on the same obstacle, append \`blocked: {why}\` and stop.
+   A third attempt requires a captain decision path (never silent infinite retry); use \`$FM_ROOT/bin/fm-workflow-bound.sh note-obstacle $ID <obstacle-key>\` and surface \`needs-decision:\` on exit 3.
+   Child GSD work inherits the admitted parent budget pin (provider/model/effort, depth, concurrency, total turns) via \`fm-spawn.sh --parent $ID\`.
 
 # Decision routing
 Route every NEEDS-HUMAN gate, every milestone-boundary decision, and every substantive GSD question (scope, the captain's intent, dispositions) back to firstmate: append \`needs-decision [key=gsd-gate-{slug}]: {concise question + the options GSD surfaced}\` to the status file, with {slug} derived from the gate or check name, and wait silently until firstmate replies.
@@ -477,6 +481,8 @@ $RULE1
    If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
    If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+   A third attempt on the same obstacle requires a captain decision path: never silently retry forever.
+   Prefer \`$FM_ROOT/bin/fm-workflow-bound.sh note-obstacle $ID <obstacle-key>\` so the two-attempt cap is recorded; exit 3 means surface \`needs-decision:\` for that obstacle.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.

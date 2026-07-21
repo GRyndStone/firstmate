@@ -26,4 +26,5 @@ Escalate in order:
    Genuine wedging means looping, unresponsive, repeating the same obstacle, or truly dead.
    A low context reading is not wedging; modern harnesses auto-compact and keep going.
    The worktree and commits persist, so relaunch is cheap.
-5. If a second relaunch fails too, write `failed` to the backlog and tell the captain with evidence.
+   Before each relaunch on a repeated obstacle, record it with `bin/fm-workflow-bound.sh note-obstacle <id> <obstacle-key>` (two free attempts; exit 3 means escalate, never silent infinite retry).
+5. If a second relaunch fails too, or `note-obstacle` exits 3, write `failed` or surface `needs-decision` to the backlog/captain with evidence - never a third silent retry.

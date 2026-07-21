@@ -1397,6 +1397,97 @@ test_dead_spawn_claim_after_creation_started_is_retained() {
   pass "dead creation claims remain fail-closed until bounded absence proof"
 }
 
+test_observer_failure_invalidates_armed_and_consumed_pulses() {
+  local dir state pulse gen now out
+  dir=$(make_reconcile_case observer-failure-pulse)
+  state="$dir/state"
+  pulse="$state/task.probe-pulse"
+  gen=lifecycle-observer-pulse
+  now=$(date +%s)
+  fm_write_meta "$state/task.meta" \
+    "window=lab:w1:p1" \
+    "generation=$gen" \
+    "backend=herdr" \
+    "worktree=$dir/worktree" \
+    "project=$dir/project" \
+    "kind=ship"
+  # Armed baseline with a one-shot pulse already recovered to consumed (the
+  # CI flake path: recover_pulse marks identical-pause consumed before
+  # observer_failure runs, so an armed-only gate would skip invalidation).
+  cat > "$state/task.reconciled" <<EOF
+schema=fm-reconciled.v1
+task=task
+lifecycle_generation=$gen
+repository_identity=repo-obs-pulse
+endpoint=lab:w1:p1
+state=paused
+source=status-log
+evidence=paused baseline
+observed_at=$now
+background_probe_armed=1
+background_probe_invalidation_sequence=0
+observer_state=
+observer_evidence=
+observer_sequence=0
+EOF
+  cat > "$pulse" <<EOF
+schema=fm-background-probe-pulse.v1
+state=consumed
+task=task
+lifecycle_generation=$gen
+endpoint=lab:w1:p1
+pulse_id=pulse-obs-1
+issued_at=$now
+expires_at=$((now + 120))
+state_reason=recovered committed identical-pause return
+EOF
+  out=$(fm_reconcile_observer_failure "$state" task 'task state observer returned malformed output' "$gen") \
+    || fail "observer failure with a consumed pulse should succeed"
+  assert_contains "$out" 'observer-failure' "observer failure did not emit its action: $out"
+  [ "$(fm_reconcile_record_value "$pulse" state)" = invalidated ] \
+    || fail "observer failure left consumed pulse non-invalidated: state=$(fm_reconcile_record_value "$pulse" state)"
+  [ "$(fm_reconcile_record_value "$state/task.reconciled" background_probe_armed)" = 0 ] \
+    || fail "observer failure left background_probe_armed set"
+  assert_contains "$(fm_reconcile_record_value "$state/task.reconciled" background_probe_invalidation_reason)" \
+    'observer failure while pulse was armed' \
+    "missing observer-failure invalidation reason"
+
+  # Fresh armed pulse is also forced to invalidated (different evidence advances the sequence).
+  cat > "$pulse" <<EOF
+schema=fm-background-probe-pulse.v1
+state=armed
+task=task
+lifecycle_generation=$gen
+endpoint=lab:w1:p1
+pulse_id=pulse-obs-2
+issued_at=$now
+expires_at=$((now + 120))
+EOF
+  # Re-arm the reconciled baseline so a subsequent failure still sees a live probe.
+  {
+    printf 'schema=fm-reconciled.v1\n'
+    printf 'task=task\n'
+    printf 'lifecycle_generation=%s\n' "$gen"
+    printf 'repository_identity=repo-obs-pulse\n'
+    printf 'endpoint=lab:w1:p1\n'
+    printf 'state=paused\n'
+    printf 'source=status-log\n'
+    printf 'evidence=paused baseline\n'
+    printf 'observed_at=%s\n' "$now"
+    printf 'background_probe_armed=1\n'
+    printf 'background_probe_invalidation_sequence=1\n'
+    printf 'observer_state=failed\n'
+    printf 'observer_evidence=task state observer returned malformed output\n'
+    printf 'observer_sequence=1\n'
+  } > "$state/task.reconciled"
+  out=$(fm_reconcile_observer_failure "$state" task 'task state observer timed out after 5s' "$gen") \
+    || fail "observer failure with an armed pulse should succeed"
+  assert_contains "$out" 'observer-failure' "second observer failure lost its action: $out"
+  [ "$(fm_reconcile_record_value "$pulse" state)" = invalidated ] \
+    || fail "observer failure left armed pulse non-invalidated"
+  pass "observer failure invalidates armed and consumed probe pulses"
+}
+
 test_active_review_parks_once_past_stale_pause
 test_notified_observation_does_not_mask_newer_live_transition
 test_stopped_endpoint_without_claimed_done_wakes_once
@@ -1441,5 +1532,6 @@ test_partial_spawn_rescue_claim_survives_owner_exit
 test_treehouse_rescue_reconciles_by_persisted_holder
 test_spawn_claim_rechecks_endpoint_after_treehouse_absence
 test_dead_spawn_claim_after_creation_started_is_retained
+test_observer_failure_invalidates_armed_and_consumed_pulses
 
 echo "# fm-reconcile-lib.test.sh: all assertions passed"
