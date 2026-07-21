@@ -79,6 +79,15 @@ SH
   printf '%s\n' "$bin"
 }
 
+# Register the fixture project basename under the given delivery mode.
+# Default (omit) is direct-PR so generation routing stays off unless opted in.
+register_project_mode() {
+  local home=$1 mode=${2:-direct-PR} proj_name=${3:-project}
+  mkdir -p "$home/data"
+  printf -- '- %s [%s] - fixture project (added 2026-07-20)\n' "$proj_name" "$mode" \
+    > "$home/data/projects.md"
+}
+
 make_spawn_case() {
   local name=$1 harness=$2 case_dir home proj wt fakebin launchlog id
   shift 2
@@ -90,6 +99,7 @@ make_spawn_case() {
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
+  register_project_mode "$home" direct-PR project
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
@@ -224,6 +234,7 @@ test_spawn_pins_meta_and_env_exactly() {
   id=nm-pin-z2
   rec=$(make_spawn_case nm-pin claude "$id")
   read_case_record "$rec"
+  register_project_mode "$HOME_DIR" no-mistakes project
   root="$CASE_DIR/gen-green"
   bin=$(make_fake_generation "$root" healthy)
   gen_home="$root/home"
@@ -235,6 +246,7 @@ test_spawn_pins_meta_and_env_exactly() {
   expect_code 0 "$status" "spawn with healthy generation should succeed"
   assert_contains "$out" "nm_generation=green-fixture" "spawn line missing generation id"
   meta="$HOME_DIR/state/$id.meta"
+  assert_grep "mode=no-mistakes" "$meta" "meta must record explicit no-mistakes mode"
   assert_grep "nm_generation=green-fixture" "$meta" "meta nm_generation mismatch"
   assert_grep "nm_binary=$bin" "$meta" "meta nm_binary mismatch"
   assert_grep "nm_home=$gen_home" "$meta" "meta nm_home mismatch"
@@ -247,10 +259,38 @@ test_spawn_pins_meta_and_env_exactly() {
   pass "spawn snapshots exact generation meta and pane exports"
 }
 
-test_spawn_rejects_invalid_generation_config() {
-  local rec id out status
-  id=nm-bad-z3
-  rec=$(make_spawn_case nm-bad claude "$id")
+test_direct_pr_ignores_generation_config() {
+  local rec id out status shelllog meta root bin gen_home
+  id=nm-direct-z8
+  rec=$(make_spawn_case nm-direct claude "$id")
+  read_case_record "$rec"
+  # Keep default direct-PR mode; install a healthy generation config that must
+  # not be applied.
+  root="$CASE_DIR/gen-ignored"
+  bin=$(make_fake_generation "$root" healthy)
+  gen_home="$root/home"
+  write_generation_config "$HOME_DIR" ignored-gen "$bin" "$gen_home"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "direct-PR spawn must succeed even with generation config present"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_grep "mode=direct-PR" "$meta" "ordinary spawn must record direct-PR mode"
+  if grep -q '^nm_' "$meta"; then
+    fail "direct-PR must not pin generation meta: $(cat "$meta")"
+  fi
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
+  if grep -q 'export NM_HOME=' "$shelllog"; then
+    fail "direct-PR must not export NM_HOME: $(cat "$shelllog")"
+  fi
+  pass "direct-PR launch ignores no-mistakes generation config"
+}
+
+test_direct_pr_ignores_invalid_generation_config() {
+  local rec id out status meta
+  id=nm-direct-bad-z9
+  rec=$(make_spawn_case nm-direct-bad claude "$id")
   read_case_record "$rec"
   cat > "$HOME_DIR/config/no-mistakes-generation" <<'EOF'
 id=broken
@@ -261,11 +301,62 @@ EOF
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
     "$id" "$PROJ_DIR")
   status=$?
-  expect_code 1 "$status" "invalid generation must fail spawn"
+  expect_code 0 "$status" "invalid generation config must not fail direct-PR spawn"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_present "$meta" "direct-PR meta should be written"
+  assert_grep "mode=direct-PR" "$meta" "mode should stay direct-PR"
+  if grep -q '^nm_' "$meta"; then
+    fail "direct-PR must not pin nm_* from invalid config: $(cat "$meta")"
+  fi
+  pass "absent/invalid generation config does not affect direct-PR launches"
+}
+
+test_local_only_ignores_generation_config() {
+  local rec id meta shelllog root bin gen_home
+  id=nm-local-z10
+  rec=$(make_spawn_case nm-local claude "$id")
+  read_case_record "$rec"
+  register_project_mode "$HOME_DIR" local-only project
+  root="$CASE_DIR/gen-local"
+  bin=$(make_fake_generation "$root" healthy)
+  gen_home="$root/home"
+  write_generation_config "$HOME_DIR" local-ignored "$bin" "$gen_home"
+
+  run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" >/dev/null
+  expect_code 0 $? "local-only spawn must succeed with generation config present"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_grep "mode=local-only" "$meta" "local-only mode missing"
+  if grep -q '^nm_' "$meta"; then
+    fail "local-only must not pin generation: $(cat "$meta")"
+  fi
+  shelllog="${LAUNCH_LOG%.log}.shell.log"
+  if grep -q 'export NM_HOME=' "$shelllog"; then
+    fail "local-only must not export NM_HOME"
+  fi
+  pass "local-only launch ignores no-mistakes generation config"
+}
+
+test_spawn_rejects_invalid_generation_config() {
+  local rec id out status
+  id=nm-bad-z3
+  rec=$(make_spawn_case nm-bad claude "$id")
+  read_case_record "$rec"
+  register_project_mode "$HOME_DIR" no-mistakes project
+  cat > "$HOME_DIR/config/no-mistakes-generation" <<'EOF'
+id=broken
+binary=/no/such/binary
+home=/no/such/home
+EOF
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 1 "$status" "invalid generation must fail spawn for no-mistakes mode"
   assert_contains "$out" "no-mistakes generation routing failed" "spawn error missing"
   assert_contains "$out" "refusing ambient fallback" "fail-closed wording missing"
   assert_absent "$HOME_DIR/state/$id.meta" "failed spawn must not write meta"
-  pass "invalid generation config fails closed before meta write"
+  pass "invalid generation config fails closed for explicit no-mistakes only"
 }
 
 test_old_and_new_generation_coexistence() {
@@ -275,6 +366,7 @@ test_old_and_new_generation_coexistence() {
   id_a=nm-coexist-old-z4
   rec_a=$(make_spawn_case nm-coexist-a claude "$id_a")
   read_case_record "$rec_a"
+  register_project_mode "$HOME_DIR" no-mistakes project
   root_a="$CASE_DIR/gen-old"
   bin_a=$(make_fake_generation "$root_a" healthy)
   home_a="$root_a/home"
@@ -292,6 +384,7 @@ test_old_and_new_generation_coexistence() {
   id_b=nm-coexist-new-z5
   rec_b=$(make_spawn_case nm-coexist-b codex "$id_b")
   read_case_record "$rec_b"
+  register_project_mode "$HOME_DIR" no-mistakes project
   root_b="$CASE_DIR/gen-new"
   bin_b=$(make_fake_generation "$root_b" healthy)
   home_b="$root_b/home"
@@ -317,6 +410,7 @@ test_recovery_preserves_prior_pin_over_config() {
   id=nm-recover-z6
   rec=$(make_spawn_case nm-recover claude "$id")
   read_case_record "$rec"
+  register_project_mode "$HOME_DIR" no-mistakes project
   root_old="$CASE_DIR/gen-prior"
   bin_old=$(make_fake_generation "$root_old" healthy)
   home_old="$root_old/home"
@@ -397,6 +491,9 @@ test_relative_paths_fail_closed
 test_unhealthy_daemon_fails_closed
 test_spawn_absent_config_no_pin_no_run_agents
 test_spawn_pins_meta_and_env_exactly
+test_direct_pr_ignores_generation_config
+test_direct_pr_ignores_invalid_generation_config
+test_local_only_ignores_generation_config
 test_spawn_rejects_invalid_generation_config
 test_old_and_new_generation_coexistence
 test_recovery_preserves_prior_pin_over_config

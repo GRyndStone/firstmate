@@ -1,12 +1,13 @@
 # shellcheck shell=bash
 # No-mistakes generation routing for Firstmate.
 #
-# Firstmate chooses which no-mistakes runtime generation a newly spawned ordinary
-# task (ship/scout) validates against. The selection is local and gitignored
-# (config/no-mistakes-generation), resolved once at spawn, snapshotted into
-# task meta, and exported into that worker's pane. Later recovery and status
-# reads use the task pin, not the live config, so a mid-flight config change
-# never rewrites live metadata or force-switches an in-flight process.
+# Firstmate chooses which no-mistakes runtime generation an explicit no-mistakes
+# ship task validates against. The selection is local and gitignored
+# (config/no-mistakes-generation), resolved once at spawn for mode=no-mistakes
+# only, snapshotted into task meta, and exported into that worker's pane.
+# direct-PR/local-only/scout/secondmate spawns never call these helpers for
+# routing. Later recovery and status reads use the task pin, not the live
+# config, so a mid-flight config change never rewrites live metadata.
 #
 # No-mistakes chooses its own validation agents from fresh quota evidence inside
 # that generation. Firstmate must not derive NO_MISTAKES_RUN_AGENTS from the

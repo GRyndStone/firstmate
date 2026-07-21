@@ -13,17 +13,18 @@ Those are unrelated axes: a worker may run on grok while no-mistakes still score
 ## Generation contract
 
 [`bin/fm-nm-generation-lib.sh`](../bin/fm-nm-generation-lib.sh) owns parse, health, resolve, meta lines, and export lines.
-[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) is the single owner of applying that pin to ordinary ship/scout tasks.
-Canonical operator docs live in [`docs/configuration.md`](configuration.md) ("No-mistakes generation").
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) applies that pin only to ship tasks whose delivery mode is explicitly `no-mistakes`.
+Canonical operator docs live in [`docs/configuration.md`](configuration.md) ("Delivery mode defaults" and "No-mistakes generation").
 
-On each ordinary spawn:
+On each explicit no-mistakes ship spawn:
 
 1. Prefer an existing task meta pin (`nm_generation=`, `nm_binary=`, `nm_home=`) for recovery continuity.
 2. Otherwise resolve `config/no-mistakes-generation` when present.
 3. Validate absolute paths, executable binary, existing home directory, and a running daemon for that home.
 4. Snapshot the pin into meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into the worker pane only.
-5. Absent config keeps ambient PATH/`NM_HOME` (backward compatible).
+5. Absent config keeps ambient PATH/`NM_HOME` for that opted-in task.
 6. Invalid or unhealthy configured generations fail closed with an actionable diagnostic and never fall back to the ambient install.
+7. `direct-PR`, `local-only`, scout, and secondmate spawns never resolve or inject generation routing.
 
 A configuration change affects only future tasks.
 Live task metadata is never rewritten by a config edit, and no process is force-restarted to pick up a new generation.

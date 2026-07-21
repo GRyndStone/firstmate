@@ -1,5 +1,6 @@
 # config/no-mistakes-generation - local selection of the no-mistakes runtime
-# generation for newly spawned ordinary (ship/scout) tasks.
+# generation for newly spawned ship tasks whose project mode is explicitly
+# [no-mistakes]. Ignored for direct-PR, local-only, scout, and secondmate.
 # Copy this into a local, gitignored config/no-mistakes-generation and edit.
 # Do not commit captain-specific paths.
 #

@@ -162,9 +162,17 @@ The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, `conf
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
 For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
+## Delivery mode defaults (data/projects.md)
+
+[`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the single owner of delivery-mode resolution from `data/projects.md`.
+`direct-PR` is the default for omitted mode brackets, unknown modes, missing registry, and unknown projects.
+`no-mistakes` is explicit opt-in only (`[no-mistakes]` on the registry line).
+`AGENTS.md` section 6 keeps the operator-facing mode list and points here for the fallback rule.
+
 ## No-mistakes generation (config/no-mistakes-generation)
 
-`config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned ordinary (ship/scout) tasks use for validation.
+`config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned **explicit `no-mistakes` ship** tasks use for validation.
+It is ignored for `direct-PR`, `local-only`, scout, and secondmate launches.
 This section is the single owner of the operator-facing generation contract; script headers and [`docs/no-mistakes-agent-handoff.md`](no-mistakes-agent-handoff.md) point here instead of restating it.
 
 Format (key=value lines; comments and blanks ignored):
@@ -179,14 +187,15 @@ home=<absolute-state-root>
 `id` is optional and defaults to the basename of `home`.
 See [`docs/examples/no-mistakes-generation`](examples/no-mistakes-generation) for a copy-paste template.
 
-Resolution and pinning:
+Resolution and pinning (ship + `mode=no-mistakes` only):
 
-1. On ordinary spawn, prefer an existing task meta pin (`nm_generation=`, `nm_binary=`, `nm_home=`) so recovery keeps the original generation.
+1. Prefer an existing task meta pin (`nm_generation=`, `nm_binary=`, `nm_home=`) so recovery keeps the original generation.
 2. Otherwise read `config/no-mistakes-generation` when present.
 3. Validate executable binary, existing home directory, and a healthy daemon for that home (`NM_HOME=<home> <binary> daemon status` reports running).
 4. Snapshot the pin into the new task's meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into that worker pane only.
-5. Absent file: ambient PATH `no-mistakes` and default `NM_HOME` (backward compatible).
-6. Present but incomplete, invalid, or unhealthy: fail closed at spawn with an actionable diagnostic; never silently route to the ambient/default installation.
+5. Absent file on an opted-in no-mistakes task: ambient PATH `no-mistakes` and default `NM_HOME`.
+6. Present but incomplete, invalid, or unhealthy on an opted-in no-mistakes task: fail closed at spawn with an actionable diagnostic; never silently route to the ambient/default installation.
+7. Non-no-mistakes tasks never read this file: a bad or absent generation config cannot break direct-PR or local-only launches.
 
 A later edit to the config file affects only future spawns.
 It must not rewrite live task metadata or force-restart a process.

@@ -73,12 +73,14 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
-#   For ordinary ship/scout tasks, the no-mistakes generation pin is resolved
-#   from config/no-mistakes-generation (or preserved from existing task meta on
-#   recovery), snapshotted into meta as nm_generation=/nm_binary=/nm_home=, and
-#   exported into the worker pane as NM_HOME plus a PATH prefix for that binary.
-#   Absent config keeps ambient PATH/NM_HOME. Invalid or unhealthy configured
-#   generations fail closed and never fall back to the ambient install.
+#   For ship tasks whose delivery mode is explicitly no-mistakes, the no-mistakes
+#   generation pin is resolved from config/no-mistakes-generation (or preserved
+#   from existing task meta on recovery), snapshotted into meta as
+#   nm_generation=/nm_binary=/nm_home=, and exported into the worker pane as
+#   NM_HOME plus a PATH prefix for that binary. direct-PR and local-only tasks
+#   never resolve or inject generation routing; an absent or invalid generation
+#   config does not affect them. For opted-in no-mistakes tasks, invalid or
+#   unhealthy configured generations fail closed and never fall back to ambient.
 #   Firstmate does not export NO_MISTAKES_RUN_AGENTS from the crewmate harness;
 #   no-mistakes selects validation agents from its own quota evidence.
 #   See bin/fm-nm-generation-lib.sh and docs/configuration.md.
@@ -393,20 +395,12 @@ esac
 
 [ -n "$HARNESS" ] || { echo "error: could not derive a harness from the raw launch command; refusing an empty harness" >&2; exit 1; }
 
-# No-mistakes generation pin for ordinary ship/scout tasks only. Secondmates do
-# not validate their own home through no-mistakes; their crewmates resolve the
-# pin when spawned inside the secondmate home (inherited config when set).
+# Generation pin is resolved later, only for ship tasks with mode=no-mistakes
+# (after delivery mode is known). See the MODE block near meta write.
 FM_NM_GEN_ID=
 FM_NM_GEN_BINARY=
 FM_NM_GEN_HOME=
 FM_NM_GEN_ERR=
-if [ "$KIND" != secondmate ]; then
-  if ! fm_nm_generation_resolve_for_spawn "$CONFIG" "$STATE/$ID.meta"; then
-    echo "error: no-mistakes generation routing failed: ${FM_NM_GEN_ERR:-unknown error}" >&2
-    echo "error: fix or remove config/no-mistakes-generation; refusing ambient fallback for validation work" >&2
-    exit 1
-  fi
-fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -1010,6 +1004,18 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
+# No-mistakes generation pin: only for ship tasks with explicit mode=no-mistakes.
+# Prefer an existing task meta pin (recovery continuity). direct-PR, local-only,
+# scout, and secondmate launches never resolve config/no-mistakes-generation, so
+# a missing/invalid generation config cannot break ordinary direct-PR work.
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+  if ! fm_nm_generation_resolve_for_spawn "$CONFIG" "$STATE/$ID.meta"; then
+    echo "error: no-mistakes generation routing failed: ${FM_NM_GEN_ERR:-unknown error}" >&2
+    echo "error: fix or remove config/no-mistakes-generation; refusing ambient fallback for no-mistakes validation work" >&2
+    exit 1
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 {
@@ -1050,9 +1056,7 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
-  # Task-pinned no-mistakes generation (ordinary ship/scout only). Written only
-  # when a generation is selected; ambient tasks omit these keys so existing
-  # meta readers stay compatible.
+  # Task-pinned no-mistakes generation (explicit no-mistakes ship only).
   fm_nm_generation_meta_lines
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
