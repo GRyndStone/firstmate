@@ -110,7 +110,7 @@ state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
-  <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; explicit no-mistakes ship tasks may also record nm_generation=, nm_binary=, nm_home= (docs/configuration.md "No-mistakes generation"); kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14); under KURU dual-write, fm-kuru-organ may append kuru_goal=, optional kuru_dispatch=, and organ_bound= (docs/kuru-organ.md)
+  <id>.meta          written by fm-spawn: window=, worktree=, project=, provider=, harness=, model=, effort=, optional quota_posture=/quota_percent_used= admission fields, kind=, mode=, yolo=, tasktmp=; explicit no-mistakes ship tasks may also record nm_generation=, nm_binary=, nm_home= (docs/configuration.md "No-mistakes generation"); kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14); under KURU dual-write, fm-kuru-organ may append kuru_goal=, optional kuru_dispatch=, and organ_bound= (docs/kuru-organ.md)
   <id>.identity      durable ship/scout task-id repository binding; survives teardown so an unrelated repository cannot reuse the id
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
   <id>.tearing-down  teardown tombstone touched by fm-teardown before it takes the task's endpoint down; the watcher absorbs that task's gone endpoint only while it is fresh (bounded), then fails back to waking; removed with the task's other state files
@@ -206,16 +206,17 @@ Pick the single best-fit rule using your own judgment.
 This is explicitly not first-match: weigh all rules, their `when` text, and their `why` rationales against the actual task.
 For a chosen rule with a single-object `use`, or an array `use` with no `select`, resolve the first profile directly.
 For a chosen rule with `select: "quota-balanced"`, pipe the full rule JSON to `bin/fm-dispatch-select.sh` and use the compact JSON profile it prints.
-Extract that chosen concrete profile `(harness, model, effort)` and pass it to `bin/fm-spawn.sh` with explicit `--harness`, `--model`, and `--effort` flags for the axes that are set.
+Pass every selected profile through `bin/fm-dispatch-select.sh --admit` so provider postures are applied once at admission; freeze refuses launch and never substitutes another provider or harness.
+Pass the admitted `provider`, `harness`, `model`, `effort`, and quota observation fields to `bin/fm-spawn.sh` with matching explicit flags.
 If no rule fits, use `default`.
-If `default` is absent, fall back to `config/crew-harness` through `bin/fm-harness.sh crew`, exactly as the static path did before dispatch profiles, but still pass that resolved harness explicitly.
-This is enforced: when `config/crew-dispatch.json` exists, `bin/fm-spawn.sh` refuses crewmate and scout launches that do not include an explicit harness (`--harness <name>`, a positional adapter name, or a raw launch command).
+If `default` is absent, fall back to `config/crew-harness` through `bin/fm-harness.sh crew`, wrap that result as a profile for admission, and pass the admitted provider and harness explicitly.
+This is enforced: when `config/crew-dispatch.json` exists, `bin/fm-spawn.sh` refuses crewmate and scout launches that lack both the admitted provider and an explicit harness (`--harness <name>`, a positional adapter name, or a raw launch command), then re-admits that exact profile before launch.
 That refusal is the consultation backstop, so the rules are never silently skipped.
 The requirement is gated only on the file's presence; when the file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness` as before.
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
-`quota-balanced` selection is deterministic and owned by `bin/fm-dispatch-select.sh`; its header documents the general-window rules, freshness margin, and every fallback, and it degrades to the first array element whenever quota data is unusable.
-Quota trouble must never block dispatch.
+Provider admission and `quota-balanced` selection are owned by `bin/fm-dispatch-select.sh`; its header documents provider identity, 60/80/90 postures, freeze refusal, general-window rules, freshness handling, and pinned-profile resume.
+Missing or unusable quota evidence stays observable and cannot prove freeze; it retains the selected profile with `quota_posture=unknown` instead of silently switching harness or model.
 
 Precedence, highest first:
 
@@ -431,15 +432,15 @@ Load `harness-adapters` before spawning or recovering any direct report so trust
 
 ```sh
 bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harness only when no crew-dispatch.json is active
-bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
+bin/fm-spawn.sh <id> projects/<repo> --provider codex --harness codex --model gpt-5.5 --effort high   # admitted selector output; spawn rechecks it
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|orca|cmux>   # explicit runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
 bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch or recover a persistent secondmate in its home
 bin/fm-spawn.sh <id1>=projects/<repo1> <id2>=projects/<repo2> [--scout]   # batch: one call, several tasks
 ```
 
-Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--harness`, `--model`, `--effort`, and `--backend` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
-When `config/crew-dispatch.json` exists, include an explicit resolved harness for every crewmate or scout spawn or batch after consulting the dispatch rules (section 4).
+Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--provider`, `--harness`, `--model`, `--effort`, `--quota-posture`, `--quota-used`, and `--backend` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
+When `config/crew-dispatch.json` exists, pass the admitted provider, explicit harness, concrete model and effort axes, and quota observation fields for every crewmate or scout spawn or batch after consulting the dispatch rules (section 4).
 `bin/fm-spawn.sh`'s header owns the full resolution contract: harness and runtime-backend resolution order, spawn-capable backends and the `codex-app` rejection, verified launch templates, delivery-mode resolution, recorded meta fields, and per-harness turn-end hook installation.
 A backend spawn refusal - a missing dependency, an unauthenticated socket, or a version gate - must be surfaced to the captain as a blocker; never silently retry the spawn on a different backend to work around it.
 For ship and scout tasks, the script asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout, aborting the spawn otherwise to prevent the worktree tangle of section 8.
