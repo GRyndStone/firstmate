@@ -22,10 +22,10 @@
 # 2026-07-02 incident in the first place.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
@@ -35,12 +35,12 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 
 SESSION="fm-lab-prune-safety-e2e-$$"
 export HERDR_SESSION="$SESSION"
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-prune-safety.XXXXXX")
+SCRATCH=
+fm_test_tmproot SCRATCH fm-herdr-prune-safety
 cleanup_all() {
   herdr_safe_stop_and_delete "$SESSION"
-  rm -rf "$SCRATCH"
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
@@ -150,5 +150,4 @@ pass "happy path: a genuinely fresh workspace's seeded default tab is still prun
 
 fm_backend_herdr_kill "$SESSION:$HAPPY_PANE"
 
-cleanup_all
-trap - EXIT
+# EXIT trap tears down the lab session and SCRATCH.

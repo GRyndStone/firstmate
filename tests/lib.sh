@@ -44,10 +44,28 @@ pass() {
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <varname> <prefix>
-#   Creates a fresh temp dir under TMPDIR, assigns its path to <varname> in the
-#   caller's shell (via printf -v; works with caller-local variables), and
-#   registers it for removal on EXIT. The first registration installs
-#   `trap fm_test_cleanup EXIT` in the parent shell.
+#   Creates a fresh temp dir under TMPDIR, resolves it to a physical path
+#   (pwd -P), assigns that path to <varname> in the caller's shell (via
+#   printf -v; works with caller-local variables), and registers it for
+#   removal on EXIT. Every registration (re)installs
+#   `trap fm_test_cleanup EXIT` so a later `trap - EXIT` cannot silently
+#   strand subsequent roots.
+#
+# fm_test_register_tmp <path>
+#   Registers an already-created path for the same EXIT cleanup. Prefer
+#   fm_test_tmproot for new roots; use this when a path must be built another
+#   way (rare) or when adopting a path from a helper.
+#
+# fm_test_add_cleanup <function-name>
+#   Registers a zero-arg shell function to run on EXIT *before* registered
+#   dirs are removed (kill daemons, drop lab sessions, etc.). Prefer this
+#   over installing a custom EXIT trap: a raw `trap ... EXIT` that does not
+#   call fm_test_cleanup drops every registered root.
+#
+# fm_test_cleanup
+#   Runs registered exit hooks (best-effort), then rm -rf every registered
+#   temp path. Safe to call mid-suite; re-registration after that still
+#   reinstalls the EXIT trap.
 #
 # fm-tmproot-static-allow: unsafe historical example `root=$(fm_test_tmproot ...)`
 # runs the function in a subshell. The EXIT trap then fires in that subshell and
@@ -56,19 +74,54 @@ pass() {
 # under it) then leak the recreated tree. Always call as:
 #   fm_test_tmproot TMP_ROOT fm-my-suite
 #
-# A test file that needs extra teardown (e.g. killing a daemon) should define
-# its own EXIT trap and call fm_test_cleanup from inside it so registered dirs
-# are still removed. Overwriting the trap without calling fm_test_cleanup drops
-# cleanup of every root registered so far.
+# Raw `mktemp -d .../fm-*.XXXXXX` in tests/ is also rejected by the static
+# scan unless the preceding line carries `# fm-tmproot-static-allow: <reason>`.
 
 FM_TEST_CLEANUP_DIRS=()
+FM_TEST_EXIT_HOOKS=()
+
+fm_test_install_cleanup_trap() {
+  # Always (re)install. Bash keeps only one EXIT trap; composing extra work
+  # goes through fm_test_add_cleanup, not a second trap line.
+  trap fm_test_cleanup EXIT
+}
 
 fm_test_cleanup() {
-  local d
+  local hook d
+  for hook in "${FM_TEST_EXIT_HOOKS[@]:-}"; do
+    if [ -n "$hook" ] && declare -F "$hook" >/dev/null 2>&1; then
+      "$hook" || true
+    fi
+  done
+  FM_TEST_EXIT_HOOKS=()
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
-    [ -n "$d" ] && rm -rf "$d"
+    [ -n "$d" ] && rm -rf -- "$d"
   done
   FM_TEST_CLEANUP_DIRS=()
+}
+
+fm_test_add_cleanup() {
+  local __hook=$1
+  if [ "$#" -ne 1 ] || [ -z "${__hook:-}" ]; then
+    printf 'fm_test_add_cleanup: usage: fm_test_add_cleanup FUNCTION_NAME\n' >&2
+    return 1
+  fi
+  if ! declare -F "$__hook" >/dev/null 2>&1; then
+    printf 'fm_test_add_cleanup: %s is not a defined function\n' "$__hook" >&2
+    return 1
+  fi
+  FM_TEST_EXIT_HOOKS+=("$__hook")
+  fm_test_install_cleanup_trap
+}
+
+fm_test_register_tmp() {
+  local __path=$1
+  if [ "$#" -ne 1 ] || [ -z "${__path:-}" ]; then
+    printf 'fm_test_register_tmp: usage: fm_test_register_tmp PATH\n' >&2
+    return 1
+  fi
+  FM_TEST_CLEANUP_DIRS+=("$__path")
+  fm_test_install_cleanup_trap
 }
 
 fm_test_tmproot() {
@@ -83,11 +136,19 @@ fm_test_tmproot() {
     printf 'fm_test_tmproot: need a valid variable name as arg1 (got %q)\n' "${__varname:-}" >&2
     return 1
   fi
-  __root=$(mktemp -d "${TMPDIR:-/tmp}/${__prefix}.XXXXXX") || return 1
-  if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
-    trap fm_test_cleanup EXIT
+  if [ -z "${__prefix:-}" ] || [[ ! "$__prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'fm_test_tmproot: need a safe temp prefix as arg2 (got %q)\n' "${__prefix:-}" >&2
+    return 1
   fi
+  __root=$(mktemp -d "${TMPDIR:-/tmp}/${__prefix}.XXXXXX") || return 1
+  # Physical path: macOS TMPDIR is often a symlink farm; herdr/cwd compares
+  # and later leak scans must see the same path the suite will remove.
+  __root=$(cd "$__root" && pwd -P) || {
+    rm -rf -- "$__root"
+    return 1
+  }
   FM_TEST_CLEANUP_DIRS+=("$__root")
+  fm_test_install_cleanup_trap
   # printf -v assigns through dynamic scope: a caller-local varname is updated.
   printf -v "$__varname" '%s' "$__root"
 }

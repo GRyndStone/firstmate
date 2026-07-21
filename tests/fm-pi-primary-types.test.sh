@@ -2,7 +2,8 @@
 # Strict no-emit contract check for both tracked Pi primary extensions.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 command -v npm >/dev/null 2>&1 || { echo "skip: npm not found for Pi extension typecheck"; exit 0; }
 command -v tsc >/dev/null 2>&1 || { echo "skip: tsc not found for Pi extension typecheck"; exit 0; }
@@ -17,11 +18,8 @@ if [ ! -d "$PI_PACKAGE_DIR/node_modules/typebox" ] || [ ! -d "$PI_PACKAGE_DIR/no
   exit 1
 fi
 
-TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-pi-primary-types.XXXXXX")
-cleanup() {
-  rm -rf "$TMP_ROOT"
-}
-trap cleanup EXIT
+TMP_ROOT=
+fm_test_tmproot TMP_ROOT fm-pi-primary-types
 
 mkdir -p "$TMP_ROOT/node_modules/@earendil-works" "$TMP_ROOT/node_modules/@types"
 cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$TMP_ROOT/fm-primary-pi-watch.ts"

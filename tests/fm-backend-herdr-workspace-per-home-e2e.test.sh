@@ -30,10 +30,10 @@
 #   - list-live recovery seeing only its own home's tabs, for both homes
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 assert_contains_local() {  # <haystack> <needle> <msg>
   case "$1" in
     *"$2"*) : ;;
@@ -54,13 +54,10 @@ command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found (requi
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
-# TMP_ROOT is physically resolved (mktemp -d "$(pwd -P)"-relative) for the same
-# low-noise scratch fixture shape used by
-# tests/fm-backend-autodetect-smoke.test.sh.
-# fm-spawn no longer needs this as a symlink workaround: fm-spawn-symlink-guard-s8
-# canonicalized project and backend cwd comparisons in the worktree-discovery
-# poll.
-TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-herdr-e2e.XXXXXX")
+# fm_test_tmproot resolves to a physical path (pwd -P) so herdr/cwd compares
+# stay free of OS TMPDIR symlink noise.
+TMP_ROOT=
+fm_test_tmproot TMP_ROOT fm-herdr-e2e
 SESSION="fm-lab-herdr-e2e-$$"
 export HERDR_SESSION="$SESSION"
 WT1=; WT2=
@@ -68,9 +65,8 @@ cleanup_all() {
   [ -n "$WT1" ] && command -v treehouse >/dev/null 2>&1 && treehouse return --force "$WT1" >/dev/null 2>&1
   [ -n "$WT2" ] && command -v treehouse >/dev/null 2>&1 && treehouse return --force "$WT2" >/dev/null 2>&1
   herdr_safe_stop_and_delete "$SESSION"
-  rm -rf "$TMP_ROOT"
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # shellcheck source=bin/fm-backend.sh
@@ -236,5 +232,4 @@ pass "real herdr E2E: tearing down cm2 closes only its own tab - the secondmate'
 
 fm_backend_herdr_kill "$SESSION:$SM_PANE"
 
-cleanup_all
-trap - EXIT
+# EXIT trap tears down worktrees, the lab session, and TMP_ROOT.

@@ -27,10 +27,10 @@
 # is not reliably honored once another herdr server is already running.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
-pass() { printf 'ok - %s\n' "$1"; }
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 assert_contains_local() {  # <haystack> <needle> <msg>
   case "$1" in
     *"$2"*) : ;;
@@ -45,14 +45,11 @@ command -v treehouse >/dev/null 2>&1 || { echo "skip: treehouse not found (requi
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
-# TMP_ROOT is physically resolved (mktemp -d "$(pwd -P)"-relative) to keep this
-# real-herdr smoke fixture free of unrelated OS symlink noise.
-# The old fm-spawn bug that originally motivated this fixture shape was fixed in
-# fm-spawn-symlink-guard-s8: fm-spawn.sh now normalizes PROJ_ABS and observed
-# backend cwd reads before the worktree-discovery comparison.
-# The dedicated regression is
+# fm_test_tmproot resolves physically (pwd -P). The old fm-spawn symlink false
+# refusal is covered by
 # tests/fm-backend.test.sh:test_spawn_symlinked_project_prefix_avoids_false_refusal.
-TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-backend-autodetect-smoke.XXXXXX")
+TMP_ROOT=
+fm_test_tmproot TMP_ROOT fm-backend-autodetect-smoke
 SESSION="fm-lab-autodetect-smoke-$$"
 export HERDR_SESSION="$SESSION"
 ID="autodetectsmoke1"
@@ -60,9 +57,8 @@ WT=
 cleanup_all() {
   [ -n "$WT" ] && command -v treehouse >/dev/null 2>&1 && treehouse return --force "$WT" >/dev/null 2>&1
   herdr_safe_stop_and_delete "$SESSION"
-  rm -rf "$TMP_ROOT"
 }
-trap cleanup_all EXIT
+fm_test_add_cleanup cleanup_all
 fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab session"
 
 # --- scratch world: FM_HOME with NO backend config, one throwaway project ---
@@ -140,5 +136,4 @@ fi
 WT=
 pass "real herdr: teardown completes the auto-detected spawn/teardown cycle (meta cleared, pane closed)"
 
-cleanup_all
-trap - EXIT
+# EXIT trap tears down worktrees, the lab session, and TMP_ROOT.

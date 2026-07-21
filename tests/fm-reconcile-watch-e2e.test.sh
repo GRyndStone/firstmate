@@ -21,9 +21,8 @@ cleanup_canary() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  fm_test_cleanup
 }
-trap cleanup_canary EXIT
+fm_test_add_cleanup cleanup_canary
 
 start_watch() {  # <dir> <out>
   local dir=$1 out=$2 state="$1/state" fakebin="$1/fakebin" live="$1/live" window="session:fm-task"

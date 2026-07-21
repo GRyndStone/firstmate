@@ -51,9 +51,9 @@ cleanup() {
   if [ "$LAB_OWNED" -eq 1 ]; then
     "$HERDR_LAB_HELPER" teardown "$LAB_SESSION" >/dev/null 2>&1 || true
   fi
-  rm -rf "$TMP_ROOT"
+  # TMP_ROOT removal is owned by fm_test_cleanup after this hook.
 }
-trap cleanup EXIT
+fm_test_add_cleanup cleanup
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
