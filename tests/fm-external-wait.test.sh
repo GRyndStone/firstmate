@@ -209,14 +209,24 @@ SH
   [ "$(fm_reconcile_record_value "$state/task.reconciled" background_probe_armed)" = 1 ] \
     || { kill "$pid" 2>/dev/null || true; fail "background-probe paused baseline was not armed durably"; }
   fm_reconcile_background_probe_can_absorb "$state" task session:fm-task \
-    || { kill "$pid" 2>/dev/null || true; fail "unchanged background-probe baseline was not absorbable"; }
+    && { kill "$pid" 2>/dev/null || true; fail "static background-probe registration was absorbable without a one-shot pulse"; }
 
+  FM_STATE_OVERRIDE="$state" "$WAIT" arm-background-probe-pulse task "$pid" >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "could not arm the first one-shot background-probe pulse"; }
+  fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
+    || { kill "$pid" 2>/dev/null || true; fail "could not persist the first pulse working edge"; }
   printf 'state: working · source: pane · one-shot progress probe\n' > "$live"
   [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "background-probe pulse start unexpectedly woke"; }
   printf 'state: paused · source: status-log · supervising a background ledger probe\n' > "$live"
   restarted=$(FM_RECONCILE_CREW_STATE_BIN="$fake" FM_FAKE_RECONCILED_STATE_FILE="$live" \
     bash -c '. "$1"; fm_reconcile_observe "$2" task' _ "$RECONCILE" "$state")
   [ -z "$restarted" ] || { kill "$pid" 2>/dev/null || true; fail "identical background-probe return woke after restart: $restarted"; }
+  [ "$(fm_reconcile_record_value "$state/task.probe-pulse" state)" = consumed ] \
+    || { kill "$pid" 2>/dev/null || true; fail "first background-probe pulse was not consumed durably"; }
+  FM_STATE_OVERRIDE="$state" "$WAIT" arm-background-probe-pulse task "$pid" >/dev/null \
+    || { kill "$pid" 2>/dev/null || true; fail "could not arm the repeated background-probe pulse"; }
+  fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
+    || { kill "$pid" 2>/dev/null || true; fail "could not persist the repeated pulse working edge"; }
   printf 'state: working · source: pane · repeated progress probe\n' > "$live"
   [ -z "$(observe)" ] || { kill "$pid" 2>/dev/null || true; fail "repeated background-probe pulse start unexpectedly woke"; }
   printf 'state: idle · source: pane · returned to the paused endpoint\n' > "$live"
@@ -226,16 +236,23 @@ SH
   mv "$predicate.tmp" "$predicate"
   chmod +x "$predicate"
   out=$(observe)
-  assert_contains "$out" 'external-wait-changed' "changed still-pending background-probe evidence did not wake"
+  assert_contains "$out" 'background-probe-invalidated' "changed still-pending background-probe evidence did not invalidate"
   token=$(printf '%s' "$out" | cut -f2)
   version=$(printf '%s' "$out" | cut -f3)
   fm_reconcile_ack "$state" task "$token" "$version" || fail "could not acknowledge changed background-probe evidence"
-  [ -z "$(observe)" ] || fail "acknowledged background-probe evidence change duplicated"
+  [ -z "$(observe)" ] || fail "acknowledged background-probe invalidation duplicated"
+
+  sed 's/revision 2/revision 1/' "$predicate" > "$predicate.tmp"
+  mv "$predicate.tmp" "$predicate"
+  chmod +x "$predicate"
+  FM_STATE_OVERRIDE="$state" "$WAIT" register-background-probe task "$pid" "$predicate" 'background corpus build' >/dev/null \
+    || fail "background-probe re-registration after acknowledged invalidation failed"
+  [ -z "$(observe)" ] || fail "replacement background-probe baseline did not arm quietly"
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   out=$(observe)
-  assert_contains "$out" 'external-wait-failed' "background-probe child exit did not fail loudly"
+  assert_contains "$out" 'background-probe-invalidated' "background-probe child exit did not invalidate loudly"
   assert_contains "$out" 'child' "background-probe child failure lost its ownership evidence"
   token=$(printf '%s' "$out" | cut -f2)
   version=$(printf '%s' "$out" | cut -f3)

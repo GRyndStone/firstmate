@@ -193,6 +193,7 @@ external_wait_json() {  # <id>
   local id=$1 record observed_sig observed_state observed_evidence observed_at freshness registration current_sig
   local progress_sig progress_at progress_age meta_generation registration_generation registration_current=0
   local probe_armed probe_wait_sig probe_endpoint probe_status_sequence probe_status_signature probe_status_signal probe_wait_evidence probe_observed
+  local probe_invalidation_sequence probe_invalidation_reason probe_invalidated_at pulse_state pulse_id pulse_registration pulse_endpoint pulse_issued pulse_expires
   record="$STATE/$id.reconciled"
   registration=$(fm_reconcile_wait_registration "$STATE" "$id")
   meta_generation=$(fm_reconcile_meta_generation "$STATE/$id.meta" 2>/dev/null || true)
@@ -215,6 +216,16 @@ external_wait_json() {  # <id>
   probe_status_signal=$(fm_reconcile_record_value "$record" background_probe_status_signal_signature)
   probe_wait_evidence=$(fm_reconcile_record_value "$record" background_probe_wait_evidence)
   probe_observed=$(fm_reconcile_record_value "$record" background_probe_observed_at)
+  probe_invalidation_sequence=$(fm_reconcile_record_value "$record" background_probe_invalidation_sequence)
+  probe_invalidation_reason=$(fm_reconcile_record_value "$record" background_probe_invalidation_reason)
+  probe_invalidated_at=$(fm_reconcile_record_value "$record" background_probe_invalidated_at)
+  fm_reconcile_background_probe_pulse_load "$STATE" "$id"
+  pulse_state=$FM_RECONCILE_PROBE_PULSE_STATE
+  pulse_id=$FM_RECONCILE_PROBE_PULSE_ID
+  pulse_registration=$FM_RECONCILE_PROBE_PULSE_REGISTRATION
+  pulse_endpoint=$FM_RECONCILE_PROBE_PULSE_ENDPOINT
+  pulse_issued=$FM_RECONCILE_PROBE_PULSE_ISSUED_AT
+  pulse_expires=$FM_RECONCILE_PROBE_PULSE_EXPIRES_AT
   if ! reconciled_matches_lifecycle "$id"; then
     observed_sig=
     observed_state=
@@ -230,12 +241,25 @@ external_wait_json() {  # <id>
     probe_status_signal=
     probe_wait_evidence=
     probe_observed=0
+    probe_invalidation_sequence=0
+    probe_invalidation_reason=
+    probe_invalidated_at=0
+    pulse_state=
+    pulse_id=
+    pulse_registration=
+    pulse_endpoint=
+    pulse_issued=0
+    pulse_expires=0
   fi
   case "$observed_at" in ''|*[!0-9]*) observed_at=0 ;; esac
   case "$progress_at" in ''|*[!0-9]*) progress_at=0 ;; esac
   case "$probe_armed" in 1) ;; *) probe_armed=0 ;; esac
   case "$probe_status_sequence" in ''|*[!0-9]*) probe_status_sequence=0 ;; esac
   case "$probe_observed" in ''|*[!0-9]*) probe_observed=0 ;; esac
+  case "$probe_invalidation_sequence" in ''|*[!0-9]*) probe_invalidation_sequence=0 ;; esac
+  case "$probe_invalidated_at" in ''|*[!0-9]*) probe_invalidated_at=0 ;; esac
+  case "$pulse_issued" in ''|*[!0-9]*) pulse_issued=0 ;; esac
+  case "$pulse_expires" in ''|*[!0-9]*) pulse_expires=0 ;; esac
   progress_age=$(( $(date +%s) - progress_at ))
   [ "$progress_age" -ge 0 ] || progress_age=0
   current_sig=$(printf '%s' "$registration" | jq -r '.signature')
@@ -254,14 +278,23 @@ external_wait_json() {  # <id>
     --arg probe_status_signature "$probe_status_signature" \
     --arg probe_status_signal_signature "$probe_status_signal" \
     --arg probe_wait_evidence "$probe_wait_evidence" \
+    --arg probe_invalidation_reason "$probe_invalidation_reason" \
+    --arg pulse_state "$pulse_state" \
+    --arg pulse_id "$pulse_id" \
+    --arg pulse_registration "$pulse_registration" \
+    --arg pulse_endpoint "$pulse_endpoint" \
     --argjson checked_at "$observed_at" \
     --argjson progress_at "$progress_at" \
     --argjson progress_age "$progress_age" \
     --argjson probe_armed "$(bool_json "$probe_armed")" \
     --argjson probe_status_sequence "$probe_status_sequence" \
     --argjson probe_observed_at "$probe_observed" \
+    --argjson probe_invalidation_sequence "$probe_invalidation_sequence" \
+    --argjson probe_invalidated_at "$probe_invalidated_at" \
+    --argjson pulse_issued "$pulse_issued" \
+    --argjson pulse_expires "$pulse_expires" \
     --argjson lifecycle_current "$(bool_json "$registration_current")" \
-    '$registration + {lifecycle_current:$lifecycle_current,observation:{state:($state | if . == "" then "unobserved" else . end),evidence:$evidence,checked_at:($checked_at | if . == 0 then null else . end),freshness:$freshness,progress_signature:($progress_signature | if . == "" then null else . end),progress_at:($progress_at | if . == 0 then null else . end),progress_age_seconds:($progress_age | if $progress_at == 0 then null else . end)},background_probe:{armed:$probe_armed,wait_signature:($probe_wait_signature | if . == "" then null else . end),endpoint:($probe_endpoint | if . == "" then null else . end),status_sequence:($probe_status_sequence | if $probe_observed_at == 0 then null else . end),status_signature:($probe_status_signature | if . == "" then null else . end),status_signal_signature:($probe_status_signal_signature | if . == "" then null else . end),wait_evidence:($probe_wait_evidence | if . == "" then null else . end),observed_at:($probe_observed_at | if . == 0 then null else . end)}}'
+    '$registration + {lifecycle_current:$lifecycle_current,observation:{state:($state | if . == "" then "unobserved" else . end),evidence:$evidence,checked_at:($checked_at | if . == 0 then null else . end),freshness:$freshness,progress_signature:($progress_signature | if . == "" then null else . end),progress_at:($progress_at | if . == 0 then null else . end),progress_age_seconds:($progress_age | if $progress_at == 0 then null else . end)},background_probe:{armed:$probe_armed,wait_signature:($probe_wait_signature | if . == "" then null else . end),endpoint:($probe_endpoint | if . == "" then null else . end),status_sequence:($probe_status_sequence | if $probe_observed_at == 0 then null else . end),status_signature:($probe_status_signature | if . == "" then null else . end),status_signal_signature:($probe_status_signal_signature | if . == "" then null else . end),wait_evidence:($probe_wait_evidence | if . == "" then null else . end),observed_at:($probe_observed_at | if . == 0 then null else . end),invalidation_sequence:($probe_invalidation_sequence | if . == 0 then null else . end),invalidation_reason:($probe_invalidation_reason | if . == "" then null else . end),invalidated_at:($probe_invalidated_at | if . == 0 then null else . end),pulse:{state:($pulse_state | if . == "" then null else . end),id:($pulse_id | if . == "" then null else . end),registration_id:($pulse_registration | if . == "" then null else . end),endpoint:($pulse_endpoint | if . == "" then null else . end),issued_at:($pulse_issued | if . == 0 then null else . end),expires_at:($pulse_expires | if . == 0 then null else . end)}}}'
 }
 
 status_event_json() {  # <id> <status-log>

@@ -31,6 +31,7 @@ bin/fm-external-wait.sh register-predicate <task-id> <executable> [description]
 bin/fm-external-wait.sh register-process <task-id> <pid> [description]
 bin/fm-external-wait.sh register-command <task-id> <pid> [description]
 bin/fm-external-wait.sh register-background-probe <task-id> <pid> <predicate> [description]
+bin/fm-external-wait.sh arm-background-probe-pulse <task-id> <pid>
 bin/fm-external-wait.sh clear <task-id>
 ```
 
@@ -42,6 +43,13 @@ The reconciler follows only descendants of the exact registered pid and compares
 Fresh descendant progress is `working` evidence with source `owned-command`, while a live but unchanged tree ages out after the registered grace instead of masking a wedge forever.
 The exact process exit or identity change remains an immediate model-free completion signal.
 A paused task whose task-owned child can trigger a foreground progress probe must opt in with `register-background-probe`, which binds the exact live child identity, its task-scoped cwd, and an executable ledger predicate that is still pending at registration.
+The static registration only establishes an eligible paused baseline and never owns foreground activity by itself.
+Immediately before each one-shot foreground probe, the registered child must call `arm-background-probe-pulse` with its exact pid.
+That durable pulse binds the registration id, lifecycle, endpoint, child identity, predicate evidence, paused status sequence and signatures, freshness deadline, and the pre-pulse Herdr working-edge marker.
+Absorption requires the same pulse to remain current and a new Herdr `working` edge after the pulse was armed, then consumes the pulse atomically before committing the identical-pause return.
+Any blocked edge without that exact pulse, a second use of a consumed pulse, pending composer input, expiry, or a changed bound value is fail-closed.
+The reconciled record persists a `background-probe-invalidated` action before delivery whenever the armed baseline or pulse changes, including status/event/freshness, endpoint, task state, registration, child identity/liveness, predicate result/evidence, or push-time composer state.
+An invalidated registration cannot re-arm until its action is acknowledged and a replacement registration establishes a new paused baseline.
 The reconciler arms that opt-in only after it durably records an explicit paused status baseline containing the endpoint, status-event sequence, content signature, freshness signature, and pending predicate evidence.
 An owned pulse may return to `idle` or the same explicit pause without waking only while the registration remains lifecycle-current, the child identity and cwd remain valid, the composer is empty, and every baseline field and pending predicate evidence remain byte-identical.
 The baseline survives watcher restarts and repeated pulses, but any status change, predicate evidence change, predicate completion or failure, child exit or identity change, endpoint change, terminal state, non-empty or unreadable composer, or unacknowledged action fails closed to a wake.
@@ -70,8 +78,8 @@ The pre-fix baseline has no `bin/fm-reconcile-lib.sh`, and the new regression su
 - `tests/fm-reconcile-watch-e2e.test.sh` runs the real durable watcher with heartbeat and stale cadences disabled, proves each production failure wakes within the classification poll, drains exactly one queued wake, restarts quietly, and observes a fleet in one bounded parallel batch.
 - The stopped-endpoint canary touches the existing turn-end file without appending `done`, then asserts the wake reports status-event sequence 1 and the old pause as historical evidence rather than current truth.
 - `tests/fm-crew-state-reconciled.test.sh` proves wake-time readers consume the fresh stopped state while the watcher retains a live-only evidence path.
-- `tests/fm-external-wait.test.sh` covers predicate disappearance and evidence changes, tracked-process completion, task-scope refusal, owned-command progress/completion, repeated background-probe pulses across restart, and exact child failure.
-- `tests/fm-supervision-events.test.sh` proves generic paused push activity wakes while only an armed identical-pause background probe with an empty composer is absorbed.
+- `tests/fm-external-wait.test.sh` covers predicate disappearance and evidence changes, tracked-process completion, task-scope refusal, owned-command progress/completion, durable one-shot background-probe pulses, invalidation, and exact child failure.
+- `tests/fm-reconcile-watch-e2e.test.sh` drives the production watcher and Herdr event adapter across restart, proving generic paused activity wakes, explicitly owned pulses stay quiet without a stale wedge, unrelated blocked activity invalidates, and child/predicate failure wakes once.
 - `tests/fm-daemon.test.sh` proves the durable daemon cannot re-absorb reconciled verdicts behind stale pause prose, replays an unaccepted queue handoff exactly once, and signals only the identity-matched daemon during restart.
 - `tests/fm-fleet-snapshot-view.test.sh` proves snapshot, fleet view, and bearings keep reconciled truth, prior state, status event, and observer separate.
 - `tests/fm-task-identity.test.sh` proves same-repository recovery and cross-repository refusal.
@@ -90,7 +98,7 @@ The stopped-endpoint canary pins the production evidence shape of a delivered tu
 8. Register a short task-worktree command through `register-command`, let its foreground harness read idle while the command advances past `FM_STALE_ESCALATE_SECS`, and confirm no stale/wedge queue record appears.
 9. Stop that exact command, require one queue record containing `external-wait-complete`, then re-arm and confirm the unchanged completed state produces no second record.
 10. Run one active-run to parked transition and one stopped-endpoint transition with no new `done` event, and require exactly one `reconciled-transition` queue record for each without waiting for heartbeat or stale cadence.
-11. On a disposable paused Grok task, register a live task-worktree child and still-pending ledger predicate through `register-background-probe`, confirm the structured fleet snapshot reports an armed baseline, and trigger at least two notification-driven progress pulses across one supervisor restart.
+11. On a disposable paused Grok task, register a live task-worktree child and still-pending ledger predicate through `register-background-probe`, confirm the structured fleet snapshot reports an armed baseline, call `arm-background-probe-pulse` from that exact child immediately before each notification-driven foreground check, and trigger at least two pulses across one supervisor restart.
 12. Require both pulses to return to the identical pause with no captain wake and no 255-second stale-wedge alarm, then change the predicate evidence and require one immediate wake.
 13. Re-register the canary, stop the exact child while its predicate remains pending, require one `external-wait-failed` wake, and confirm the unchanged failure does not wake twice.
 14. On a separate ordinary paused task with no background-probe registration, trigger direct endpoint activity and require exactly one immediate wake.

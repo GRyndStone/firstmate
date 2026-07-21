@@ -631,6 +631,56 @@ watch_cleanup() {
   fm_lock_release "$WATCH_LOCK"
 }
 
+deliver_reconciled_action() {  # <id> <token> <version> <evidence>
+  local selected_id=$1 selected_token=$2 selected_version=$3 selected_evidence=$4
+  local meta pending pending_version notified notified_version record_repository record_generation current_generation
+  local kind identity_failure_delivery target marker reason queue_rc=0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_reconcile_lock_acquire "$STATE" "$selected_id"
+  meta="$STATE/$selected_id.meta"
+  if [ ! -f "$meta" ] || fm_reconcile_tombstone_active "$STATE" "$selected_id"; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
+  pending_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_version)
+  notified=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_token)
+  notified_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_version)
+  record_repository=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" repository_identity)
+  record_generation=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" lifecycle_generation)
+  current_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  kind=$(fm_reconcile_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  identity_failure_delivery=0
+  case "$selected_token:$selected_evidence" in
+    observer:*:failed:observer-failure\ \(repository\ identity\ cannot\ be\ resolved\ for\ *) identity_failure_delivery=1 ;;
+  esac
+  if [ "$pending" != "$selected_token" ] || [ "$pending_version" != "$selected_version" ] \
+    || { [ "$notified" = "$selected_token" ] && [ "$notified_version" = "$selected_version" ]; } \
+    || [ -z "$record_generation" ] || [ "$record_generation" != "$current_generation" ] \
+    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ] && [ "$identity_failure_delivery" -ne 1 ]; }; then
+    fm_reconcile_lock_release "$STATE" "$selected_id"
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  target=$(fm_backend_target_of_meta "$meta")
+  [ -n "$target" ] || target="fm-$selected_id"
+  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token" "$selected_version")
+  reason="stale: $target $selected_evidence $marker"
+  fm_wake_append_locked stale "$target" "$reason" || queue_rc=$?
+  if [ "$queue_rc" -eq 0 ]; then
+    fm_reconcile_advance_seen "$STATE" "$selected_id" || queue_rc=$?
+  fi
+  if [ "$queue_rc" -eq 0 ]; then
+    mark_surfaced "$STATE/$selected_id.status"
+  fi
+  fm_reconcile_lock_release "$STATE" "$selected_id"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  [ "$queue_rc" -eq 0 ] || return "$queue_rc"
+  wake "$reason"
+}
+
 # Observe every task's deterministic current state in one bounded parallel batch
 # and surface the first pending transition or external-wait action.
 # fm-reconcile-lib.sh persists each state and pending token before returning.
@@ -724,50 +774,7 @@ EOF
   done
   reconcile_batch_cleanup
   [ -n "$selected_id" ] || return 0
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-  fm_reconcile_lock_acquire "$STATE" "$selected_id"
-  meta="$STATE/$selected_id.meta"
-  if [ ! -f "$meta" ] || fm_reconcile_tombstone_active "$STATE" "$selected_id"; then
-    fm_reconcile_lock_release "$STATE" "$selected_id"
-    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    return 0
-  fi
-  pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
-  pending_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_version)
-  notified=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_token)
-  notified_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" notified_action_version)
-  record_repository=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" repository_identity)
-  record_generation=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" lifecycle_generation)
-  current_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
-  kind=$(fm_reconcile_meta_value "$meta" kind)
-  [ -n "$kind" ] || kind=ship
-  identity_failure_delivery=0
-  case "$selected_token:$selected_evidence" in
-    observer:*:failed:observer-failure\ \(repository\ identity\ cannot\ be\ resolved\ for\ *) identity_failure_delivery=1 ;;
-  esac
-  if [ "$pending" != "$selected_token" ] || [ "$pending_version" != "$selected_version" ] \
-    || { [ "$notified" = "$selected_token" ] && [ "$notified_version" = "$selected_version" ]; } \
-    || [ -z "$record_generation" ] || [ "$record_generation" != "$current_generation" ] \
-    || { [ "$kind" != secondmate ] && [ -z "$record_repository" ] && [ "$identity_failure_delivery" -ne 1 ]; }; then
-    fm_reconcile_lock_release "$STATE" "$selected_id"
-    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    return 0
-  fi
-  target=$(fm_backend_target_of_meta "$meta")
-  [ -n "$target" ] || target="fm-$selected_id"
-  marker=$(fm_reconcile_action_marker "$selected_id" "$selected_token" "$selected_version")
-  reason="stale: $target $selected_evidence $marker"
-  fm_wake_append_locked stale "$target" "$reason" || queue_rc=$?
-  if [ "$queue_rc" -eq 0 ]; then
-    fm_reconcile_advance_seen "$STATE" "$selected_id" || queue_rc=$?
-  fi
-  if [ "$queue_rc" -eq 0 ]; then
-    mark_surfaced "$STATE/$selected_id.status"
-  fi
-  fm_reconcile_lock_release "$STATE" "$selected_id"
-  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-  [ "$queue_rc" -eq 0 ] || exit "$queue_rc"
-  wake "$reason"
+  deliver_reconciled_action "$selected_id" "$selected_token" "$selected_version" "$selected_evidence" || exit $?
 }
 
 run_check() {
@@ -920,6 +927,7 @@ event_wait_or_sleep() {
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
   local backend=$1 session=$2 record=$3 pane_id to window task reason input_state input_state_after
+  local rejection out tag token version evidence
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
@@ -935,6 +943,26 @@ handle_push_transition() {  # <backend> <session> <record>
   fi
   if [ "$input_state_after" = empty ]; then
     triage_log "absorbed push $to (owned background probe returned to identical pause): $window"
+    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+    return
+  fi
+  rejection=${FM_RECONCILE_BACKGROUND_PROBE_REJECTION:-}
+  if [ "$input_state" != empty ]; then
+    rejection="composer state was $input_state"
+  elif [ "$input_state_after" != unknown ] && [ "$input_state_after" != empty ]; then
+    rejection="composer state changed to $input_state_after during pulse validation"
+  fi
+  if [ -n "$task" ] && fm_reconcile_background_probe_active "$STATE" "$task"; then
+    if ! out=$(fm_reconcile_background_probe_invalidate "$STATE" "$task" \
+      "blocked push was not owned by an exact one-shot pulse${rejection:+: $rejection}"); then
+      exit 1
+    fi
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || exit 1
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) exit 1 ;; esac
+    deliver_reconciled_action "$task" "$token" "$version" "$evidence" || exit $?
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     return
   fi

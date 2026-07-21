@@ -273,9 +273,9 @@ spawn_abort_cleanup() {
         fi
         ;;
       cmux)
-        if [ -n "${CMUX_WORKSPACE_ID:-}" ] || [ "$SPAWN_PARTIAL_ENDPOINT" -eq 1 ]; then
-          fm_backend_kill cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" '' "${W:-fm-${ID:-}}" 2>/dev/null || true
-          fm_backend_target_absent cmux "${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial}" \
+        if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+          fm_backend_kill cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" '' "${W:-fm-${ID:-}}" 2>/dev/null || true
+          fm_backend_target_absent cmux "$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial}" \
             '' "${W:-fm-${ID:-}}" || endpoint_cleanup_failed=1
         else
           endpoint_cleanup_failed=1
@@ -1025,9 +1025,11 @@ EOF
       if [ "$CREATE_RC" -eq 2 ] && parse_partial_create_result "$CMUX_TASK_IDS"; then
         CMUX_WORKSPACE_ID=$PARTIAL_CREATE_FIRST
         CMUX_SURFACE_ID=$PARTIAL_CREATE_SECOND
-        T="${CMUX_WORKSPACE_ID:-partial-$ID}:${CMUX_SURFACE_ID:-partial-$ID}"
-        SPAWN_ENDPOINT_CREATED=1
-        SPAWN_PARTIAL_ENDPOINT=1
+        if [ -n "$CMUX_WORKSPACE_ID" ]; then
+          T="$CMUX_WORKSPACE_ID:${CMUX_SURFACE_ID:-partial-$ID}"
+          SPAWN_ENDPOINT_CREATED=1
+          SPAWN_PARTIAL_ENDPOINT=1
+        fi
       fi
       exit 1
     fi

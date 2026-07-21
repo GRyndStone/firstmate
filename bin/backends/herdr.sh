@@ -1376,6 +1376,7 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
       fi
       ;;
     absorb)
+      fm_transition_record_working "$state" "$window" "$record" || return 2
       rm -f "$marker" 2>/dev/null || true
       ;;
   esac

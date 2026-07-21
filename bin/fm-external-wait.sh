@@ -6,6 +6,7 @@
 #   fm-external-wait.sh register-process   <task-id> <pid>        [description]
 #   fm-external-wait.sh register-command   <task-id> <pid>        [description]
 #   fm-external-wait.sh register-background-probe <task-id> <pid> <predicate> [description]
+#   fm-external-wait.sh arm-background-probe-pulse <task-id> <pid>
 #   fm-external-wait.sh clear              <task-id>
 #
 # The validated registration is written atomically to state/<id>.wait using the
@@ -224,6 +225,16 @@ case "$command" in
       owner_tasktmp "$tasktmp"
     echo "registered supervisor-owned background probe for $id: child $pid, predicate $predicate"
     ;;
+  arm-background-probe-pulse)
+    [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+    pid=${3:-}
+    case "$pid" in ''|*[!0-9]*) echo "error: background-probe pulse pid must be decimal" >&2; exit 2 ;; esac
+    if ! pulse_id=$(fm_reconcile_background_probe_arm_pulse "$STATE" "$id" "$pid"); then
+      echo "error: cannot arm background-probe pulse for $id: ${FM_RECONCILE_BACKGROUND_PROBE_REJECTION:-ownership validation failed}" >&2
+      exit 1
+    fi
+    echo "armed one-shot background-probe pulse for $id: $pulse_id"
+    ;;
   clear)
     [ "$#" -eq 2 ] || { usage >&2; exit 2; }
     wait_signature=$(fm_reconcile_file_signature "$wait_file")
@@ -239,9 +250,9 @@ case "$command" in
       clear_rc=1
     else
       if [ "$(fm_reconcile_record_value "$wait_file" kind)" = legacy-check ]; then
-        rm -f "$wait_file" "$STATE/$id.check.sh" "$wait_commit" || clear_rc=$?
+        rm -f "$wait_file" "$STATE/$id.check.sh" "$wait_commit" "$STATE/$id.probe-pulse" || clear_rc=$?
       else
-        rm -f "$wait_file" "$wait_commit" || clear_rc=$?
+        rm -f "$wait_file" "$wait_commit" "$STATE/$id.probe-pulse" || clear_rc=$?
       fi
     fi
     fm_reconcile_lock_release "$STATE" "$id"

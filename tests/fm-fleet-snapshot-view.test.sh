@@ -649,6 +649,14 @@ test_snapshot_exposes_background_probe_ownership() {
     "background_probe_status_signal_signature=$status_signal" \
     'background_probe_wait_evidence=ledger revision 4 pending' \
     "background_probe_observed_at=$now"
+  fm_write_meta "$home/state/background-probe.probe-pulse" \
+    'schema=fm-background-probe-pulse.v1' \
+    'state=armed' \
+    'pulse_id=background-probe-pulse' \
+    'registration_id=background-probe-registration' \
+    'endpoint=firstmate:fm-background-probe' \
+    "issued_at=$now" \
+    "expires_at=$((now + 120))"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -660,6 +668,9 @@ test_snapshot_exposes_background_probe_ownership() {
       and .external_wait.background_probe.endpoint == "firstmate:fm-background-probe"
       and .external_wait.background_probe.status_sequence == 1
       and .external_wait.background_probe.wait_evidence == "ledger revision 4 pending"
+      and .external_wait.background_probe.pulse.state == "armed"
+      and .external_wait.background_probe.pulse.id == "background-probe-pulse"
+      and .external_wait.background_probe.pulse.registration_id == "background-probe-registration"
   ' >/dev/null || fail "snapshot omitted durable background-probe ownership: $out"
   pass "snapshot exposes lifecycle-bound background-probe ownership and its paused baseline"
 }

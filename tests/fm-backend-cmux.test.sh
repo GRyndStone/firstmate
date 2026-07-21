@@ -1077,6 +1077,47 @@ test_list_live_filters_by_title_prefix() {
 
 # --- fm-spawn.sh: --secondmate refuses backend=cmux --------------------------
 
+test_spawn_empty_partial_never_targets_same_label_workspace() {
+  local dir proj data state config fb log id out status title
+  dir="$TMP_ROOT/spawn-empty-partial"
+  proj="$dir/project"
+  data="$dir/data"
+  state="$dir/state"
+  config="$dir/config"
+  log="$dir/cmux.log"
+  id=cmuxpartialz8
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config" "$dir/responses"
+  printf 'brief\n' > "$data/$id/brief.md"
+  title=$(cmux_expected_scoped_title "fm-$id")
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  printf '1\n' > "$dir/responses/2.exit"
+  printf '{"workspaces":[]}' > "$dir/responses/3.out"
+  cmux_panes_empty_response "$dir" 4
+  cmux_workspace_list_response "$dir" 5 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  cmux_panes_response "$dir" 6 "cccccccc-2222-2222-2222-222222222222"
+  cmux_windows_response "$dir" 7 "dddddddd-3333-3333-3333-333333333333" 2
+  cmux_workspace_list_response "$dir" 8 \
+    "bbbbbbbb-1111-1111-1111-111111111111" "$title" \
+    "eeeeeeee-4444-4444-4444-444444444444" other
+  fb=$(make_cmux_fakebin "$dir")
+  fm_fake_exit0 "$fb" treehouse
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$dir/projects" FM_SPAWN_NO_GUARD=1 \
+    FM_CMUX_LOG="$log" FM_CMUX_RESPONSES="$dir/responses" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend cmux 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "cmux empty-partial creation unexpectedly spawned"
+  assert_not_contains "$(cat "$log")" $'\x1f''close-workspace' \
+    "cmux empty-partial rollback targeted a same-label workspace without a returned UUID"
+  assert_grep 'creation_phase=backend-creation' "$state/$id.spawn-claim" \
+    "cmux empty-partial creation did not retain uncertain ownership"
+  assert_contains "$out" 'retained spawn ownership' \
+    "cmux empty-partial creation did not report retained ownership"
+  pass "fm-spawn: empty cmux partials never roll back a same-label workspace"
+}
+
 test_secondmate_spawn_refuses_cmux_backend() {
   local dir state data config projects out status
   dir="$TMP_ROOT/secondmate-refuse"; state="$dir/state"; data="$dir/data"; config="$dir/config"; projects="$dir/projects"
@@ -1149,4 +1190,5 @@ test_workspace_absence_requires_parseable_inventory
 test_kill_recovers_stale_target_by_label
 test_kill_recovers_stale_target_across_windows
 test_list_live_filters_by_title_prefix
+test_spawn_empty_partial_never_targets_same_label_workspace
 test_secondmate_spawn_refuses_cmux_backend

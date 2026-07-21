@@ -67,6 +67,24 @@ fm_transition_from_status()  { fm_transition_field "$1" 3; }
 fm_transition_to_status()    { fm_transition_field "$1" 4; }
 fm_transition_agent()        { fm_transition_field "$1" 5; }
 
+fm_transition_working_marker_path() {  # <state-dir> <window>
+  local state=$1 window=$2 key
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s/.transition-working-%s' "$state" "$key"
+}
+
+fm_transition_record_working() {  # <state-dir> <window> <record>
+  local state=$1 window=$2 record=$3 marker tmp
+  marker=$(fm_transition_working_marker_path "$state" "$window")
+  tmp="$marker.tmp.${BASHPID:-$$}"
+  {
+    printf 'record=%s\n' "$(fm_transition_clean_field "$record")"
+    printf 'observed_at=%s\n' "$(date +%s)"
+    printf 'nonce=%s:%s\n' "${BASHPID:-$$}" "$RANDOM"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$marker"
+}
+
 # fm_transition_policy: THE single-owner status -> supervision-action table.
 # Given a normalized `to_status`, print exactly one action token:
 #

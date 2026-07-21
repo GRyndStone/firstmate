@@ -130,6 +130,84 @@ assert_restart_quiet() {  # <dir>
   stop_watch "$pid"
 }
 
+setup_fake_herdr() {  # <dir>
+  local dir=$1 fakebin="$1/fakebin"
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf 'herdr %s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
+case "$*" in
+  *'status --json'*)
+    printf '{"client":{"protocol":16},"server":{"protocol":16,"running":true}}\n'
+    ;;
+  *'session list --json'*)
+    printf '{"sessions":[{"name":"lab","socket_path":"/tmp/fm-fake-herdr.sock"}]}\n'
+    ;;
+  *'agent get'*)
+    state=$(cat "$FM_FAKE_HERDR_AGENT_STATE" 2>/dev/null || printf 'idle')
+    printf '{"ok":true,"result":{"agent":{"agent_status":"%s"}}}\n' "$state"
+    ;;
+  *'pane get'*)
+    printf '{"ok":true,"result":{"pane":{"id":"w1:p1"}}}\n'
+    ;;
+  *'pane read'*)
+    composer=$(cat "$FM_FAKE_HERDR_COMPOSER_FILE" 2>/dev/null || true)
+    printf '│ %s │\n' "$composer"
+    ;;
+  *) printf '{"ok":true,"result":{}}\n' ;;
+esac
+SH
+  chmod +x "$fakebin/herdr"
+  cat > "$fakebin/herdr-event-reader" <<'SH'
+#!/usr/bin/env bash
+timeout=${2:-1}
+printf 'reader start %s\n' "$*" >> "$FM_FAKE_HERDR_LOG"
+printf '@subscribed\n'
+i=0
+limit=$((timeout * 100))
+while [ "$i" -lt "$limit" ]; do
+  if mv "$FM_FAKE_HERDR_EVENT_FILE" "$FM_FAKE_HERDR_EVENT_FILE.claim.$$" 2>/dev/null; then
+    printf 'reader claimed event\n' >> "$FM_FAKE_HERDR_LOG"
+    cat "$FM_FAKE_HERDR_EVENT_FILE.claim.$$"
+    rm -f "$FM_FAKE_HERDR_EVENT_FILE.claim.$$"
+    exit 0
+  fi
+  sleep 0.01
+  i=$((i + 1))
+done
+exit 0
+SH
+  chmod +x "$fakebin/herdr-event-reader"
+  printf 'idle\n' > "$dir/herdr-agent-state"
+  : > "$dir/herdr-composer"
+  : > "$dir/herdr.log"
+}
+
+queue_herdr_events() {  # <dir> <record-lines>
+  local dir=$1 records=$2 tmp="$1/herdr-events.tmp.$$"
+  printf '%s\n' "$records" > "$tmp"
+  mv "$tmp" "$dir/herdr-events"
+}
+
+wait_for_probe_armed() {  # <record>
+  local record=$1 i=0
+  while [ "$i" -lt 100 ]; do
+    if [ "$(fm_reconcile_record_value "$record" background_probe_armed)" = 1 ]; then return 0; fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_pulse_state() {  # <pulse> <state>
+  local pulse=$1 expected=$2 i=0
+  while [ "$i" -lt 100 ]; do
+    if [ "$(fm_reconcile_record_value "$pulse" state)" = "$expected" ]; then return 0; fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 test_active_review_parks_without_stale_cadence() {
   local dir state out pid
   dir=$(make_canary parked 'paused: old review head still active')
@@ -606,6 +684,162 @@ SH
   pass "canary: watcher exit reaps reconciliation workers and batch state"
 }
 
+test_herdr_push_probe_pulses_are_owned_across_restart() {
+  local generic generic_state generic_out generic_pid predicate wait_bin
+  local dir state out pid wt child drained
+  wait_bin="$ROOT/bin/fm-external-wait.sh"
+
+  generic=$(make_canary herdr-generic 'paused: waiting on an observable upstream gate')
+  generic_state="$generic/state"
+  generic_out="$generic/watch.out"
+  setup_fake_herdr "$generic"
+  printf 'state: paused · source: status-log · waiting on an observable upstream gate\n' > "$generic/live"
+  fm_write_meta "$generic_state/task.meta" \
+    'window=lab:w1:p1' \
+    'backend=herdr' \
+    "worktree=$generic/worktree" \
+    "project=$generic/project" \
+    'kind=ship'
+  predicate="$generic/pending.sh"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'upstream gate pending\n'
+exit 1
+SH
+  chmod +x "$predicate"
+  FM_STATE_OVERRIDE="$generic_state" "$wait_bin" register-predicate task "$predicate" 'upstream gate' >/dev/null \
+    || fail "could not register the generic paused canary predicate"
+  export FM_BACKEND_HERDR_EVENTS_FORCE=1
+  export FM_BACKEND_HERDR_EVENT_READER="$generic/fakebin/herdr-event-reader"
+  export FM_FAKE_HERDR_EVENT_FILE="$generic/herdr-events"
+  export FM_FAKE_HERDR_AGENT_STATE="$generic/herdr-agent-state"
+  export FM_FAKE_HERDR_COMPOSER_FILE="$generic/herdr-composer"
+  export FM_FAKE_HERDR_LOG="$generic/herdr.log"
+  start_watch "$generic" "$generic_out"
+  generic_pid=$CANARY_PID
+  wait_for_record_state "$generic_state/task.reconciled" paused || fail "generic Herdr canary did not persist its pause"
+  queue_herdr_events "$generic" $'w1:p1\tw1\tblocked\tgrok'
+  wait_for_watch_exit "$generic_pid" \
+    || fail "ordinary paused Herdr activity did not wake: $(cat "$generic_out"); transport: $(cat "$generic/herdr.log"); queued: $(cat "$generic/herdr-events" 2>/dev/null || true)"
+  assert_one_wake "$generic_state" 'herdr: agent blocked'
+  assert_restart_quiet "$generic"
+
+  dir=$(make_canary herdr-probe 'paused: supervising an owned corpus probe')
+  state="$dir/state"
+  out="$dir/watch.out"
+  wt="$dir/worktree"
+  setup_fake_herdr "$dir"
+  printf 'state: paused · source: status-log · supervising an owned corpus probe\n' > "$dir/live"
+  fm_write_meta "$state/task.meta" \
+    'window=lab:w1:p1' \
+    'backend=herdr' \
+    "worktree=$wt" \
+    "project=$dir/project" \
+    'kind=ship'
+  predicate="$dir/probe-predicate.sh"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'corpus ledger pending\n'
+exit 1
+SH
+  chmod +x "$predicate"
+  sh -c 'cd "$1" || exit 1; exec sleep 180' _ "$wt" &
+  child=$!
+  ACTIVE_PIDS+=("$child")
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not register the controlled Herdr background probe"
+  export FM_BACKEND_HERDR_EVENT_READER="$dir/fakebin/herdr-event-reader"
+  export FM_FAKE_HERDR_EVENT_FILE="$dir/herdr-events"
+  export FM_FAKE_HERDR_AGENT_STATE="$dir/herdr-agent-state"
+  export FM_FAKE_HERDR_COMPOSER_FILE="$dir/herdr-composer"
+  export FM_FAKE_HERDR_LOG="$dir/herdr.log"
+  export FM_CANARY_STALE_ESCALATE=2
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "controlled Herdr background probe did not arm"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
+    || fail "could not arm controlled Herdr pulse one"
+  queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
+  wait_for_pulse_state "$state/task.probe-pulse" consumed || fail "controlled Herdr pulse one was not consumed"
+  kill -0 "$pid" 2>/dev/null || fail "controlled Herdr pulse one woke the watcher: $(cat "$out")"
+  [ ! -e "$state/.wake-queue" ] || fail "controlled Herdr pulse one enqueued a captain wake"
+  stop_watch "$pid"
+
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
+    || fail "could not arm controlled Herdr pulse two after restart"
+  queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
+  wait_for_pulse_state "$state/task.probe-pulse" consumed || fail "controlled Herdr pulse two was not consumed"
+  sleep 3
+  kill -0 "$pid" 2>/dev/null || fail "owned Herdr pulses tripped the stale-wedge path: $(cat "$out")"
+  [ ! -e "$state/.wake-queue" ] || fail "owned Herdr pulses produced a stale-wedge wake"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
+    || fail "could not arm the pending-composer Herdr pulse"
+  printf 'captain draft' > "$dir/herdr-composer"
+  queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
+  wait_for_watch_exit "$pid" || fail "pending composer input during a probe pulse did not wake: $(cat "$out")"
+  assert_one_wake "$state" 'background-probe-invalidated'
+  : > "$dir/herdr-composer"
+  assert_restart_quiet "$dir"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not replace the pending-composer invalidation"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "non-probe Herdr registration did not arm"
+  queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
+  wait_for_watch_exit "$pid" || fail "unowned Herdr activity while armed did not wake: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'background-probe-invalidated' "unowned Herdr activity used the wrong wake path"
+  drained=$(FM_STATE_OVERRIDE="$state" "$DRAIN")
+  [ "$(printf '%s\n' "$drained" | awk 'NF { n++ } END { print n + 0 }')" -eq 1 ] \
+    || fail "unowned Herdr activity did not wake exactly once: $drained"
+  assert_contains "$drained" 'background-probe-invalidated' "unowned Herdr activity lost its invalidation evidence"
+  assert_restart_quiet "$dir"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not replace the invalidated Herdr registration"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "replacement Herdr registration did not arm"
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'corpus predicate failed\n'
+exit 2
+SH
+  chmod +x "$predicate"
+  wait_for_watch_exit "$pid" || fail "background-probe predicate failure did not wake: $(cat "$out")"
+  assert_one_wake "$state" 'background-probe-invalidated'
+  assert_restart_quiet "$dir"
+
+  cat > "$predicate" <<'SH'
+#!/usr/bin/env bash
+printf 'corpus ledger pending\n'
+exit 1
+SH
+  chmod +x "$predicate"
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not register the child-failure Herdr canary"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "child-failure Herdr registration did not arm"
+  kill "$child" 2>/dev/null || true
+  wait "$child" 2>/dev/null || true
+  wait_for_watch_exit "$pid" || fail "background-probe child failure did not wake: $(cat "$out")"
+  assert_one_wake "$state" 'background-probe-invalidated'
+  assert_restart_quiet "$dir"
+
+  unset FM_BACKEND_HERDR_EVENTS_FORCE FM_BACKEND_HERDR_EVENT_READER FM_FAKE_HERDR_EVENT_FILE
+  unset FM_FAKE_HERDR_AGENT_STATE FM_FAKE_HERDR_COMPOSER_FILE FM_FAKE_HERDR_LOG FM_CANARY_STALE_ESCALATE
+  pass "canary: real watcher owns Herdr probe pulses across restart and fails closed once"
+}
+
 test_active_review_parks_without_stale_cadence
 test_stopped_without_claimed_done_preserves_turn_end_evidence
 test_oauth_callback_completion_after_park
@@ -620,5 +854,6 @@ test_observer_budget_includes_configured_check_timeout
 test_later_worker_failure_is_recorded_after_first_action_selection
 test_first_repository_identity_failure_is_delivered
 test_watcher_exit_reaps_reconciliation_workers
+test_herdr_push_probe_pulses_are_owned_across_restart
 
 echo "# fm-reconcile-watch-e2e.test.sh: all assertions passed"

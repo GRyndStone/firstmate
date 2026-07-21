@@ -187,7 +187,7 @@ States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
 Before parking on a machine-observable wait, register its model-free completion observer with \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\` or \`register-process\`; an unobservable parked task wakes as a runtime failure.
 When a task-owned command will keep working after the foreground harness turn ends, register its exact pid with the same helper's \`register-command\` form before yielding; this makes fresh descendant progress positive working evidence and its exit an immediate completion signal.
-When that task-owned child can wake a paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`; ordinary paused activity remains actionable.
+When that task-owned child can wake a paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
 This is also how you return the answer to a marked from-firstmate request above.
 When a decision you escalated is answered or a blocker clears and your domain resumes, append \`resolved: {how it was decided or unblocked}\` (keyed with \`[key=<slug>]\` if you opened it with one) so it is durably closed instead of resurfacing behind later unrelated events.
@@ -276,7 +276,7 @@ The report is the only thing that survives, so anything worth keeping must be in
    \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
    or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
    If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
-   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`; ordinary paused activity remains actionable.
+   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
@@ -359,7 +359,7 @@ When firstmate replies, feed the decision to GSD; when it replies or a blocker c
    \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
    or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
    If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
-   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`; ordinary paused activity remains actionable.
+   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 5. Keep your own context lean: do not read large project artifacts into context - sample heads only;
    GSD's units hold the detail. If your context passes ~85% used, finish the current supervision step,
    write a handoff note to \`$DATA/$ID/handoff.md\` (GSD state, running units, next action, any open
@@ -469,7 +469,7 @@ $RULE1
    \`FM_STATE_OVERRIDE=$WAIT_STATE_DIR $WAIT_HELPER register-predicate $ID <executable> [description]\`
    or the same helper's \`register-process\` form; an unobservable parked task wakes as a runtime failure.
    If a task-owned command continues after the foreground turn ends, use the helper's \`register-command\` form so exact-pid progress remains positive working evidence and completion wakes immediately.
-   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`; ordinary paused activity remains actionable.
+   If that child can wake the paused foreground harness only to check unchanged progress, use \`register-background-probe $ID <pid> <predicate> [description]\`, then have that exact child call \`arm-background-probe-pulse $ID <pid>\` immediately before every one-shot foreground check; ordinary paused activity remains actionable.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.

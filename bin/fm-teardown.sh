@@ -1038,7 +1038,7 @@ cleanup_firstmate_home_children() {
     remove_rc=0
     if fm_reconcile_teardown_matches_locked "$sub_state" "$child_id" "$child_generation"; then
       remove_grok_turnend_auth "$sub_state" "$child_id"
-      rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.wait-commit" "$sub_state/$child_id.x-followup-op" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
+      rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.reconciled" "$sub_state/$child_id.wait" "$sub_state/$child_id.wait-commit" "$sub_state/$child_id.probe-pulse" "$sub_state/$child_id.x-followup-op" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.tearing-down" "$sub_state/$child_id.spawn-claim" || remove_rc=$?
     else
       [ "$(fm_reconcile_record_value "$sub_state/$child_id.tearing-down" lifecycle_generation)" != "$child_generation" ] \
         || rm -f "$sub_state/$child_id.tearing-down"
@@ -1202,7 +1202,7 @@ if fm_reconcile_teardown_matches_locked "$STATE" "$ID" "$LIFECYCLE_GENERATION"; 
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.wait-commit" "$STATE/$ID.x-followup-op" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.reconciled" "$STATE/$ID.wait" "$STATE/$ID.wait-commit" "$STATE/$ID.probe-pulse" "$STATE/$ID.x-followup-op" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.tearing-down" "$STATE/$ID.spawn-claim" || remove_rc=$?
 else
   [ "$(fm_reconcile_record_value "$STATE/$ID.tearing-down" lifecycle_generation)" != "$LIFECYCLE_GENERATION" ] \
     || rm -f "$STATE/$ID.tearing-down"
