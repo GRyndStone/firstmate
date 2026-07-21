@@ -404,11 +404,36 @@ test_gsd_rejects_secondmate_and_scout() {
   pass "fm-brief.sh: --gsd rejects --secondmate and --scout combinations"
 }
 
+test_ship_acceptance_evidence_contract() {
+  local home id brief
+  home="$TMP_ROOT/acceptance-home"
+  mkdir -p "$home/data"
+  id="brief-accept-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "ship brief was not scaffolded"
+  assert_grep "# Acceptance evidence" "$brief" "ship brief missing Acceptance evidence section"
+  assert_grep "acceptance.md" "$brief" "ship brief missing acceptance.md handoff path"
+  assert_grep "fm-acceptance-check.sh" "$brief" "ship brief missing acceptance check invocation"
+  assert_grep "none: no concrete acceptance criteria" "$brief" \
+    "ship brief missing proportional none: declaration guidance"
+  assert_grep "config/catalog/API does not satisfy a UI" "$brief" \
+    "ship brief missing proxy-rejection guidance"
+
+  id="brief-accept-scout"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_no_grep "# Acceptance evidence" "$brief" \
+    "scout brief must not carry the ship acceptance gate"
+  pass "fm-brief.sh: ship briefs carry acceptance evidence contract; scouts omit it"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_ship_acceptance_evidence_contract
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout

@@ -27,6 +27,10 @@ assert_contains "$SECTION_ONE" 'Never omit, paraphrase, merge into analysis, or 
   "AGENTS.md does not protect the captain-owned question from omission or paraphrase"
 assert_grep 'a gate verdict is an input to Firstmate' "$AGENTS" \
   "validation workflow does not apply the evidence-not-authority rule at its highest-risk boundary"
+assert_grep 'bin/fm-acceptance-check.sh' "$AGENTS" \
+  "ship done path does not require the criterion-to-evidence acceptance gate"
+assert_grep 'docs/acceptance-evidence.md' "$AGENTS" \
+  "acceptance gate pointer must name the single contract owner"
 assert_no_grep 'Relay the findings to the captain' "$AGENTS" \
   "scout workflow still instructs Firstmate to forward findings without synthesis"
 assert_no_grep 'relayed verbatim unless routine approval' "$AGENTS" \
