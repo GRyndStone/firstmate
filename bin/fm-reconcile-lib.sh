@@ -955,9 +955,13 @@ fm_reconcile_background_probe_pulse_set_state() {  # <pulse-file> <state> [reaso
 fm_reconcile_background_probe_arm_pulse() {  # <state-dir> <id> <child-pid>
   local state=$1 id=$2 child_pid=$3 endpoint pulse pulse_id now expires marker marker_signature blocked_marker blocked_marker_signature
   local composer_marker composer_marker_signature
-  local invoker_pid invoker_identity tmp arm_rc=0
+  local helper_pid invoker_pid invoker_identity tmp arm_rc=0
   case "$child_pid" in ''|*[!0-9]*) return 2 ;; esac
-  invoker_pid=$(fm_reconcile_process_parent_pid "${BASHPID:-$$}" 2>/dev/null || true)
+  # Capture this shell before entering command substitution.  On modern Bash,
+  # BASHPID inside $(...) identifies the substitution child, which would make
+  # its parent the helper rather than the registered probe child.
+  helper_pid=${BASHPID:-$$}
+  invoker_pid=$(fm_reconcile_process_parent_pid "$helper_pid" 2>/dev/null || true)
   invoker_identity=$(fm_reconcile_process_identity "$invoker_pid" 2>/dev/null || true)
   pulse="$state/$id.probe-pulse"
   fm_reconcile_lock_acquire "$state" "$id"

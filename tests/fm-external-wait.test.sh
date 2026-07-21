@@ -260,7 +260,7 @@ SH
   assert_contains "$(cat "$err")" 'not owned by the registered background-probe child identity' \
     "unowned pulse rejection lost its identity evidence"
   arm_probe_from_child "$control" \
-    || { kill "$pid" 2>/dev/null || true; fail "could not arm the first one-shot background-probe pulse"; }
+    || { kill "$pid" 2>/dev/null || true; fail "could not arm the first one-shot background-probe pulse: $(cat "$control/err" 2>/dev/null)"; }
   fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
     || { kill "$pid" 2>/dev/null || true; fail "could not persist the first pulse working edge"; }
   printf 'state: working · source: pane · one-shot progress probe\n' > "$live"
@@ -274,7 +274,7 @@ SH
   [ -e "$state/.herdr-escalated-session_fm-task" ] \
     || { kill "$pid" 2>/dev/null || true; fail "poll consumption did not acknowledge its blocked edge"; }
   arm_probe_from_child "$control" \
-    || { kill "$pid" 2>/dev/null || true; fail "could not arm the repeated background-probe pulse"; }
+    || { kill "$pid" 2>/dev/null || true; fail "could not arm the repeated background-probe pulse: $(cat "$control/err" 2>/dev/null)"; }
   fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
     || { kill "$pid" 2>/dev/null || true; fail "could not persist the repeated pulse working edge"; }
   printf 'state: working · source: pane · repeated progress probe\n' > "$live"
