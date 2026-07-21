@@ -8,7 +8,7 @@ set -u
 # shellcheck source=bin/fm-task-identity-lib.sh
 . "$ROOT/bin/fm-task-identity-lib.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-task-identity)
+fm_test_tmproot TMP_ROOT fm-task-identity
 state="$TMP_ROOT/state"
 repo="$TMP_ROOT/repo"
 same_wt="$TMP_ROOT/same-worktree"
@@ -72,6 +72,8 @@ pass "task identity refuses cross-repository reuse with linked-task guidance"
 
 mkdir -p "$TMP_ROOT/data/task" "$TMP_ROOT/config" "$TMP_ROOT/projects"
 printf 'brief\n' > "$TMP_ROOT/data/task/brief.md"
+printf 'live pi hook\n' > "$state/task.pi-ext.ts"
+printf 'live-token\n' > "$state/task.grok-turnend-token"
 spawn_before=$(cksum "$state/task.meta")
 if FM_ROOT_OVERRIDE='' FM_HOME="$TMP_ROOT" \
   FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$TMP_ROOT/data" \
@@ -84,7 +86,27 @@ grep -F 'Create a new task id' "$err" >/dev/null \
   || fail "spawn lifecycle refusal lost linked-task guidance"
 [ "$(cksum "$state/task.meta")" = "$spawn_before" ] \
   || fail "spawn lifecycle refusal rewrote the existing task metadata"
-pass "spawn refuses cross-repository reuse before endpoint creation or metadata replacement"
+[ "$(cat "$state/task.pi-ext.ts")" = 'live pi hook' ] \
+  || fail "failed replacement spawn removed another lifecycle's pi hook"
+[ "$(cat "$state/task.grok-turnend-token")" = 'live-token' ] \
+  || fail "failed replacement spawn removed another lifecycle's Grok token"
+pass "failed replacement spawn preserves the live lifecycle and its owned artifacts"
+
+path_state="$TMP_ROOT/path-state"
+escape_artifact="$TMP_ROOT/escape.pi-ext.ts"
+mkdir -p "$path_state"
+printf 'live lifecycle hook\n' > "$escape_artifact"
+if FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$TMP_ROOT" FM_STATE_OVERRIDE="$path_state" \
+  FM_DATA_OVERRIDE="$TMP_ROOT/data" FM_CONFIG_OVERRIDE="$TMP_ROOT/config" \
+  FM_PROJECTS_OVERRIDE="$TMP_ROOT/projects" FM_SPAWN_NO_GUARD=1 FM_BACKEND=tmux \
+  "$ROOT/bin/fm-spawn.sh" '../escape' "$other" --harness codex 2> "$err"; then
+  fail "spawn accepted a path-traversing task id"
+fi
+grep -F "invalid task id '../escape'" "$err" >/dev/null \
+  || fail "path-traversing spawn refusal did not identify the invalid task id"
+[ "$(cat "$escape_artifact")" = 'live lifecycle hook' ] \
+  || fail "invalid-id abort cleanup removed an artifact outside its task scope"
+pass "spawn validates task ids before installing artifact cleanup"
 
 fm_write_meta "$state/missing.meta" 'window=session:fm-missing' 'kind=ship'
 if fm_task_identity_validate "$state" missing "$repo" 2> "$err"; then

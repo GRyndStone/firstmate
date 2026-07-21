@@ -45,10 +45,13 @@ The exact process exit or identity change remains an immediate model-free comple
 A paused task whose task-owned child can trigger a foreground progress probe must opt in with `register-background-probe`, which binds the exact live child identity, its task-scoped cwd, and an executable ledger predicate that is still pending at registration.
 The static registration only establishes an eligible paused baseline and never owns foreground activity by itself.
 Immediately before each one-shot foreground probe, the registered child must call `arm-background-probe-pulse` with its exact pid.
-That durable pulse binds the registration id, lifecycle, endpoint, child identity, predicate evidence, paused status sequence and signatures, freshness deadline, and the pre-pulse Herdr working-edge marker.
-Absorption requires the same pulse to remain current and a new Herdr `working` edge after the pulse was armed, then consumes the pulse atomically before committing the identical-pause return.
+The arm path derives the invoking script's direct parent pid and live process identity, so forwarding the registered pid from any other caller cannot authenticate a pulse.
+That durable pulse binds the registration id, lifecycle, endpoint, child identity, predicate evidence, paused status sequence and signatures, freshness deadline, and the pre-pulse Herdr working, blocked, and composer-event markers.
+Absorption requires the same pulse to remain current and a genuine streamed Herdr `working` edge after the pulse was armed, then durably acknowledges the corresponding blocked edge before marking the identical-pause pulse consumed.
 Any blocked edge without that exact pulse, a second use of a consumed pulse, pending composer input, expiry, or a changed bound value is fail-closed.
+While a pulse is armed, Herdr output events persist the composer classification from their exact screen revision, so input that appears and clears before the next level read still invalidates the pulse.
 The reconciled record persists a `background-probe-invalidated` action before delivery whenever the armed baseline or pulse changes, including status/event/freshness, endpoint, task state, registration, child identity/liveness, predicate result/evidence, or push-time composer state.
+The reconciled action and disarmed authority are committed together before the secondary pulse file changes, and restart recovery completes any interrupted pulse update without losing the action.
 An invalidated registration cannot re-arm until its action is acknowledged and a replacement registration establishes a new paused baseline.
 The reconciler arms that opt-in only after it durably records an explicit paused status baseline containing the endpoint, status-event sequence, content signature, freshness signature, and pending predicate evidence.
 An owned pulse may return to `idle` or the same explicit pause without waking only while the registration remains lifecycle-current, the child identity and cwd remain valid, the composer is empty, and every baseline field and pending predicate evidence remain byte-identical.
@@ -60,6 +63,7 @@ An unacknowledged transition token cannot be replaced by a newer observation dur
 Newer status and turn-end evidence is folded into that pending wake before its exact suppressor signatures advance.
 An unchanged pane remains quiet at every stale threshold while the reconciled reader still reports positive run-step, busy-pane, or progressing owned-command evidence; the watcher revalidates that evidence instead of converting elapsed time alone into a possible-wedge alarm.
 Observer crashes, malformed results, and outer timeouts persist one `observer-failure` action, while watcher shutdown terminates and waits for every active batch worker before releasing singleton ownership.
+Fleet snapshots expose a pulse as current only after validating its lifecycle, registration, endpoint, exact live child identity, task-scoped cwd, paused baseline, and expiry; an invalid pulse retains only `raw_state` diagnostics.
 
 ## Task identity boundary
 

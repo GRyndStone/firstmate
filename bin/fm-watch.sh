@@ -306,6 +306,19 @@ window_key() {  # <target>
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+registered_process_transition_due() {  # <task>
+  local task=$1 record now
+  [ -n "$task" ] || return 1
+  record="$STATE/$task.reconciled"
+  [ -f "$record" ] || return 1
+  fm_reconcile_wait_load "$STATE" "$task"
+  [ "$FM_RECONCILE_WAIT_KIND" = process ] || return 1
+  now=$(date +%s)
+  fm_reconcile_wait_evaluate "$record" "$now"
+  case "$FM_RECONCILE_WAIT_RESULT" in complete|failed) return 0 ;; esac
+  return 1
+}
+
 # Repeat-poll stale-timer bookkeeping for an already-classified hash absorbed as
 # provably-working. It repairs a missing/corrupt timer, then revalidates current
 # working evidence once STALE_ESCALATE_SECS has elapsed. Positive evidence resets
@@ -330,6 +343,8 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
           date +%s > "$since_file"
           rm -f "$escalation_file"
           triage_log "absorbed $label after threshold (positive working evidence still current): $win"
+        elif registered_process_transition_due "$task"; then
+          triage_log "deferred $label to authoritative process reconciliation: $win"
         else
           n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
           echo "$n" > "$escalation_file"
@@ -631,17 +646,18 @@ watch_cleanup() {
   fm_lock_release "$WATCH_LOCK"
 }
 
-deliver_reconciled_action() {  # <id> <token> <version> <evidence>
+enqueue_reconciled_action() {  # <id> <token> <version> <evidence>
   local selected_id=$1 selected_token=$2 selected_version=$3 selected_evidence=$4
   local meta pending pending_version notified notified_version record_repository record_generation current_generation
   local kind identity_failure_delivery target marker reason queue_rc=0
+  FM_RECONCILED_WAKE_REASON=
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   fm_reconcile_lock_acquire "$STATE" "$selected_id"
   meta="$STATE/$selected_id.meta"
   if [ ! -f "$meta" ] || fm_reconcile_tombstone_active "$STATE" "$selected_id"; then
     fm_reconcile_lock_release "$STATE" "$selected_id"
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    return 0
+    return 3
   fi
   pending=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_token)
   pending_version=$(fm_reconcile_record_value "$STATE/$selected_id.reconciled" pending_action_version)
@@ -662,7 +678,7 @@ deliver_reconciled_action() {  # <id> <token> <version> <evidence>
     || { [ "$kind" != secondmate ] && [ -z "$record_repository" ] && [ "$identity_failure_delivery" -ne 1 ]; }; then
     fm_reconcile_lock_release "$STATE" "$selected_id"
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    return 0
+    return 3
   fi
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || target="fm-$selected_id"
@@ -678,7 +694,18 @@ deliver_reconciled_action() {  # <id> <token> <version> <evidence>
   fm_reconcile_lock_release "$STATE" "$selected_id"
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   [ "$queue_rc" -eq 0 ] || return "$queue_rc"
-  wake "$reason"
+  FM_RECONCILED_WAKE_REASON=$reason
+}
+
+deliver_reconciled_action() {  # <id> <token> <version> <evidence>
+  local deliver_rc=0
+  if enqueue_reconciled_action "$@"; then
+    wake "$FM_RECONCILED_WAKE_REASON"
+  else
+    deliver_rc=$?
+  fi
+  [ "$deliver_rc" -eq 3 ] && return 0
+  return "$deliver_rc"
 }
 
 # Observe every task's deterministic current state in one bounded parallel batch
@@ -926,15 +953,26 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task reason input_state input_state_after
-  local rejection out tag token version evidence
+  local backend=$1 session=$2 record=$3 pane_id to transition_origin window task reason input_state input_state_after
+  local rejection out tag token version evidence enqueue_rc observe_rc
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
+  transition_origin=$(fm_transition_workspace_id "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
   input_state=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state=unknown
-  if [ "$input_state" = empty ] \
+  if [ "$input_state" = empty ] && [ -n "$task" ] \
+    && fm_reconcile_background_probe_active "$STATE" "$task"; then
+    if fm_reconcile_background_probe_observe_composer "$STATE" "$task" "$window" empty >/dev/null; then
+      :
+    else
+      observe_rc=$?
+      [ "$observe_rc" -eq 2 ] || exit 1
+    fi
+  fi
+  if [ "$transition_origin" != @level ] \
+    && [ "$input_state" = empty ] \
     && [ -n "$task" ] \
     && fm_reconcile_background_probe_can_absorb "$STATE" "$task" "$window"; then
     input_state_after=$(fm_backend_composer_state "$backend" "$window" 2>/dev/null) || input_state_after=unknown
@@ -943,12 +981,13 @@ handle_push_transition() {  # <backend> <session> <record>
   fi
   if [ "$input_state_after" = empty ]; then
     triage_log "absorbed push $to (owned background probe returned to identical pause): $window"
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     return
   fi
   rejection=${FM_RECONCILE_BACKGROUND_PROBE_REJECTION:-}
   if [ "$input_state" != empty ]; then
     rejection="composer state was $input_state"
+  elif [ "$transition_origin" = @level ]; then
+    rejection='blocked state came from a reconnect level read'
   elif [ "$input_state_after" != unknown ] && [ "$input_state_after" != empty ]; then
     rejection="composer state changed to $input_state_after during pulse validation"
   fi
@@ -962,15 +1001,56 @@ $out
 EOF
     [ "$tag" = action ] && [ -n "$token" ] || exit 1
     case "$version" in ''|*[!A-Za-z0-9._:-]*) exit 1 ;; esac
-    deliver_reconciled_action "$task" "$token" "$version" "$evidence" || exit $?
+    if enqueue_reconciled_action "$task" "$token" "$version" "$evidence"; then
+      :
+    else
+      enqueue_rc=$?
+      [ "$enqueue_rc" -eq 3 ] || exit "$enqueue_rc"
+      return
+    fi
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-    return
+    wake "$FM_RECONCILED_WAKE_REASON"
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
   mark_surfaced "$STATE/$task.status"
   wake "$reason"
+}
+
+observe_background_probe_composer_inputs() {
+  local meta id backend endpoint composer out observe_rc tag token version evidence enqueue_rc
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=${meta##*/}
+    id=${id%.meta}
+    fm_reconcile_background_probe_active "$STATE" "$id" || continue
+    backend=$(fm_backend_of_meta "$meta")
+    [ "$backend" = herdr ] || continue
+    endpoint=$(fm_backend_target_of_meta "$meta")
+    [ -n "$endpoint" ] || continue
+    composer=$(fm_backend_composer_state "$backend" "$endpoint" 2>/dev/null) || composer=unknown
+    if out=$(fm_reconcile_background_probe_observe_composer "$STATE" "$id" "$endpoint" "$composer"); then
+      [ -n "$out" ] || continue
+    else
+      observe_rc=$?
+      [ "$observe_rc" -eq 2 ] && continue
+      exit "$observe_rc"
+    fi
+    IFS=$(printf '\t') read -r tag token version evidence <<EOF
+$out
+EOF
+    [ "$tag" = action ] && [ -n "$token" ] || exit 1
+    case "$version" in ''|*[!A-Za-z0-9._:-]*) exit 1 ;; esac
+    if enqueue_reconciled_action "$id" "$token" "$version" "$evidence"; then
+      :
+    else
+      enqueue_rc=$?
+      [ "$enqueue_rc" -eq 3 ] && continue
+      exit "$enqueue_rc"
+    fi
+    wake "$FM_RECONCILED_WAKE_REASON"
+  done
 }
 
 # Accept ownership only from a wrapper that declares its live process identity.
@@ -1067,6 +1147,7 @@ while :; do
   # check/status/stale cadence paths and therefore does not depend on a heartbeat,
   # pane hash becoming stale, or a fresh status append.
   reconcile_cycle
+  observe_background_probe_composer_inputs
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.

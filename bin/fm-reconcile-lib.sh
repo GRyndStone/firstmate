@@ -236,6 +236,16 @@ fm_reconcile_process_identity() {  # <pid>
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
+fm_reconcile_process_parent_pid() {  # <pid>
+  local out
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  out=$(LC_ALL=C ps -p "$1" -o ppid= 2>/dev/null) || return 1
+  out=${out#"${out%%[![:space:]]*}"}
+  out=${out%"${out##*[![:space:]]}"}
+  case "$out" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$out"
+}
+
 fm_reconcile_process_cwd() {  # <pid>
   local pid=$1 out
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -715,6 +725,7 @@ fm_reconcile_background_probe_pulse_load() {  # <state-dir> <id>
   FM_RECONCILE_PROBE_PULSE_SIGNATURE=$(fm_reconcile_file_signature "$pulse")
   FM_RECONCILE_PROBE_PULSE_STATE=$(fm_reconcile_record_value "$pulse" state)
   FM_RECONCILE_PROBE_PULSE_ID=$(fm_reconcile_record_value "$pulse" pulse_id)
+  FM_RECONCILE_PROBE_PULSE_TASK=$(fm_reconcile_record_value "$pulse" task)
   FM_RECONCILE_PROBE_PULSE_LIFECYCLE=$(fm_reconcile_record_value "$pulse" lifecycle_generation)
   FM_RECONCILE_PROBE_PULSE_REGISTRATION=$(fm_reconcile_record_value "$pulse" registration_id)
   FM_RECONCILE_PROBE_PULSE_WAIT_SIGNATURE=$(fm_reconcile_record_value "$pulse" wait_signature)
@@ -726,16 +737,92 @@ fm_reconcile_background_probe_pulse_load() {  # <state-dir> <id>
   FM_RECONCILE_PROBE_PULSE_STATUS_SIGNAL=$(fm_reconcile_record_value "$pulse" status_signal_signature)
   FM_RECONCILE_PROBE_PULSE_WAIT_EVIDENCE=$(fm_reconcile_record_value "$pulse" wait_evidence)
   FM_RECONCILE_PROBE_PULSE_WORKING_MARKER=$(fm_reconcile_record_value "$pulse" working_marker_signature)
+  FM_RECONCILE_PROBE_PULSE_BLOCKED_MARKER=$(fm_reconcile_record_value "$pulse" blocked_marker_signature)
+  FM_RECONCILE_PROBE_PULSE_COMPOSER_MARKER=$(fm_reconcile_record_value "$pulse" composer_marker_signature)
   FM_RECONCILE_PROBE_PULSE_ISSUED_AT=$(fm_reconcile_record_value "$pulse" issued_at)
   FM_RECONCILE_PROBE_PULSE_EXPIRES_AT=$(fm_reconcile_record_value "$pulse" expires_at)
   : "$FM_RECONCILE_PROBE_PULSE_SIGNATURE" "$FM_RECONCILE_PROBE_PULSE_ID"
 }
 
 fm_reconcile_background_probe_active() {  # <state-dir> <id>
-  local state=$1 id=$2
-  [ "$(fm_reconcile_record_value "$state/$id.reconciled" background_probe_armed)" = 1 ] && return 0
+  local state=$1 id=$2 record
+  record="$state/$id.reconciled"
+  if [ -f "$record" ]; then
+    [ "$(fm_reconcile_record_value "$record" background_probe_armed)" = 1 ]
+    return
+  fi
   fm_reconcile_background_probe_pulse_load "$state" "$id"
   [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]
+}
+
+fm_reconcile_background_probe_pulse_owned() {  # <state-dir> <id> [endpoint]
+  local state=$1 id=$2 endpoint=${3:-} meta record generation pulse_signature current_identity current_cwd now
+  local meta_signature record_signature wait_signature
+  FM_RECONCILE_BACKGROUND_PROBE_REJECTION=
+  meta="$state/$id.meta"
+  record="$state/$id.reconciled"
+  [ -f "$meta" ] && [ -f "$record" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='reconciled task or metadata is absent'; return 1; }
+  meta_signature=$(fm_reconcile_file_signature "$meta")
+  record_signature=$(fm_reconcile_file_signature "$record")
+  generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
+  [ -n "$generation" ] \
+    && [ "$(fm_reconcile_record_value "$record" lifecycle_generation)" = "$generation" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='task lifecycle changed'; return 1; }
+  [ -n "$endpoint" ] || endpoint=$(fm_reconcile_endpoint "$meta")
+  fm_reconcile_wait_load "$state" "$id"
+  wait_signature=$FM_RECONCILE_WAIT_SIGNATURE
+  fm_reconcile_background_probe_pulse_load "$state" "$id"
+  pulse_signature=$FM_RECONCILE_PROBE_PULSE_SIGNATURE
+  [ "$(fm_reconcile_record_value "$FM_RECONCILE_PROBE_PULSE_FILE" schema)" = fm-background-probe-pulse.v1 ] \
+    && [ -n "$FM_RECONCILE_PROBE_PULSE_ID" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_TASK" = "$id" ] \
+    && [ "$FM_RECONCILE_WAIT_KIND" = process ] \
+    && [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ] \
+    && [ "$FM_RECONCILE_WAIT_LIFECYCLE_GENERATION" = "$generation" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_LIFECYCLE" = "$generation" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_REGISTRATION" = "$FM_RECONCILE_WAIT_REGISTRATION_ID" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_WAIT_SIGNATURE" = "$FM_RECONCILE_WAIT_SIGNATURE" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_ENDPOINT" = "$endpoint" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_PID" = "$FM_RECONCILE_WAIT_PID" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_PID_IDENTITY" = "$FM_RECONCILE_WAIT_PID_IDENTITY" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_STATUS_SEQUENCE" = "$(fm_reconcile_record_value "$record" background_probe_status_sequence)" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_STATUS_SIGNATURE" = "$(fm_reconcile_record_value "$record" background_probe_status_signature)" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_STATUS_SIGNAL" = "$(fm_reconcile_record_value "$record" background_probe_status_signal_signature)" ] \
+    && [ "$FM_RECONCILE_PROBE_PULSE_WAIT_EVIDENCE" = "$(fm_reconcile_record_value "$record" background_probe_wait_evidence)" ] \
+    && [ -n "$FM_RECONCILE_PROBE_PULSE_WORKING_MARKER" ] \
+    && [ -n "$FM_RECONCILE_PROBE_PULSE_BLOCKED_MARKER" ] \
+    && [ -n "$FM_RECONCILE_PROBE_PULSE_COMPOSER_MARKER" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse ownership does not match its lifecycle, registration, endpoint, child, or paused baseline'; return 1; }
+  case "$FM_RECONCILE_PROBE_PULSE_STATE" in
+    armed|consumed|invalidated) ;;
+    *) FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse state is invalid'; return 1 ;;
+  esac
+  current_identity=$(fm_reconcile_process_identity "$FM_RECONCILE_WAIT_PID" 2>/dev/null || true)
+  [ -n "$current_identity" ] && [ "$current_identity" = "$FM_RECONCILE_WAIT_PID_IDENTITY" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='registered background-probe child identity is not current'; return 1; }
+  current_cwd=$(fm_reconcile_process_cwd "$FM_RECONCILE_WAIT_PID" 2>/dev/null || true)
+  if ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_WORKTREE" \
+    && ! fm_reconcile_path_is_within "$current_cwd" "$FM_RECONCILE_WAIT_OWNER_TASKTMP"; then
+    FM_RECONCILE_BACKGROUND_PROBE_REJECTION='registered background-probe child is outside its task-scoped roots'
+    return 1
+  fi
+  if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
+    [ "$(fm_reconcile_record_value "$record" background_probe_armed)" = 1 ] \
+      || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='armed pulse has no current reconciled baseline'; return 1; }
+  fi
+  now=$(date +%s)
+  case "$FM_RECONCILE_PROBE_PULSE_ISSUED_AT:$FM_RECONCILE_PROBE_PULSE_EXPIRES_AT" in
+    *[!0-9:]*) FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse freshness is invalid'; return 1 ;;
+  esac
+  [ "$now" -ge "$FM_RECONCILE_PROBE_PULSE_ISSUED_AT" ] \
+    && [ "$now" -le "$FM_RECONCILE_PROBE_PULSE_EXPIRES_AT" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse expired'; return 1; }
+  [ "$(fm_reconcile_file_signature "$meta")" = "$meta_signature" ] \
+    && [ "$(fm_reconcile_file_signature "$record")" = "$record_signature" ] \
+    && [ "$(fm_reconcile_file_signature "$FM_RECONCILE_WAIT_FILE")" = "$wait_signature" ] \
+    && [ "$(fm_reconcile_file_signature "$FM_RECONCILE_PROBE_PULSE_FILE")" = "$pulse_signature" ] \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse changed during validation'; return 1; }
 }
 
 fm_reconcile_background_probe_baseline_valid() {  # <state-dir> <id> [endpoint]
@@ -806,9 +893,10 @@ fm_reconcile_background_probe_baseline_valid() {  # <state-dir> <id> [endpoint]
 }
 
 fm_reconcile_background_probe_pulse_valid() {  # <state-dir> <id> [endpoint]
-  local state=$1 id=$2 endpoint=${3:-} now marker marker_signature
+  local state=$1 id=$2 endpoint=${3:-} now marker marker_signature composer_marker composer_signature composer_state
   fm_reconcile_background_probe_baseline_valid "$state" "$id" "$endpoint" || return 1
   [ -n "$endpoint" ] || endpoint=$(fm_reconcile_endpoint "$state/$id.meta")
+  fm_reconcile_background_probe_pulse_owned "$state" "$id" "$endpoint" || return 1
   fm_reconcile_background_probe_pulse_load "$state" "$id"
   [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ] \
     || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='no one-shot probe pulse is armed'; return 1; }
@@ -837,6 +925,13 @@ fm_reconcile_background_probe_pulse_valid() {  # <state-dir> <id> [endpoint]
   esac
   [ "$marker_signature" != "$FM_RECONCILE_PROBE_PULSE_WORKING_MARKER" ] \
     || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse did not observe a post-arm working edge'; return 1; }
+  composer_marker=$(fm_transition_composer_marker_path "$state" "$endpoint")
+  composer_signature=$(fm_reconcile_file_signature "$composer_marker")
+  if [ "$composer_signature" != "$FM_RECONCILE_PROBE_PULSE_COMPOSER_MARKER" ]; then
+    composer_state=$(fm_reconcile_record_value "$composer_marker" state)
+    FM_RECONCILE_BACKGROUND_PROBE_REJECTION="composer state changed while pulse was armed: ${composer_state:-unknown}"
+    return 1
+  fi
 }
 
 fm_reconcile_background_probe_pulse_set_state() {  # <pulse-file> <state> [reason]
@@ -858,15 +953,22 @@ fm_reconcile_background_probe_pulse_set_state() {  # <pulse-file> <state> [reaso
 }
 
 fm_reconcile_background_probe_arm_pulse() {  # <state-dir> <id> <child-pid>
-  local state=$1 id=$2 child_pid=$3 endpoint pulse pulse_id now expires marker marker_signature tmp arm_rc=0
+  local state=$1 id=$2 child_pid=$3 endpoint pulse pulse_id now expires marker marker_signature blocked_marker blocked_marker_signature
+  local composer_marker composer_marker_signature
+  local invoker_pid invoker_identity tmp arm_rc=0
   case "$child_pid" in ''|*[!0-9]*) return 2 ;; esac
+  invoker_pid=$(fm_reconcile_process_parent_pid "${BASHPID:-$$}" 2>/dev/null || true)
+  invoker_identity=$(fm_reconcile_process_identity "$invoker_pid" 2>/dev/null || true)
   pulse="$state/$id.probe-pulse"
   fm_reconcile_lock_acquire "$state" "$id"
   endpoint=$(fm_reconcile_endpoint "$state/$id.meta")
   if ! fm_reconcile_background_probe_baseline_valid "$state" "$id" "$endpoint"; then
     arm_rc=1
-  elif [ "$child_pid" != "$FM_RECONCILE_WAIT_PID" ]; then
-    FM_RECONCILE_BACKGROUND_PROBE_REJECTION='pulse caller is not the registered background-probe child'
+  elif [ "$child_pid" != "$FM_RECONCILE_WAIT_PID" ] \
+    || [ "$invoker_pid" != "$FM_RECONCILE_WAIT_PID" ] \
+    || [ -z "$invoker_identity" ] \
+    || [ "$invoker_identity" != "$FM_RECONCILE_WAIT_PID_IDENTITY" ]; then
+    FM_RECONCILE_BACKGROUND_PROBE_REJECTION='pulse invocation is not owned by the registered background-probe child identity'
     arm_rc=1
   else
     fm_reconcile_background_probe_pulse_load "$state" "$id"
@@ -881,6 +983,10 @@ fm_reconcile_background_probe_arm_pulse() {  # <state-dir> <id> <child-pid>
     expires=$((now + FM_BACKGROUND_PROBE_PULSE_TTL))
     marker=$(fm_transition_working_marker_path "$state" "$endpoint")
     marker_signature=$(fm_reconcile_file_signature "$marker")
+    blocked_marker=$(fm_transition_blocked_marker_path "$state" "$endpoint")
+    blocked_marker_signature=$(fm_reconcile_file_signature "$blocked_marker")
+    composer_marker=$(fm_transition_composer_marker_path "$state" "$endpoint")
+    composer_marker_signature=$(fm_reconcile_file_signature "$composer_marker")
     tmp="$pulse.tmp.${BASHPID:-$$}"
     if [ "$arm_rc" -eq 0 ]; then
       {
@@ -899,6 +1005,8 @@ fm_reconcile_background_probe_arm_pulse() {  # <state-dir> <id> <child-pid>
         printf 'status_signal_signature=%s\n' "$(fm_reconcile_record_value "$state/$id.reconciled" background_probe_status_signal_signature)"
         printf 'wait_evidence=%s\n' "$(fm_reconcile_clean_value "$FM_RECONCILE_WAIT_EVIDENCE")"
         printf 'working_marker_signature=%s\n' "$marker_signature"
+        printf 'blocked_marker_signature=%s\n' "$blocked_marker_signature"
+        printf 'composer_marker_signature=%s\n' "$composer_marker_signature"
         printf 'issued_at=%s\n' "$now"
         printf 'expires_at=%s\n' "$expires"
       } > "$tmp" || arm_rc=1
@@ -911,17 +1019,94 @@ fm_reconcile_background_probe_arm_pulse() {  # <state-dir> <id> <child-pid>
   printf '%s' "$pulse_id"
 }
 
+fm_reconcile_background_probe_consume_locked() {  # <state-dir> <id> [endpoint]
+  local state=$1 id=$2 endpoint=${3:-} pane_id record
+  [ -n "$endpoint" ] || endpoint=$(fm_reconcile_endpoint "$state/$id.meta")
+  fm_reconcile_background_probe_pulse_valid "$state" "$id" "$endpoint" || return 1
+  pane_id=${endpoint#*:}
+  record=$(fm_transition_record "$pane_id" "" "" blocked "")
+  fm_transition_record_blocked "$state" "$endpoint" "$record" \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='correlated blocked-edge acknowledgement could not be persisted'; return 1; }
+  fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" consumed \
+    || { FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse consumption could not be persisted'; return 1; }
+}
+
 fm_reconcile_background_probe_can_absorb() {  # <state-dir> <id> [endpoint]
   local state=$1 id=$2 endpoint=${3:-} absorb_rc=0
   fm_reconcile_lock_acquire "$state" "$id"
-  if ! fm_reconcile_background_probe_pulse_valid "$state" "$id" "$endpoint"; then
-    absorb_rc=1
-  elif ! fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" consumed; then
-    FM_RECONCILE_BACKGROUND_PROBE_REJECTION='probe pulse consumption could not be persisted'
+  if ! fm_reconcile_background_probe_consume_locked "$state" "$id" "$endpoint"; then
     absorb_rc=1
   fi
   fm_reconcile_lock_release "$state" "$id"
   return "$absorb_rc"
+}
+
+fm_reconcile_background_probe_observe_composer() {  # <state-dir> <id> <endpoint> <empty|pending|unknown>
+  local state=$1 id=$2 endpoint=$3 composer=$4 out observe_rc=0 marker marker_signature marker_state
+  case "$composer" in empty|pending|unknown) ;; *) composer=unknown ;; esac
+  fm_reconcile_lock_acquire "$state" "$id"
+  fm_reconcile_background_probe_pulse_load "$state" "$id"
+  if [ "$FM_RECONCILE_PROBE_PULSE_STATE" != armed ] \
+    || ! fm_reconcile_background_probe_active "$state" "$id"; then
+    observe_rc=2
+  else
+    marker=$(fm_transition_composer_marker_path "$state" "$endpoint")
+    marker_signature=$(fm_reconcile_file_signature "$marker")
+    if [ "$marker_signature" != "$FM_RECONCILE_PROBE_PULSE_COMPOSER_MARKER" ]; then
+      marker_state=$(fm_reconcile_record_value "$marker" state)
+      composer=${marker_state:-unknown}
+    fi
+  fi
+  if [ "$observe_rc" -ne 0 ]; then
+    :
+  elif [ "$composer" != empty ]; then
+    if out=$(fm_reconcile_background_probe_invalidate_locked "$state" "$id" "composer state changed while pulse was armed: $composer"); then
+      [ -z "$out" ] || printf '%s\n' "$out"
+    else
+      observe_rc=$?
+    fi
+  else
+    if [ "$FM_RECONCILE_PROBE_PULSE_STATE" != armed ]; then
+      observe_rc=2
+    fi
+  fi
+  fm_reconcile_lock_release "$state" "$id"
+  return "$observe_rc"
+}
+
+fm_reconcile_background_probe_recover_pulse_locked() {  # <state-dir> <id>
+  local state=$1 id=$2 record endpoint working_marker blocked_marker composer_marker
+  local working_signature blocked_signature composer_signature composer_state reason
+  record="$state/$id.reconciled"
+  [ -f "$record" ] || return 0
+  fm_reconcile_background_probe_pulse_load "$state" "$id"
+  [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ] || return 0
+  if [ "$(fm_reconcile_record_value "$record" background_probe_armed)" != 1 ]; then
+    reason=$(fm_reconcile_record_value "$record" background_probe_invalidation_reason)
+    [ -n "$reason" ] || reason=$(fm_reconcile_record_value "$record" pending_action_reason)
+    [ -n "$reason" ] || reason='reconciled probe invalidation recovery'
+    fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$reason"
+    return
+  fi
+  case "$(fm_reconcile_record_value "$record" state)" in paused|idle) ;; *) return 0 ;; esac
+  endpoint=$(fm_reconcile_record_value "$record" endpoint)
+  working_marker=$(fm_transition_working_marker_path "$state" "$endpoint")
+  blocked_marker=$(fm_transition_blocked_marker_path "$state" "$endpoint")
+  composer_marker=$(fm_transition_composer_marker_path "$state" "$endpoint")
+  working_signature=$(fm_reconcile_file_signature "$working_marker")
+  blocked_signature=$(fm_reconcile_file_signature "$blocked_marker")
+  composer_signature=$(fm_reconcile_file_signature "$composer_marker")
+  if [ "$composer_signature" != "$FM_RECONCILE_PROBE_PULSE_COMPOSER_MARKER" ]; then
+    composer_state=$(fm_reconcile_record_value "$composer_marker" state)
+    fm_reconcile_background_probe_invalidate_locked "$state" "$id" \
+      "composer state changed while pulse was armed: ${composer_state:-unknown}" >/dev/null
+    return
+  fi
+  case "$working_signature:$blocked_signature" in *unreadable*) return 1 ;; esac
+  if [ "$working_signature" != "$FM_RECONCILE_PROBE_PULSE_WORKING_MARKER" ] \
+    && [ "$blocked_signature" != "$FM_RECONCILE_PROBE_PULSE_BLOCKED_MARKER" ]; then
+    fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" consumed 'recovered committed identical-pause return'
+  fi
 }
 
 fm_reconcile_write_record() {  # uses FM_RECONCILE_WRITE_* globals
@@ -1042,6 +1227,32 @@ fm_reconcile_meta_matches() {  # <state-dir> <id> <signature> <generation>
   ! fm_reconcile_tombstone_active "$state" "$id" || return 1
   [ "$(fm_reconcile_file_signature "$meta")" = "$expected" ] || return 1
   [ "$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)" = "$expected_generation" ]
+}
+
+fm_reconcile_reset_stale_lifecycle_locked() {  # <state-dir> <id> <lifecycle-generation>
+  local state=$1 id=$2 generation=$3 record wait pulse wait_generation registration kind marker
+  record="$state/$id.reconciled"
+  wait="$state/$id.wait"
+  pulse="$state/$id.probe-pulse"
+  if [ -f "$record" ] \
+    && [ "$(fm_reconcile_record_value "$record" lifecycle_generation)" != "$generation" ]; then
+    rm -f "$record" || return 1
+  fi
+  if [ -f "$pulse" ] \
+    && [ "$(fm_reconcile_record_value "$pulse" lifecycle_generation)" != "$generation" ]; then
+    rm -f "$pulse" || return 1
+  fi
+  [ -f "$wait" ] || return 0
+  wait_generation=$(fm_reconcile_record_value "$wait" lifecycle_generation)
+  [ "$wait_generation" = "$generation" ] && return 0
+  case "$generation:$wait_generation" in legacy:*:) return 0 ;; esac
+  kind=$(fm_reconcile_record_value "$wait" kind)
+  registration=$(fm_reconcile_record_value "$wait" registration_id)
+  marker=$(fm_reconcile_legacy_check_marker "$state/$id.check.sh")
+  if [ "$kind" = legacy-check ] && [ -n "$registration" ] && [ "$marker" = "$registration" ]; then
+    rm -f "$state/$id.check.sh" || return 1
+  fi
+  rm -f "$wait" "$state/$id.wait-commit" "$pulse"
 }
 
 fm_reconcile_task_id_valid() {
@@ -1431,7 +1642,7 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   local old_probe_wait_evidence old_probe_observed probe_armed probe_wait_sig probe_endpoint probe_status_seq probe_status_sig
   local old_probe_invalidation_seq old_probe_invalidation_reason old_probe_invalidated_at
   local probe_status_signal probe_wait_evidence probe_observed probe_invalidation_seq probe_invalidation_reason probe_invalidated_at
-  local background_probe_return=0 pending_evidence_changed=0 pulse_now=0
+  local background_probe_return=0 pending_evidence_changed=0 pulse_now=0 probe_consume_after_write=0
   local current_state current_source current_detail status_seq status_sig status_signal_before status_signal_sig turn_signal_sig last_status
   local prior_endpoint prior_state prior_source prior_evidence prior_observed transition_seq
   local wait_seq pending pending_version reason observation_key pending_observation candidate_token='' candidate_reason='' event_note=''
@@ -1440,6 +1651,8 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
 
   meta="$state/$id.meta"
   fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || return 0
+  fm_reconcile_reset_stale_lifecycle_locked "$state" "$id" "$lifecycle_generation" || return 1
+  fm_reconcile_background_probe_recover_pulse_locked "$state" "$id" || return 1
   record="$state/$id.reconciled"
   status_file="$state/$id.status"
   project=$(fm_reconcile_meta_value "$meta" project)
@@ -1632,10 +1845,6 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     probe_armed=0
     probe_invalidation_seq=$((old_probe_invalidation_seq + 1))
     probe_invalidated_at=$now
-    fm_reconcile_background_probe_pulse_load "$state" "$id"
-    if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
-      fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
-    fi
   fi
   if [ "$FM_RECONCILE_WAIT_ROLE" = background-probe ] \
     && [ "$FM_RECONCILE_WAIT_RESULT" = pending ] \
@@ -1690,9 +1899,9 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
     && [ "$probe_status_sig" = "$status_sig" ] \
     && [ "$probe_status_signal" = "$status_signal_sig" ] \
     && [ "$probe_wait_evidence" = "$FM_RECONCILE_WAIT_EVIDENCE" ]; then
-    if fm_reconcile_background_probe_pulse_valid "$state" "$id" "$endpoint" \
-      && fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" consumed; then
+    if fm_reconcile_background_probe_pulse_valid "$state" "$id" "$endpoint"; then
       background_probe_return=1
+      probe_consume_after_write=1
     else
       [ -n "$FM_RECONCILE_BACKGROUND_PROBE_REJECTION" ] \
         || FM_RECONCILE_BACKGROUND_PROBE_REJECTION='one-shot pulse consumption failed'
@@ -1700,10 +1909,6 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
       probe_armed=0
       probe_invalidation_seq=$((old_probe_invalidation_seq + 1))
       probe_invalidated_at=$now
-      fm_reconcile_background_probe_pulse_load "$state" "$id"
-      if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
-        fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
-      fi
     fi
   fi
 
@@ -1857,6 +2062,14 @@ fm_reconcile_observe_locked() {  # <state-dir> <id> <meta-signature> <lifecycle-
   FM_RECONCILE_WRITE_OBSERVER_SEQUENCE=$old_observer_seq
   fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || return 0
   fm_reconcile_write_record "$record" || return 1
+  if [ "$probe_consume_after_write" -eq 1 ]; then
+    fm_reconcile_background_probe_consume_locked "$state" "$id" "$endpoint" || return 1
+  elif [ -n "$probe_invalidation_reason" ] && [ "$probe_invalidation_seq" -gt "$old_probe_invalidation_seq" ]; then
+    fm_reconcile_background_probe_pulse_load "$state" "$id"
+    if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
+      fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
+    fi
+  fi
 
   if [ -n "$pending" ] \
     && { [ "$pending" != "$old_notified" ] || [ "$pending_version" != "$old_notified_version" ]; }; then
@@ -1892,6 +2105,7 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   local state=$1 id=$2 evidence=$3 expected_generation=${4:-} meta meta_signature lifecycle_generation record input tmp project kind repository_identity resolved_identity endpoint now
   local old_state old_evidence old_sequence old_pending old_reason old_notified old_pending_version old_notified_version pending pending_version reason token
   local old_pending_observation observation_key pending_observation
+  local old_probe_armed old_probe_invalidation_sequence probe_invalidation_sequence probe_invalidation_reason probe_invalidated_at=0
   meta="$state/$id.meta"
   [ -f "$meta" ] || return 0
   ! fm_reconcile_tombstone_active "$state" "$id" || return 0
@@ -1899,6 +2113,8 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   lifecycle_generation=$(fm_reconcile_meta_generation "$meta" 2>/dev/null || true)
   [ -n "$lifecycle_generation" ] || return 0
   [ -z "$expected_generation" ] || [ "$expected_generation" = "$lifecycle_generation" ] || return 0
+  fm_reconcile_reset_stale_lifecycle_locked "$state" "$id" "$lifecycle_generation" || return 1
+  fm_reconcile_background_probe_recover_pulse_locked "$state" "$id" || return 1
   record="$state/$id.reconciled"
   project=$(fm_reconcile_meta_value "$meta" project)
   kind=$(fm_reconcile_meta_value "$meta" kind)
@@ -1921,10 +2137,22 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   old_notified=$(fm_reconcile_record_value "$record" notified_action_token)
   old_notified_version=$(fm_reconcile_record_value "$record" notified_action_version)
   old_pending_observation=$(fm_reconcile_record_value "$record" pending_action_observation_key)
+  old_probe_armed=$(fm_reconcile_record_value "$record" background_probe_armed)
+  old_probe_invalidation_sequence=$(fm_reconcile_record_value "$record" background_probe_invalidation_sequence)
   case "$old_sequence" in ''|*[!0-9]*) old_sequence=0 ;; esac
   case "$old_pending_version" in *[!A-Za-z0-9._:-]*) old_pending_version= ;; esac
   case "$old_notified_version" in *[!A-Za-z0-9._:-]*) old_notified_version= ;; esac
+  case "$old_probe_armed" in 1) ;; *) old_probe_armed=0 ;; esac
+  case "$old_probe_invalidation_sequence" in ''|*[!0-9]*) old_probe_invalidation_sequence=0 ;; esac
   evidence=$(fm_reconcile_clean_value "$evidence")
+  probe_invalidation_sequence=$old_probe_invalidation_sequence
+  probe_invalidation_reason=$(fm_reconcile_record_value "$record" background_probe_invalidation_reason)
+  fm_reconcile_background_probe_pulse_load "$state" "$id"
+  if [ "$old_probe_armed" -eq 1 ] || [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
+    probe_invalidation_sequence=$((old_probe_invalidation_sequence + 1))
+    probe_invalidation_reason="observer failure while pulse was armed: $evidence"
+    probe_invalidated_at=$(date +%s)
+  fi
   pending=$old_pending
   pending_version=$old_pending_version
   reason=$old_reason
@@ -1980,6 +2208,9 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
     -v now="$now" \
     -v observer_evidence="$evidence" \
     -v observer_sequence="$old_sequence" \
+    -v probe_invalidation_sequence="$probe_invalidation_sequence" \
+    -v probe_invalidation_reason="$probe_invalidation_reason" \
+    -v probe_invalidated_at="$probe_invalidated_at" \
     -v observation_key="$observation_key" \
     -v pending="$pending" \
     -v pending_version="$pending_version" \
@@ -2009,6 +2240,12 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
       updates["observer_state"] = "failed"
       updates["observer_evidence"] = observer_evidence
       updates["observer_sequence"] = observer_sequence
+      if (probe_invalidated_at != 0) {
+        updates["background_probe_armed"] = "0"
+        updates["background_probe_invalidation_sequence"] = probe_invalidation_sequence
+        updates["background_probe_invalidation_reason"] = probe_invalidation_reason
+        updates["background_probe_invalidated_at"] = probe_invalidated_at
+      }
     }
     {
       split($0, parts, "=")
@@ -2041,7 +2278,11 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
       order[18] = "observer_state"
       order[19] = "observer_evidence"
       order[20] = "observer_sequence"
-      for (i = 1; i <= 20; i++) {
+      order[21] = "background_probe_armed"
+      order[22] = "background_probe_invalidation_sequence"
+      order[23] = "background_probe_invalidation_reason"
+      order[24] = "background_probe_invalidated_at"
+      for (i = 1; i <= 24; i++) {
         key = order[i]
         if (!(key in seen)) {
           if (key in updates) print key "=" updates[key]
@@ -2052,6 +2293,12 @@ fm_reconcile_observer_failure_locked() {  # <state-dir> <id> <evidence> [expecte
   ' "$input" > "$tmp" || { rm -f "$tmp"; return 1; }
   fm_reconcile_meta_matches "$state" "$id" "$meta_signature" "$lifecycle_generation" || { rm -f "$tmp"; return 0; }
   mv -f "$tmp" "$record" || return 1
+  if [ "$probe_invalidated_at" -ne 0 ]; then
+    fm_reconcile_background_probe_pulse_load "$state" "$id"
+    if [ "$FM_RECONCILE_PROBE_PULSE_STATE" = armed ]; then
+      fm_reconcile_background_probe_pulse_set_state "$FM_RECONCILE_PROBE_PULSE_FILE" invalidated "$probe_invalidation_reason" || return 1
+    fi
+  fi
   if [ -n "$pending" ] \
     && { [ "$pending" != "$old_notified" ] || [ "$pending_version" != "$old_notified_version" ]; }; then
     printf 'action\t%s\t%s\t%s\n' "$pending" "$pending_version" "$reason"

@@ -208,6 +208,50 @@ wait_for_pulse_state() {  # <pulse> <state>
   return 1
 }
 
+start_canary_probe_child() {  # <dir> <state> <worktree> <wait-bin>
+  local dir=$1 state=$2 wt=$3 wait_bin=$4 control="$1/probe-control" i=0
+  mkdir -p "$control"
+  cat > "$control/child.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+cd "$FM_PROBE_WORKTREE" || exit 1
+printf '%s\n' "$$" > "$FM_PROBE_CONTROL/ready"
+while :; do
+  if mv "$FM_PROBE_CONTROL/request" "$FM_PROBE_CONTROL/request.claim" 2>/dev/null; then
+    FM_STATE_OVERRIDE="$FM_PROBE_STATE" "$FM_PROBE_WAIT" arm-background-probe-pulse task "$$" \
+      > "$FM_PROBE_CONTROL/out.tmp" 2> "$FM_PROBE_CONTROL/err.tmp"
+    printf '%s\n' "$?" > "$FM_PROBE_CONTROL/rc.tmp"
+    mv "$FM_PROBE_CONTROL/out.tmp" "$FM_PROBE_CONTROL/out"
+    mv "$FM_PROBE_CONTROL/err.tmp" "$FM_PROBE_CONTROL/err"
+    mv "$FM_PROBE_CONTROL/rc.tmp" "$FM_PROBE_CONTROL/rc"
+    rm -f "$FM_PROBE_CONTROL/request.claim"
+  fi
+  sleep 0.02
+done
+SH
+  chmod +x "$control/child.sh"
+  FM_PROBE_WORKTREE="$wt" FM_PROBE_CONTROL="$control" FM_PROBE_STATE="$state" FM_PROBE_WAIT="$wait_bin" \
+    "$control/child.sh" &
+  CANARY_PROBE_CHILD=$!
+  ACTIVE_PIDS+=("$CANARY_PROBE_CHILD")
+  while [ ! -e "$control/ready" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ]
+}
+
+arm_canary_probe() {  # <dir>
+  local control="$1/probe-control" i=0 rc
+  rm -f "$control/rc" "$control/out" "$control/err"
+  : > "$control/request.tmp"
+  mv "$control/request.tmp" "$control/request"
+  while [ ! -e "$control/rc" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || return 1
+  rc=$(cat "$control/rc")
+  if [ "$rc" -ne 0 ]; then
+    cat "$control/err" >&2
+    return 1
+  fi
+}
+
 test_active_review_parks_without_stale_cadence() {
   local dir state out pid
   dir=$(make_canary parked 'paused: old review head still active')
@@ -425,7 +469,7 @@ SH
 }
 
 test_fleet_reconciliation_observes_tasks_in_one_bounded_batch() {
-  local dir state out pid task record start elapsed
+  local dir state out pid task record lifecycle_generation start elapsed
   dir=$(make_canary parallel-batch 'working: parallel reconciliation baseline')
   state="$dir/state"
   out="$dir/watch.out"
@@ -438,11 +482,14 @@ test_fleet_reconciliation_observes_tasks_in_one_bounded_batch() {
       "worktree=$dir/worktree-$task" \
       "project=$dir/project-$task" \
       'kind=ship'
+    lifecycle_generation=$(fm_reconcile_meta_generation "$state/$task.meta") \
+      || fail "could not resolve $task lifecycle generation"
     printf 'working: %s baseline\n' "$task" > "$state/$task.status"
     record="$state/$task.reconciled"
     fm_write_meta "$record" \
       'schema=fm-reconciled.v1' \
       "task=$task" \
+      "lifecycle_generation=$lifecycle_generation" \
       "endpoint=session:fm-$task" \
       'state=working' \
       'source=pane' \
@@ -474,7 +521,7 @@ SH
   pid=$CANARY_PID
   wait_for_watch_exit "$pid" || fail "bounded fleet reconciliation did not surface the ready task: $(cat "$out")"
   elapsed=$(( $(date +%s) - start ))
-  [ "$elapsed" -lt 3 ] || fail "fleet reconciliation serialized task observers (${elapsed}s)"
+  [ "$elapsed" -le 3 ] || fail "fleet reconciliation serialized task observers (${elapsed}s)"
   assert_contains "$(cat "$out")" 'working -> idle' "parallel fleet batch missed the actionable task"
   assert_one_wake "$state" 'working -> idle'
   unset FM_PARALLEL_STARTED FM_PARALLEL_LIVE
@@ -610,7 +657,7 @@ test_first_repository_identity_failure_is_delivered() {
 }
 
 test_later_worker_failure_is_recorded_after_first_action_selection() {
-  local dir state out pid task record
+  local dir state out pid task record lifecycle_generation
   dir=$(make_canary later-worker-failure 'working: batch failure fixture')
   state="$dir/state"
   out="$dir/watch.out"
@@ -624,10 +671,13 @@ test_later_worker_failure_is_recorded_after_first_action_selection() {
       'kind=ship'
     printf 'working: %s baseline\n' "$task" > "$state/$task.status"
   done
+  lifecycle_generation=$(fm_reconcile_meta_generation "$state/task-a.meta") \
+    || fail "could not resolve task-a lifecycle generation"
   record="$state/task-a.reconciled"
   fm_write_meta "$record" \
     'schema=fm-reconciled.v1' \
     'task=task-a' \
+    "lifecycle_generation=$lifecycle_generation" \
     'endpoint=session:fm-task-a' \
     'state=working' \
     'source=pane' \
@@ -686,7 +736,7 @@ SH
 
 test_herdr_push_probe_pulses_are_owned_across_restart() {
   local generic generic_state generic_out generic_pid predicate wait_bin
-  local dir state out pid wt child drained
+  local dir state out pid wt child drained invalidation
   wait_bin="$ROOT/bin/fm-external-wait.sh"
 
   generic=$(make_canary herdr-generic 'paused: waiting on an observable upstream gate')
@@ -743,9 +793,9 @@ printf 'corpus ledger pending\n'
 exit 1
 SH
   chmod +x "$predicate"
-  sh -c 'cd "$1" || exit 1; exec sleep 180' _ "$wt" &
-  child=$!
-  ACTIVE_PIDS+=("$child")
+  start_canary_probe_child "$dir" "$state" "$wt" "$wait_bin" \
+    || fail "controlled Herdr background-probe child did not start"
+  child=$CANARY_PROBE_CHILD
   FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
     || fail "could not register the controlled Herdr background probe"
   export FM_BACKEND_HERDR_EVENT_READER="$dir/fakebin/herdr-event-reader"
@@ -758,7 +808,10 @@ SH
   pid=$CANARY_PID
   wait_for_probe_armed "$state/task.reconciled" || fail "controlled Herdr background probe did not arm"
 
-  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
+  if FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null 2>&1; then
+    fail "the watcher canary driver authenticated with a caller-supplied child pid"
+  fi
+  arm_canary_probe "$dir" \
     || fail "could not arm controlled Herdr pulse one"
   queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
   wait_for_pulse_state "$state/task.probe-pulse" consumed || fail "controlled Herdr pulse one was not consumed"
@@ -769,7 +822,7 @@ SH
   : > "$out"
   start_watch "$dir" "$out"
   pid=$CANARY_PID
-  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
+  arm_canary_probe "$dir" \
     || fail "could not arm controlled Herdr pulse two after restart"
   queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
   wait_for_pulse_state "$state/task.probe-pulse" consumed || fail "controlled Herdr pulse two was not consumed"
@@ -777,13 +830,13 @@ SH
   kill -0 "$pid" 2>/dev/null || fail "owned Herdr pulses tripped the stale-wedge path: $(cat "$out")"
   [ ! -e "$state/.wake-queue" ] || fail "owned Herdr pulses produced a stale-wedge wake"
 
-  FM_STATE_OVERRIDE="$state" "$wait_bin" arm-background-probe-pulse task "$child" >/dev/null \
-    || fail "could not arm the pending-composer Herdr pulse"
-  printf 'captain draft' > "$dir/herdr-composer"
-  queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
-  wait_for_watch_exit "$pid" || fail "pending composer input during a probe pulse did not wake: $(cat "$out")"
-  assert_one_wake "$state" 'background-probe-invalidated'
+  arm_canary_probe "$dir" || fail "could not arm the transient-composer Herdr pulse"
+  queue_herdr_events "$dir" $'@composer\tw1:p1\tw1\t"│ captain draft │"'
   : > "$dir/herdr-composer"
+  wait_for_watch_exit "$pid" || fail "transient composer input during a probe pulse did not wake: $(cat "$out")"
+  wait_for_pulse_state "$state/task.probe-pulse" invalidated \
+    || fail "transient composer input did not durably invalidate its pulse"
+  assert_one_wake "$state" 'background-probe-invalidated'
   assert_restart_quiet "$dir"
 
   FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
@@ -793,7 +846,8 @@ SH
   pid=$CANARY_PID
   wait_for_probe_armed "$state/task.reconciled" || fail "non-probe Herdr registration did not arm"
   queue_herdr_events "$dir" $'w1:p1\tw1\tworking\tgrok\nw1:p1\tw1\tblocked\tgrok'
-  wait_for_watch_exit "$pid" || fail "unowned Herdr activity while armed did not wake: $(cat "$out")"
+  wait_for_watch_exit "$pid" \
+    || fail "unowned Herdr activity while armed did not wake: $(cat "$out")"
   assert_contains "$(cat "$out")" 'background-probe-invalidated' "unowned Herdr activity used the wrong wake path"
   drained=$(FM_STATE_OVERRIDE="$state" "$DRAIN")
   [ "$(printf '%s\n' "$drained" | awk 'NF { n++ } END { print n + 0 }')" -eq 1 ] \
@@ -807,6 +861,7 @@ SH
   start_watch "$dir" "$out"
   pid=$CANARY_PID
   wait_for_probe_armed "$state/task.reconciled" || fail "replacement Herdr registration did not arm"
+  arm_canary_probe "$dir" || fail "could not arm the predicate-failure Herdr pulse"
   cat > "$predicate" <<'SH'
 #!/usr/bin/env bash
 printf 'corpus predicate failed\n'
@@ -824,11 +879,49 @@ exit 1
 SH
   chmod +x "$predicate"
   FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not register the observer-failure Herdr canary"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "observer-failure Herdr registration did not arm"
+  arm_canary_probe "$dir" || fail "could not arm the observer-failure Herdr pulse"
+  printf 'malformed observer result\n' > "$dir/live"
+  wait_for_watch_exit "$pid" || fail "observer failure during an armed pulse did not wake: $(cat "$out")"
+  wait_for_pulse_state "$state/task.probe-pulse" invalidated \
+    || fail "observer failure did not invalidate the armed pulse"
+  assert_one_wake "$state" 'observer-failure'
+  printf 'state: paused · source: status-log · supervising an owned corpus probe\n' > "$dir/live"
+  assert_restart_quiet "$dir"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
+    || fail "could not register the crash-replay Herdr canary"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_probe_armed "$state/task.reconciled" || fail "crash-replay Herdr registration did not arm"
+  arm_canary_probe "$dir" || fail "could not arm the crash-replay Herdr pulse"
+  stop_watch "$pid"
+  invalidation=$(fm_reconcile_background_probe_invalidate "$state" task 'simulated crash after durable invalidation commit') \
+    || fail "could not persist the crash-replay invalidation"
+  assert_contains "$invalidation" 'background-probe-invalidated' "crash seam did not persist an action"
+  fm_reconcile_background_probe_pulse_set_state "$state/task.probe-pulse" armed \
+    || fail "could not recreate the post-commit crash seam"
+  : > "$out"
+  start_watch "$dir" "$out"
+  pid=$CANARY_PID
+  wait_for_watch_exit "$pid" || fail "watcher did not replay the committed probe invalidation: $(cat "$out")"
+  wait_for_pulse_state "$state/task.probe-pulse" invalidated \
+    || fail "crash replay left the secondary pulse armed"
+  assert_one_wake "$state" 'background-probe-invalidated'
+  assert_restart_quiet "$dir"
+
+  FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
     || fail "could not register the child-failure Herdr canary"
   : > "$out"
   start_watch "$dir" "$out"
   pid=$CANARY_PID
   wait_for_probe_armed "$state/task.reconciled" || fail "child-failure Herdr registration did not arm"
+  arm_canary_probe "$dir" || fail "could not arm the child-failure Herdr pulse"
   kill "$child" 2>/dev/null || true
   wait "$child" 2>/dev/null || true
   wait_for_watch_exit "$pid" || fail "background-probe child failure did not wake: $(cat "$out")"

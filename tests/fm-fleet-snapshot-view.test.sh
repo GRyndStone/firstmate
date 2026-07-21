@@ -593,7 +593,7 @@ test_snapshot_rejects_stale_generation_reconciliation() {
   pass "snapshot rejects stale-generation reconciliation data"
 }
 
-test_snapshot_exposes_background_probe_ownership() {
+test_snapshot_rejects_unowned_background_probe_pulse() {
   local home fakebin out now wait_sig status_sig status_signal
   home=$(make_home background-probe-snapshot)
   mkdir -p "$home/projects/background-probe"
@@ -668,11 +668,13 @@ test_snapshot_exposes_background_probe_ownership() {
       and .external_wait.background_probe.endpoint == "firstmate:fm-background-probe"
       and .external_wait.background_probe.status_sequence == 1
       and .external_wait.background_probe.wait_evidence == "ledger revision 4 pending"
-      and .external_wait.background_probe.pulse.state == "armed"
-      and .external_wait.background_probe.pulse.id == "background-probe-pulse"
-      and .external_wait.background_probe.pulse.registration_id == "background-probe-registration"
-  ' >/dev/null || fail "snapshot omitted durable background-probe ownership: $out"
-  pass "snapshot exposes lifecycle-bound background-probe ownership and its paused baseline"
+      and .external_wait.background_probe.pulse.current == false
+      and .external_wait.background_probe.pulse.state == null
+      and .external_wait.background_probe.pulse.raw_state == "armed"
+      and .external_wait.background_probe.pulse.id == null
+      and .external_wait.background_probe.pulse.registration_id == null
+  ' >/dev/null || fail "snapshot promoted an unowned raw pulse to reconciled truth: $out"
+  pass "snapshot exposes raw stale pulse state without promoting it as current"
 }
 
 test_snapshot_reports_unmanaged_check_as_lifecycle_current() {
@@ -863,5 +865,5 @@ test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
 test_snapshot_separates_reconciled_truth_event_history_and_wait
 test_snapshot_rejects_stale_generation_reconciliation
-test_snapshot_exposes_background_probe_ownership
+test_snapshot_rejects_unowned_background_probe_pulse
 test_snapshot_reports_unmanaged_check_as_lifecycle_current

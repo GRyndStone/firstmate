@@ -196,6 +196,13 @@ SPAWN_ENDPOINT_CREATED=0
 SPAWN_WORKTREE_CREATED=0
 SPAWN_PARTIAL_ENDPOINT=0
 SPAWN_CREATION_STARTED=0
+SPAWN_TASK_TMP_CREATED=0
+SPAWN_CLAUDE_HOOK_CREATED=0
+SPAWN_OPENCODE_HOOK_CREATED=0
+SPAWN_PI_EXT_CREATED=0
+SPAWN_GROK_POINTER_CREATED=0
+SPAWN_GROK_TOKEN_CREATED=0
+SPAWN_GROK_AUTH_TOKEN=
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -326,13 +333,18 @@ spawn_abort_cleanup() {
     cleanup_failed=1
   fi
   if [ -n "${WT:-}" ] && [ -d "$WT" ]; then
-    rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend" 2>/dev/null || true
+    if [ "$SPAWN_CLAUDE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.claude/settings.local.json" 2>/dev/null || true; fi
+    if [ "$SPAWN_OPENCODE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.opencode/plugins/fm-turn-end.js" 2>/dev/null || true; fi
+    if [ "$SPAWN_GROK_POINTER_CREATED" -eq 1 ]; then rm -f "$WT/.fm-grok-turnend" 2>/dev/null || true; fi
   fi
-  if [ -n "${TASK_TMP:-}" ]; then rm -rf "$TASK_TMP" 2>/dev/null || true; fi
+  if [ "$SPAWN_TASK_TMP_CREATED" -eq 1 ] && [ -n "${TASK_TMP:-}" ]; then rm -rf "$TASK_TMP" 2>/dev/null || true; fi
   if [ -n "${STATE:-}" ] && [ -n "${ID:-}" ]; then
-    token=$(cat "$STATE/$ID.grok-turnend-token" 2>/dev/null || true)
-    case "$token" in ''|*[!A-Za-z0-9._-]*) ;; *) rm -f "${GROK_AUTH_DIR:-/nonexistent}/$token" 2>/dev/null || true ;; esac
-    rm -f "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" 2>/dev/null || true
+    if [ "$SPAWN_GROK_TOKEN_CREATED" -eq 1 ]; then
+      token=$SPAWN_GROK_AUTH_TOKEN
+      case "$token" in ''|*[!A-Za-z0-9._-]*) ;; *) rm -f "${GROK_AUTH_DIR:-/nonexistent}/$token" 2>/dev/null || true ;; esac
+      rm -f "$STATE/$ID.grok-turnend-token" 2>/dev/null || true
+    fi
+    if [ "$SPAWN_PI_EXT_CREATED" -eq 1 ]; then rm -f "$STATE/$ID.pi-ext.ts" 2>/dev/null || true; fi
   fi
   if [ "$cleanup_failed" -eq 1 ] && [ "$SPAWN_CLAIMED" -eq 1 ]; then
     if [ "$creation_uncertain" -eq 1 ]; then
@@ -386,7 +398,6 @@ spawn_abort_cleanup() {
   fi
   return "$status"
 }
-trap spawn_abort_cleanup EXIT
 
 parse_partial_create_result() {
   local raw=$1 rest
@@ -436,10 +447,15 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   done
   exit "$rc"
 fi
-ID=${POS[0]}
+ID=${POS[0]:-}
+if ! fm_reconcile_task_id_valid "$ID"; then
+  echo "error: invalid task id '$ID'" >&2
+  exit 2
+fi
 LIFECYCLE_GENERATION=$(fm_task_identity_new_token) \
   || { echo "error: cannot create lifecycle generation for task $ID" >&2; exit 1; }
 TREEHOUSE_LEASE_HOLDER="$ID-$LIFECYCLE_GENERATION"
+trap spawn_abort_cleanup EXIT
 PROJ=
 ARG3=
 FIRSTMATE_HOME=
@@ -1162,6 +1178,7 @@ fi
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
 # targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
 TASK_TMP="/tmp/fm-$ID"
+if [ ! -e "$TASK_TMP" ]; then SPAWN_TASK_TMP_CREATED=1; fi
 mkdir -p "$TASK_TMP/gotmp"
 
 # Per-harness turn-end hook: a file that touches state/<id>.turn-ended when the
@@ -1181,6 +1198,9 @@ if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
+      [ ! -e "$WT/.claude/settings.local.json" ] \
+        || { echo "error: refusing to replace existing Claude hook in $WT" >&2; exit 1; }
+      SPAWN_CLAUDE_HOOK_CREATED=1
       cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
@@ -1188,6 +1208,9 @@ EOF
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
+      [ ! -e "$WT/.opencode/plugins/fm-turn-end.js" ] \
+        || { echo "error: refusing to replace existing OpenCode hook in $WT" >&2; exit 1; }
+      SPAWN_OPENCODE_HOOK_CREATED=1
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
 export const FmTurnEnd = async ({ \$ }) => ({
   event: async ({ event }) => {
@@ -1201,6 +1224,9 @@ EOF
       # Written OUTSIDE the worktree: pi's project-trust gate fires on any extension
       # loaded from inside the project (verified live), but an explicit -e path
       # elsewhere loads without a dialog. Lives in state/, cleaned by teardown.
+      [ ! -e "$STATE/$ID.pi-ext.ts" ] \
+        || { echo "error: refusing to replace existing pi hook for $ID" >&2; exit 1; }
+      SPAWN_PI_EXT_CREATED=1
       cat > "$STATE/$ID.pi-ext.ts" <<EOF
 // Firstmate turn-end signal; written by fm-spawn.
 // Use "turn_end" (fires after each turn the agent finishes), not "agent_end"
@@ -1232,11 +1258,17 @@ EOF
       # touches grok's managed config - only firstmate-owned files.
       GROK_HOOKS_DIR="${GROK_HOME:-$HOME/.grok}/hooks"
       GROK_AUTH_DIR="$GROK_HOOKS_DIR/fm-turn-end.d"
+      [ ! -e "$STATE/$ID.grok-turnend-token" ] \
+        || { echo "error: refusing to replace existing Grok token for $ID" >&2; exit 1; }
+      [ ! -e "$WT/.fm-grok-turnend" ] \
+        || { echo "error: refusing to replace existing Grok hook pointer in $WT" >&2; exit 1; }
       mkdir -p "$GROK_AUTH_DIR"
       old_umask=$(umask)
       umask 077
       auth_file=$(mktemp "$GROK_AUTH_DIR/fm.XXXXXXXXXXXX")
       umask "$old_umask"
+      SPAWN_GROK_AUTH_TOKEN=${auth_file##*/}
+      SPAWN_GROK_TOKEN_CREATED=1
       printf '%s\n' "$TURNEND" > "$auth_file"
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.grok-turnend-token"
       sq_grok_auth_dir=$(shell_quote "$GROK_AUTH_DIR")
@@ -1261,6 +1293,7 @@ EOF
       chmod +x "$GROK_HOOKS_DIR/fm-turn-end.sh"
       hook_command=$(json_escape "bash $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
       printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$hook_command" > "$GROK_HOOKS_DIR/fm-turn-end.json"
+      SPAWN_GROK_POINTER_CREATED=1
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
       exclude_path '.fm-grok-turnend'
       ;;

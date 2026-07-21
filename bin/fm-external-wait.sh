@@ -229,10 +229,14 @@ case "$command" in
     [ "$#" -eq 3 ] || { usage >&2; exit 2; }
     pid=${3:-}
     case "$pid" in ''|*[!0-9]*) echo "error: background-probe pulse pid must be decimal" >&2; exit 2 ;; esac
-    if ! pulse_id=$(fm_reconcile_background_probe_arm_pulse "$STATE" "$id" "$pid"); then
+    arm_result="$STATE/.$id.probe-arm.${BASHPID:-$$}"
+    if ! fm_reconcile_background_probe_arm_pulse "$STATE" "$id" "$pid" > "$arm_result"; then
+      rm -f "$arm_result"
       echo "error: cannot arm background-probe pulse for $id: ${FM_RECONCILE_BACKGROUND_PROBE_REJECTION:-ownership validation failed}" >&2
       exit 1
     fi
+    pulse_id=$(< "$arm_result")
+    rm -f "$arm_result"
     echo "armed one-shot background-probe pulse for $id: $pulse_id"
     ;;
   clear)

@@ -2022,6 +2022,38 @@ test_apply_transition_working_clears_marker() {
   pass "fm_backend_herdr_apply_transition: a working edge clears the marker so the next ->blocked re-escalates"
 }
 
+test_level_working_never_creates_correlation() {
+  local dir state working escalation correlation rc
+  dir="$TMP_ROOT/apply-level-working"; state="$dir/state"; mkdir -p "$state"
+  escalation="$state/.herdr-escalated-default_wG_pQ"
+  correlation="$state/.transition-working-default_wG_pQ"
+  : > "$escalation"
+  working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3" level' \
+    "$ROOT" "$state" default "$working"; rc=$?
+  [ "$rc" = 1 ] || fail "a level-read working state must remain non-actionable, got $rc"
+  [ ! -e "$escalation" ] || fail "a level-read working state did not clear prior blocked dedupe"
+  [ ! -e "$correlation" ] || fail "a reconnect level read created a false working-edge correlation"
+  pass "reconnect level reads never create working-edge pulse correlation"
+}
+
+test_working_marker_failure_propagates_and_reopens_blocked_edge() {
+  local dir state agent fb reader lines rc escalation
+  dir="$TMP_ROOT/wt-working-marker-failure"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  fb=$(make_herdr_eventfake "$dir")
+  set_fake_agent "$agent" "wG:pQ" idle
+  reader=$(make_fake_reader "$dir"); lines="$dir/lines"
+  printf 'wG:pQ\t\tworking\tclaude\n' > "$lines"
+  escalation="$state/.herdr-escalated-sess_wG_pQ"
+  : > "$escalation"
+  rc=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
+    FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_transition_record_working() { return 1; }; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; echo $?' "$ROOT" "$state" | tail -1)
+  [ "$rc" = 2 ] || fail "working-marker persistence failure was not propagated as adapter failure: $rc"
+  [ ! -e "$escalation" ] || fail "working-marker failure left the prior blocked marker deduping the next edge"
+  pass "working-marker failures fail closed and leave the next blocked edge eligible"
+}
+
 test_clear_transition_removes_task_marker() {
   local dir state marker
   dir="$TMP_ROOT/clear-transition"; state="$dir/state"; mkdir -p "$state"
@@ -2075,6 +2107,8 @@ test_wait_transition_reconcile_blocked_returns_record() {
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ' "$ROOT" "$state"); rc=$?
   [ "$rc" = 0 ] || fail "reconcile of an already-blocked pane must return 0, got $rc"
   case "$out" in *blocked*) : ;; *) fail "reconcile must print the blocked record, got '$out'" ;; esac
+  [ "$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_workspace_id "$1"' "$ROOT" "$out")" = @level ] \
+    || fail "reconnect reconciliation did not identify its record as a level read"
   [ ! -e "$marker" ] || fail "reconcile must not mark a blocked pane before the caller durably handles it"
   [ -z "$(find "$temp" -mindepth 1 -print -quit)" ] || fail "actionable reconciliation must remove its private FIFO directory"
   pass "fm_backend_herdr_wait_transition: reconnect level-reconcile returns an uncommitted blocked pane"
@@ -2145,6 +2179,23 @@ test_wait_transition_stream_absorb_clears_then_timeout() {
   [ "$rc" = 1 ] || fail "a stream of only working/idle edges must end as a clean timeout (rc 1), got $rc"
   [ ! -e "$marker" ] || fail "a streamed working edge must clear the escalation marker"
   pass "fm_backend_herdr_wait_transition: streamed working clears the marker, idle/done are deferred (clean timeout)"
+}
+
+test_wait_transition_persists_transient_composer_snapshot() {
+  local dir state agent fb reader lines rc marker
+  dir="$TMP_ROOT/wt-composer-snapshot"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  fb=$(make_herdr_eventfake "$dir")
+  set_fake_agent "$agent" "wG:pQ" idle
+  reader=$(make_fake_reader "$dir"); lines="$dir/lines"
+  printf '@composer\twG:pQ\twG\t"│ captain draft │"\n' > "$lines"
+  rc=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
+    FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; echo $?' "$ROOT" "$state" | tail -1)
+  [ "$rc" = 1 ] || fail "composer-only stream should finish as a clean wait, got $rc"
+  marker="$state/.transition-composer-sess_wG_pQ"
+  [ "$(awk -F= '$1 == "state" { print substr($0, index($0, "=") + 1); exit }' "$marker")" = pending ] \
+    || fail "the exact pending composer event snapshot was not persisted"
+  pass "Herdr output events durably preserve transient pending composer input"
 }
 
 test_wait_transition_reader_failure_returns_2() {
@@ -2288,6 +2339,8 @@ test_normalize_event_leaves_from_empty
 test_escalation_marker_keys_like_watcher
 test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
+test_level_working_never_creates_correlation
+test_working_marker_failure_propagates_and_reopens_blocked_edge
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2
@@ -2297,6 +2350,7 @@ test_wait_transition_subscribes_before_reconcile
 test_wait_transition_reconcile_dedupes_when_marked
 test_wait_transition_stream_blocked_returns_record
 test_wait_transition_stream_absorb_clears_then_timeout
+test_wait_transition_persists_transient_composer_snapshot
 test_wait_transition_reader_failure_returns_2
 test_wait_transition_bad_ack_returns_2_and_cleans_up
 test_wait_transition_clean_timeout_returns_1

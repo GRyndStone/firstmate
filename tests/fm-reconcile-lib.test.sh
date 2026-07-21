@@ -945,7 +945,19 @@ test_delivery_version_is_unique_across_task_lifecycles() {
   first_token=$(printf '%s' "$first" | cut -f2)
   first_version=$(printf '%s' "$first" | cut -f3)
 
-  rm -f "$state/task.reconciled"
+  fm_write_meta "$state/task.wait" \
+    'schema=fm-external-wait.v1' \
+    'kind=predicate' \
+    'description=old lifecycle wait' \
+    'registration_id=old-lifecycle-registration' \
+    'lifecycle_generation=lifecycle-one' \
+    "predicate=$dir/predicate.sh" \
+    'registered_at=1'
+  fm_write_meta "$state/task.probe-pulse" \
+    'schema=fm-background-probe-pulse.v1' \
+    'state=armed' \
+    'lifecycle_generation=lifecycle-one' \
+    'pulse_id=old-lifecycle-pulse'
   fm_write_meta "$state/task.meta" \
     'window=session:fm-task' \
     'generation=lifecycle-two' \
@@ -960,6 +972,8 @@ test_delivery_version_is_unique_across_task_lifecycles() {
   second_version=$(printf '%s' "$second" | cut -f3)
   [ "$second_token" = "$first_token" ] || fail "lifecycle replay fixture did not reuse its action token"
   [ "$second_version" != "$first_version" ] || fail "replacement lifecycle reused an old delivery version"
+  [ ! -e "$state/task.wait" ] || fail "replacement lifecycle inherited an old external wait"
+  [ ! -e "$state/task.probe-pulse" ] || fail "replacement lifecycle inherited an old probe pulse"
 
   old_reason="stale: session:fm-task old lifecycle $(fm_reconcile_action_marker task "$first_token" "$first_version")"
   fm_reconcile_consumer_ack_reason "$state" "$old_reason" \

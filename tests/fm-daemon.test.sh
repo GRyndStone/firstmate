@@ -335,8 +335,10 @@ test_handle_wake_escalates_reconciled_verdicts() {
   for verdict in \
     'reconciled-transition (working -> unknown)' \
     'external-wait-complete (OAuth callback)' \
+    'external-wait-changed (OAuth callback progress changed)' \
     'external-wait-failed (predicate exited 3)' \
     'external-wait-unobservable (no predicate registered)' \
+    'background-probe-invalidated (owned child changed)' \
     'observer-failure (task state observer timed out)'; do
     reason="stale: $win $verdict"
     FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"

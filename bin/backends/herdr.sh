@@ -72,12 +72,6 @@ FM_BACKEND_HERDR_MIN_PROTOCOL=14
 # (14): the adapter's spawn/capture/send primitives work on 14, only the push
 # subscriber needs 16.
 FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL=16
-# Per-pane escalation dedupe marker prefix, under the state dir. One marker per
-# window (keyed like the watcher's own .stale-<key>): set when a ->blocked edge
-# is enqueued, cleared on any working edge, so exactly one wake fires per
-# ->blocked edge and a reconnect level-reconcile never re-delivers a still-
-# blocked pane. Mirrors bin/fm-watch.sh's .stale-<key> naming.
-FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
 # .fm-secondmate-home is written by bin/fm-home-seed.sh (AGENTS.md section 6)
 # at a seeded secondmate home's root, containing exactly that secondmate's id.
 # The primary firstmate home never carries this marker.
@@ -907,10 +901,8 @@ FM_BACKEND_HERDR_IDLE_RE=${FM_BACKEND_HERDR_IDLE_RE:-'^Type a message\.\.\.$'}
 # recognized after a bordered composer row has already been structurally found.
 FM_BACKEND_HERDR_BARE_PROMPT_RE=${FM_BACKEND_HERDR_BARE_PROMPT_RE:-'^[❯›]'}
 
-fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
-  local target=$1 cap line trimmed found=0 shape="" raw_match="" bordered=0 stripped
-  cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
-    || fm_backend_herdr_capture "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+fm_backend_herdr_composer_state_from_capture() {  # <capture> -> empty|pending|unknown
+  local cap=$1 line trimmed found=0 shape="" raw_match="" bordered=0 stripped
   # Structural scan: locate the bottom-most composer row and remember its RAW
   # (styled) bytes. Shape detection runs on the plain row (fm_backend_herdr_strip_ansi
   # keeps ghost text so the border/prompt glyph is still visible); the raw row is
@@ -960,6 +952,13 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
   # is '^[❯›]'), so a bare shell prompt never reaches here - it stays 'unknown'
   # via the no-composer-row path above, exactly as before.
   fm_composer_classify_content "$bordered" "$stripped" "$FM_BACKEND_HERDR_IDLE_RE"
+}
+
+fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
+  local target=$1 cap
+  cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
+    || fm_backend_herdr_capture "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+  fm_backend_herdr_composer_state_from_capture "$cap"
 }
 
 # fm_backend_herdr_send_text_submit: type <text> into <target> once (raw,
@@ -1292,7 +1291,8 @@ fm_backend_herdr_socket_path() {  # <session>
 # fast-path (report section 5c trigger 1). Fails closed to the poll loop unless
 # ALL hold: herdr+jq present; the raw-socket reader available (python3, unless a
 # reader override is configured); client protocol >= FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL;
-# and both `events.subscribe` and `pane.agent_status_changed` present in `herdr
+# and `events.subscribe`, `pane.agent_status_changed`, and
+# `pane.output_matched` present in `herdr
 # api schema`. FM_BACKEND_HERDR_EVENTS_FORCE overrides the whole verdict for
 # tests (1 = capable, 0 = incapable) without touching the real binary. The
 # `api schema` read is ~220KB, so callers (the watcher) memoize this per session
@@ -1313,6 +1313,7 @@ fm_backend_herdr_events_capable() {  # <session>
   schema=$(herdr api schema --json 2>/dev/null) || return 1
   printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
   printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+  printf '%s' "$schema" | grep -Fq 'pane.output_matched' || return 1
   return 0
 }
 
@@ -1346,9 +1347,7 @@ fm_backend_herdr_event_reader_cmd() {
 # <window> ("<session>:<pane_id>"), keyed identically to the watcher's
 # .stale-<key> (tr ':/.' '___'), under <state_dir>.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
-  local state=$1 window=$2 key
-  key=$(printf '%s' "$window" | tr ':/.' '___')
-  printf '%s/%s%s' "$state" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$key"
+  fm_transition_blocked_marker_path "$1" "$2"
 }
 
 # fm_backend_herdr_apply_transition: route one normalized record through the
@@ -1360,8 +1359,9 @@ fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
 # returns 1. `defer`/`fallback`, and an already-marked `actionable`, return 1
 # with no output. <session> reconstructs the window ("<session>:<pane_id>") for
 # the marker key, matching the watcher's own key scheme.
-fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id to action window marker
+fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record> [stream|level]
+  local state=$1 session=$2 record=$3 origin=${4:-stream} pane_id to action window marker
+  case "$origin" in stream|level) ;; *) return 2 ;; esac
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   to=$(fm_transition_to_status "$record")
@@ -1376,20 +1376,21 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
       fi
       ;;
     absorb)
-      fm_transition_record_working "$state" "$window" "$record" || return 2
-      rm -f "$marker" 2>/dev/null || true
+      rm -f "$marker" || return 2
+      if [ "$origin" = stream ]; then
+        fm_transition_record_working "$state" "$window" "$record" || return 2
+      fi
       ;;
   esac
   return 1
 }
 
 fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id window marker
+  local state=$1 session=$2 record=$3 pane_id window
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   window="$session:$pane_id"
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  : > "$marker"
+  fm_transition_record_blocked "$state" "$window" "$record"
 }
 
 fm_backend_herdr_clear_transition() {  # <state_dir> <window>
@@ -1440,7 +1441,8 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   done < <(fm_backend_herdr_event_reader_cmd)
   [ "${#reader[@]}" -gt 0 ] || return 2
 
-  local fifo_dir fifo reader_pid line ws status agent raw record hit rc=1 reader_rc=0
+  local fifo_dir fifo reader_pid line ws status agent raw record hit apply_rc rc=1 reader_rc=0
+  local event_pane composer_snapshot composer_state known_pane
   fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
   fifo="$fifo_dir/events"
   if ! mkfifo "$fifo" 2>/dev/null; then
@@ -1471,12 +1473,14 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
       fi
       raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
       [ -n "$raw" ] || continue
-      record=$(fm_backend_herdr_normalize_event "$pane_id" "" "$raw" "")
-      if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
-        printf '%s' "$hit"
-        rc=0
-        break
-      fi
+      record=$(fm_backend_herdr_normalize_event "$pane_id" "@level" "$raw" "")
+      hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record" level)
+      apply_rc=$?
+      case "$apply_rc" in
+        0) printf '%s' "$hit"; rc=0; break ;;
+        1) ;;
+        *) rc=2; break ;;
+      esac
     done
   fi
 
@@ -1493,13 +1497,36 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
     ws=$(printf '%s' "$line" | cut -f2)
     status=$(printf '%s' "$line" | cut -f3)
     agent=$(printf '%s' "$line" | cut -f4)
-    [ -n "$pane_id" ] || continue
-    record=$(fm_backend_herdr_normalize_event "$pane_id" "$ws" "$status" "$agent")
-    if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
-      printf '%s' "$hit"
-      rc=0
-      break
+    if [ "$pane_id" = @composer ]; then
+      event_pane=$ws
+      known_pane=0
+      for w in "${pane_ids[@]}"; do
+        [ "$event_pane" != "$w" ] || known_pane=1
+      done
+      [ "$known_pane" -eq 1 ] || continue
+      composer_snapshot=$(printf '%s' "$agent" | jq -er 'select(type == "string")' 2>/dev/null) \
+        || { rc=2; break; }
+      composer_state=$(fm_backend_herdr_composer_state_from_capture "$composer_snapshot")
+      if [ "$composer_state" != empty ]; then
+        fm_transition_record_composer "$state" "$session:$event_pane" "$composer_state" \
+          || { rc=2; break; }
+      fi
+      continue
     fi
+    [ -n "$pane_id" ] || continue
+    known_pane=0
+    for w in "${pane_ids[@]}"; do
+      [ "$pane_id" != "$w" ] || known_pane=1
+    done
+    [ "$known_pane" -eq 1 ] || continue
+    record=$(fm_backend_herdr_normalize_event "$pane_id" "$ws" "$status" "$agent")
+    hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record" stream)
+    apply_rc=$?
+    case "$apply_rc" in
+      0) printf '%s' "$hit"; rc=0; break ;;
+      1) ;;
+      *) rc=2; break ;;
+    esac
   done
   if [ "$rc" -eq 0 ]; then
     kill "$reader_pid" 2>/dev/null || true

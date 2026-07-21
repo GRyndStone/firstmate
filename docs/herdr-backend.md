@@ -708,8 +708,13 @@ This is the follow-up the former "No `events.subscribe` native push" gap note de
 
 **Mechanism (one owner per contract).**
 `bin/fm-transition-lib.sh` owns the backend-neutral normalized-transition record shape and the single-owner status->action policy table (`fm_transition_policy`: `blocked`=actionable, `working`=absorb-and-clear-dedupe, `idle`/`done`=defer, anything else=fall back to polling).
-`bin/backends/herdr.sh` (`fm_backend_herdr_wait_transition`) subscribes to `pane.agent_status_changed` for this home's herdr panes over ONE raw `AF_UNIX` connection via `bin/backends/herdr-eventwait.py`, subscribing to ALL statuses (so `working` edges clear the per-pane dedupe marker) and returning the first fresh `blocked` edge; after the subscription acknowledgement it level-reconciles each pane's current state while the stream remains live, so a pane that went blocked during the gap is caught once and transitions during reconciliation are buffered.
+`bin/backends/herdr.sh` (`fm_backend_herdr_wait_transition`) subscribes to `pane.agent_status_changed` and snapshot-bearing `pane.output_matched` events for this home's herdr panes over ONE raw `AF_UNIX` connection via `bin/backends/herdr-eventwait.py`, subscribing to ALL statuses and returning the first fresh `blocked` edge.
+Streamed `working` edges clear the per-pane dedupe marker and create pulse correlation, while reconnect level reads may clear obsolete dedupe state but never create working-edge correlation.
+Reconnect `blocked` level reads are tagged as level observations and fail closed instead of consuming a pulse; only the poll reconciler may consume an identical-pause return without a streamed blocked edge, and it persists the corresponding blocked acknowledgement first.
+Output events durably classify the composer from the event's exact screen revision whenever it is non-empty or unreadable.
+After the subscription acknowledgement the adapter level-reconciles each pane's current state while the stream remains live, so a pane that went blocked during the gap is caught once and transitions during reconciliation are buffered.
 `bin/fm-watch.sh` splices this in as the watcher's terminal wait (`event_wait_or_sleep`, replacing the blind `sleep POLL` for push-capable homes): on a returned `blocked` it maps `pane_id -> <session>:<pane_id> -> task`, exempts `kind=secondmate` endpoints, and enqueues an immediate `stale` wake unless the state-reconciliation contract validates and consumes an exact one-shot background-probe pulse.
+The watcher commits the Herdr transition only after durable enqueue and before the wake path exits.
 There is no second watcher process: the reader is a short-lived subprocess of the single watcher, so the "exactly one live supervision cycle" invariant and every guard/beacon/arm/turn-end mechanism are unchanged.
 
 **Polling is the permanent fail-closed backstop.**

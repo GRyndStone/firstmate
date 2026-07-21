@@ -107,6 +107,47 @@ wait_for_process_cwd() {  # <pid> <root>
   return 1
 }
 
+start_probe_child() {  # <control-dir>
+  local control=$1
+  mkdir -p "$control"
+  cat > "$control/child.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+cd "$FM_PROBE_WORKTREE" || exit 1
+printf '%s\n' "$$" > "$FM_PROBE_CONTROL/ready"
+while :; do
+  if mv "$FM_PROBE_CONTROL/request" "$FM_PROBE_CONTROL/request.claim" 2>/dev/null; then
+    FM_STATE_OVERRIDE="$FM_PROBE_STATE" "$FM_PROBE_WAIT" arm-background-probe-pulse task "$$" \
+      > "$FM_PROBE_CONTROL/out.tmp" 2> "$FM_PROBE_CONTROL/err.tmp"
+    printf '%s\n' "$?" > "$FM_PROBE_CONTROL/rc.tmp"
+    mv "$FM_PROBE_CONTROL/out.tmp" "$FM_PROBE_CONTROL/out"
+    mv "$FM_PROBE_CONTROL/err.tmp" "$FM_PROBE_CONTROL/err"
+    mv "$FM_PROBE_CONTROL/rc.tmp" "$FM_PROBE_CONTROL/rc"
+    rm -f "$FM_PROBE_CONTROL/request.claim"
+  fi
+  sleep 0.02
+done
+SH
+  chmod +x "$control/child.sh"
+  FM_PROBE_WORKTREE="$wt" FM_PROBE_CONTROL="$control" FM_PROBE_STATE="$state" FM_PROBE_WAIT="$WAIT" \
+    "$control/child.sh" &
+  PROBE_CHILD_PID=$!
+  local i=0
+  while [ ! -e "$control/ready" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ]
+}
+
+arm_probe_from_child() {  # <control-dir>
+  local control=$1 i=0 rc
+  rm -f "$control/rc" "$control/out" "$control/err"
+  : > "$control/request.tmp"
+  mv "$control/request.tmp" "$control/request"
+  while [ ! -e "$control/rc" ] && [ "$i" -lt 100 ]; do sleep 0.02; i=$((i + 1)); done
+  [ "$i" -lt 100 ] || return 1
+  rc=$(cat "$control/rc")
+  [ "$rc" -eq 0 ]
+}
+
 test_owned_command_progress_and_scope() {
   local pid outside out token err detail registration physical_wt
   err="$TMP_ROOT/command-scope.err"
@@ -184,7 +225,7 @@ test_stalled_owned_command_ages_out() {
 }
 
 test_background_probe_is_durable_and_fail_closed() {
-  local pid predicate registration out token version restarted
+  local pid predicate registration out token version restarted control err
   predicate="$TMP_ROOT/background-probe.sh"
   cat > "$predicate" <<'SH'
 #!/usr/bin/env bash
@@ -193,8 +234,9 @@ exit 1
 SH
   chmod +x "$predicate"
   predicate="$(cd "$(dirname "$predicate")" && pwd -P)/$(basename "$predicate")"
-  sh -c 'cd "$1" || exit 1; exec sleep 30' _ "$wt" &
-  pid=$!
+  control="$TMP_ROOT/probe-control"
+  start_probe_child "$control" || fail "background-probe child did not start"
+  pid=$PROBE_CHILD_PID
   wait_for_process_cwd "$pid" "$wt" || { kill "$pid" 2>/dev/null || true; fail "background-probe child did not enter task worktree"; }
   printf 'paused: supervising a background ledger probe\n' > "$state/task.status"
   printf 'state: paused · source: status-log · supervising a background ledger probe\n' > "$live"
@@ -211,7 +253,13 @@ SH
   fm_reconcile_background_probe_can_absorb "$state" task session:fm-task \
     && { kill "$pid" 2>/dev/null || true; fail "static background-probe registration was absorbable without a one-shot pulse"; }
 
-  FM_STATE_OVERRIDE="$state" "$WAIT" arm-background-probe-pulse task "$pid" >/dev/null \
+  err="$TMP_ROOT/unowned-arm.err"
+  if FM_STATE_OVERRIDE="$state" "$WAIT" arm-background-probe-pulse task "$pid" 2> "$err"; then
+    fail "caller-supplied child pid authenticated an unowned pulse invocation"
+  fi
+  assert_contains "$(cat "$err")" 'not owned by the registered background-probe child identity' \
+    "unowned pulse rejection lost its identity evidence"
+  arm_probe_from_child "$control" \
     || { kill "$pid" 2>/dev/null || true; fail "could not arm the first one-shot background-probe pulse"; }
   fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
     || { kill "$pid" 2>/dev/null || true; fail "could not persist the first pulse working edge"; }
@@ -223,7 +271,9 @@ SH
   [ -z "$restarted" ] || { kill "$pid" 2>/dev/null || true; fail "identical background-probe return woke after restart: $restarted"; }
   [ "$(fm_reconcile_record_value "$state/task.probe-pulse" state)" = consumed ] \
     || { kill "$pid" 2>/dev/null || true; fail "first background-probe pulse was not consumed durably"; }
-  FM_STATE_OVERRIDE="$state" "$WAIT" arm-background-probe-pulse task "$pid" >/dev/null \
+  [ -e "$state/.herdr-escalated-session_fm-task" ] \
+    || { kill "$pid" 2>/dev/null || true; fail "poll consumption did not acknowledge its blocked edge"; }
+  arm_probe_from_child "$control" \
     || { kill "$pid" 2>/dev/null || true; fail "could not arm the repeated background-probe pulse"; }
   fm_transition_record_working "$state" session:fm-task "$(fm_transition_record pane task '' working grok)" \
     || { kill "$pid" 2>/dev/null || true; fail "could not persist the repeated pulse working edge"; }
@@ -258,7 +308,7 @@ SH
   version=$(printf '%s' "$out" | cut -f3)
   fm_reconcile_ack "$state" task "$token" "$version" || fail "could not acknowledge background-probe child failure"
   [ -z "$(observe)" ] || fail "acknowledged background-probe child failure duplicated"
-  pass "owned background probes absorb identical pause returns and surface evidence or child failure once"
+  pass "only the registered child can arm owned probes, whose returns and failures stay exact-once"
 }
 
 test_registration_and_clear_revalidate_serialized_lifecycle() {
