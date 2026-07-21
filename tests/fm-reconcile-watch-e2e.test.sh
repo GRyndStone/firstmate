@@ -200,12 +200,20 @@ wait_for_probe_armed() {  # <record>
 
 wait_for_pulse_state() {  # <pulse> <state>
   local pulse=$1 expected=$2 i=0
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt 200 ]; do
     if [ "$(fm_reconcile_record_value "$pulse" state)" = "$expected" ]; then return 0; fi
     sleep 0.05
     i=$((i + 1))
   done
   return 1
+}
+
+pulse_state_dump() {  # <pulse> <label>
+  local pulse=$1 label=$2
+  printf '%s: state=%s reason=%s\n' "$label" \
+    "$(fm_reconcile_record_value "$pulse" state)" \
+    "$(fm_reconcile_record_value "$pulse" state_reason)"
+  [ -f "$pulse" ] && cat "$pulse" || printf '%s: pulse file absent\n' "$label"
 }
 
 start_canary_probe_child() {  # <dir> <state> <worktree> <wait-bin>
@@ -878,6 +886,12 @@ printf 'corpus ledger pending\n'
 exit 1
 SH
   chmod +x "$predicate"
+  # The earlier pulse-ownership steps need a short stale escalate (2s) to prove
+  # owned pulses do not wedge. That same short window races the observer-failure
+  # step on loaded CI runners: a paused recheck can exit the watcher before
+  # reconcile_cycle records observer-failure and invalidates the pulse. Raise the
+  # threshold for the remaining fail-closed steps so only observer/probe paths wake.
+  export FM_CANARY_STALE_ESCALATE=999999
   FM_STATE_OVERRIDE="$state" "$wait_bin" register-background-probe task "$child" "$predicate" 'corpus ledger' >/dev/null \
     || fail "could not register the observer-failure Herdr canary"
   : > "$out"
@@ -887,8 +901,10 @@ SH
   arm_canary_probe "$dir" || fail "could not arm the observer-failure Herdr pulse"
   printf 'malformed observer result\n' > "$dir/live"
   wait_for_watch_exit "$pid" || fail "observer failure during an armed pulse did not wake: $(cat "$out")"
+  assert_contains "$(cat "$out")" 'observer-failure' \
+    "armed-pulse observer failure woke without observer-failure evidence: $(cat "$out")"
   wait_for_pulse_state "$state/task.probe-pulse" invalidated \
-    || fail "observer failure did not invalidate the armed pulse"
+    || fail "observer failure did not invalidate the armed pulse ($(pulse_state_dump "$state/task.probe-pulse" pulse); out=$(cat "$out"); reconciled armed=$(fm_reconcile_record_value "$state/task.reconciled" background_probe_armed) reason=$(fm_reconcile_record_value "$state/task.reconciled" background_probe_invalidation_reason))"
   assert_one_wake "$state" 'observer-failure'
   printf 'state: paused · source: status-log · supervising an owned corpus probe\n' > "$dir/live"
   assert_restart_quiet "$dir"
