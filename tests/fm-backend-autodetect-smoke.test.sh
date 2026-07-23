@@ -66,6 +66,7 @@ fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab se
 STATE="$TMP_ROOT/state"; DATA="$TMP_ROOT/data"; CONFIG="$TMP_ROOT/config"
 mkdir -p "$STATE" "$DATA/$ID" "$CONFIG"
 printf 'trivial autodetect-smoke brief: nothing to do.\n' > "$DATA/$ID/brief.md"
+fm_write_criteria "$DATA" "$ID"
 
 PROJ="$TMP_ROOT/scratch-project"
 mkdir -p "$PROJ"

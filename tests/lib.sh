@@ -246,6 +246,34 @@ fm_write_secondmate_meta() {
     "projects=$projects"
 }
 
+# fm_write_criteria <data-dir> <id> [brief-path]: write a minimal dispatchable
+# criteria artifact for <id>, and make sure the brief quotes its claim verbatim
+# so bin/fm-criteria-check.sh passes.
+#
+# Every fixture that spawns a ship or scout task now needs this, because the
+# dispatch gate refuses work whose criteria trace to nothing the captain asked
+# for. That cost is the point: a fixture that can dispatch without a mandate is
+# a fixture that proves the gate does not hold.
+fm_write_criteria() {
+  local data=$1 id=$2 brief=${3:-$1/$2/brief.md} claim
+  claim="fixture criterion for $id"
+  mkdir -p "$data/$id"
+  cat > "$data/$id/criteria.md" <<EOF
+# Ideal state
+> fixture: the captain asked for $id
+
+## AC-1
+claim:  $claim
+source: captain
+origin: "fixture: the captain asked for $id"
+probe:  fixture probe for $id
+anti:   a fixture criterion that cannot fail proves nothing
+EOF
+  if [ -f "$brief" ]; then
+    grep -Fq "$claim" "$brief" || printf '\n## Acceptance\n- AC-1: %s\n' "$claim" >> "$brief"
+  fi
+}
+
 # --- common assertions ------------------------------------------------------
 
 # assert_contains <haystack> <needle> <msg>

@@ -72,6 +72,7 @@ pass "task identity refuses cross-repository reuse with linked-task guidance"
 
 mkdir -p "$TMP_ROOT/data/task" "$TMP_ROOT/config" "$TMP_ROOT/projects"
 printf 'brief\n' > "$TMP_ROOT/data/task/brief.md"
+fm_write_criteria "$TMP_ROOT/data" "task"
 printf 'live pi hook\n' > "$state/task.pi-ext.ts"
 printf 'live-token\n' > "$state/task.grok-turnend-token"
 spawn_before=$(cksum "$state/task.meta")

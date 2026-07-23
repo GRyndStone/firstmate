@@ -1044,6 +1044,24 @@ else
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
+# Dispatch gate. Brief existence was the only thing ever checked here, which is
+# how a worker was once launched on a brief whose task section still read
+# {TASK}, and how four consecutive repair briefs went out carrying criteria that
+# traced only to the previous round's findings and never to anything the captain
+# asked for. bin/fm-criteria-check.sh gates on provenance: a criterion cannot
+# claim the captain as its source without carrying his words, so work with no
+# mandate cannot be dispatched at all. Fail-closed and deliberately without a
+# bypass - the artifact costs four lines, and an escape hatch is how a gate
+# becomes theater. Secondmate charters are a different contract and are exempt.
+if [ "$KIND" != "secondmate" ] && [ -x "$SCRIPT_DIR/fm-criteria-check.sh" ]; then
+  if ! criteria_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-criteria-check.sh" "$ID" --brief "$BRIEF" 2>&1); then
+    printf '%s\n' "$criteria_out" >&2
+    echo "error: refusing to dispatch $ID until its criteria trace to the captain" >&2
+    exit 1
+  fi
+fi
+
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
 # Every backend's own current-path read (tmux's pane_current_path, herdr's
