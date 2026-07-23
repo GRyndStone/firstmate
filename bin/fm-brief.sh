@@ -123,6 +123,51 @@ BRIEF="$DATA/$ID/brief.md"
 [ -e "$BRIEF" ] && { echo "error: $BRIEF already exists" >&2; exit 1; }
 mkdir -p "$DATA/$ID"
 
+# --- criteria: authored once, copied mechanically ---------------------------
+#
+# The criteria artifact is written BEFORE the brief and the brief quotes it
+# verbatim. That order is the whole point. When the brief was authored first and
+# its criteria written from whatever was most recently learned, each round
+# produced a fresh document inheriting nothing, and the link back to what the
+# captain asked for was made by hand once and then dropped.
+#
+# This composer is deliberately dumb: it copies claim text, it never rewrites
+# it. A composer allowed to paraphrase is how a criterion silently becomes a
+# different criterion between the artifact and the worker.
+# bin/fm-criteria-check.sh refuses the dispatch if the copy does not match.
+CRITERIA="$DATA/$ID/criteria.md"
+CRITERIA_SECTION=""
+if [ "$KIND" != secondmate ]; then
+  if [ ! -e "$CRITERIA" ]; then
+    cat > "$CRITERIA" <<'CRITEOF'
+# Ideal state
+> {CAPTAIN_LITERAL}
+
+## AC-1
+claim:  {CLAIM}
+source: captain
+origin: {ORIGIN}
+probe:  {PROBE}
+anti:   {ANTI}
+CRITEOF
+    echo "scaffolded: $CRITERIA (fill it from the captain's own words BEFORE the brief)"
+  fi
+  CRITERIA_SECTION=$(awk '
+    /^##[[:space:]]*AC-[0-9]+/ {
+      id=$2; sub(/[^A-Za-z0-9-]+$/, "", id); next
+    }
+    id != "" && /^[[:space:]]*claim:/ {
+      sub(/^[[:space:]]*claim:[[:space:]]*/, "")
+      printf "- %s: %s\n", id, $0
+      id=""
+    }
+  ' "$CRITERIA" 2>/dev/null || true)
+  if [ -n "$CRITERIA_SECTION" ]; then
+    CRITERIA_SECTION="## Acceptance
+$CRITERIA_SECTION"
+  fi
+fi
+
 shell_quote() {
   printf "'"
   printf '%s' "$1" | sed "s/'/'\\\\''/g"
@@ -254,6 +299,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 # Task
 {TASK}
 
+$CRITERIA_SECTION
+
 $HERDR_SECTION
 
 # Setup
@@ -305,6 +352,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$CRITERIA_SECTION
 
 $HERDR_SECTION
 
@@ -447,6 +496,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$CRITERIA_SECTION
 
 $HERDR_SECTION
 

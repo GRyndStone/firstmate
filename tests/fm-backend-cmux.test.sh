@@ -1089,6 +1089,7 @@ test_spawn_empty_partial_never_targets_same_label_workspace() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config" "$dir/responses"
   printf 'brief\n' > "$data/$id/brief.md"
+  fm_write_criteria "$data" "$id"
   title=$(cmux_expected_scoped_title "fm-$id")
   printf '{"workspaces":[]}' > "$dir/responses/1.out"
   printf '1\n' > "$dir/responses/2.exit"
