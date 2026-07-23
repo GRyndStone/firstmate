@@ -678,6 +678,73 @@ test_partial_cleanup_absence_probes_fail_closed() {
   pass "partial Herdr cleanup proves last-tab absence from workspace inventory and otherwise fails closed"
 }
 
+# Regression: real herdr 0.7.1 prints pane_not_found JSON on stderr with exit 1
+# (success bodies stay on stdout). fm_backend_herdr_pane_absent must capture both
+# streams; discarding stderr made teardown treat a confirmed-gone pane as
+# uncertain (rc 2) and refuse to clear state/<id>.meta.
+test_pane_absent_reads_pane_not_found_on_stderr() {
+  local dir status
+  dir="$TMP_ROOT/pane-absent-stderr"
+  mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = pane ] && [ "${2:-}" = get ]; then
+  printf '{"error":{"code":"pane_not_found","message":"pane %s not found"},"id":"cli:pane:get"}\n' "${3:-}" >&2
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$dir/fakebin/herdr"
+  set +e
+  PATH="$dir/fakebin:$PATH" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_pane_absent fmtest w1:p9
+  ' "$ROOT"
+  status=$?
+  set -e
+  expect_code 0 "$status" "stderr pane_not_found must yield absent_rc=0 (not uncertain rc 2)"
+  # Present pane on stdout (success path) still counts as present.
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = pane ] && [ "${2:-}" = get ]; then
+  printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$dir/fakebin/herdr"
+  set +e
+  PATH="$dir/fakebin:$PATH" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_pane_absent fmtest w1:p9
+  ' "$ROOT"
+  status=$?
+  set -e
+  expect_code 1 "$status" "stdout success pane get must yield present_rc=1"
+  # Unreadable / non-matching payload stays uncertain.
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = pane ] && [ "${2:-}" = get ]; then
+  printf 'not-json\n' >&2
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$dir/fakebin/herdr"
+  set +e
+  PATH="$dir/fakebin:$PATH" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_pane_absent fmtest w1:p9
+  ' "$ROOT"
+  status=$?
+  set -e
+  expect_code 2 "$status" "unreadable pane get must yield uncertain_rc=2"
+  pass "fm_backend_herdr_pane_absent: stderr pane_not_found is absent; present and uncertain retained"
+}
+
 test_task_label_absence_requires_valid_workspace_inventory() {
   local dir log resp fb status
   dir="$TMP_ROOT/task-label-absence"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2282,6 +2349,7 @@ test_create_task_rolls_back_unparseable_created_tab
 test_create_task_reports_partial_ids_on_incomplete_create_response
 test_container_ensure_reports_partial_workspace_after_ambiguous_create
 test_partial_cleanup_absence_probes_fail_closed
+test_pane_absent_reads_pane_not_found_on_stderr
 test_task_label_absence_requires_valid_workspace_inventory
 test_create_task_creates_with_no_focus_flag
 test_workspace_find_matches_only_this_homes_own_label

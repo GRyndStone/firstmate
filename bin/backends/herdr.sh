@@ -432,11 +432,10 @@ fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
   # 2>&1, not 2>/dev/null: verified empirically that real herdr 0.7.1 writes
   # an error response's JSON body to STDERR (success bodies go to stdout), so
   # discarding stderr here would blind this function to exactly the
-  # error.code values (pane_not_found, agent_not_found) it exists to read -
-  # every OTHER call site in this file discards stderr safely only because
-  # its caller collapses both the error and the not-an-error paths to the
-  # same final answer, which this function's dead/no-agent/live/unknown
-  # distinction cannot afford to do.
+  # error.code values (pane_not_found, agent_not_found) it exists to read.
+  # Call sites that only need success-path fields (or collapse error and
+  # empty into the same answer) may discard stderr; helpers that branch on
+  # error.code - this function and fm_backend_herdr_pane_absent - must not.
   out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
   code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
   if [ -n "$code" ]; then
@@ -707,9 +706,15 @@ fm_backend_herdr_workspace_absent() {  # <session> <workspace-id>
 }
 
 fm_backend_herdr_pane_absent() {  # <session> <pane-id>
+  # Return: 0 = absent (pane_not_found), 1 = still present, 2 = uncertain.
+  # 2>&1, not 2>/dev/null: real herdr writes error-body JSON (including
+  # pane_not_found) to stderr with exit 1; success bodies stay on stdout.
+  # Discarding stderr leaves out empty so neither jq branch matches and this
+  # falsely returns 2, which makes fm-teardown refuse cleanup of a gone pane.
+  # Same stream rule as fm_backend_herdr_pane_agent_state.
   local session=$1 pane_id=$2 out
   [ -n "$session" ] && [ -n "$pane_id" ] || return 2
-  out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>/dev/null) || true
+  out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1) || true
   if printf '%s' "$out" | jq -e --arg id "$pane_id" '.result.pane.pane_id == $id' >/dev/null 2>&1; then
     return 1
   fi
