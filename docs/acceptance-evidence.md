@@ -38,11 +38,26 @@ Path: `data/<id>/acceptance.md` under the active firstmate home.
 - command: open existing model chooser; list selectable entries
 - result: xai-oauth / grok-4.5 listed and selectable
 - head: <git-sha or observation timestamp>
+- relevance: blocks-ideal
 ```
 
-Required fields per `## AC-N` entry: `surface`, `class`, `command`, `result`.
+Required fields per `## AC-N` entry: `surface`, `class`, `command`, `result`, `relevance`.
 `head` (or `freshness`) is required when the required class is `ui` or `live`.
 Optional: `statement`, `required_class` (overrides keyword inference).
+
+### Relevance classification
+
+`relevance` records what the finding means against the captain-approved ideal state.
+It is required because truth and relevance are separate axes: a criterion whose evidence is verified true still has to be weighed against the ideal before it can close, or a true-but-out-of-model finding silently sets the agenda.
+
+| Value | Meaning |
+| --- | --- |
+| `blocks-ideal` | The ideal state is not reached until this is addressed. |
+| `later-scope` | Real and correctly scoped, but belongs to later work, not this task. |
+| `out-of-model` | True, but outside the operating model this work runs in; it is informational only. |
+
+A missing value or any value outside that set fails closed with a `repair:` line, exactly like an incomplete evidence mapping.
+The proportional `none:` path carries no `## AC-N` entries, so it needs no `relevance` and is unchanged.
 
 ### Proportional (no concrete criteria)
 

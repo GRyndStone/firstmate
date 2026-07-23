@@ -20,6 +20,17 @@ assert_contains "$SECTION_ONE" 'decide the real implication and recommended acti
   "AGENTS.md does not require independent implication analysis and recommendation"
 assert_contains "$SECTION_ONE" 'Never adopt or forward a conclusion merely because' \
   "AGENTS.md does not prohibit adopting delegated or tool conclusions on assertion alone"
+# Truth alone is not a reason to act: a verified finding still has to be scored
+# for relevance against the reconstructed ideal state, or true-but-irrelevant
+# findings silently set the agenda.
+assert_contains "$SECTION_ONE" 'blocking the ideal, correctly-scoped later work, or outside the operating model entirely' \
+  "AGENTS.md does not require classifying verified findings by ideal-state relevance"
+assert_contains "$SECTION_ONE" 'a finding being true is never on its own sufficient reason to act on it' \
+  "AGENTS.md does not state that truth alone is insufficient grounds to act"
+assert_grep 'Lead with the ideal-state implication' "$AGENTS" \
+  "captain-facing reporting does not lead with the ideal-state implication"
+assert_grep 'is supporting detail and never the headline' "$AGENTS" \
+  "captain-facing reporting still lets a worker or verifier framing lead"
 # shellcheck disable=SC2016 # Single-quoted contract text intentionally preserves literal Markdown backticks.
 assert_contains "$SECTION_ONE" 'use this response shape: `Question (verbatim): <full original question>` followed by `Firstmate analysis: <independent implication analysis>` and `Recommendation: <recommended captain action>`' \
   "AGENTS.md does not require the verbatim question alongside independent analysis and recommendation"

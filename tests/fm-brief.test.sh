@@ -428,6 +428,82 @@ test_ship_acceptance_evidence_contract() {
   pass "fm-brief.sh: ship briefs carry acceptance evidence contract; scouts omit it"
 }
 
+# Every dispatchable brief carries the operating context the work will actually
+# run in, as a must-fill placeholder. A worker with no operating context
+# optimizes for findings that do not matter where the change is deployed, so an
+# unfilled block has to be as loudly wrong as an unreplaced {TASK}. Secondmate
+# charters are a standing domain contract rather than a dispatched task, so they
+# deliberately stay out of scope.
+test_operating_context_block_ship_and_scout() {
+  local home id brief
+  home="$TMP_ROOT/operating-context-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout; do
+    id="brief-opctx-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+    assert_grep "# Operating context" "$brief" \
+      "$kind brief omitted the operating-context block"
+    assert_grep "{OPERATING_CONTEXT}" "$brief" \
+      "$kind brief omitted the must-fill operating-context placeholder"
+    assert_grep "what counts as blocking versus informational in that context" "$brief" \
+      "$kind brief operating-context block did not demand the blocking-versus-informational bar"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_grep 'append `blocked: operating context not filled in` to the status file and stop' "$brief" \
+      "$kind brief lets an unfilled operating context pass silently"
+    assert_grep "is informational, belongs in your handoff" "$brief" \
+      "$kind brief did not bind findings outside the operating context to informational handling"
+  done
+
+  FM_HOME="$home" FM_SECONDMATE_CHARTER=ops \
+    "$ROOT/bin/fm-brief.sh" brief-opctx-secondmate --secondmate --no-projects >/dev/null 2>&1
+  assert_no_grep "# Operating context" "$home/data/brief-opctx-secondmate/brief.md" \
+    "secondmate charter must not carry the per-task operating-context block"
+  pass "fm-brief.sh: ship and scout briefs carry a must-fill operating-context block"
+}
+
+# Repair and verification work is specified as the property to establish, never
+# as a list of cases to defeat: an enumerated list gets fitted exactly, failing
+# one case to the side. Planted negatives must be red at the parent commit and
+# green at the fix, and the run must prove it had something to judge.
+test_repair_verification_discipline_ship_and_scout() {
+  local home id brief
+  home="$TMP_ROOT/repair-discipline-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout; do
+    id="brief-repair-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+    assert_grep "Work from the property to establish, never from an enumerated list of cases to defeat" "$brief" \
+      "$kind brief did not forbid specifying repair work as a case list"
+    assert_grep "Fitting a fix to exactly the cases named is the failure this rule exists to prevent" "$brief" \
+      "$kind brief did not name the fit-to-the-list failure mode"
+    assert_grep "demonstrated failing at the parent commit and passing at the fix" "$brief" \
+      "$kind brief did not require planted negatives to be red at parent and green at fix"
+    assert_grep "A negative that already passes at the parent commit tested nothing" "$brief" \
+      "$kind brief did not require deleting and rewriting an already-passing negative"
+    assert_grep "anti-vacuity check" "$brief" \
+      "$kind brief omitted the anti-vacuity requirement"
+    assert_grep "so a silently empty run is never read as a pass" "$brief" \
+      "$kind brief did not state what the anti-vacuity check protects against"
+    assert_no_grep "EOF" "$brief" \
+      "$kind brief leaked a heredoc EOF marker (unterminated heredoc)"
+  done
+  pass "fm-brief.sh: ship and scout briefs carry the repair and verification discipline"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
@@ -443,3 +519,5 @@ test_pause_verb_override_renders_all_brief_scaffolds
 test_external_wait_registration_renders_all_brief_scaffolds
 test_gsd_brief_contract
 test_gsd_rejects_secondmate_and_scout
+test_operating_context_block_ship_and_scout
+test_repair_verification_discipline_ship_and_scout

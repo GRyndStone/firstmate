@@ -541,6 +541,31 @@ if ! fm_reconcile_task_id_valid "$ID"; then
   echo "error: invalid task id '$ID'" >&2
   exit 2
 fi
+
+# Fail-closed dispatch gate: never launch a crewmate on a brief whose fill-in
+# slots were never replaced. A crewmate has been launched on a brief still
+# holding the raw {TASK} placeholder, and nothing stopped it; the worker began on
+# an empty brief.
+#
+# fm-brief.sh emits every slot as a line whose ENTIRE content is the placeholder
+# token, while the scaffold's own prose may mention the same token inline (its
+# Herdr declaration does). So only a whole-line occurrence is a slot: matching a
+# bare substring instead is what let the original failed substitution through.
+#
+# Deliberately ahead of project, worktree, and backend resolution so a
+# never-filled brief costs nothing and creates nothing. A brief that does not
+# exist yet belongs to the missing-brief check further down, not here.
+# Secondmate charters resolve their brief elsewhere and are out of scope.
+if [ "$KIND" != secondmate ] && [ -f "$DATA/$ID/brief.md" ]; then
+  UNFILLED_SLOTS=$(grep -nE '^[[:space:]]*\{[A-Z][A-Z0-9_]*\}[[:space:]]*$' "$DATA/$ID/brief.md" || true)
+  if [ -n "$UNFILLED_SLOTS" ]; then
+    echo "error: refusing to launch $ID: brief still has unfilled slot(s) at $DATA/$ID/brief.md" >&2
+    printf '%s\n' "$UNFILLED_SLOTS" | sed 's/^\([0-9][0-9]*\):[[:space:]]*/  line \1: /' >&2
+    echo "repair: replace each placeholder above in $DATA/$ID/brief.md, then spawn again" >&2
+    exit 1
+  fi
+fi
+
 LIFECYCLE_GENERATION=$(fm_task_identity_new_token) \
   || { echo "error: cannot create lifecycle generation for task $ID" >&2; exit 1; }
 TREEHOUSE_LEASE_HOLDER="$ID-$LIFECYCLE_GENERATION"

@@ -6,6 +6,12 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
+# Ship and scout briefs open with an Operating context block carrying a second
+# must-fill {OPERATING_CONTEXT} placeholder: the context the work will actually
+# run in, and what counts as blocking versus informational there. A worker given
+# no operating context optimizes for findings that do not matter where the
+# change is deployed, so the block uses the same visible-placeholder convention
+# as {TASK} and the brief tells the crewmate to block on an unfilled one.
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout|--gsd] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
@@ -61,6 +67,12 @@
 # data/<id>/acceptance.md before done; firstmate runs bin/fm-acceptance-check.sh
 # before validation/PR-ready/merge recommendation. Full contract:
 # docs/acceptance-evidence.md. Scout/GSD/secondmate scaffolds omit this gate.
+# Ship and scout Rules also carry the repair/verification discipline: repair and
+# verification work is specified as the property to establish rather than an
+# enumerated list of cases to defeat (an enumerated list gets fitted exactly and
+# fails one case to the side), every planted negative must be shown red at the
+# parent commit and green at the fix, and the run must record an anti-vacuity
+# count so a silently empty suite or scan is never read as a pass.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -247,9 +259,40 @@ EOF
 )
 fi
 
+# Shared by ship and scout briefs. Both blocks are literal brief prose with no
+# scaffold-time interpolation, so they use a quoted heredoc: an unquoted
+# `$(cat <<EOF ...)` body would expand `$` and would break `bash -n` on the
+# whole script at the first stray apostrophe (see tests/fm-brief.test.sh).
+# The operating-context placeholder follows the {TASK} convention so firstmate
+# must fill it and an unfilled one is loudly visible rather than silently empty.
+OPERATING_CONTEXT_SECTION=$(cat <<'EOF'
+# Operating context
+{OPERATING_CONTEXT}
+
+Firstmate must replace the line above with the context this work will actually run in, and with what counts as blocking versus informational in that context.
+A brief dispatched with that placeholder still unreplaced is as broken as one dispatched with the task placeholder unreplaced: append `blocked: operating context not filled in` to the status file and stop.
+Judge every finding against that context: a true finding lying outside it is informational, belongs in your handoff, and is never on its own a reason to widen scope, change the fix, or raise an alarm.
+EOF
+)
+
+# Repair/verification discipline, emitted as a rule in the ship and scout Rules
+# lists. Enumerated case lists get fitted exactly and fail one case to the side,
+# and a negative that was never red proves nothing, so both are specified out.
+REPAIR_DISCIPLINE=$(cat <<'EOF'
+7. Repair and verification discipline, whenever this task fixes a defect or verifies a fix.
+   Work from the property to establish, never from an enumerated list of cases to defeat: when cases are supplied, treat them as examples of that property and establish the property itself, so cases beside the list are covered too.
+   Fitting a fix to exactly the cases named is the failure this rule exists to prevent.
+   Every negative you plant must be demonstrated failing at the parent commit and passing at the fix, with both outputs recorded in the deliverable you hand back.
+   A negative that already passes at the parent commit tested nothing: delete it and rewrite it so it fails there first.
+   Record an anti-vacuity check alongside that evidence - the number of tests, cases, or matches the suite or scan actually judged - so a silently empty run is never read as a pass.
+EOF
+)
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+
+$OPERATING_CONTEXT_SECTION
 
 # Task
 {TASK}
@@ -288,6 +331,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+$REPAIR_DISCIPLINE
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -295,7 +339,7 @@ The report must stand alone: what you did, what you found, the evidence (command
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
-echo "scaffolded: $BRIEF (scout; replace {TASK})"
+echo "scaffolded: $BRIEF (scout; replace {TASK} and {OPERATING_CONTEXT})"
 exit 0
 fi
 
@@ -445,6 +489,8 @@ esac
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
+$OPERATING_CONTEXT_SECTION
+
 # Task
 {TASK}
 
@@ -486,6 +532,7 @@ $RULE1
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+$REPAIR_DISCIPLINE
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
@@ -496,7 +543,8 @@ Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced 
 
 # Acceptance evidence
 Concrete acceptance criteria written into the Task section above must carry stable ids (\`AC-1\`, \`AC-2\`, ...).
-Before any \`done:\` line, write \`$DATA/$ID/acceptance.md\` mapping each id to direct same-surface evidence fields: \`surface\`, \`class\`, \`command\` (or interaction), \`result\`, and \`head\` (git sha or observation timestamp) when the criterion is live/UI.
+Before any \`done:\` line, write \`$DATA/$ID/acceptance.md\` mapping each id to direct same-surface evidence fields: \`surface\`, \`class\`, \`command\` (or interaction), \`result\`, \`relevance\`, and \`head\` (git sha or observation timestamp) when the criterion is live/UI.
+\`relevance\` classifies the finding against the ideal state in the Operating context above - exactly one of \`blocks-ideal\`, \`later-scope\`, or \`out-of-model\` - because a criterion being verifiably true is not on its own what closes it.
 Status prose and worker authority are claims, not evidence; a bare \`done:\` cannot advance the task.
 Reject proxy substitutions across evidence classes: config/catalog/API does not satisfy a UI/menu criterion; unit tests do not satisfy a required live-server check; current selection does not prove alternatives remain selectable.
 Firstmate independently runs \`$FM_ROOT/bin/fm-acceptance-check.sh $ID\` before validation, PR-ready, or merge recommendation and returns incomplete mappings to you with precise repair direction.
@@ -505,4 +553,4 @@ Do not invent hand-written schema boilerplate beyond that map; the check owns th
 
 $DOD
 EOF
-echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK})"
+echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK} and {OPERATING_CONTEXT})"

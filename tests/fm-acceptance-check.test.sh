@@ -104,6 +104,7 @@ EOF
 - class: unit
 - command: bash tests/fm-acceptance-check.test.sh
 - result: all assertions pass
+- relevance: blocks-ideal
 
 ## AC-2
 - statement: docs pointer names the contract owner
@@ -111,6 +112,7 @@ EOF
 - class: code
 - command: rg -n 'fm-acceptance-check' docs/acceptance-evidence.md
 - result: file documents the gate and CLI
+- relevance: blocks-ideal
 EOF
   out=$(run_check "$brief" "$evidence") || status=$?
   expect_code 0 "$status" "full direct evidence must pass"
@@ -238,6 +240,7 @@ EOF
 - command: open existing model chooser; list selectable entries; select grok-4.5
 - result: xai-oauth / grok-4.5 listed and selectable; selection applies
 - head: abcdef1 2026-07-18T13:00:00Z
+- relevance: blocks-ideal
 
 ## AC-2
 - statement: Grok remains the active/default selection after reload
@@ -246,6 +249,7 @@ EOF
 - command: reload service; open chooser; confirm default and send probe message
 - result: default remains grok-4.5; probe answers as Grok
 - head: abcdef1 2026-07-18T13:10:00Z
+- relevance: blocks-ideal
 EOF
   status=0
   out=$(run_check "$brief" "$evidence") || status=$?
@@ -311,6 +315,80 @@ EOF
   pass "ui evidence requires head"
 }
 
+# A finding cannot close a criterion on truth alone. Every AC-N entry must also
+# be classified against the captain-approved ideal state, so a verified but
+# out-of-model finding is visibly out-of-model instead of silently setting the
+# agenda. Missing or unrecognized values fail closed with a repair line.
+test_relevance_classification_required() {
+  local brief evidence out status=0 value
+  brief="$TMP_ROOT/relevance-brief.md"
+  evidence="$TMP_ROOT/relevance-evidence.md"
+  write_brief "$brief" "- AC-1: unit test covers the helper"
+
+  # Missing relevance: fails closed, even though every evidence field is present.
+  cat > "$evidence" <<'EOF'
+## AC-1
+- surface: tests/example.test.sh
+- class: unit
+- command: bash tests/example.test.sh
+- result: pass
+EOF
+  out=$(run_check "$brief" "$evidence") || status=$?
+  expect_code 1 "$status" "entry without relevance: must fail"
+  assert_contains "$out" "relevance" "failure must name the missing relevance classification"
+  assert_contains "$out" "repair AC-1:" "precise per-id repair missing"
+  assert_contains "$out" "blocks-ideal" "repair must list the allowed values"
+
+  # An unrecognized value fails closed rather than being waved through.
+  cat > "$evidence" <<'EOF'
+## AC-1
+- surface: tests/example.test.sh
+- class: unit
+- command: bash tests/example.test.sh
+- result: pass
+- relevance: important
+EOF
+  status=0
+  out=$(run_check "$brief" "$evidence") || status=$?
+  expect_code 1 "$status" "unrecognized relevance value must fail"
+  assert_contains "$out" "relevance" "failure must name the bad relevance value"
+  assert_contains "$out" "repair AC-1:" "unrecognized value needs a repair line"
+
+  # Each allowed value passes.
+  for value in blocks-ideal later-scope out-of-model; do
+    cat > "$evidence" <<EOF
+## AC-1
+- surface: tests/example.test.sh
+- class: unit
+- command: bash tests/example.test.sh
+- result: pass
+- relevance: $value
+EOF
+    status=0
+    out=$(run_check "$brief" "$evidence") || status=$?
+    expect_code 0 "$status" "relevance $value must be accepted"
+    assert_contains "$out" "PASS AC-1" "relevance $value should pass AC-1"
+  done
+  pass "acceptance gate requires an ideal-state relevance classification per criterion"
+}
+
+# The proportional none: path is for tasks with genuinely no concrete criteria.
+# It has no AC-N entries, so the relevance requirement must not reach it.
+test_relevance_not_required_for_none_path() {
+  local brief evidence out status=0
+  brief="$TMP_ROOT/relevance-none-brief.md"
+  evidence="$TMP_ROOT/relevance-none-evidence.md"
+  write_brief "$brief" "Typo fix in a comment. No concrete acceptance list."
+  cat > "$evidence" <<'EOF'
+# Acceptance evidence
+none: no concrete acceptance criteria
+EOF
+  out=$(run_check "$brief" "$evidence") || status=$?
+  expect_code 0 "$status" "none: path must still pass without relevance fields"
+  assert_contains "$out" "proportional none" "none pass message missing"
+  pass "acceptance gate leaves the proportional none: path unchanged"
+}
+
 test_task_id_path_resolution() {
   local home id brief evidence out status=0
   home="$TMP_ROOT/home"
@@ -329,6 +407,7 @@ test_task_id_path_resolution() {
 - class: unit
 - command: bash tests/example.test.sh
 - result: pass
+- relevance: blocks-ideal
 EOF
   out=$(FM_HOME="$home" "$CHECK" "$id" 2>&1) || status=$?
   expect_code 0 "$status" "task-id resolution should find data/<id> paths"
@@ -348,6 +427,8 @@ test_gryndstone_chooser_regression
 test_proportional_none_without_criteria
 test_none_with_criteria_rejected
 test_ui_requires_head
+test_relevance_classification_required
+test_relevance_not_required_for_none_path
 test_task_id_path_resolution
 
 pass "fm-acceptance-check: all cases"

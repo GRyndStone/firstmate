@@ -8,6 +8,11 @@
 # Status prose and worker authority are claims, never evidence. Proxy
 # substitutions across evidence classes fail closed.
 #
+# Each entry also carries a relevance: classification against the
+# captain-approved ideal state - blocks-ideal, later-scope, or out-of-model -
+# because a finding being true is not by itself a reason to act on it. A missing
+# or unrecognized value fails closed like any other incomplete mapping.
+#
 # Public entrypoints (also exposed by bin/fm-acceptance-check.sh):
 #   fm_acceptance_extract_ids <brief-path>          # prints AC-N lines
 #   fm_acceptance_required_class <statement-text>   # prints one class token
@@ -194,7 +199,7 @@ fm_acceptance_extract_statement() {
 }
 
 # Parse a single ## AC-N section from an evidence file into key=value lines on stdout.
-# Keys: statement, surface, class, command, result, head, required_class
+# Keys: statement, surface, class, command, result, head, relevance, required_class
 fm_acceptance_parse_entry() {
   local evidence=$1 want=$2
   local in=0 line key val
@@ -220,7 +225,7 @@ fm_acceptance_parse_entry() {
         key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr '-' '_')
         val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//')
         case "$key" in
-          statement|surface|class|command|result|head|freshness|required_class|required)
+          statement|surface|class|command|result|head|freshness|relevance|required_class|required)
             if [ "$key" = freshness ]; then
               key="head"
             fi
@@ -260,7 +265,7 @@ fm_acceptance_paths_for_task() {
 fm_acceptance_check() {
   local brief=$1 evidence=$2
   local -a ids=()
-  local id entry statement required offered surface command result head missing rc=0
+  local id entry statement required offered surface command result head relevance missing rc=0
   local repair=()
 
   if [ ! -f "$brief" ]; then
@@ -279,7 +284,7 @@ fm_acceptance_check() {
       printf 'repair: write %s with a single line: none: no concrete acceptance criteria\n' "$evidence"
     else
       printf 'repair: write %s mapping each of: %s\n' "$evidence" "${ids[*]}"
-      printf 'repair: each ## AC-N entry needs surface, class, command, result (and head when relevant)\n'
+      printf 'repair: each ## AC-N entry needs surface, class, command, result, relevance (and head when relevant)\n'
     fi
     printf 'note: a bare done: status line is a claim, not evidence; it cannot advance the task\n'
     return 1
@@ -308,7 +313,7 @@ fm_acceptance_check() {
     entry=$(fm_acceptance_parse_entry "$evidence" "$id" || true)
     if [ -z "$entry" ]; then
       printf 'FAIL %s: no ## %s section in evidence handoff\n' "$id" "$id"
-      repair+=("repair $id: add a ## $id section with surface, class, command, result")
+      repair+=("repair $id: add a ## $id section with surface, class, command, result, relevance")
       rc=1
       continue
     fi
@@ -375,7 +380,29 @@ fm_acceptance_check() {
         ;;
     esac
 
-    printf 'PASS %s: class=%s surface=%s\n' "$id" "$offered" "$surface"
+    # Truth is not sufficient. A criterion closes only when its finding has also
+    # been weighed against the captain-approved ideal state, so a verified but
+    # out-of-model finding is declared out-of-model instead of silently setting
+    # the agenda. Checked last so class, proxy, and freshness failures keep
+    # reporting their own cause.
+    relevance=$(fm_acceptance_entry_field "$entry" relevance)
+    if [ -z "$relevance" ]; then
+      printf 'FAIL %s: no relevance: classification against the ideal state\n' "$id"
+      repair+=("repair $id: add relevance: one of blocks-ideal, later-scope, out-of-model")
+      rc=1
+      continue
+    fi
+    case "$(printf '%s' "$relevance" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+      blocks-ideal|later-scope|out-of-model) ;;
+      *)
+        printf 'FAIL %s: unrecognized relevance value: %s\n' "$id" "$relevance"
+        repair+=("repair $id: relevance must be exactly one of blocks-ideal, later-scope, out-of-model")
+        rc=1
+        continue
+        ;;
+    esac
+
+    printf 'PASS %s: class=%s surface=%s relevance=%s\n' "$id" "$offered" "$surface" "$relevance"
   done
 
   if [ "$rc" -ne 0 ]; then
