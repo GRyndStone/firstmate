@@ -2145,6 +2145,51 @@ test_apply_transition_defer_and_fallback_are_noops() {
   pass "fm_backend_herdr_apply_transition: idle/done (defer) and unknown/empty (fallback) take no fast action"
 }
 
+test_events_capable_emits_no_broken_pipe_on_large_schema() {
+  # Regression: fm_backend_herdr_events_capable checked schema-token presence with
+  # `printf '%s' "$schema" | grep -Fq TOKEN`. The `api schema` output is ~220KB;
+  # grep -q exits on the (early) match and closes the pipe while printf is still
+  # writing, so printf takes EPIPE. In an arm environment that ignores SIGPIPE
+  # (`trap "" PIPE`), that surfaced as a recurring "printf: write error: Broken
+  # pipe" on stderr - three times per capability check, once per token. Drive the
+  # real capability path against a large multi-line schema with SIGPIPE ignored
+  # and assert it is capable AND silent on stderr.
+  local dir fb schema out rc
+  dir="$TMP_ROOT/events-broken-pipe"; fb="$dir/fakebin"; mkdir -p "$fb"
+  schema="$dir/schema.json"
+  {
+    printf '{"methods":{\n'
+    printf '"events.subscribe":{},\n'
+    printf '"pane.agent_status_changed":{},\n'
+    printf '"pane.output_matched":{},\n'
+    # Pad past any pipe buffer so printf is mid-write when grep -q would exit.
+    head -c 400000 /dev/zero | tr '\0' 'x' | fold -w 80
+    printf '\n}}\n'
+  } > "$schema"
+  cat > "$fb/herdr" <<SH
+#!/usr/bin/env bash
+case "\$1 \${2:-}" in
+  "status --json") printf '{"client":{"protocol":16},"server":{"running":true}}\n' ;;
+  "api schema") cat "$schema" ;;
+  *) : ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  # FM_BACKEND_HERDR_EVENT_READER set nonempty so the python3 requirement is
+  # skipped; the test targets the schema-token check, not the reader gate.
+  out=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENT_READER="fake-reader" \
+    bash -c 'trap "" PIPE; . "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable sess' \
+    "$ROOT" 2>&1 >/dev/null); rc=$?
+  # rc from the subshell is lost through command-substitution capture of stderr;
+  # re-run to capture rc cleanly.
+  PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENT_READER="fake-reader" \
+    bash -c 'trap "" PIPE; . "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable sess' \
+    "$ROOT" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || fail "events_capable must report capable for a schema carrying all three tokens, got $rc"
+  [ -z "$out" ] || fail "events_capable emitted stderr noise (broken pipe) on a large schema: $out"
+  pass "fm_backend_herdr_events_capable: large schema token checks are silent (no broken-pipe noise)"
+}
+
 test_wait_transition_no_panes_returns_2() {
   local rc
   bash -c '. "$0/bin/backends/herdr.sh"; FM_BACKEND_HERDR_EVENTS_FORCE=1 fm_backend_herdr_wait_transition default 1 /tmp/st' "$ROOT"; rc=$?
@@ -2411,6 +2456,7 @@ test_level_working_never_creates_correlation
 test_working_marker_failure_propagates_and_reopens_blocked_edge
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
+test_events_capable_emits_no_broken_pipe_on_large_schema
 test_wait_transition_no_panes_returns_2
 test_wait_transition_not_capable_returns_2
 test_wait_transition_reconcile_blocked_returns_record
