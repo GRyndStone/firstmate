@@ -11,7 +11,10 @@
 #   fm-herdr-lab.sh teardown <session>
 #
 # Session names must begin with "fm-lab-" and can never be "default".
-# Every Herdr call made here carries a trailing --session <session>.
+# Every Herdr call made here carries --session <session> as a herdr option,
+# spliced in before any "--" argument separator so a worker launch of the form
+# "agent start <pane> -- <worker argv>" scopes the herdr call to the lab session
+# instead of leaking --session into the worker's own argv.
 # The run command rejects caller-supplied --session flags, any leading option
 # before the subcommand, all session lifecycle operations, and every server
 # operation.
@@ -46,10 +49,32 @@ fm_herdr_lab_tripwire_path() { # <session>
   printf '%s/%s.fleet-state.json' "$(fm_herdr_lab_state_dir)" "$1"
 }
 
+# Assemble the herdr argument vector for a lab call, splicing the mandatory
+# --session <session> in as a herdr option before the first bare -- argument
+# separator. A worker launch is `agent start <pane> -- <worker argv>`; appending
+# --session after "$@" would push it past that -- into the worker's own argv,
+# leaving the worker unscoped. With no --, the flag is appended at the end as
+# before. The result is placed in the caller-declared array FM_HERDR_LAB_ARGV.
+fm_herdr_lab_build_argv() { # <session> <herdr arguments...>
+  local name=$1 spliced=0 arg
+  shift
+  FM_HERDR_LAB_ARGV=()
+  for arg in "$@"; do
+    if [ "$spliced" -eq 0 ] && [ "$arg" = -- ]; then
+      FM_HERDR_LAB_ARGV+=(--session "$name" --)
+      spliced=1
+    else
+      FM_HERDR_LAB_ARGV+=("$arg")
+    fi
+  done
+  [ "$spliced" -eq 1 ] || FM_HERDR_LAB_ARGV+=(--session "$name")
+}
+
 fm_herdr_lab_raw() { # <session> <herdr arguments...>
   local name=$1
-  shift
-  HERDR_SESSION="$name" herdr "$@" --session "$name"
+  local -a FM_HERDR_LAB_ARGV=()
+  fm_herdr_lab_build_argv "$@"
+  HERDR_SESSION="$name" herdr "${FM_HERDR_LAB_ARGV[@]}"
 }
 
 fm_herdr_lab_session_list() { # <session>

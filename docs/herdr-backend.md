@@ -332,12 +332,12 @@ This is not a hypothetical: it killed the captain's live default herdr server, t
 
 The fix, verified against the real binary in an isolated session (both a genuinely separate isolated session and the default session's untouched state confirmed before and after):
 
-- The `--session <name>` GLOBAL FLAG reliably routes every herdr subcommand tried (`status`, `workspace *`, `tab *`, `pane *`, `agent *`, `server`, `session stop`/`delete`) to the named session, in either leading (`herdr --session <name> <subcommand>`) or trailing (`herdr <subcommand> ... --session <name>`) position - both verified to work identically.
+- The `--session <name>` GLOBAL FLAG reliably routes every herdr subcommand tried (`status`, `workspace *`, `tab *`, `pane *`, `agent *`, `server`, `session stop`/`delete`) to the named session, in either leading (`herdr --session <name> <subcommand>`) or trailing (`herdr <subcommand> ... --session <name>`) position - both verified to work identically, with one caveat: for a subcommand that carries a `--` argument separator (an agent-launch of the form `agent start <pane> -- <worker argv>`), a trailing `--session` appended after `--` is swallowed into the worker's own argv instead of scoping the herdr call, so `--session` must sit before the `--`.
 - `bin/backends/herdr.sh`'s `fm_backend_herdr_cli` helper wraps every herdr invocation in the adapter: it sets `HERDR_SESSION` (kept for cosmetic/forward-compat reasons - harmless, and it is what the client's own JSON echoes back) AND appends a trailing `--session <name>`, so every adapter call is correctly scoped regardless of what else is running on the machine.
 - For destructive session cleanup specifically, use `herdr session stop <name>` / `herdr session delete <name>` (the explicit-by-name forms - `<name>` is a REQUIRED positional argument, so herdr cannot resolve it ambiguously; herdr's own help text requires literally typing `default` to affect the default session), never the ambient `herdr server stop`. `bin/fm-herdr-lab.sh` now owns this guard as the single source of truth: `fm_herdr_lab_teardown` does the stop-then-delete, gated by a read-only hard guard (`fm_herdr_lab_refuse_if_default`, re-querying `herdr session list --json` immediately before EVERY stop/delete call, refusing on a literal `default` name, a not-found name, or `default:true`) as a second, independent layer that fails closed on any ambiguity. `tests/herdr-test-safety.sh` now sources that helper, so its `herdr_safe_stop_and_delete`/`herdr_refuse_if_default` names are thin delegating wrappers over the same owner.
 
 The same guard is now a first-class production helper, `bin/fm-herdr-lab.sh`, not just test scaffolding.
-It provisions an isolated never-`default` lab session (names must start with `fm-lab-`), runs every task command through `run <session> ...` with a mandatory trailing `--session` appended, and refuses caller-supplied `--session`, any leading option before the subcommand, and every server or session-lifecycle subcommand.
+It provisions an isolated never-`default` lab session (names must start with `fm-lab-`), runs every task command through `run <session> ...` with a mandatory `--session` spliced in as a herdr option before any `--` worker separator (so an `agent start <pane> -- <worker argv>` launch scopes the herdr call instead of leaking `--session` into the worker's argv), and refuses caller-supplied `--session`, any leading option before the subcommand, and every server or session-lifecycle subcommand.
 Destructive teardown goes only through `teardown <session>` (or a deliberate mid-run `stop <session>`), each re-running the refuse-default check immediately before every stop and delete.
 It also adds a before/after fleet-state tripwire: `provision` records the live `default` session before creating the lab session, and `teardown` verifies that recorded state is byte-identical afterward before clearing it, treating any missing, stopped, or changed default session as a hard failure rather than a warning.
 Crewmate briefs for tasks that drive Herdr lifecycle get this exact contract embedded by scaffolding with `bin/fm-brief.sh --herdr-lab`; every crewmate brief scaffolded without the flag instead carries a loud not-enabled gate, because the scaffold cannot detect from the caller-supplied repo string whether the task will touch Herdr lifecycle.
@@ -720,6 +720,25 @@ There is no second watcher process: the reader is a short-lived subprocess of th
 **Polling is the permanent fail-closed backstop.**
 The watcher's poll loop runs every cycle regardless, so the event path only ever shortens latency and can never drop an escalation.
 Three documented triggers fall back to pure polling (`fm_backend_herdr_events_capable` and the watcher's runtime-disable counter): a build below protocol 16 or missing the events surface in `herdr api schema`; a connect/subscribe failure; and repeated runtime failures, which disable the fast path for the rest of that watcher process (a restart re-probes).
+
+**Incident (2026-07-24): benign `printf: write error: Broken pipe` noise from the capability gate.**
+`fm_backend_herdr_events_capable` checked the three schema tokens with `printf '%s' "$schema" | grep -Fq TOKEN`.
+The `herdr api schema` output is ~220KB; `grep -q` exits on the (early) match and closes the pipe while `printf` is still writing, so `printf` takes `EPIPE`.
+In a watcher-arm environment that ignores `SIGPIPE`, that surfaced as a recurring `bin/backends/herdr.sh: line 1319-1321: printf: write error: Broken pipe` - three lines per capability check, once per token - even though the check returned the correct verdict (supervision was never affected).
+Reproduction (matches the observed output exactly; without the `trap` the writer is silently killed by the signal and no message prints):
+
+```
+$ bash -c '
+trap "" PIPE
+schema=$(printf "events.subscribe\n"; head -c 300000 /dev/zero | tr "\0" "x" | fold -w 80)
+printf "%s" "$schema" | grep -Fq "events.subscribe"; echo "grep rc=$?"
+'
+bash: line 3: printf: write error: Broken pipe
+grep rc=0
+```
+
+Fix: the token checks are now bash substring matches (`[[ "$schema" == *TOKEN* ]]`), which need no subprocess or pipe and cannot break, and are semantically identical to the fixed-string `grep -Fq` presence test.
+`tests/fm-backend-herdr.test.sh`'s `test_events_capable_emits_no_broken_pipe_on_large_schema` drives the real capability path against a large multi-line schema with `SIGPIPE` ignored and asserts the check is both capable and silent on stderr.
 
 **Empirical evidence (2026-07-11, herdr 0.7.3, protocol 16, macOS aarch64 Darwin 25.5.0, python3 3.13, jq present).**
 Capability, verified read-only:

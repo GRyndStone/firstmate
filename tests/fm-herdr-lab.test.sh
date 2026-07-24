@@ -231,7 +231,46 @@ SH
   pass "fm-herdr-lab: timed-out provisioning cancels the launch before teardown"
 }
 
+test_session_flag_precedes_worker_separator() {
+  # A worker launch takes the form `agent start <pane> -- <worker argv>`. The
+  # mandatory --session must land as a herdr flag BEFORE the `--` separator, or
+  # it leaks past `--` into the worker's own argv and the worker is never scoped
+  # to the lab session. Assert on the exact command line the helper constructs,
+  # using a recording stub instead of driving real herdr.
+  local recbin="$TMP_ROOT/recbin" reclog="$TMP_ROOT/rec-argv.log"
+  local name="fm-lab-argv-$$" sess_idx='' sep_idx='' i=0
+  local -a argv=()
+  mkdir -p "$recbin"
+  cat > "$recbin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FM_REC_ARGV_LOG"
+SH
+  chmod +x "$recbin/herdr"
+  : > "$reclog"
+  PATH="$recbin:$PATH" FM_REC_ARGV_LOG="$reclog" \
+    fm_herdr_lab_raw "$name" agent start workpane -- worker-cmd --worker-flag \
+    || fail "recording raw call failed"
+
+  while IFS= read -r line; do argv+=("$line"); done < "$reclog"
+  for i in "${!argv[@]}"; do
+    [ "${argv[$i]}" = --session ] && sess_idx=$i
+    [ -z "$sep_idx" ] && [ "${argv[$i]}" = -- ] && sep_idx=$i
+  done
+  [ -n "$sess_idx" ] || fail "constructed herdr call carries no --session flag"
+  [ -n "$sep_idx" ] || fail "constructed herdr call lost the -- worker separator"
+  [ "$sess_idx" -lt "$sep_idx" ] \
+    || fail "--session ($sess_idx) leaks at or past the -- separator ($sep_idx); worker is not isolated to the lab session"
+  # The lab session value must be the flag's argument, not part of the worker argv.
+  [ "${argv[$((sess_idx + 1))]}" = "$name" ] \
+    || fail "--session is not immediately followed by the lab session name"
+  # Everything after -- is exactly the untouched worker argv.
+  [ "${argv[$((sep_idx + 1))]}" = worker-cmd ] && [ "${argv[$((sep_idx + 2))]}" = --worker-flag ] \
+    || fail "worker argv after -- was altered by the helper"
+  pass "fm-herdr-lab: --session is spliced before the -- worker separator, isolating the worker"
+}
+
 test_refuses_unsafe_names
+test_session_flag_precedes_worker_separator
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown

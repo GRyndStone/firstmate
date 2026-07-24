@@ -1316,9 +1316,15 @@ fm_backend_herdr_events_capable() {  # <session>
   case "$protocol" in ''|*[!0-9]*) return 1 ;; esac
   [ "$protocol" -ge "$FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL" ] || return 1
   schema=$(herdr api schema --json 2>/dev/null) || return 1
-  printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
-  printf '%s' "$schema" | grep -Fq 'pane.output_matched' || return 1
+  # Fixed-string presence checks via bash pattern matching, not `printf | grep
+  # -Fq`. With the ~220KB schema, `grep -q` exits on the (early) match and closes
+  # the pipe while printf is still writing, so printf takes EPIPE; in an arm
+  # environment that ignores SIGPIPE, that surfaced as a recurring
+  # "printf: write error: Broken pipe" line per check. Substring matching needs
+  # no subprocess or pipe and cannot break.
+  [[ "$schema" == *events.subscribe* ]] || return 1
+  [[ "$schema" == *pane.agent_status_changed* ]] || return 1
+  [[ "$schema" == *pane.output_matched* ]] || return 1
   return 0
 }
 
