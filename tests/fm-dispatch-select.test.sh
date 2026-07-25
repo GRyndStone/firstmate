@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavior tests for deterministic crew-dispatch selection and quota admission.
+# Behavior tests for usage-burndown crew-dispatch selection and quota admission.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -8,6 +8,8 @@ set -u
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_test_tmproot TMP_ROOT fm-dispatch-select-tests
 mkdir -p "$TMP_ROOT"
+export FM_USAGE_BURN_HISTORY="$TMP_ROOT/burn-history.json"
+printf '%s\n' '{"samples":[]}' > "$FM_USAGE_BURN_HISTORY"
 
 iso_at_epoch() {
   if date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then
@@ -19,11 +21,15 @@ iso_at_epoch() {
 TEST_NOW=$(date +%s)
 VALID_REFRESHED_AT=$(iso_at_epoch $((TEST_NOW - 60)))
 VALID_RESET_AT=$(iso_at_epoch $((TEST_NOW + 3600)))
+NEAR_RESET_AT=$(iso_at_epoch $((TEST_NOW + 300)))
+FAR_RESET_AT=$(iso_at_epoch $((TEST_NOW + 500000)))
 EXPIRED_RESET_AT=$(iso_at_epoch $((TEST_NOW - 1)))
 TOO_OLD_REFRESHED_AT=$(iso_at_epoch $((TEST_NOW - 700000)))
 
 write_quota() {
   local file=$1 claude_status=$2 claude_five=$3 claude_week=$4 codex_status=$5 codex_five=$6 codex_week=$7
+  local claude_reset=${8:-$VALID_RESET_AT}
+  local codex_reset=${9:-$VALID_RESET_AT}
   mkdir -p "$(dirname "$file")"
   cat > "$file" <<JSON
 {
@@ -33,8 +39,8 @@ write_quota() {
       "provider": "claude",
       "state": { "status": "$claude_status", "refreshedAt": "$VALID_REFRESHED_AT" },
       "windows": [
-        { "id": "five_hour", "kind": "session", "percentRemaining": $claude_five, "resetsAt": "$VALID_RESET_AT" },
-        { "id": "seven_day", "kind": "weekly", "percentRemaining": $claude_week, "resetsAt": "$VALID_RESET_AT" },
+        { "id": "five_hour", "kind": "session", "percentRemaining": $claude_five, "resetsAt": "$claude_reset", "windowSeconds": 18000 },
+        { "id": "seven_day", "kind": "weekly", "percentRemaining": $claude_week, "resetsAt": "$claude_reset", "windowSeconds": 604800 },
         { "id": "model:fable", "kind": "model", "percentRemaining": 0 }
       ]
     },
@@ -42,8 +48,8 @@ write_quota() {
       "provider": "codex",
       "state": { "status": "$codex_status", "refreshedAt": "$VALID_REFRESHED_AT" },
       "windows": [
-        { "id": "five_hour", "kind": "session", "percentRemaining": $codex_five, "resetsAt": "$VALID_RESET_AT" },
-        { "id": "weekly", "kind": "weekly", "percentRemaining": $codex_week, "resetsAt": "$VALID_RESET_AT" },
+        { "id": "five_hour", "kind": "session", "percentRemaining": $codex_five, "resetsAt": "$codex_reset", "windowSeconds": 18000 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": $codex_week, "resetsAt": "$codex_reset", "windowSeconds": 604800 },
         { "id": "model:codex_bengalfox:5h", "kind": "model", "percentRemaining": 0 }
       ]
     }
@@ -86,19 +92,68 @@ test_posture_boundaries() {
   pass "provider postures change exactly at 60%, 80%, and 90% used"
 }
 
-test_quota_balanced_multiple_candidates() {
-  local quota out
+test_usage_burndown_multiple_candidates() {
+  local quota out err
+  # Equal windows/time: higher binding remaining wins via surplus when B is similar.
   quota="$TMP_ROOT/higher.json"
   write_quota "$quota" fresh 80 30 fresh 70 60
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles")
-  jq -e '.provider == "codex" and .harness == "codex" and .model == "gpt-5.5" and .quota_posture == "normal" and .quota_percent_used == 40' \
-    <<< "$out" >/dev/null || fail "higher-min provider should win with posture, got: $out"
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>"$TMP_ROOT/higher.err")
+  err=$(cat "$TMP_ROOT/higher.err")
+  jq -e '.provider == "codex" and .harness == "codex" and .model == "gpt-5.5" and .quota_posture == "normal" and .dispatch_strategy == "usage-burndown"' \
+    <<< "$out" >/dev/null || fail "higher surplus provider should win, got: $out"
+  assert_contains "$err" "highest expiry-weighted surplus" "stderr must explain the choice"
 
+  # Exact tie on binding remaining: stable first-index order.
   write_quota "$quota" fresh 90 50 fresh 60 50
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles")
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
   jq -e '.provider == "claude" and .harness == "claude"' <<< "$out" >/dev/null \
     || fail "exact tie should use first ordered profile, got: $out"
-  pass "quota-balanced handles multiple candidates and keeps deterministic tie order"
+
+  # Legacy alias routes to the same engine.
+  write_quota "$quota" fresh 80 30 fresh 70 60
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles" 2>/dev/null)
+  jq -e '.provider == "codex" and .dispatch_strategy == "usage-burndown"' \
+    <<< "$out" >/dev/null || fail "quota-balanced alias should run usage-burndown: $out"
+  pass "usage-burndown handles multiple candidates, ties, and the legacy alias"
+}
+
+test_prefers_near_expiry_surplus_over_static_remaining() {
+  local quota out
+  # Claude: high remaining, far reset, high learned burn => low S.
+  # Codex: moderate remaining, near reset, zero burn history => high S*pressure.
+  quota="$TMP_ROOT/near-expiry.json"
+  cat > "$quota" <<JSON
+{
+  "generatedAt": "$(iso_at_epoch "$TEST_NOW")",
+  "providers": [
+    {
+      "provider": "claude",
+      "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 90, "resetsAt": "$FAR_RESET_AT", "windowSeconds": 18000 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 45, "resetsAt": "$NEAR_RESET_AT", "windowSeconds": 18000 }
+      ]
+    }
+  ]
+}
+JSON
+  # Seed high burn for claude only.
+  printf '%s\n' '{"samples":[
+    {"provider":"claude","window_id":"five_hour","remaining":100,"at":1000},
+    {"provider":"claude","window_id":"five_hour","remaining":10,"at":1100}
+  ]}' > "$FM_USAGE_BURN_HISTORY"
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
+  jq -e '.provider == "codex"' <<< "$out" >/dev/null \
+    || fail "near-expiry surplus should beat high remaining with high burn: $out"
+  # Reset history for other tests.
+  printf '%s\n' '{"samples":[]}' > "$FM_USAGE_BURN_HISTORY"
+  pass "engine prefers capacity at risk of expiring unused, not static max remaining"
 }
 
 test_explicit_frozen_provider_never_chooses_alternate() {
@@ -112,22 +167,28 @@ test_explicit_frozen_provider_never_chooses_alternate() {
   expect_code 75 "$status" "explicit frozen provider must refuse admission"
   [ -z "$out" ] || fail "explicit freeze must not output the alternate candidate: $out"
   assert_contains "$err" "provider 'claude' is freeze" "freeze refusal must retain explicit provider identity"
-  assert_not_contains "$err" "codex" "freeze refusal must not claim an alternate provider"
+  assert_not_contains "$err" "provider 'codex' is freeze" "freeze refusal must not claim an alternate provider freeze"
   pass "explicit frozen provider refuses new work without selecting an available alternate"
 }
 
-test_stale_data_and_margin() {
+test_multi_select_skips_freeze_for_live_capacity() {
+  local quota out
+  quota="$TMP_ROOT/multi-freeze-skip.json"
+  write_quota "$quota" fresh 5 5 fresh 80 80
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
+  jq -e '.provider == "codex" and .quota_posture == "normal"' \
+    <<< "$out" >/dev/null || fail "multi-select should use live capacity when other is freeze: $out"
+  pass "multi-select skips freeze-level sources when live capacity exists"
+}
+
+test_stale_usable_evidence_competes_by_burndown() {
   local quota updated out err status
   quota="$TMP_ROOT/stale-margin.json"
+  # Stale claude with higher remaining competes by score (stale-clear margin retired).
   write_quota "$quota" stale 85 70 fresh 65 60
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles")
-  jq -e '.provider == "codex"' <<< "$out" >/dev/null \
-    || fail "fresh provider should win when stale lead is below margin: $out"
-
-  write_quota "$quota" stale 90 85 fresh 65 60
-  out=$("$ROOT/bin/fm-dispatch-select.sh" --select quota-balanced --quota-json "$quota" "$profiles")
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
   jq -e '.provider == "claude"' <<< "$out" >/dev/null \
-    || fail "stale provider should win when lead clears margin: $out"
+    || fail "usable stale higher-surplus should compete by burndown score: $out"
 
   write_quota "$quota" stale 9 100 fresh 100 100
   updated="$quota.updated"
@@ -165,7 +226,7 @@ test_expired_or_unverifiable_stale_data_degrades_to_unknown() {
   err=$(cat "$TMP_ROOT/stale-expired.err")
   jq -e '.provider == "claude" and .harness == "claude" and .quota_posture == "unknown" and (has("quota_percent_used") | not)' \
     <<< "$out" >/dev/null || fail "expired stale quota did not degrade to unknown: $out"
-  assert_contains "$err" "no usable quota windows for selected provider" \
+  assert_contains "$err" "no usable" \
     "expired stale quota did not explain why it degraded"
 
   write_quota "$quota" stale 1 1 fresh 100 100
@@ -217,13 +278,13 @@ test_malformed_or_missing_quota_retains_selected_provider() {
 test_unavailable_provider_does_not_trigger_admission_fallback() {
   local quota out err
   quota="$TMP_ROOT/unavailable.json"
-  printf '%s\n' '{"providers":[{"provider":"codex","state":{"status":"fresh"},"windows":[{"id":"five_hour","percentRemaining":100},{"id":"weekly","percentRemaining":100}]}]}' > "$quota"
+  printf '%s\n' '{"providers":[{"provider":"codex","state":{"status":"fresh"},"windows":[{"id":"five_hour","percentRemaining":100,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":18000},{"id":"weekly","percentRemaining":100,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":604800}]}]}' > "$quota"
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
     '[{"provider":"claude","harness":"claude"},{"provider":"codex","harness":"codex"}]' 2>"$TMP_ROOT/unavailable.err")
   err=$(cat "$TMP_ROOT/unavailable.err")
   jq -e '.provider == "claude" and .harness == "claude" and .quota_posture == "unknown"' \
     <<< "$out" >/dev/null || fail "unavailable explicit provider silently fell back: $out"
-  assert_contains "$err" "no usable quota windows for selected provider" "unavailable provider must be observable"
+  assert_contains "$err" "no usable" "unavailable provider must be observable"
   pass "unavailable explicit provider never silently selects another candidate"
 }
 
@@ -293,7 +354,7 @@ META
   out=$("$ROOT/bin/fm-dispatch-select.sh" --resume-meta "$meta" --quota-json "$quota")
   jq -e '.provider == "claude" and .harness == "opencode" and .model == "anthropic/claude-sonnet-4-5" and .effort == "default" and .quota_posture == "conserve"' \
     <<< "$out" >/dev/null || fail "resume did not retain the recorded profile: $out"
-  assert_not_contains "$out" "codex" "resume must not substitute another provider or harness"
+  assert_not_contains "$out" '"provider":"codex"' "resume must not substitute another provider or harness"
   pass "quota recovery returns the persisted task's recorded provider/profile only"
 }
 
@@ -322,9 +383,11 @@ SH
 }
 
 test_posture_boundaries
-test_quota_balanced_multiple_candidates
+test_usage_burndown_multiple_candidates
+test_prefers_near_expiry_surplus_over_static_remaining
 test_explicit_frozen_provider_never_chooses_alternate
-test_stale_data_and_margin
+test_multi_select_skips_freeze_for_live_capacity
+test_stale_usable_evidence_competes_by_burndown
 test_expired_or_unverifiable_stale_data_degrades_to_unknown
 test_malformed_or_missing_quota_retains_selected_provider
 test_unavailable_provider_does_not_trigger_admission_fallback

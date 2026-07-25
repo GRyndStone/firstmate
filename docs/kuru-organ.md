@@ -85,7 +85,7 @@ bin/fm-kuru-organ.sh validate-dispatch path.json
 
 This Firstmate PR implements **linkage + organ boundary + AGENTS organ clause** for M1.
 It does **not** implement M2 cutover or sole-door chat.
-Usage admission lives in `bin/fm-dispatch-select.sh`; primary session compact/rotate controls live in `bin/fm-session-lifecycle.sh`.
+Usage admission and usage-burndown routing live in `bin/fm-dispatch-select.sh` (`docs/usage-burndown-dispatch.md`); primary session compact/rotate controls live in `bin/fm-session-lifecycle.sh`.
 
 ## Tests
 
