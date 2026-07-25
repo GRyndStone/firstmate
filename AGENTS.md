@@ -89,7 +89,7 @@ skills/              standalone public installer-facing skills, committed; not l
 bin/                 helper scripts, committed; read each script's header before first use
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
-config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
+config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; its default candidate set drives routine self-routing and its natural-language rules support intentional task-specific overrides (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
@@ -205,35 +205,28 @@ See `docs/examples/crew-dispatch.json` for a documented starting point to copy i
 
 The canonical schema and per-field semantics are owned by `docs/configuration.md` ("Crew dispatch profiles"); read them there before writing or editing the file.
 
-When `config/crew-dispatch.json` is present, read it during intake before every crewmate or scout dispatch.
-Pick the single best-fit rule using your own judgment.
-This is explicitly not first-match: weigh all rules, their `when` text, and their `why` rationales against the actual task.
-Natural-language rules supply the eligible profile set and preferences; they are not a rival numeric selector.
-For a chosen rule with a single-object `use`, or an array `use` with no `select`, resolve the first profile directly.
-For a chosen rule with `select: "usage-burndown"` (legacy alias `quota-balanced`), pipe the full rule JSON to `bin/fm-dispatch-select.sh` and use the compact JSON profile it prints.
-Pass every selected profile through `bin/fm-dispatch-select.sh --admit` so usage observation and admission run once; freeze refuses an explicit pin and never substitutes another provider for that pin.
-Pass the admitted `provider`, `harness`, `model`, `effort`, and quota observation fields to `bin/fm-spawn.sh` with matching explicit flags.
-If no rule fits, use `default`.
-If `default` is absent, fall back to `config/crew-harness` through `bin/fm-harness.sh crew`, wrap that result as a profile for admission, and pass the admitted provider and harness explicitly.
-This is enforced: when `config/crew-dispatch.json` exists, `bin/fm-spawn.sh` refuses crewmate and scout launches that lack both the admitted provider and an explicit harness (`--harness <name>`, a positional adapter name, or a raw launch command), then re-admits that exact profile before launch.
-That refusal is the consultation backstop, so the rules are never silently skipped.
-The requirement is gated only on the file's presence; when the file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness` as before.
+When `config/crew-dispatch.json` is present, routine crewmate and scout spawns omit provider, harness, model, and effort.
+`bin/fm-spawn.sh` mechanically runs the configured `default` candidate set through usage-burndown and launches the returned profile.
+Do not preselect or pass routine routing axes.
+When the captain specifically overrides default routing, pass the concrete provider and harness plus `--override-reason "<captain reason>"`; spawn admits the pin in place and records the reason separately from algorithm decisions.
+An intentional task-specific natural-language rule is also an override of the routine default: resolve it to a concrete profile, then pass those axes with a one-line rule reason so spawn records the override and performs one-profile admission.
+When the dispatch file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness`.
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
 Routine multi-candidate routing is the usage-burndown engine owned by `bin/fm-dispatch-select.sh` with `bin/fm-usage-burndown-lib.sh` and `bin/fm-usage-source-lib.sh`; full policy, adapters, and recipe are in `docs/usage-burndown-dispatch.md`.
-Missing or unusable usage evidence stays observable and cannot prove freeze; it retains the selected profile with `quota_posture=unknown` instead of silently switching harness or model.
+Missing or unusable usage evidence stays observable and cannot prove freeze or rate exhaustion; routine routing launches the deterministic first default with `quota_posture=unknown`.
 
 Precedence, highest first:
 
 1. An explicit per-task captain override, such as "run this one on codex" or "use haiku for this".
-2. firstmate's best-fit rule from `config/crew-dispatch.json` (engine selects among that rule's eligible profiles when multi-select is set).
-3. The dispatch file's `default` profile.
+2. An intentionally invoked task-specific rule from `config/crew-dispatch.json`.
+3. The dispatch file's mechanically selected `default` candidate set.
 4. `config/crew-harness`.
 
 Never select an unverified harness.
 Validate every selected harness name against the verified adapter list above.
 If a dispatch rule or default names an unverified harness, ignore that profile, fall back to the next valid source, and note the problem when it affects the dispatch.
-The shell scripts never parse or match the natural-language rules; firstmate does the matching and passes only concrete flags to `fm-spawn`.
+The shell scripts never parse or match natural-language rules; only an intentional rule override requires firstmate to match one and pass concrete flags with a reason.
 
 Per-harness model/effort flags: `harness-adapters` (loaded before every spawn per section 4's closing trigger).
 
@@ -436,8 +429,8 @@ Write the brief per section 11.
 Load `harness-adapters` before spawning or recovering any direct report so trust dialogs, verified adapters, and harness-specific behavior are handled correctly.
 
 ```sh
-bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harness only when no crew-dispatch.json is active
-bin/fm-spawn.sh <id> projects/<repo> --provider codex --harness codex --model gpt-5.5 --effort high   # admitted selector output; spawn rechecks it
+bin/fm-spawn.sh <id> projects/<repo>             # self-routes through the configured default candidate set when crew-dispatch.json is active
+bin/fm-spawn.sh <id> projects/<repo> --provider codex --harness codex --model gpt-5.5 --effort high --override-reason "captain requested Codex"   # explicit auditable override
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|orca|cmux>   # explicit runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
 bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch or recover a persistent secondmate in its home
@@ -445,7 +438,7 @@ bin/fm-spawn.sh <id1>=projects/<repo1> <id2>=projects/<repo2> [--scout]   # batc
 ```
 
 Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--provider`, `--harness`, `--model`, `--effort`, `--quota-posture`, `--quota-used`, and `--backend` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
-When `config/crew-dispatch.json` exists, pass the admitted provider, explicit harness, concrete model and effort axes, and quota observation fields for every crewmate or scout spawn or batch after consulting the dispatch rules (section 4).
+When `config/crew-dispatch.json` exists, omit routing axes for routine crewmate or scout spawns so `fm-spawn.sh` selects and records the configured default candidate set itself; pass concrete axes plus `--override-reason` only for an intentional task-specific override (section 4).
 `bin/fm-spawn.sh`'s header owns the full resolution contract: harness and runtime-backend resolution order, spawn-capable backends and the `codex-app` rejection, verified launch templates, delivery-mode resolution, recorded meta fields, and per-harness turn-end hook installation.
 A backend spawn refusal - a missing dependency, an unauthenticated socket, or a version gate - must be surfaced to the captain as a blocker; never silently retry the spawn on a different backend to work around it.
 For ship and scout tasks, the script asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout, aborting the spawn otherwise to prevent the worktree tangle of section 8.
