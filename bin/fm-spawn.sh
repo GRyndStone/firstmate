@@ -7,6 +7,8 @@
 #   distinct from --harness (the launch adapter) and is recorded with the concrete
 #   profile in task metadata. When omitted and no crew-dispatch profile is active,
 #   provider defaults to harness for pin continuity.
+#   Explicit, dispatch-managed, and inherited provider pins must be recognized by
+#   bin/fm-usage-source-lib.sh or crewmate/scout launch refuses with exit 64.
 #   --parent <task-id> inherits the admitted provider/model/effort pin plus
 #   budget_depth / budget_concurrency / budget_max_turns from that parent's meta
 #   via bin/fm-workflow-bound.sh inherit-budget (GSD children and other bounded
@@ -17,8 +19,8 @@
 #   --quota-posture and --quota-used may carry the caller's selector observation;
 #   when config/crew-dispatch.json is active, spawn always re-admits the exact
 #   profile through bin/fm-dispatch-select.sh --admit and records that current
-#   result before any endpoint or worktree mutation. Freeze (exit 75) blocks
-#   launch and never substitutes another provider or harness.
+#   result before any endpoint or worktree mutation. Freeze (exit 75) and an
+#   unrecognized provider (exit 64) block launch without substitution.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -136,6 +138,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-reconcile-lib.sh
 . "$SCRIPT_DIR/fm-reconcile-lib.sh"
+# shellcheck source=bin/fm-usage-source-lib.sh
+. "$SCRIPT_DIR/fm-usage-source-lib.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -728,6 +732,17 @@ esac
 # Provider defaults to harness when the caller did not separate quota identity
 # from the launch adapter (compatibility for non-dispatch and simple pins).
 [ -n "$PROVIDER" ] || PROVIDER=$HARNESS
+
+# Explicit, dispatch-managed, and inherited provider pins must use the shared
+# usage-source registry before any endpoint, worktree, or metadata mutation.
+# Legacy no-provider launches outside dispatch keep their harness fallback.
+if [ "$KIND" != secondmate ] \
+  && { [ "$PROVIDER_SET" -eq 1 ] || [ -f "$CONFIG/crew-dispatch.json" ] || [ -n "$PARENT_ID" ]; } \
+  && ! fm_usage_source_provider_known "$PROVIDER"; then
+  recognized_providers=$(fm_usage_source_provider_ids_csv)
+  echo "error: unrecognized provider token '$PROVIDER'; recognized providers: $recognized_providers" >&2
+  exit 64
+fi
 
 # Generation pin is resolved later, only for ship tasks with mode=no-mistakes
 # (after delivery mode is known). See the MODE block near meta write.

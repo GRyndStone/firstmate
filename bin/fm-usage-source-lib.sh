@@ -12,26 +12,67 @@
 #   binding{id,remaining,T,window_seconds} when evidence is usable,
 #   diagnostics[] optional human strings.
 #
-# Shipped classes: anthropic-class (claude), openai-class (codex),
-# grok-class (grok), gemini-class (gemini stub), openrouter-class (openrouter
-# stub). Recipe for new sources: docs/usage-burndown-dispatch.md.
+# The registry below is the single owner of recognized provider identities,
+# their adapter classes, and whether a meter is wired.
+# Recipe for new sources: docs/usage-burndown-dispatch.md.
 #
 # Sourced only; not executed as a main program.
 
 _FM_USAGE_SOURCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_USAGE_SOURCE_LIB_DIR="."
 
-# Map a quota provider id to its adapter class name.
+# Registry rows are provider identity, adapter class, and meter kind.
+# Adding a recognized provider without a meter needs only one unmetered row.
+fm_usage_source_registry() {
+  printf '%s\t%s\t%s\n' \
+    claude anthropic-class quota-axi \
+    codex openai-class quota-axi \
+    grok grok-class quota-axi \
+    gemini gemini-class unmetered \
+    openrouter openrouter-class unmetered \
+    cursor cursor-class quota-axi \
+    copilot copilot-class quota-axi
+}
+
+_fm_usage_source_registry_field() { # <provider> <field-number>
+  local provider=${1:-} field=${2:-} value
+  value=$(fm_usage_source_registry | awk -F '\t' -v provider="$provider" -v field="$field" '
+    $1 == provider { print $field; exit }
+  ')
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+fm_usage_source_provider_ids() {
+  fm_usage_source_registry | awk -F '\t' 'NF >= 3 { print $1 }'
+}
+
+fm_usage_source_provider_ids_csv() {
+  fm_usage_source_provider_ids | awk '
+    BEGIN { separator = "" }
+    { printf "%s%s", separator, $0; separator = ", " }
+    END { print "" }
+  '
+}
+
+fm_usage_source_provider_known() { # <provider>
+  _fm_usage_source_registry_field "${1:-}" 1 >/dev/null
+}
+
+# Map a recognized quota provider id to its adapter class name.
 fm_usage_source_class() { # <provider>
-  case "${1:-}" in
-    claude) printf '%s\n' anthropic-class ;;
-    codex) printf '%s\n' openai-class ;;
-    grok) printf '%s\n' grok-class ;;
-    gemini) printf '%s\n' gemini-class ;;
-    openrouter) printf '%s\n' openrouter-class ;;
-    cursor) printf '%s\n' cursor-class ;;
-    copilot) printf '%s\n' copilot-class ;;
-    *) printf '%s\n' generic-class ;;
-  esac
+  local provider=${1:-}
+  if ! _fm_usage_source_registry_field "$provider" 2; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
+}
+
+fm_usage_source_meter_kind() { # <provider>
+  local provider=${1:-}
+  if ! _fm_usage_source_registry_field "$provider" 3; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
 }
 
 # General (non-model) window id list for a provider class / id.
@@ -63,13 +104,18 @@ fm_usage_source_default_window_seconds() { # <provider> <window_id>
 # Emits a single-line JSON object on stdout.
 fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   local provider=$1 quota_json=$2 now_epoch=$3
-  local class general_ids
-  class=$(fm_usage_source_class "$provider")
+  local class general_ids meter_kind
+  if ! fm_usage_source_provider_known "$provider"; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
+  class=$(fm_usage_source_class "$provider") || return $?
+  meter_kind=$(fm_usage_source_meter_kind "$provider") || return $?
   general_ids=$(fm_usage_source_general_ids_json "$provider")
 
-  # Stub classes with no meter path always degrade honestly to unknown.
-  case "$class" in
-    gemini-class|openrouter-class)
+  # Recognized providers with no meter path always degrade honestly to unknown.
+  case "$meter_kind" in
+    unmetered)
       jq -cn \
         --arg source_id "$provider" \
         --arg class "$class" \
@@ -81,9 +127,14 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           evidence:"unknown",
           unit:"percent",
           windows:[],
-          diagnostics:["no usage meter wired for this class yet; see docs/usage-burndown-dispatch.md"]
+          diagnostics:["no usage meter wired for this recognized provider yet; see docs/usage-burndown-dispatch.md"]
         }'
       return 0
+      ;;
+    quota-axi) ;;
+    *)
+      printf "fm-usage-source: provider '%s' has unsupported meter kind '%s'\n" "$provider" "$meter_kind" >&2
+      return 70
       ;;
   esac
 
@@ -219,7 +270,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
 # Prints a JSON array of observation objects (one per distinct provider id).
 fm_usage_source_observe_profiles() { # <profiles_json> <quota_json> <now_epoch>
   local profiles_json=$1 quota_json=$2 now_epoch=$3
-  local providers p obs out
+  local providers p obs out class
   providers=$(printf '%s\n' "$profiles_json" | jq -r '
     [.[] | (.provider // .harness // empty) | select(type == "string" and length > 0)]
     | unique | .[]
@@ -227,10 +278,17 @@ fm_usage_source_observe_profiles() { # <profiles_json> <quota_json> <now_epoch>
   out='[]'
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    obs=$(fm_usage_source_observe "$p" "$quota_json" "$now_epoch") || obs=$(jq -cn \
-      --arg provider "$p" \
-      --arg class "$(fm_usage_source_class "$p")" \
-      '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],diagnostics:["adapter failed"]}')
+    if ! fm_usage_source_provider_known "$p"; then
+      printf "fm-usage-source: unrecognized provider token '%s'\n" "$p" >&2
+      return 64
+    fi
+    if ! obs=$(fm_usage_source_observe "$p" "$quota_json" "$now_epoch"); then
+      class=$(fm_usage_source_class "$p") || return $?
+      obs=$(jq -cn \
+        --arg provider "$p" \
+        --arg class "$class" \
+        '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],diagnostics:["adapter failed"]}')
+    fi
     out=$(jq -cn --argjson acc "$out" --argjson o "$obs" '$acc + [$o]')
   done <<< "$providers"
   printf '%s\n' "$out"

@@ -65,6 +65,23 @@ test_class_map() {
   pass "provider class map covers shipped adapter classes"
 }
 
+test_provider_registry_distinguishes_unknown_tokens() {
+  local ids class_out status
+  ids=$(fm_usage_source_provider_ids)
+  [ "$ids" = $'claude\ncodex\ngrok\ngemini\nopenrouter\ncursor\ncopilot' ] \
+    || fail "recognized provider registry changed: $ids"
+  fm_usage_source_provider_known gemini \
+    || fail "recognized unmetered provider must be accepted by the shared registry"
+  if fm_usage_source_provider_known openai; then
+    fail "adapter class token openai must not be accepted as a provider identity"
+  fi
+  class_out=$(fm_usage_source_class openai)
+  status=$?
+  expect_code 64 "$status" "unrecognized provider class lookup must refuse"
+  [ -z "$class_out" ] || fail "unrecognized provider must not receive a generic class: $class_out"
+  pass "shared provider registry distinguishes provider identities from unknown tokens"
+}
+
 test_quota_backed_adapters() {
   local quota obs
   quota="$TMP_ROOT/quota.json"
@@ -90,6 +107,8 @@ test_quota_backed_adapters() {
 
 test_stubs_degrade_unknown() {
   local obs
+  [ "$(fm_usage_source_meter_kind gemini)" = unmetered ] \
+    || fail "recognized unmetered provider must be declared in the shared registry"
   obs=$(fm_usage_source_observe gemini '{"providers":[]}' "$TEST_NOW")
   jq -e '.class == "gemini-class" and .evidence == "unknown" and (.windows|length)==0' \
     <<< "$obs" >/dev/null || fail "gemini stub: $obs"
@@ -118,6 +137,7 @@ test_observe_profiles_dedupes() {
 }
 
 test_class_map
+test_provider_registry_distinguishes_unknown_tokens
 test_quota_backed_adapters
 test_stubs_degrade_unknown
 test_absent_provider_unknown

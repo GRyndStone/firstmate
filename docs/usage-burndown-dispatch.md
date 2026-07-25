@@ -49,9 +49,11 @@ Freeze (`percent used >= 90` on the binding general windows) is admission, not s
 - If every known candidate is freeze, admission refuses (exit 75) with an actionable reason, same as an explicit pin.
 - An explicit single-profile `--admit` or `--resume-meta` pin still freezes in place and never substitutes another provider.
 
-Unknown or unusable evidence never fabricates `R`/`T`/`B`.
-That source stays selectable with `quota_posture=unknown`, scores as non-competing for surplus minimization, and wins only when no known competitor remains (stable first-index tie-break among unknowns).
-Missing `quota-axi` or malformed JSON cannot prove freeze.
+Unknown or unusable evidence for a recognized provider never fabricates `R`/`T`/`B`.
+That source stays selectable with `provider_recognition=recognized` and `quota_posture=unknown`, scores as non-competing for surplus minimization, and wins only when no known competitor remains (stable first-index tie-break among unknowns).
+Missing `quota-axi` or malformed JSON cannot prove freeze for a recognized provider.
+An unrecognized provider token is caller input failure rather than evidence absence.
+It emits a machine-distinct profile with `provider_recognition=unrecognized` and `dispatch_error=unrecognized-provider`, names the bad token and recognized set on stderr, and exits 64.
 
 ## Feasible burn rate `B` (dynamic, not assumed)
 
@@ -103,30 +105,31 @@ Adapters emit a uniform observation JSON; the optimizer never parses provider-sp
 `binding` is the tightest general window (minimum remaining; soonest reset on ties).
 `evidence=unknown` means the adapter could not produce a usable binding; `windows` may be empty.
 
-### Shipped classes
+### Provider registry
 
-| Class | Provider ids (quota identity) | Evidence backend |
-| --- | --- | --- |
-| `anthropic-class` | `claude` | `quota-axi` general windows `five_hour`, `seven_day` |
-| `openai-class` | `codex` | `quota-axi` general windows `five_hour`, `weekly` |
-| `grok-class` | `grok` | `quota-axi` non-model windows (`credits`, `product:*`) |
-| `gemini-class` | `gemini` | documented stub: always `evidence=unknown` until a meter exists |
-| `openrouter-class` | `openrouter` | documented stub: always `evidence=unknown` until a meter exists |
+`fm_usage_source_registry` is the single owner of recognized provider identities, adapter classes, and meter kinds.
+Both `fm-dispatch-select.sh` and `fm-spawn.sh` ask this registry whether a provider token is recognized.
+Each row declares the quota identity, adapter class, and either `quota-axi` or `unmetered` as its meter kind.
+The executable registry is the only current recognized-provider list.
+An `unmetered` row always emits honest `evidence=unknown` until its meter kind and observation path are wired.
 
 Provider is the quota identity; harness remains the launch adapter (`provider` may differ from `harness`, e.g. Claude via opencode).
-Additional `quota-axi` providers (`cursor`, `copilot`) map through the same plug with class labels `cursor-class` and `copilot-class` when present in evidence.
+Adapter class tokens such as `openai` are not provider aliases.
+The selector refuses them instead of mapping them because a convenience mapping would hide a caller bug and could route against the wrong quota identity.
 
 ### Recipe: add a new agentic source
 
 1. Choose a stable `provider` string (quota identity) and a `class` name (`*-class`).
-2. Implement a branch in `fm_usage_source_observe` (or a sourced sibling) that, given raw quota JSON or another meter, fills the plug surface.
+2. Add one row to `fm_usage_source_registry` with meter kind `unmetered` until evidence is wired.
+3. Implement a branch in `fm_usage_source_observe` (or a sourced sibling) that, given raw quota JSON or another meter, fills the plug surface.
    Prefer real remaining + `resetsAt` + window length; never invent numbers when the meter is missing.
-3. Register the provider→class map used by `fm_usage_source_class`.
-4. If the source is not in `quota-axi`, document the external meter command and wire it behind the same observation shape (optional env override for the command).
-5. Add a unit test that fixtures the meter output and asserts binding + unknown degradation.
-6. Optionally add a crew-dispatch example profile using the new `provider` with a verified harness.
+4. Change that same registry row to the wired meter kind.
+5. If the source is not in `quota-axi`, document the external meter command and wire it behind the same observation shape (optional env override for the command).
+6. Add a unit test that fixtures the meter output and asserts binding + unknown degradation.
+7. Optionally add a crew-dispatch example profile using the new `provider` with a verified harness.
 
 No optimizer change is required when the plug surface is honored.
+No selector or spawn refusal-path change is required when the registry row is added.
 
 ## Supersession and `config/crew-dispatch.json`
 
@@ -137,8 +140,9 @@ Strategy name: `usage-burndown`.
 Legacy alias: `quota-balanced` (same engine; kept so existing local configs and tests keep working without a forced rewrite).
 
 Stdout remains one compact profile JSON for `fm-spawn.sh`:
-`provider`, `harness`, `model`, `effort`, `quota_posture`, optional `quota_percent_used`, plus `dispatch_strategy` and `dispatch_explain` for inspectability.
+`provider`, `harness`, `model`, `effort`, `provider_recognition`, `quota_posture`, optional `quota_percent_used`, plus `dispatch_strategy` and `dispatch_explain` for inspectability.
 Stderr carries human-readable decision logs (inputs, per-candidate scores, chosen source, why).
+An unrecognized-token error profile additionally carries `dispatch_error`, `unrecognized_providers`, and `recognized_providers`.
 
 ### What natural-language rules become
 
@@ -162,7 +166,9 @@ They do not rank multi-candidate winners.
 ## Compatibility
 
 - `fm-spawn.sh` flags `--provider`, `--harness`, `--model`, `--effort`, `--quota-posture`, `--quota-used` keep working; spawn still re-admits through `fm-dispatch-select.sh --admit`.
-- Missing/stale quota evidence: unknown posture, no silent freeze, no silent provider switch on explicit pins.
+- Missing/stale quota evidence for recognized providers: unknown posture, no silent freeze, no silent provider switch on explicit pins.
+- Unrecognized provider token: distinct error profile and exit 64 before quota observation.
+- Crewmate and scout spawn: explicit, dispatch-managed, and inherited provider pins are checked against the same usage-source registry before launch.
 - Tests: colocated `tests/fm-usage-burndown-lib.test.sh`, `tests/fm-usage-source-lib.test.sh`, and updated `tests/fm-dispatch-select.test.sh`.
 - Bootstrap accepts `usage-burndown` and the `quota-balanced` alias for `select`.
 
