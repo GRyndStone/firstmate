@@ -136,6 +136,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-nm-generation-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-worktree-ownership-lib.sh
+. "$SCRIPT_DIR/fm-worktree-ownership-lib.sh"
 # shellcheck source=bin/fm-reconcile-lib.sh
 . "$SCRIPT_DIR/fm-reconcile-lib.sh"
 # shellcheck source=bin/fm-usage-source-lib.sh
@@ -1393,10 +1395,21 @@ spawn_send_key() {  # <target> <key>
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  lease_path=
+  lease_path_seen=
+  lease_real=
+  last_p=
+  last_p_real=
   SPAWN_WORKTREE_CREATED=1
   spawn_send_text_line "$WT_TARGET" "fm_treehouse_worktree=\$(treehouse get --lease --lease-holder $(shell_quote "$TREEHOUSE_LEASE_HOLDER")) && cd -- \"\$fm_treehouse_worktree\""
 
   # Wait for the shell's explicit cd after treehouse returns the leased worktree path.
+  # The durable treehouse lease holder is the source of truth, not the first pane cwd
+  # that merely differs from the project checkout. Under spawn/teardown pool traffic,
+  # a stale or transitional cwd read can point at a recently released slot; recording
+  # that path would make teardown inspect and return the wrong worktree. Only proceed
+  # once treehouse status says this task's unique holder owns a path and the pane cwd
+  # is that same path.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
@@ -1405,15 +1418,28 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
   for _ in $(seq 1 60); do
+    lease_path=$(fm_worktree_treehouse_holder_path "$PROJ_ABS" "$TREEHOUSE_LEASE_HOLDER" 2>/dev/null || true)
+    if [ -n "$lease_path" ]; then
+      lease_path_seen=$lease_path
+      lease_real=$lease_path
+    fi
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
+    if [ -n "$p" ]; then
+      last_p=$p
+      last_p_real=$(real_path_or_raw "$p")
+    fi
+    if [ -n "$lease_real" ] && [ -n "$last_p_real" ] && [ "$last_p_real" = "$lease_real" ]; then
+      WT=$lease_real
       break
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    if [ -n "$lease_path_seen" ]; then
+      echo "error: treehouse holder $TREEHOUSE_LEASE_HOLDER leased $lease_path_seen, but pane $T cwd was ${last_p_real:-${last_p:-<unknown>}}; refusing to record a mismatched worktree" >&2
+    else
+      echo "error: treehouse get did not publish a lease for holder $TREEHOUSE_LEASE_HOLDER within 60s; inspect window $T" >&2
+    fi
     exit 1
   fi
 

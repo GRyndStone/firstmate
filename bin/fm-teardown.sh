@@ -94,6 +94,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-lock-lib.sh"
 # shellcheck source=bin/fm-reconcile-lib.sh
 . "$SCRIPT_DIR/fm-reconcile-lib.sh"
+# shellcheck source=bin/fm-worktree-ownership-lib.sh
+. "$SCRIPT_DIR/fm-worktree-ownership-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -1058,7 +1060,7 @@ remove_secondmate_registry_entry() {
 }
 
 validate_current_task_teardown() {
-  local child_meta safety_rc
+  local child_meta safety_rc ownership_out
   if [ "$KIND" = secondmate ]; then
     [ -n "$HOME_PATH" ] || HOME_PATH=$WT
     validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || return 1
@@ -1083,6 +1085,11 @@ validate_current_task_teardown() {
       echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
       return 1
     fi
+  fi
+  if ! ownership_out=$(fm_worktree_validate_task_ownership "$ID" "$META" strict 2>&1); then
+    [ -n "$ownership_out" ] && printf '%s\n' "$ownership_out" >&2
+    echo "REFUSED: recorded worktree for task $ID is not the task's own; preserving metadata." >&2
+    return 1
   fi
   if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
     ORCA_WORKTREE_ID=$(require_orca_worktree_id "$META") || return 1
