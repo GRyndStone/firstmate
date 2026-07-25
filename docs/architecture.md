@@ -53,7 +53,10 @@ Optional X mode rides the same check path: the locked session-start bootstrap st
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live supervision shape for the running primary harness: Claude and Grok use background-notify cycles, Codex uses the identity-bound local supervisor daemon, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.
-`bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints exactly one honest status line (`started` / `attached` / restart-only `healthy` / `FAILED`, the last exiting non-zero).
+`bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it starts the watcher detached from its own process tree (`bin/fm-detach.sh`), verifies it is genuinely alive with a fresh liveness beacon, and prints exactly one honest status line (`started` / `attached` / restart-only `healthy` / `FAILED`, the last exiting non-zero).
+Detached is the point: a harness stopping the arm's background task signals that task's whole descendant tree, so a watcher forked as an ordinary child died with its launcher and the fleet ran unsupervised.
+The arm therefore leaves the watcher running when it is signalled, and records the arm ownership provenance into the lock itself, since a detached watcher cannot read it from its own parent.
+`docs/turnend-guard.md` ("Detached supervision watcher") owns the mechanism, the measured kill evidence, and the duplicate-prevention rules.
 On `attached` it stays live until that existing cycle ends so background-notify harnesses do not get an empty false wake from a healthy no-op exit.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.

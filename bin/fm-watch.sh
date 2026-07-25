@@ -1053,9 +1053,14 @@ EOF
   done
 }
 
-# Accept ownership only from a wrapper that declares its live process identity.
+# Accept ownership only from a wrapper that declares its live process identity
+# AND is this watcher's actual parent; command-name ancestry is not ownership
+# evidence. bin/fm-watch-arm.sh no longer arrives here: it starts this watcher
+# detached so a harness kill of the arm cannot take supervision down with it, so
+# it is not the parent and records its own arm provenance into the lock instead.
 # Arm ownership also carries the live process that tracks the wrapper across a
-# turn yield; command-name ancestry is not ownership evidence.
+# turn yield, and stays in the accepted set because fm_watcher_live_owner reads
+# back exactly these fields whoever wrote them.
 watch_owner_from_env() {
   local current_identity current_tracker_identity
   WATCH_OWNER_KIND=${FM_WATCH_OWNER_KIND:-}

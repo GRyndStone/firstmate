@@ -48,6 +48,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-review-diff.sh`      | Review a crewmate branch or recorded PR head against the authoritative base          |
 | `fm-marker-lib.sh`       | Shared from-firstmate request marker and detector                                    |
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
+| `fm-detach.sh`           | Launch a command detached from the caller's process tree and print its pid            |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher diagnostic checkpoint                             |
 | `fm-supervisor-start.sh` | Start or identity-safely restart the durable normal-mode local supervisor for Codex   |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |

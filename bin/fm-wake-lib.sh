@@ -81,6 +81,57 @@ fm_watcher_healthy() {
   return 0
 }
 
+# Classify this home's watcher from DURABLE STATE ALONE - the singleton lock and
+# the liveness beacon - so a watcher that died or wedged is provable on the next
+# fleet action, with no dependence on a harness kill notification ever arriving.
+# Sets FM_WATCHER_STATE and FM_WATCHER_STATE_PID; always returns 0.
+#   live    the lock names a live, identity-matched watcher and the beacon is fresh
+#   wedged  that same watcher is alive but its beacon stopped advancing. A pid
+#           liveness check calls this healthy while it supervises nothing, and a
+#           plain re-arm cannot displace it, so it is named separately
+#   dead    the lock names a watcher that is provably gone - the pid exited, or
+#           the pid was recycled onto an unrelated process. No grace applies to
+#           this one: it is proof, not a timeout
+#   absent  no lock names a watcher for this home, including the moment a lock is
+#           still being furnished by a watcher that just acquired it
+FM_WATCHER_STATE=
+FM_WATCHER_STATE_PID=
+fm_watcher_state() {  # <state-dir> <watch-path> [grace-seconds] [home]
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME}
+  local lockdir pid
+  FM_WATCHER_STATE=absent
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+  FM_WATCHER_STATE_PID=
+  lockdir="$state/.watch.lock"
+  { [ -e "$lockdir" ] || [ -L "$lockdir" ]; } || return 0
+  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  FM_WATCHER_STATE_PID=$pid
+  if fm_pid_alive "$pid" \
+    && ! fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" \
+    && [ "$(fm_path_age "$lockdir")" -lt "$FM_LOCK_STALE_AFTER" ]; then
+    # A live pid whose identity fields are not written yet is a watcher still
+    # furnishing the lock it just took, not a recycled pid. Only past the write
+    # window is a mismatch evidence of anything.
+    FM_WATCHER_STATE=absent
+    # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+    FM_WATCHER_STATE_PID=
+    return 0
+  fi
+  if ! fm_pid_alive "$pid" || ! fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home"; then
+    FM_WATCHER_STATE=dead
+    return 0
+  fi
+  if [ "$(fm_path_age "$state/.last-watcher-beat")" -lt "$grace" ]; then
+    # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+    FM_WATCHER_STATE=live
+  else
+    # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+    FM_WATCHER_STATE=wedged
+  fi
+  return 0
+}
+
 FM_WATCHER_OWNER_KIND=
 FM_WATCHER_OWNER_PID=
 FM_WATCHER_OWNER_MODE=
