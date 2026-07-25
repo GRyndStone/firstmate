@@ -98,13 +98,37 @@ An arm that fails to confirm its own watcher stops the exact pid it launched, an
 
 ### Detecting the absence from durable state
 
-`fm_watcher_state` in `bin/fm-wake-lib.sh` classifies the watcher from the singleton lock and the beacon alone, so no kill notification has to be delivered for the absence to be seen.
+`fm_watcher_state` in `bin/fm-wake-lib.sh` classifies the watcher from the singleton lock, the recorded exit disposition, and the beacon alone, so no kill notification has to be delivered for the absence to be seen.
 `bin/fm-guard.sh` and this guard both read it through `fm_supervision_status`.
 
-- `dead`: the lock names a pid that is provably gone, or recycled onto an unrelated process. Reported immediately, because a dead pid is proof rather than a timeout, where beacon age alone stays silent for the whole `FM_GUARD_GRACE` window.
+- `dead`: the watcher is provably gone, in either of two shapes. Reported immediately in both, because each is proof rather than a timeout, where beacon age alone stays silent for the whole `FM_GUARD_GRACE` window.
 - `wedged`: the lock names a live, identity-matched watcher whose beacon stopped advancing. Named separately because a liveness check on the pid alone calls this healthy, and because only `bin/fm-watch-arm.sh --restart` can displace a live lock holder.
-- `absent`: no lock names a watcher, including the sub-second window where one is still furnishing a lock it just took.
+- `absent`: nothing proves a watcher died - a deliberate wake exit, a duplicate standing down, none ever armed, or the sub-second window where one is still furnishing a lock it just took.
 - `live`: live, identity-matched, and beating inside the grace window.
+
+### Why the lock alone is not enough
+
+The first `dead` shape is a lock left behind naming an exited or recycled pid.
+That only happens when no trap ran: a `SIGKILL`, or a crash.
+
+The second shape is the one that mattered and was missed at first.
+`bin/fm-watch.sh` sets an `EXIT` trap, and bash runs that trap when the shell terminates on a signal too, so a plain `SIGTERM` releases the lock on the way out exactly like a deliberate wake exit does.
+Durable state was then identical for both: no lock, and a beacon that merely ages.
+A watcher signalled out from under a live fleet was therefore invisible for the whole grace window, which is precisely the mid-turn blind gap this whole section exists to close.
+
+So the watcher records WHY it exited, at trap time, in `state/.watcher-exit`: `wake` (this exit IS the wake being delivered, already durable in `state/.wake-queue`), `stood-down` (a duplicate yielding to the rightful singleton), `signalled:<SIG>`, or `error`.
+The first two are legitimate and stay silent inside grace; the last two are `dead` with no grace.
+
+Attribution is explicit rather than assumed, so a stale record can never alarm about a healthy watcher:
+
+- Only the process that actually held the singleton writes a record, so a watcher that stood down on a collision cannot file a report about the real one.
+- The record names the home, the watcher path, and the pid it describes.
+- A fresh watcher deletes the record when it acquires the lock, so a record only ever describes the most recent holder, and only after that holder is gone.
+- The lock is consulted first and wins outright: a live, identity-matched holder is never overruled by any record.
+
+One platform note that shapes the tests: a shell starting a background job in a non-interactive script sets `SIGINT` to `SIG_IGN` for that job, and bash will not install a trap for a signal it inherited as ignored.
+A background watcher therefore cannot be interrupted at all, and the `INT` trap matters for the foreground checkpoint run (`bin/fm-watch-checkpoint.sh`).
+`tests/fm-watch-detach.test.sh` resets the disposition through perl before exec so its `SIGINT` case exercises the trap rather than proving nothing.
 
 ## Harness Integrations
 

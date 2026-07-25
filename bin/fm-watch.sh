@@ -285,6 +285,9 @@ wake() {
     *) echo 0 > "$STATE/.heartbeat-streak" ;;
   esac
   echo "$1"
+  # The one legitimate reason to stop: this exit is the wake being delivered, and
+  # the reason is already durable in the wake queue.
+  WATCH_EXIT_CAUSE=wake
   exit 0
 }
 
@@ -641,8 +644,52 @@ reconcile_batch_cleanup() {
   RECONCILE_BATCH_DIR=
 }
 
+# Durable exit disposition.
+#
+# The EXIT trap releases the singleton lock on EVERY exit path, so from durable
+# state a watcher that deliberately exited to surface a wake and a watcher that
+# was signalled out from under the fleet look identical: no lock, and a beacon
+# that merely ages. That is the mid-turn blind window - a signalled watcher hides
+# behind the beacon for the whole FM_GUARD_GRACE. Recording WHY this watcher
+# exited, at trap time, is what lets bin/fm-guard.sh separate the two.
+#
+# Written only by the process that actually HELD the singleton, so a watcher that
+# stood down on a collision can never file a report about the real one. A fresh
+# watcher deletes the record when it acquires the lock, so a record only ever
+# describes the most recent holder, and only after that holder is gone.
+WATCH_EXIT_RECORD="$STATE/.watcher-exit"
+WATCH_EXIT_CAUSE=error
+WATCHER_HELD_LOCK=0
+WATCHER_PID=
+
+record_watch_exit() {
+  local tmp
+  [ "$WATCHER_HELD_LOCK" = 1 ] || return 0
+  tmp="$WATCH_EXIT_RECORD.$WATCHER_PID"
+  {
+    printf 'schema=fm-watcher-exit.v1\n'
+    printf 'pid=%s\n' "$WATCHER_PID"
+    printf 'cause=%s\n' "$WATCH_EXIT_CAUSE"
+    printf 'epoch=%s\n' "$(date +%s)"
+    printf 'fm-home=%s\n' "$FM_HOME"
+    printf 'watcher-path=%s\n' "$WATCH_PATH"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f "$tmp" "$WATCH_EXIT_RECORD" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
+# Classify a terminating signal before the EXIT trap runs. Without these the
+# shell still runs the EXIT trap on the way out, which is exactly why a signalled
+# exit was indistinguishable from a deliberate one.
+watch_signal_exit() {  # <signal-name> <status>
+  WATCH_EXIT_CAUSE="signalled:$1"
+  exit "$2"
+}
+
 watch_cleanup() {
   reconcile_batch_cleanup
+  # Record BEFORE releasing, so the lock never disappears while durable state is
+  # still silent about why.
+  record_watch_exit
   fm_lock_release "$WATCH_LOCK"
 }
 
@@ -1113,10 +1160,18 @@ if ! fm_lock_try_acquire "$WATCH_LOCK" 1; then
   exit 0
 fi
 trap watch_cleanup EXIT
+trap 'watch_signal_exit TERM 143' TERM
+trap 'watch_signal_exit INT 130' INT
+trap 'watch_signal_exit HUP 129' HUP
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
 WATCHER_PID=${BASHPID:-$$}
+WATCHER_HELD_LOCK=1
+# This watcher supersedes whatever the last one reported on its way out, so its
+# record must not outlive it. Deleting here is what keeps a stale exit cause from
+# ever describing a live watcher.
+rm -f "$WATCH_EXIT_RECORD" 2>/dev/null || true
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
@@ -1141,6 +1196,9 @@ while :; do
   # This makes any duplicate self-resolve within one poll instead of persisting
   # and doubling every wake.
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" != "$WATCHER_PID" ]; then
+    # A duplicate standing down is benign: the rightful singleton is still there,
+    # so this must never read as supervision going away.
+    WATCH_EXIT_CAUSE=stood-down
     exit 0
   fi
 

@@ -81,31 +81,103 @@ fm_watcher_healthy() {
   return 0
 }
 
-# Classify this home's watcher from DURABLE STATE ALONE - the singleton lock and
-# the liveness beacon - so a watcher that died or wedged is provable on the next
-# fleet action, with no dependence on a harness kill notification ever arriving.
+fm_watcher_exit_field() {  # <record-path> <key>
+  local record=$1 key=$2
+  grep "^$key=" "$record" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+# Read the exit disposition the last holder of this home's singleton recorded on
+# its way out (bin/fm-watch.sh, "Durable exit disposition"). Sets
+# FM_WATCHER_EXIT_CAUSE and FM_WATCHER_EXIT_PID; returns 1 when there is no
+# record, or the record is not about this home's watcher.
+# Attribution is explicit rather than assumed: the record names the home, the
+# watcher path, and the pid it describes, only the process that actually held the
+# lock writes one, and a fresh watcher deletes it on acquire. So a record can only
+# ever describe the most recent holder, and only after that holder is gone.
+FM_WATCHER_EXIT_CAUSE=
+FM_WATCHER_EXIT_PID=
+fm_watcher_exit_record() {  # <state-dir> <watch-path> [home]
+  local state=$1 watch_path=$2 home=${3:-$FM_HOME} record cause rec_home rec_path rec_pid
+  FM_WATCHER_EXIT_CAUSE=
+  FM_WATCHER_EXIT_PID=
+  record="$state/.watcher-exit"
+  [ -f "$record" ] || return 1
+  rec_home=$(fm_watcher_exit_field "$record" fm-home)
+  rec_path=$(fm_watcher_exit_field "$record" watcher-path)
+  rec_pid=$(fm_watcher_exit_field "$record" pid)
+  cause=$(fm_watcher_exit_field "$record" cause)
+  [ "$rec_home" = "$home" ] || return 1
+  [ "$rec_path" = "$watch_path" ] || return 1
+  case "$rec_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$cause" ] || return 1
+  FM_WATCHER_EXIT_CAUSE=$cause
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_exit_record returns.
+  FM_WATCHER_EXIT_PID=$rec_pid
+  return 0
+}
+
+# Classify this home's watcher from DURABLE STATE ALONE - the singleton lock, the
+# recorded exit disposition, and the liveness beacon - so a watcher that died or
+# wedged is provable on the next fleet action, with no dependence on a harness
+# kill notification ever arriving.
 # Sets FM_WATCHER_STATE and FM_WATCHER_STATE_PID; always returns 0.
 #   live    the lock names a live, identity-matched watcher and the beacon is fresh
 #   wedged  that same watcher is alive but its beacon stopped advancing. A pid
 #           liveness check calls this healthy while it supervises nothing, and a
 #           plain re-arm cannot displace it, so it is named separately
-#   dead    the lock names a watcher that is provably gone - the pid exited, or
-#           the pid was recycled onto an unrelated process. No grace applies to
-#           this one: it is proof, not a timeout
-#   absent  no lock names a watcher for this home, including the moment a lock is
-#           still being furnished by a watcher that just acquired it
+#   dead    the watcher is provably gone. Either the lock names a pid that exited
+#           or was recycled onto an unrelated process (a SIGKILL or a crash, where
+#           no trap ran to release the lock), or there is no lock but the last
+#           holder recorded that it was SIGNALLED or failed rather than exiting on
+#           a wake. No grace applies to either: both are proof, not a timeout
+#   absent  no lock names a watcher for this home and nothing proves one died -
+#           a deliberate wake exit, a duplicate standing down, none ever armed, or
+#           the moment a lock is still being furnished by a watcher that just took it
+#
+# The lock is consulted FIRST and wins outright. A live, identity-matched holder
+# is never overruled by an exit record, which is what stops a leftover record from
+# alarming about a watcher that is currently healthy.
 FM_WATCHER_STATE=
 FM_WATCHER_STATE_PID=
+FM_WATCHER_STATE_CAUSE=
+
+# With no lock, durable state must still separate a watcher that exited
+# DELIBERATELY from one that was signalled or failed. The EXIT trap releases the
+# lock on both paths, so without the recorded cause they are indistinguishable and
+# a signalled watcher hides behind the beacon for the whole grace window.
+fm_watcher_state_from_exit_record() {  # <state-dir> <watch-path> <home>
+  fm_watcher_exit_record "$1" "$2" "$3" || return 0
+  case "$FM_WATCHER_EXIT_CAUSE" in
+    wake|stood-down) return 0 ;;
+  esac
+  FM_WATCHER_STATE=dead
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+  FM_WATCHER_STATE_PID=$FM_WATCHER_EXIT_PID
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+  FM_WATCHER_STATE_CAUSE=$FM_WATCHER_EXIT_CAUSE
+  return 0
+}
+
 fm_watcher_state() {  # <state-dir> <watch-path> [grace-seconds] [home]
   local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME}
   local lockdir pid
   FM_WATCHER_STATE=absent
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
   FM_WATCHER_STATE_PID=
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_state returns.
+  FM_WATCHER_STATE_CAUSE=
   lockdir="$state/.watch.lock"
-  { [ -e "$lockdir" ] || [ -L "$lockdir" ]; } || return 0
+  { [ -e "$lockdir" ] || [ -L "$lockdir" ]; } || {
+    fm_watcher_state_from_exit_record "$state" "$watch_path" "$home"
+    return 0
+  }
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  case "$pid" in
+    ''|*[!0-9]*)
+      fm_watcher_state_from_exit_record "$state" "$watch_path" "$home"
+      return 0
+      ;;
+  esac
   FM_WATCHER_STATE_PID=$pid
   if fm_pid_alive "$pid" \
     && ! fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" \

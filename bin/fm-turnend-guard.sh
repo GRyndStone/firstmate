@@ -87,7 +87,13 @@ daemon_owner_is_active() {
 # forced continuation reads as "the watcher died" or "the watcher wedged" rather
 # than the same generic line for every cause.
 case "$FM_SUP_WATCHER_STATE" in
-  dead) WATCH_OWNER_DESC="the recorded watcher (pid $FM_SUP_WATCHER_PID) is provably dead" ;;
+  dead)
+    if [ -n "$FM_SUP_WATCHER_CAUSE" ]; then
+      WATCH_OWNER_DESC="watcher pid $FM_SUP_WATCHER_PID stopped without delivering a wake (recorded cause: $FM_SUP_WATCHER_CAUSE)"
+    else
+      WATCH_OWNER_DESC="the recorded watcher (pid $FM_SUP_WATCHER_PID) is provably dead"
+    fi
+    ;;
   wedged) WATCH_OWNER_DESC="the recorded watcher (pid $FM_SUP_WATCHER_PID) is wedged - alive, but its beacon stopped" ;;
   *) WATCH_OWNER_DESC="no healthy watcher" ;;
 esac

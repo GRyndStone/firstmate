@@ -13,17 +13,23 @@
 # Three dangerous states, all read from durable state with no dependence on a
 # harness kill notification ever being delivered (fm_watcher_state in
 # bin/fm-wake-lib.sh owns the classification):
-#   DEAD    the singleton lock names a watcher that is provably gone. Reported
-#           immediately, because a dead pid is proof rather than a timeout, where
-#           beacon age alone would stay silent for the whole grace window.
+#   DEAD    the watcher is provably gone: the lock names an exited or recycled
+#           pid (SIGKILL or a crash, where no trap ran), or there is no lock but
+#           the last holder recorded that it was SIGNALLED or failed rather than
+#           exiting on a wake. Reported immediately in both shapes, because both
+#           are proof rather than a timeout, where beacon age alone would stay
+#           silent for the whole grace window. The signalled shape is the one
+#           that matters most: the EXIT trap releases the lock there too, so
+#           without the recorded cause a SIGTERMed watcher was indistinguishable
+#           from one that deliberately exited to deliver a wake.
 #   WEDGED  the lock names a live, identity-matched watcher whose beacon stopped
 #           advancing. Named separately from DOWN because a pid liveness check
 #           calls it healthy, and because only --restart can displace it.
 #   DOWN    no watcher, and the beacon (state/.last-watcher-beat, touched every
 #           poll cycle) is missing or older than FM_GUARD_GRACE seconds.
 # Normal wake handling (watcher briefly down between a wake and the next
-# supervision resume) leaves no lock behind and stays inside the grace window, so
-# it stays silent.
+# supervision resume) leaves no lock behind, records that its exit WAS the wake,
+# and stays inside the grace window, so it stays silent.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,6 +88,7 @@ watcher_fresh=$FM_SUP_WATCHER_FRESH
 beacon_desc=$FM_SUP_BEACON_DESC
 watcher_state=$FM_SUP_WATCHER_STATE
 watcher_pid=$FM_SUP_WATCHER_PID
+watcher_cause=$FM_SUP_WATCHER_CAUSE
 [ "$in_flight" -eq 0 ] && exit 0
 
 [ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
@@ -96,7 +103,11 @@ alarm_extra=
 case "$watcher_state" in
   dead)
     alarm_title='WATCHER DEAD - SUPERVISION IS OFF'
-    alarm_detail=$(printf 'The recorded watcher (pid %s) is gone. Durable state proves it, so no grace window applies and no kill notification was needed.' "$watcher_pid")
+    if [ -n "$watcher_cause" ]; then
+      alarm_detail=$(printf 'Watcher pid %s stopped without delivering a wake (recorded cause: %s), so it did not hand supervision on to anything. Durable state proves it, so no grace window applies and no kill notification was needed.' "$watcher_pid" "$watcher_cause")
+    else
+      alarm_detail=$(printf 'The recorded watcher (pid %s) is gone. Durable state proves it, so no grace window applies and no kill notification was needed.' "$watcher_pid")
+    fi
     ;;
   wedged)
     alarm_title='WATCHER WEDGED - SUPERVISION IS OFF'

@@ -30,6 +30,9 @@ fm_sup_stat_mtime() {
 #                         fm_watcher_state in bin/fm-wake-lib.sh, or "unknown"
 #                         when that library was not sourced by the caller
 #   FM_SUP_WATCHER_PID    the pid that classification is about, when there is one
+#   FM_SUP_WATCHER_CAUSE  the recorded exit cause, when the classification came
+#                         from a departed watcher's own exit record rather than
+#                         from a lock left behind
 # The beacon fields answer "is supervision fresh"; the watcher-state fields answer
 # "and if not, is that because it died, wedged, or was never armed" - a distinction
 # only the lock can make, and the one that lets a dead watcher be named without
@@ -46,12 +49,15 @@ fm_supervision_status() {
   FM_SUP_QUEUE_PENDING=false
   FM_SUP_WATCHER_STATE=unknown
   FM_SUP_WATCHER_PID=
+  FM_SUP_WATCHER_CAUSE=
   if command -v fm_watcher_state >/dev/null 2>&1; then
     fm_watcher_state "$state" "$watch_path" "$grace" "$home"
     # shellcheck disable=SC2034 # Read by callers (fm-guard.sh) after sourcing.
     FM_SUP_WATCHER_STATE=$FM_WATCHER_STATE
     # shellcheck disable=SC2034 # Read by callers (fm-guard.sh) after sourcing.
     FM_SUP_WATCHER_PID=$FM_WATCHER_STATE_PID
+    # shellcheck disable=SC2034 # Read by callers (fm-guard.sh) after sourcing.
+    FM_SUP_WATCHER_CAUSE=$FM_WATCHER_STATE_CAUSE
   fi
 
   for meta in "$state"/*.meta; do
