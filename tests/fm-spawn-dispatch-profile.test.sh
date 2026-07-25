@@ -316,13 +316,13 @@ test_active_dispatch_profile_allows_raw_launch_command() {
   enable_dispatch_profile "$HOME_DIR"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-    "$id" "$PROJ_DIR" "custom-agent --flag" --provider custom-provider)
+    "$id" "$PROJ_DIR" "custom-agent --flag" --provider codex)
   status=$?
   expect_code 0 "$status" "raw launch command should satisfy active dispatch-profile requirement"
   assert_contains "$out" "spawned $id harness=custom-agent" "spawn did not report raw command harness"
   assert_meta_profile "$HOME_DIR/state/$id.meta" custom-agent default default
-  assert_grep "provider=custom-provider" "$HOME_DIR/state/$id.meta" "meta missing custom provider pin"
-  assert_grep "quota_posture=unknown" "$HOME_DIR/state/$id.meta" "unknown provider should admit with unknown posture"
+  assert_grep "provider=codex" "$HOME_DIR/state/$id.meta" "meta missing recognized provider pin"
+  assert_grep "quota_posture=normal" "$HOME_DIR/state/$id.meta" "recognized provider should admit from fresh evidence"
   launch=$(cat "$LAUNCH_LOG")
   shelllog="${LAUNCH_LOG%.log}.shell.log"
   [ "$launch" = "custom-agent --flag" ] || fail "raw launch command changed"$'\n'"actual: $launch"
@@ -330,6 +330,31 @@ test_active_dispatch_profile_allows_raw_launch_command() {
     fail "raw harness must not export NO_MISTAKES_RUN_AGENTS: $(cat "$shelllog")"
   fi
   pass "active crew-dispatch profile allows the raw launch-command escape hatch"
+}
+
+test_spawn_refuses_unrecognized_provider_without_selector_backstop() {
+  local kind rec id out status
+  for kind in ship scout; do
+    id="profile-unrecognized-$kind-z24"
+    rec=$(make_spawn_case "profile-unrecognized-$kind" codex "$id")
+    read_case_record "$rec"
+    if [ "$kind" = scout ]; then
+      out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+        "$id" "$PROJ_DIR" --provider typo-provider --harness codex --scout)
+    else
+      out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+        "$id" "$PROJ_DIR" --provider typo-provider --harness codex)
+    fi
+    status=$?
+    expect_code 64 "$status" "$kind spawn with an unrecognized provider must refuse"
+    assert_contains "$out" "unrecognized provider token 'typo-provider'" \
+      "$kind refusal did not name the bad provider token"
+    assert_contains "$out" "recognized providers: claude, codex, grok, gemini, openrouter, cursor, copilot" \
+      "$kind refusal did not name the shared recognized set"
+    assert_absent "$HOME_DIR/state/$id.meta" "$kind refusal should happen before meta is written"
+    [ ! -s "$LAUNCH_LOG" ] || fail "$kind refusal reached harness launch: $(cat "$LAUNCH_LOG")"
+  done
+  pass "ship and scout spawns independently refuse unrecognized provider identities"
 }
 
 test_grok_default_dispatch_admits_without_silent_substitution() {
@@ -565,6 +590,7 @@ test_active_dispatch_profile_cannot_bypass_freeze
 test_existing_task_profile_is_immutable
 test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
+test_spawn_refuses_unrecognized_provider_without_selector_backstop
 test_grok_default_dispatch_admits_without_silent_substitution
 test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort

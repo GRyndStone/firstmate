@@ -269,6 +269,11 @@ Per rule, `when` and `use` are required.
 `use` may be a single profile object or an ordered array of profile objects; the single-object form stays fully backward-compatible, and every profile needs `harness`.
 `use.provider`, `use.model`, `use.effort`, and `why` are optional.
 `provider` identifies the quota account independently of the launch `harness`; when omitted it defaults to the harness for compatibility.
+That fallback is admissible only when the harness name is itself a recognized provider identity.
+Cross-provider harnesses such as OpenCode and Pi therefore need an explicit quota provider for admission.
+Explicit provider values must be identities recognized by the single registry in `bin/fm-usage-source-lib.sh`; adapter class tokens are not aliases.
+Admission emits exit 64 plus a machine-distinct error profile for an unrecognized token, and `fm-spawn.sh` independently refuses an unrecognized crewmate or scout provider pin before launch.
+Recognized providers declared `unmetered` in that registry remain admissible with `provider_recognition=recognized` and `quota_posture=unknown`.
 `select` is optional and supports `usage-burndown` (canonical) and the legacy alias `quota-balanced` (same engine).
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback when the engine has no scorable evidence.
 `default` is optional.

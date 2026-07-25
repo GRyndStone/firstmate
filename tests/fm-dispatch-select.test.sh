@@ -288,6 +288,63 @@ test_unavailable_provider_does_not_trigger_admission_fallback() {
   pass "unavailable explicit provider never silently selects another candidate"
 }
 
+test_unrecognized_provider_is_a_distinct_machine_error() {
+  local quota token out err status
+  quota="$TMP_ROOT/unrecognized.json"
+  write_quota "$quota" fresh 100 100 fresh 65 65
+
+  for token in openai typo-provider; do
+    out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
+      '{"provider":"'"$token"'","harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"}' \
+      2>"$TMP_ROOT/unrecognized-$token.err")
+    status=$?
+    err=$(cat "$TMP_ROOT/unrecognized-$token.err")
+    expect_code 64 "$status" "unrecognized provider $token must refuse admission distinctly"
+    jq -e --arg token "$token" '
+      .provider == $token
+      and .harness == "codex"
+      and .provider_recognition == "unrecognized"
+      and .quota_posture == "unknown"
+      and .dispatch_error == "unrecognized-provider"
+      and .unrecognized_providers == [$token]
+      and (.recognized_providers | index("codex")) != null
+      and (.recognized_providers | index("gemini")) != null
+    ' <<< "$out" >/dev/null || fail "unrecognized provider profile was not machine-distinct: $out"
+    assert_contains "$err" "unrecognized provider token '$token'" \
+      "unrecognized refusal did not name the bad token"
+    assert_contains "$err" "recognized providers: claude, codex, grok, gemini, openrouter, cursor, copilot" \
+      "unrecognized refusal did not name the shared recognized set"
+    assert_not_contains "$err" "no usable usage evidence" \
+      "unrecognized provider was mislabeled as honest absence"
+  done
+  pass "unrecognized provider identities refuse with distinct JSON and stderr diagnostics"
+}
+
+test_recognized_unmetered_provider_degrades_honestly() {
+  local quota out err status
+  quota="$TMP_ROOT/recognized-unmetered.json"
+  write_quota "$quota" fresh 100 100 fresh 100 100
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
+    '{"provider":"gemini","harness":"codex","model":"future-model"}' \
+    2>"$TMP_ROOT/recognized-unmetered.err")
+  status=$?
+  err=$(cat "$TMP_ROOT/recognized-unmetered.err")
+  expect_code 0 "$status" "recognized provider without a meter must remain admissible"
+  jq -e '
+    .provider == "gemini"
+    and .harness == "codex"
+    and .provider_recognition == "recognized"
+    and .quota_posture == "unknown"
+    and (has("dispatch_error") | not)
+    and (has("unrecognized_providers") | not)
+  ' <<< "$out" >/dev/null || fail "recognized unmetered provider did not degrade honestly: $out"
+  assert_contains "$err" "provider gemini retained with unknown posture; no usable evidence" \
+    "recognized unmetered provider did not explain honest unknown evidence"
+  assert_not_contains "$err" "unrecognized provider" \
+    "recognized unmetered provider was reclassified as a caller error"
+  pass "recognized providers without meters stay distinct from unrecognized tokens"
+}
+
 test_nonfresh_provider_surfaces_actionable_diagnostics() {
   local quota out err
   quota="$TMP_ROOT/auth-required.json"
@@ -391,6 +448,8 @@ test_stale_usable_evidence_competes_by_burndown
 test_expired_or_unverifiable_stale_data_degrades_to_unknown
 test_malformed_or_missing_quota_retains_selected_provider
 test_unavailable_provider_does_not_trigger_admission_fallback
+test_unrecognized_provider_is_a_distinct_machine_error
+test_recognized_unmetered_provider_degrades_honestly
 test_nonfresh_provider_surfaces_actionable_diagnostics
 test_resume_meta_retains_pinned_profile
 test_non_admission_selection_stays_backward_compatible

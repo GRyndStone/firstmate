@@ -30,9 +30,12 @@
 #     (exit 75) and never substitutes another provider for that pin.
 #   - Stale-but-current general-window numbers remain usable under adapter rules
 #     (refreshedAt/resetsAt prove the window is still current).
-#   - Missing, failed, or unusable usage evidence stays observable on stderr but
-#     cannot prove freeze. Admission retains the selected profile with
-#     quota_posture=unknown instead of switching harness or model.
+#   - Recognized providers with missing, failed, or unusable usage evidence stay
+#     observable on stderr but cannot prove freeze. Admission retains the selected
+#     profile with provider_recognition=recognized and quota_posture=unknown.
+#   - Unrecognized provider tokens emit a machine-distinct error profile with
+#     provider_recognition=unrecognized and dispatch_error=unrecognized-provider,
+#     name the bad token and recognized set on stderr, and exit 64.
 #   - Every scored decision logs candidates and why on stderr; the profile JSON
 #     also carries dispatch_strategy and dispatch_explain when available.
 #   - --resume-meta reconstructs only the recorded provider/harness/model/effort
@@ -213,6 +216,54 @@ if [ "$select_strategy" = usage-burndown ]; then
   mode=multi
 fi
 
+recognized_providers_json=$(fm_usage_source_provider_ids | jq -Rsc '
+  split("\n") | map(select(length > 0))
+')
+recognized_providers_csv=$(fm_usage_source_provider_ids_csv)
+profile_providers_json=$(printf '%s\n' "$profiles_json" | jq -c '
+  [.[] | (.provider // .harness // empty) | select(type == "string" and length > 0)]
+  | unique
+')
+unrecognized_providers_json=$(jq -cn \
+  --argjson profiles "$profile_providers_json" \
+  --argjson recognized "$recognized_providers_json" \
+  '$profiles | map(select(. as $provider | ($recognized | index($provider)) == null))')
+if [ "$(printf '%s\n' "$unrecognized_providers_json" | jq 'length')" -gt 0 ]; then
+  while IFS= read -r unrecognized_provider; do
+    [ -z "$unrecognized_provider" ] || \
+      log "error: unrecognized provider token '$unrecognized_provider'; recognized providers: $recognized_providers_csv"
+  done < <(printf '%s\n' "$unrecognized_providers_json" | jq -r '.[]')
+  printf '%s\n' "$profiles_json" | jq -c \
+    --argjson unrecognized "$unrecognized_providers_json" \
+    --argjson recognized "$recognized_providers_json" '
+    (
+      map(
+        select(
+          (.provider // .harness) as $provider
+          | ($unrecognized | index($provider)) != null
+        )
+      )
+      | .[0]
+    ) as $profile
+    | {
+        provider: ($profile.provider // $profile.harness),
+        harness: $profile.harness
+      }
+      + (if ($profile.model? | type) == "string" then {model:$profile.model} else {} end)
+      + (if ($profile.effort? | type) == "string" then {effort:$profile.effort} else {} end)
+      + {
+          provider_recognition:"unrecognized",
+          quota_posture:"unknown",
+          dispatch_strategy:"usage-burndown",
+          dispatch_explain:"unrecognized provider token: \($unrecognized | join(", "))",
+          dispatch_error:"unrecognized-provider",
+          unrecognized_providers:$unrecognized,
+          recognized_providers:$recognized
+        }
+  '
+  exit 64
+fi
+
 quota_unavailable() {
   log "$1; retaining selected provider with quota posture unknown"
   # When multi was requested but evidence is wholly unusable, still emit first
@@ -223,6 +274,7 @@ quota_unavailable() {
       + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
       + (if ($p.effort? | type) == "string" then {effort: $p.effort} else {} end);
     clean(.[0]) + {
+      provider_recognition:"recognized",
       quota_posture:"unknown",
       dispatch_strategy:"usage-burndown",
       dispatch_explain:"usage evidence unavailable; retained first profile"
@@ -289,4 +341,4 @@ fi
 fm_usage_burndown_record_choice "$selection" "$NOW_EPOCH"
 
 # Emit profile (unavailable still prints retained profile with unknown posture).
-printf '%s\n' "$selection" | jq -c '.profile'
+printf '%s\n' "$selection" | jq -c '.profile + {provider_recognition:"recognized"}'
