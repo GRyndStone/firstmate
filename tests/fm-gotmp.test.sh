@@ -34,13 +34,13 @@ SH
 
 # Build a fake FM_HOME/FM_ROOT so the real fm-teardown.sh (symlinked in) resolves
 # state and helper scripts inside it. Stub the helper scripts fm-teardown calls so no
-# live tmux/treehouse/fleet state is touched. A nonexistent worktree path makes both
-# `if [ -d "$WT" ]` guards skip, so teardown runs straight to the cleanup + state rm.
+# live tmux/treehouse/fleet state is touched. A reported scout with a nonexistent
+# worktree skips destructive worktree checks and reaches the common cleanup path.
 make_fake_root() {
   local id=$1 tasktmp=$2
   local fake="$TMP_ROOT/$id"
   local project="$TMP_ROOT/project-$id"
-  mkdir -p "$fake/bin/backends" "$fake/state" "$project"
+  mkdir -p "$fake/bin/backends" "$fake/state" "$fake/data/$id" "$project"
   # Symlink the REAL teardown so the test exercises actual code, not a copy.
   ln -s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
   # fm-backend.sh + its tmux adapter: symlink the REAL files (teardown sources
@@ -55,6 +55,8 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   # fm-lock-lib.sh: teardown sources it for the shared lock-staleness proof.
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
+  # fm-worktree-ownership-lib.sh: teardown sources it for task/worktree binding.
+  ln -s "$ROOT/bin/fm-worktree-ownership-lib.sh" "$fake/bin/fm-worktree-ownership-lib.sh"
   # Durable teardown lifecycle publication is owned by fm-reconcile-lib.sh and
   # its two colocated libraries.
   ln -s "$ROOT/bin/fm-reconcile-lib.sh" "$fake/bin/fm-reconcile-lib.sh"
@@ -79,13 +81,14 @@ SH
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
 fm_tasks_axi_compatible() { return 1; }
 SH
-  # Meta with a nonexistent worktree so the dirty/treehouse blocks skip.
+  printf 'report\n' > "$fake/data/$id/report.md"
+  # Meta with a nonexistent scout worktree so the dirty/treehouse blocks skip.
   cat > "$fake/state/$id.meta" <<META
 window=fakeses:fm-$id
 worktree=$TMP_ROOT/nonexistent-worktree-$id
 project=$project
 harness=claude
-kind=ship
+kind=scout
 mode=no-mistakes
 yolo=off
 tasktmp=$tasktmp
@@ -153,13 +156,14 @@ test_teardown_skips_gracefully_without_tasktmp() {
   local id=td-absent-z3
   local fake="$TMP_ROOT/$id-root"
   local project="$TMP_ROOT/project-$id"
-  mkdir -p "$fake/bin/backends" "$fake/state" "$project"
+  mkdir -p "$fake/bin/backends" "$fake/state" "$fake/data/$id" "$project"
   ln -s "$TEARDOWN" "$fake/bin/fm-teardown.sh"
   ln -s "$ROOT/bin/fm-backend.sh" "$fake/bin/fm-backend.sh"
   ln -s "$ROOT/bin/backends/tmux.sh" "$fake/bin/backends/tmux.sh"
   ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   ln -s "$ROOT/bin/fm-composer-lib.sh" "$fake/bin/fm-composer-lib.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
+  ln -s "$ROOT/bin/fm-worktree-ownership-lib.sh" "$fake/bin/fm-worktree-ownership-lib.sh"
   ln -s "$ROOT/bin/fm-reconcile-lib.sh" "$fake/bin/fm-reconcile-lib.sh"
   ln -s "$ROOT/bin/fm-task-identity-lib.sh" "$fake/bin/fm-task-identity-lib.sh"
   ln -s "$ROOT/bin/fm-transition-lib.sh" "$fake/bin/fm-transition-lib.sh"
@@ -178,13 +182,14 @@ SH
   cat > "$fake/bin/fm-tasks-axi-lib.sh" <<'SH'
 fm_tasks_axi_compatible() { return 1; }
 SH
+  printf 'report\n' > "$fake/data/$id/report.md"
   # No tasktmp= line at all.
   cat > "$fake/state/$id.meta" <<META
 window=fakeses:fm-$id
 worktree=$TMP_ROOT/nonexistent-wt-$id
 project=$project
 harness=claude
-kind=ship
+kind=scout
 mode=no-mistakes
 yolo=off
 META

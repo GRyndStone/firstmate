@@ -10,23 +10,58 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 fm_test_tmproot TMP_ROOT fm-grok-harness
 
 make_spawn_fakebin() {
-  local dir=$1 fakebin
+  local dir=$1 fakebin holder_file="$1/holder"
   fakebin=$(fm_fakebin "$dir")
-  cat > "$fakebin/tmux" <<'SH'
+cat > "$fakebin/tmux" <<SH
 #!/usr/bin/env bash
 set -u
-case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+case "\$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "\${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
-case "${1:-}" in
+case "\${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  send-keys)
+    for a in "\$@"; do case "\$a" in *"treehouse get --lease --lease-holder "*)
+      fake_root=\$(cd "\$(dirname "\$0")/.." && pwd)
+      holder=\$(printf '%s\\n' "\$a" | sed -n "s/.*treehouse get --lease --lease-holder '\\([^']*\\)'.*/\\1/p")
+      if [ -n "\$holder" ]; then
+        rm -f "\$fake_root/returned"
+        printf '%s\\n' "\$holder" > "$holder_file"
+      fi
+    ;; esac; done
+    exit 0 ;;
+  has-session|new-session|new-window|kill-window) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse gh-axi gh
+  cat > "$fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  status)
+    fake_root=\$(cd "\$(dirname "\$0")/.." && pwd)
+    returned_file="\$fake_root/returned"
+    if [ -f "\$returned_file" ]; then
+      printf '1  available  %s\\n' "\${FM_FAKE_PANE_PATH:-}"
+      exit 0
+    fi
+    holder=
+    [ ! -f "$holder_file" ] || holder=\$(cat "$holder_file")
+    [ -n "\$holder" ] || exit 1
+    printf '1  leased  %s  (held by %s)\\n' "\${FM_FAKE_PANE_PATH:-}" "\$holder"
+    exit 0 ;;
+  get) printf '%s\\n' "\${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  return)
+    fake_root=\$(cd "\$(dirname "\$0")/.." && pwd)
+    [ "\${2:-}" = --force ] && : > "\$fake_root/returned"
+    exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+  fm_fake_exit0 "$fakebin" gh-axi gh
   printf '%s\n' "$fakebin"
 }
 
