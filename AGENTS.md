@@ -207,9 +207,10 @@ The canonical schema and per-field semantics are owned by `docs/configuration.md
 When `config/crew-dispatch.json` is present, read it during intake before every crewmate or scout dispatch.
 Pick the single best-fit rule using your own judgment.
 This is explicitly not first-match: weigh all rules, their `when` text, and their `why` rationales against the actual task.
+Natural-language rules supply the eligible profile set and preferences; they are not a rival numeric selector.
 For a chosen rule with a single-object `use`, or an array `use` with no `select`, resolve the first profile directly.
-For a chosen rule with `select: "quota-balanced"`, pipe the full rule JSON to `bin/fm-dispatch-select.sh` and use the compact JSON profile it prints.
-Pass every selected profile through `bin/fm-dispatch-select.sh --admit` so provider postures are applied once at admission; freeze refuses launch and never substitutes another provider or harness.
+For a chosen rule with `select: "usage-burndown"` (legacy alias `quota-balanced`), pipe the full rule JSON to `bin/fm-dispatch-select.sh` and use the compact JSON profile it prints.
+Pass every selected profile through `bin/fm-dispatch-select.sh --admit` so usage observation and admission run once; freeze refuses an explicit pin and never substitutes another provider for that pin.
 Pass the admitted `provider`, `harness`, `model`, `effort`, and quota observation fields to `bin/fm-spawn.sh` with matching explicit flags.
 If no rule fits, use `default`.
 If `default` is absent, fall back to `config/crew-harness` through `bin/fm-harness.sh crew`, wrap that result as a profile for admission, and pass the admitted provider and harness explicitly.
@@ -218,13 +219,13 @@ That refusal is the consultation backstop, so the rules are never silently skipp
 The requirement is gated only on the file's presence; when the file is absent, `fm-spawn.sh` keeps resolving the crewmate harness from `config/crew-harness` as before.
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
-Provider admission and `quota-balanced` selection are owned by `bin/fm-dispatch-select.sh`; its header documents provider identity, 60/80/90 postures, freeze refusal, general-window rules, freshness handling, and pinned-profile resume.
-Missing or unusable quota evidence stays observable and cannot prove freeze; it retains the selected profile with `quota_posture=unknown` instead of silently switching harness or model.
+Routine multi-candidate routing is the usage-burndown engine owned by `bin/fm-dispatch-select.sh` with `bin/fm-usage-burndown-lib.sh` and `bin/fm-usage-source-lib.sh`; full policy, adapters, and recipe are in `docs/usage-burndown-dispatch.md`.
+Missing or unusable usage evidence stays observable and cannot prove freeze; it retains the selected profile with `quota_posture=unknown` instead of silently switching harness or model.
 
 Precedence, highest first:
 
 1. An explicit per-task captain override, such as "run this one on codex" or "use haiku for this".
-2. firstmate's best-fit rule from `config/crew-dispatch.json`.
+2. firstmate's best-fit rule from `config/crew-dispatch.json` (engine selects among that rule's eligible profiles when multi-select is set).
 3. The dispatch file's `default` profile.
 4. `config/crew-harness`.
 

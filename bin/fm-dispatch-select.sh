@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Resolve one already-matched crew-dispatch rule to a concrete profile and,
-# when requested, apply provider quota admission to that selected profile.
+# when requested, apply provider usage admission to that selected profile.
 # Usage:
 #   fm-dispatch-select.sh [--select <strategy>] [--admit] [--quota-json <file>] [<rule-or-use-json>]
 #   fm-dispatch-select.sh --resume-meta <state/task.meta> [--quota-json <file>]
@@ -9,41 +9,49 @@
 # profile object, or an ordered array of profile objects.
 # Output is one compact JSON profile object on stdout.
 #
-# This header is the single owner of provider quota admission:
-#   - `provider` is the quota identity and `harness` is the launch adapter.
+# This header is the single owner of the CLI and admission wire contract.
+# The routine multi-candidate decision policy is the usage-burndown optimizer
+# (bin/fm-usage-burndown-lib.sh + bin/fm-usage-source-lib.sh); full design in
+# docs/usage-burndown-dispatch.md.
+#
+# Contract summary:
+#   - `provider` is the usage/quota identity and `harness` is the launch adapter.
 #     A profile may state both; provider defaults to harness for compatibility.
-#   - Per candidate provider, the minimum percentRemaining across GENERAL
-#     windows determines percent used. Claude uses five_hour and seven_day;
-#     Codex uses five_hour and weekly. Model-scoped windows are ignored.
-#   - Below 60% used the posture is normal, at 60% it is conserve, at 80% it
-#     is protect, and at 90% it is freeze. The boundary is inclusive.
-#   - Freeze refuses admission with an actionable stderr reason and exit 75.
-#     An explicitly admitted profile is checked in place and another candidate
-#     is never substituted merely because its provider is frozen.
-#   - quota-balanced is deterministic: the candidate with the higher minimum
-#     remaining quota wins, and an exact tie between equally trusted candidates
-#     uses the first array element. The selected candidate is then admitted;
-#     freeze never triggers a second selection pass.
-#   - Stale-but-cached general-window numbers are usable only while their
-#     refreshedAt and resetsAt timestamps prove they still describe the current
-#     five-hour or seven-day window. A fresh candidate wins unless the stale
-#     candidate's minimum is at least the stale-clear margin higher (default 20
-#     points). Expired or unverifiable stale windows degrade to unavailable.
-#   - A provider absent from quota output, or with no usable general windows,
-#     is unavailable to quota-balanced selection.
-#   - Missing, failed, stale-shape, or malformed quota data stays observable on
-#     stderr but cannot prove freeze. New admission therefore retains the
-#     selected profile with quota_posture=unknown instead of switching it.
+#   - Multi-candidate selection strategy: `usage-burndown` (canonical).
+#     Legacy alias: `quota-balanced` (same engine; existing configs keep working).
+#   - Per source, adapters expose remaining usage R, time-to-reset T, and
+#     feasible burn B (learned from history, never a static table). Projected
+#     expiry surplus S = max(0, R - B*T); score = S * pressure, with pressure
+#     rising as T shrinks while S > 0. Highest score wins; freeze-level sources
+#     are skipped when any non-freeze known source exists.
+#   - Observational postures from percent used: below 60% normal, at 60%
+#     conserve, at 80% protect, at 90% freeze (inclusive). Posture does not rank
+#     multi-candidate winners; freeze still refuses an explicit pin in place
+#     (exit 75) and never substitutes another provider for that pin.
+#   - Stale-but-current general-window numbers remain usable under adapter rules
+#     (refreshedAt/resetsAt prove the window is still current).
+#   - Missing, failed, or unusable usage evidence stays observable on stderr but
+#     cannot prove freeze. Admission retains the selected profile with
+#     quota_posture=unknown instead of switching harness or model.
+#   - Every scored decision logs candidates and why on stderr; the profile JSON
+#     also carries dispatch_strategy and dispatch_explain when available.
 #   - --resume-meta reconstructs only the recorded provider/harness/model/effort
 #     pin. It never evaluates candidates or replaces a task, branch, or run.
 #     Freeze pauses that pinned provider; once it clears, the same pin is output.
+#   - Captain per-task instructions outrank the engine: when firstmate passes a
+#     single explicit pin (admit without multi-select), the pin is admitted in
+#     place and dispatch_explain records that path.
 #
-# quota-balanced and --admit use quota-axi --json unless --quota-json supplies
+# usage-burndown and --admit use quota-axi --json unless --quota-json supplies
 # a fixture. FM_DISPATCH_QUOTA_AXI overrides the quota command.
-# FM_DISPATCH_STALE_CLEAR_MARGIN overrides the default 20 point stale margin.
+# FM_BURNDOWN_PRESSURE_K overrides the expiry-pressure coefficient (default 4).
+# FM_USAGE_BURN_HISTORY overrides the burn-sample history path.
 set -u
 
-STALE_CLEAR_MARGIN=${FM_DISPATCH_STALE_CLEAR_MARGIN:-20}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=bin/fm-usage-burndown-lib.sh
+. "$SCRIPT_DIR/fm-usage-burndown-lib.sh"
+
 NOW_EPOCH=$(date +%s)
 SELECT_OVERRIDE=
 QUOTA_JSON_FILE=
@@ -172,16 +180,6 @@ first_profile() {
   '
 }
 
-governed_first_profile() {
-  printf '%s\n' "$profiles_json" | jq -c '
-    def clean($p):
-      {provider: ($p.provider // $p.harness), harness: $p.harness}
-      + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
-      + (if ($p.effort? | type) == "string" then {effort: $p.effort} else {} end);
-    clean(.[0]) + {quota_posture:"unknown"}
-  '
-}
-
 select_strategy=$SELECT_OVERRIDE
 if [ -z "$select_strategy" ]; then
   select_strategy=$(printf '%s\n' "$SPEC_JSON" | jq -r '
@@ -189,7 +187,13 @@ if [ -z "$select_strategy" ]; then
   ' 2>/dev/null || true)
 fi
 
-if [ "$select_strategy" != quota-balanced ] && [ "$ADMIT" -eq 0 ]; then
+# Normalize strategy aliases.
+case "$select_strategy" in
+  quota-balanced) select_strategy=usage-burndown ;;
+esac
+
+# Legacy path: no multi-select and no admission — first profile, no quota call.
+if [ "$select_strategy" != usage-burndown ] && [ "$ADMIT" -eq 0 ]; then
   if [ -n "$select_strategy" ]; then
     log "unknown select strategy '$select_strategy'; using first profile"
   fi
@@ -197,14 +201,33 @@ if [ "$select_strategy" != quota-balanced ] && [ "$ADMIT" -eq 0 ]; then
   exit 0
 fi
 
-if [ -n "$select_strategy" ] && [ "$select_strategy" != quota-balanced ]; then
+if [ -n "$select_strategy" ] && [ "$select_strategy" != usage-burndown ]; then
   echo "error: unknown select strategy '$select_strategy' cannot be used for admission" >&2
   exit 2
 fi
 
+# Multi-select is usage-burndown (including legacy quota-balanced alias).
+# Admit-only (single pin / first profile) still scores observation for posture.
+mode=admit
+if [ "$select_strategy" = usage-burndown ]; then
+  mode=multi
+fi
+
 quota_unavailable() {
   log "$1; retaining selected provider with quota posture unknown"
-  governed_first_profile
+  # When multi was requested but evidence is wholly unusable, still emit first
+  # profile with unknown posture (never silent freeze, never fabricated numbers).
+  printf '%s\n' "$profiles_json" | jq -c '
+    def clean($p):
+      {provider: ($p.provider // $p.harness), harness: $p.harness}
+      + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
+      + (if ($p.effort? | type) == "string" then {effort: $p.effort} else {} end);
+    clean(.[0]) + {
+      quota_posture:"unknown",
+      dispatch_strategy:"usage-burndown",
+      dispatch_explain:"usage evidence unavailable; retained first profile"
+    }
+  '
   exit 0
 }
 
@@ -221,6 +244,7 @@ fi
 printf '%s\n' "$quota_json" | jq -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1 \
   || quota_unavailable "quota-axi returned unparseable JSON"
 
+# Surface non-fresh provider diagnostics for profile providers (observable).
 quota_notices=$(printf '%s\n' "$quota_json" | jq -r \
   --argjson profiles "$profiles_json" '
   def one_line: tostring | gsub("[\\r\\n\\t]+"; " ");
@@ -239,127 +263,19 @@ while IFS= read -r quota_notice; do
   [ -z "$quota_notice" ] || log "$quota_notice"
 done <<< "$quota_notices"
 
-selection=$(printf '%s\n' "$quota_json" | jq -ec \
-  --argjson profiles "$profiles_json" \
-  --argjson margin "$STALE_CLEAR_MARGIN" \
-  --argjson now "$NOW_EPOCH" \
-  --arg strategy "$select_strategy" '
-  def clean($p):
-    {provider: ($p.provider // $p.harness), harness: $p.harness}
-    + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
-    + (if ($p.effort? | type) == "string" then {effort: $p.effort} else {} end);
-  def provider_for($provider): [.providers[]? | select(.provider == $provider)][0];
-  def general_ids($provider):
-    if $provider == "claude" then ["five_hour", "seven_day"]
-    elif $provider == "codex" then ["five_hour", "weekly"]
-    else []
-    end;
-  def general_window_seconds($provider; $id):
-    if $id == "five_hour" then 18000
-    elif ($provider == "claude" and $id == "seven_day")
-      or ($provider == "codex" and $id == "weekly") then 604800
-    else null
-    end;
-  def iso_epoch:
-    if type != "string" then null
-    else try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null
-    end;
-  def stale_window_is_current($provider; $refreshed; $now):
-    (.resetsAt | iso_epoch) as $reset
-    | (general_window_seconds($provider; .id)) as $duration
-    | ($refreshed != null)
-      and ($refreshed <= $now)
-      and ($reset != null)
-      and ($reset > $now)
-      and ($reset > $refreshed)
-      and ($duration != null)
-      and (($reset - $refreshed) <= $duration);
-  def posture($used):
-    if $used >= 90 then "freeze"
-    elif $used >= 80 then "protect"
-    elif $used >= 60 then "conserve"
-    else "normal"
-    end;
-  def candidate_metric($p; $i):
-    . as $root
-    | ($p.provider // $p.harness // "") as $provider_id
-    | ($root | provider_for($provider_id)) as $provider
-    | if ($provider == null) or ((general_ids($provider_id) | length) == 0) then empty
-      else
-        (($provider.state.status? // "") as $status
-          | ($provider.state.refreshedAt? | iso_epoch) as $refreshed
-          | (($provider.windows // [])
-          | map(. as $window
-            | select(((general_ids($provider_id) | index($window.id)) != null)
-              and (($window.kind? // "") != "model")
-              and (($window.percentRemaining? | type) == "number")
-              and ($window.percentRemaining >= 0)
-              and ($window.percentRemaining <= 100)
-              and (($status == "fresh")
-                or ($status == "stale" and ($window | stale_window_is_current($provider_id; $refreshed; $now))))))) as $windows
-        | if ($windows | length) == 0 then empty
-          else
-            ($windows | map(.percentRemaining) | min) as $min
-            | (100 - $min) as $used
-            | {
-                index: $i,
-                profile: clean($p),
-                provider: $provider_id,
-                min: $min,
-                used: $used,
-                posture: posture($used),
-                fresh: ($status == "fresh")
-              }
-          end
-        )
-      end;
-  def better($a; $b):
-    if $a == null then $b
-    elif $b == null then $a
-    elif ($b.min > $a.min) then $b
-    elif ($b.min == $a.min and $b.index < $a.index) then $b
-    else $a
-    end;
-  def best_by_min($xs): reduce $xs[] as $x (null; better(.; $x));
-  . as $quota_root
-  | ([$profiles | to_entries[] | . as $entry | ($quota_root | candidate_metric($entry.value; $entry.key))]) as $candidates
-  | (if $strategy == "quota-balanced" then
-      if ($candidates | length) == 0 then null
-      else
-        (best_by_min($candidates | map(select(.fresh)))) as $fresh_best
-        | (best_by_min($candidates | map(select(.fresh | not)))) as $stale_best
-        | if $fresh_best != null and $stale_best != null then
-            if $stale_best.min >= ($fresh_best.min + $margin) then $stale_best else $fresh_best end
-          elif $fresh_best != null then $fresh_best
-          else $stale_best
-          end
-      end
-    else
-      ($candidates | map(select(.index == 0)) | .[0] // null)
-    end) as $chosen
-  | if $chosen == null then {
-      unavailable: true,
-      profile: (clean($profiles[0]) + {quota_posture:"unknown"})
-    }
-    else {
-      unavailable: false,
-      frozen: ($chosen.posture == "freeze"),
-      provider: $chosen.provider,
-      used: $chosen.used,
-      min: $chosen.min,
-      profile: ($chosen.profile + {
-        quota_posture: $chosen.posture,
-        quota_percent_used: $chosen.used
-      })
-    }
-    end
-' 2>/dev/null) || quota_unavailable "quota-axi data could not be evaluated"
+observations=$(fm_usage_source_observe_profiles "$profiles_json" "$quota_json" "$NOW_EPOCH") \
+  || quota_unavailable "usage source adapters failed"
 
-if [ "$(printf '%s\n' "$selection" | jq -r '.unavailable')" = true ]; then
-  log "no usable quota windows for selected provider; retaining it with quota posture unknown"
-  printf '%s\n' "$selection" | jq -c '.profile'
-  exit 0
-fi
+scored=$(fm_usage_burndown_score_all "$observations") \
+  || quota_unavailable "usage burndown scoring failed"
+
+selection=$(fm_usage_burndown_select "$profiles_json" "$scored" "$mode") \
+  || quota_unavailable "usage burndown selection failed"
+
+# Inspectable explanation on stderr.
+while IFS= read -r explain_line; do
+  [ -z "$explain_line" ] || log "$explain_line"
+done < <(fm_usage_burndown_format_explain "$selection")
 
 if [ "$(printf '%s\n' "$selection" | jq -r '.frozen')" = true ]; then
   frozen_provider=$(printf '%s\n' "$selection" | jq -r '.provider')
@@ -369,4 +285,8 @@ if [ "$(printf '%s\n' "$selection" | jq -r '.frozen')" = true ]; then
   exit 75
 fi
 
+# Record burn sample so B adapts after every scored dispatch with evidence.
+fm_usage_burndown_record_choice "$selection" "$NOW_EPOCH"
+
+# Emit profile (unavailable still prints retained profile with unknown posture).
 printf '%s\n' "$selection" | jq -c '.profile'

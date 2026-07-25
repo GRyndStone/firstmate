@@ -16,8 +16,8 @@
         { "provider": "claude", "harness": "claude", "model": "claude-sonnet-5", "effort": "high" },
         { "provider": "codex", "harness": "codex", "model": "gpt-5.5", "effort": "high" }
       ],
-      "select": "quota-balanced",
-      "why": "Use a strong coding profile for broad design and implementation work. Admission pins one provider; freeze never silently switches."
+      "select": "usage-burndown",
+      "why": "Use a strong coding profile for broad design and implementation work. The usage-burndown engine picks among eligible providers by remaining usage per remaining window time; freeze never silently switches an explicit pin."
     }
   ],
   "default": { "provider": "codex", "harness": "codex", "model": "gpt-5.5", "effort": "medium" }

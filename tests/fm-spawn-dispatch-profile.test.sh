@@ -347,9 +347,10 @@ test_grok_default_dispatch_admits_without_silent_substitution() {
   assert_contains "$out" "spawned $id harness=grok" "spawn did not keep the Grok pin"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4.5 high
   assert_grep "provider=grok" "$HOME_DIR/state/$id.meta" "meta missing grok provider pin"
-  # Grok has no general session windows in quota-axi; posture stays unknown rather
-  # than inventing a substitute provider or blocking the temporary Grok-default policy.
-  assert_grep "quota_posture=unknown" "$HOME_DIR/state/$id.meta" "grok without general windows should keep unknown posture"
+  # Grok-class adapter scores non-model credit windows from quota-axi; the fixture
+  # supplies full credits remaining, so posture is normal and the pin is kept
+  # (never silently substituted to another provider).
+  assert_grep "quota_posture=normal" "$HOME_DIR/state/$id.meta" "grok with credit windows should admit with observed posture"
   pass "Grok-default temporary policy admits without silent harness substitution"
 }
 

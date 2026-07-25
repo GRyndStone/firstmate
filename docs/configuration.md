@@ -269,12 +269,14 @@ Per rule, `when` and `use` are required.
 `use` may be a single profile object or an ordered array of profile objects; the single-object form stays fully backward-compatible, and every profile needs `harness`.
 `use.provider`, `use.model`, `use.effort`, and `why` are optional.
 `provider` identifies the quota account independently of the launch `harness`; when omitted it defaults to the harness for compatibility.
-`select` is optional and currently supports `quota-balanced`.
-Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback.
+`select` is optional and supports `usage-burndown` (canonical) and the legacy alias `quota-balanced` (same engine).
+Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback when the engine has no scorable evidence.
 `default` is optional.
 An omitted model or effort means the selected harness uses its own default for that axis.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
-Provider admission and `quota-balanced` selection are implemented by `bin/fm-dispatch-select.sh`, whose header owns the posture boundaries, freeze refusal, general-window rules, freshness treatment, provider availability, and pinned-profile resume contract.
+Natural-language rules choose the eligible profile set and preferences; multi-candidate routing is the usage-burndown optimizer in `bin/fm-dispatch-select.sh` (`bin/fm-usage-burndown-lib.sh`, `bin/fm-usage-source-lib.sh`).
+The full objective, modular source adapters, freeze/unknown degradation, captain-override precedence, and add-a-source recipe live in [`docs/usage-burndown-dispatch.md`](usage-burndown-dispatch.md).
+The dispatch-select header owns the CLI, admitted-profile wire fields, freeze exit code, and resume-meta pin contract.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.
 Valid files produce a `CREW_DISPATCH: active config/crew-dispatch.json` block that lists each rule and prints `default:` when present.
@@ -300,7 +302,7 @@ The script header owns flags, defaults, and exit codes.
 
 On session start the first mate detects what its required toolchain is missing or too old (tmux, node, git, gh with GitHub auth via `gh auth login`, treehouse with durable lease support, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi), lists it with the exact install commands, and installs only after you say go.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
-In that list, treehouse pools clean task worktrees, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-balanced dispatch.
+In that list, treehouse pools clean task worktrees, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and usage-burndown dispatch.
 When bootstrap resolves `backend=orca` from `FM_BACKEND` or `config/backend`, it requires `orca`, keeps the universal `node` requirement, and skips `tmux` and `treehouse`.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
