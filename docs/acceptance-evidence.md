@@ -7,7 +7,8 @@ This document, together with [`bin/fm-acceptance-lib.sh`](../bin/fm-acceptance-l
 
 Briefs can list concrete acceptance criteria, but completion used to advance from unstructured worker claims.
 That allowed the Gryndstone Grok incident: provider-catalog, active-config, inference, and restart evidence were accepted where the criterion required **user-facing model-chooser** evidence.
-The gate fails closed on missing maps, incomplete fields, and cross-class proxy substitutions.
+The gate also once accepted a `result` that explicitly declared partial completion and named still-failing checks because it validated only evidence shape.
+The gate now fails closed on missing maps, incomplete fields, cross-class proxy substitutions, ambiguous verdicts, and declared nonpassing verdicts.
 
 ## Stable criterion identity
 
@@ -36,13 +37,25 @@ Path: `data/<id>/acceptance.md` under the active firstmate home.
 - surface: Hermes Telegram model switcher (user-facing)
 - class: ui
 - command: open existing model chooser; list selectable entries
-- result: xai-oauth / grok-4.5 listed and selectable
+- result: PASS - xai-oauth / grok-4.5 listed and selectable
 - head: <git-sha or observation timestamp>
 ```
 
 Required fields per `## AC-N` entry: `surface`, `class`, `command`, `result`.
 `head` (or `freshness`) is required when the required class is `ui` or `live`.
 Optional: `statement`, `required_class` (overrides keyword inference).
+
+### Result verdicts
+
+The `result` field starts with exactly one declared verdict: `PASS`, `FAIL`, `PARTIAL`, or `UNKNOWN`.
+The verdict may stand alone or be followed by `: ` or ` - ` and a concise observed-output summary.
+Existing handoffs that place another punctuation separator after the exact verdict token remain readable.
+Only `PASS` advances a criterion.
+`FAIL`, `PARTIAL`, and `UNKNOWN` report that the criterion was not achieved and produce a verdict-specific repair message.
+A `result` without a declared verdict fails as ambiguous.
+The checker never guesses a verdict from free-form wording, so new phrases cannot silently become success.
+This protocol constrains the existing required field instead of adding another field to the handoff.
+Shape, completeness, and surface compatibility are checked first so their existing repair messages remain distinguishable from verdict failures.
 
 ### Proportional (no concrete criteria)
 
@@ -91,7 +104,7 @@ On any ship-task `done:` (all delivery modes), before validation, PR-ready, merg
 bin/fm-acceptance-check.sh <id>
 ```
 
-- Exit 0: advance according to delivery mode.
+- Exit 0: every mapped result declared `PASS`; advance according to delivery mode.
 - Exit 1: do **not** advance.
   Steer the existing worker with the script's `repair ...` lines.
   Do not escalate incomplete mappings to the captain as product questions.

@@ -548,6 +548,7 @@ Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced 
 # Acceptance evidence
 Concrete acceptance criteria written into the Task section above must carry stable ids (\`AC-1\`, \`AC-2\`, ...).
 Before any \`done:\` line, write \`$DATA/$ID/acceptance.md\` mapping each id to direct same-surface evidence fields: \`surface\`, \`class\`, \`command\` (or interaction), \`result\`, and \`head\` (git sha or observation timestamp) when the criterion is live/UI.
+Begin \`result\` with one declared verdict: \`PASS\`, \`FAIL\`, \`PARTIAL\`, or \`UNKNOWN\`; only \`PASS\` advances, and free-form result text without one of these exact prefixes fails as ambiguous.
 Status prose and worker authority are claims, not evidence; a bare \`done:\` cannot advance the task.
 Reject proxy substitutions across evidence classes: config/catalog/API does not satisfy a UI/menu criterion; unit tests do not satisfy a required live-server check; current selection does not prove alternatives remain selectable.
 Firstmate independently runs \`$FM_ROOT/bin/fm-acceptance-check.sh $ID\` before validation, PR-ready, or merge recommendation and returns incomplete mappings to you with precise repair direction.
