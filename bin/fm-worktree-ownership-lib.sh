@@ -2,6 +2,11 @@
 # Shared checks that a task meta's recorded worktree is the task's own worktree.
 # A recorded worktree is trusted only when it matches the treehouse lease holder
 # for this task generation, or it is the git worktree that holds branch fm/<id>.
+# Return codes from fm_worktree_validate_task_ownership:
+#   0 owned/safe
+#   1 proved not-owned; stdout names the mismatch
+#   2 indeterminate because the recorded worktree is absent and no other
+#     ownership proof found the task branch or holder elsewhere
 
 fm_worktree_meta_get() {  # <meta> <key>
   if command -v fm_meta_get >/dev/null 2>&1; then
@@ -84,6 +89,7 @@ fm_worktree_treehouse_holder_path() {  # <project> <holder>
 fm_worktree_validate_task_ownership() {  # <task-id> <meta> [audit|strict]
   local id=$1 meta=$2 mode=${3:-audit}
   local kind backend project recorded expected_branch recorded_real holder holder_path
+  local holder_matches=0
   local branch_paths branch_paths_rc branch_at_record joined
   kind=$(fm_worktree_meta_get "$meta" kind)
   [ -n "$kind" ] || kind=ship
@@ -108,6 +114,7 @@ fm_worktree_validate_task_ownership() {  # <task-id> <meta> [audit|strict]
         "$id" "${recorded_real:-<missing>}" "$holder" "$holder_path"
       return 1
     fi
+    [ -z "$holder_path" ] || holder_matches=1
   fi
 
   branch_paths=
@@ -123,11 +130,10 @@ fm_worktree_validate_task_ownership() {  # <task-id> <meta> [audit|strict]
     return 0
   fi
 
+  [ "$holder_matches" -eq 0 ] || return 0
   [ "$mode" = strict ] || return 0
   if [ -z "$recorded" ] || [ ! -d "$recorded" ]; then
-    printf 'MISMATCH: task %s has no inspectable recorded worktree at %s; cannot prove it owns branch %s.\n' \
-      "$id" "${recorded:-<missing>}" "$expected_branch"
-    return 1
+    return 2
   fi
   branch_at_record=$(git -C "$recorded" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   if [ "$branch_at_record" != "$expected_branch" ]; then

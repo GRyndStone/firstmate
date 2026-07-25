@@ -29,6 +29,15 @@ case "${1:-}" in
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
   send-keys)
+    for a in "$@"; do case "$a" in *"treehouse get --lease --lease-holder "*)
+      fake_root="$(cd "$(dirname "$0")/.." && pwd)"
+      holder_file="$fake_root/holder"
+      holder=$(printf '%s\n' "$a" | sed -n "s/.*treehouse get --lease --lease-holder '\([^']*\)'.*/\1/p")
+      if [ -n "$holder" ]; then
+        rm -f "$fake_root/returned"
+        printf '%s\n' "$holder" > "$holder_file"
+      fi
+    ;; esac; done
     if [ -n "${FM_FAKE_SHELL_LOG:-}" ] && [ "${4:-}" != "-l" ]; then
       printf '%s\n' "${4:-}" >> "$FM_FAKE_SHELL_LOG"
     fi
@@ -47,7 +56,32 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  status)
+    fake_root="$(cd "$(dirname "$0")/.." && pwd)"
+    holder_file="$fake_root/holder"
+    returned_file="$fake_root/returned"
+    if [ -f "$returned_file" ]; then
+      printf '1  available  %s\n' "${FM_FAKE_PANE_PATH:-}"
+      exit 0
+    fi
+    [ -f "$holder_file" ] || exit 1
+    holder=$(cat "$holder_file")
+    [ -n "$holder" ] || exit 1
+    printf '1  leased  %s  (held by %s)\n' "${FM_FAKE_PANE_PATH:-}" "$holder"
+    exit 0 ;;
+  get) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  return)
+    fake_root="$(cd "$(dirname "$0")/.." && pwd)"
+    [ "${2:-}" = --force ] && : > "$fake_root/returned"
+    exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 

@@ -10,6 +10,8 @@ set -u
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 AUDIT="$ROOT/bin/fm-worktree-audit.sh"
+# shellcheck source=bin/fm-worktree-ownership-lib.sh
+. "$ROOT/bin/fm-worktree-ownership-lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 fm_test_tmproot TMP_ROOT fm-worktree-ownership
 
@@ -170,6 +172,22 @@ write_task_meta() {
     "effort=default"
 }
 
+write_legacy_task_meta_without_generation() {
+  local case_dir=$1 id=$2 wt=$3
+  fm_write_meta "$case_dir/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "worktree=$wt" \
+    "project=$case_dir/project" \
+    "provider=codex" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=direct-PR" \
+    "yolo=off" \
+    "tasktmp=$case_dir/tmp-$id" \
+    "model=default" \
+    "effort=default"
+}
+
 run_teardown_fixture() {
   local case_dir=$1 id=$2
   FM_ROOT_OVERRIDE="$ROOT" \
@@ -256,11 +274,65 @@ test_teardown_allows_recorded_task_branch() {
   pass "teardown still allows a recorded worktree that holds the task branch"
 }
 
+test_teardown_allows_holder_matched_detached_worktree() {
+  local id case_dir rc
+  id='teardown-detached-d4'
+  case_dir=$(make_project_case teardown-detached "$id")
+  git -C "$case_dir/real" checkout --detach -q
+  write_task_meta "$case_dir" "$id" "$case_dir/real"
+
+  set +e
+  run_teardown_fixture "$case_dir" "$id" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "teardown-detached: holder-matched detached worktree should tear down"
+  [ ! -f "$case_dir/state/$id.meta" ] || fail "teardown-detached: meta should be removed after successful teardown"
+  pass "teardown allows a detached no-op task when its treehouse holder owns the recorded worktree"
+}
+
+test_ownership_reports_absent_recorded_worktree_as_indeterminate() {
+  local seed case_dir id meta rc out
+  seed='absent-seed-a5'
+  id='absent-recorded-e5'
+  case_dir=$(make_project_case absent-indeterminate "$seed")
+  write_legacy_task_meta_without_generation "$case_dir" "$id" "$case_dir/missing-worktree"
+  meta="$case_dir/state/$id.meta"
+
+  set +e
+  out=$(PATH="$case_dir/fakebin:$PATH" fm_worktree_validate_task_ownership "$id" "$meta" strict 2>&1)
+  rc=$?
+  set -e
+
+  expect_code 2 "$rc" "absent-indeterminate: missing recorded worktree should be indeterminate, not a mismatch"
+  [ -z "$out" ] || fail "absent-indeterminate: ownership predicate emitted mismatch text for an absent worktree: $out"
+  pass "ownership predicate distinguishes absent/indeterminate from proved-not-owned"
+}
+
+test_teardown_allows_absent_recorded_worktree_without_proven_owner() {
+  local seed case_dir id rc out
+  seed='absent-teardown-seed-a6'
+  id='absent-teardown-f6'
+  case_dir=$(make_project_case absent-teardown "$seed")
+  write_legacy_task_meta_without_generation "$case_dir" "$id" "$case_dir/missing-worktree"
+
+  set +e
+  out=$(run_teardown_fixture "$case_dir" "$id" 2>&1)
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "absent-teardown: teardown should clean metadata when the recorded worktree is already absent"$'\n'"$out"
+  [ ! -f "$case_dir/state/$id.meta" ] || fail "absent-teardown: meta should be removed after successful absent-worktree teardown"
+  assert_not_contains "$out" "MISMATCH:" "absent-teardown: absent worktree must not be reported as an ownership mismatch"
+  pass "teardown allows already-absent recorded worktrees without weakening proved mismatch refusal"
+}
+
 test_existing_meta_audit_reports_only_proven_mismatch() {
-  local case_dir diverged healthy detached out rc
+  local case_dir diverged healthy detached absent out rc
   diverged='diverged-b2'
   healthy='healthy-a1'
   detached='detached-ok-c3'
+  absent='absent-ok-d4'
   case_dir=$(make_project_case audit-existing "$diverged")
   git -C "$case_dir/project" worktree add -q -b "fm/$healthy" "$case_dir/healthy" main
   git -C "$case_dir/project" worktree add -q --detach "$case_dir/detached" main
@@ -275,6 +347,7 @@ test_existing_meta_audit_reports_only_proven_mismatch() {
     "kind=ship" \
     "mode=direct-PR" \
     "yolo=off"
+  write_legacy_task_meta_without_generation "$case_dir" "$absent" "$case_dir/missing-worktree"
 
   set +e
   out=$(run_audit_fixture "$case_dir" 2>&1)
@@ -286,6 +359,7 @@ test_existing_meta_audit_reports_only_proven_mismatch() {
   assert_contains "$out" "$case_dir/real" "audit must name where the task branch actually lives"
   assert_not_contains "$out" "$healthy" "audit must not flag the healthy task"
   assert_not_contains "$out" "$detached" "audit must not flag a merely detached recorded worktree"
+  assert_not_contains "$out" "$absent" "audit must not flag an absent recorded worktree with no proved owner elsewhere"
   pass "existing meta audit reports the diverged task and avoids healthy/detached noise"
 }
 
@@ -293,11 +367,17 @@ case "${FM_WORKTREE_OWNERSHIP_TEST_ONLY:-all}" in
   spawn) test_spawn_records_treehouse_holder_under_pool_turnover ;;
   teardown-mismatch) test_teardown_refuses_clean_wrong_recorded_worktree ;;
   teardown-healthy) test_teardown_allows_recorded_task_branch ;;
+  teardown-detached) test_teardown_allows_holder_matched_detached_worktree ;;
+  ownership-absent) test_ownership_reports_absent_recorded_worktree_as_indeterminate ;;
+  teardown-absent) test_teardown_allows_absent_recorded_worktree_without_proven_owner ;;
   audit) test_existing_meta_audit_reports_only_proven_mismatch ;;
   all)
     test_spawn_records_treehouse_holder_under_pool_turnover
     test_teardown_refuses_clean_wrong_recorded_worktree
     test_teardown_allows_recorded_task_branch
+    test_teardown_allows_holder_matched_detached_worktree
+    test_ownership_reports_absent_recorded_worktree_as_indeterminate
+    test_teardown_allows_absent_recorded_worktree_without_proven_owner
     test_existing_meta_audit_reports_only_proven_mismatch
     ;;
   *) fail "unknown FM_WORKTREE_OWNERSHIP_TEST_ONLY=${FM_WORKTREE_OWNERSHIP_TEST_ONLY:-}" ;;

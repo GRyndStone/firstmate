@@ -782,7 +782,7 @@ test_peek_conformance_old_vs_new() {
 # --- old vs new: fm-spawn.sh --------------------------------------------------
 
 make_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir
-  local dir=$1 wt=$2 fb="$1/fakebin"
+  local dir=$1 wt=$2 fb="$1/fakebin" holder_file="$1/holder"
   mkdir -p "$fb"
   cat > "$fb/tmux" <<SH
 #!/usr/bin/env bash
@@ -792,12 +792,32 @@ case "\${1:-}" in
   display-message)
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$wt"; exit 0 ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
+  send-keys)
+    for a in "\$@"; do case "\$a" in *"treehouse get --lease --lease-holder "*)
+      holder=\$(printf '%s\\n' "\$a" | sed -n "s/.*treehouse get --lease --lease-holder '\\([^']*\\)'.*/\\1/p")
+      [ -z "\$holder" ] || printf '%s\\n' "\$holder" > "$holder_file"
+    ;; esac; done
+    exit 0 ;;
   list-windows) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  status)
+    holder=
+    [ ! -f "$holder_file" ] || holder=\$(cat "$holder_file")
+    [ -n "\$holder" ] || exit 1
+    printf '1  leased  %s  (held by %s)\\n' "$wt" "\$holder"
+    exit 0 ;;
+  get) printf '%s\\n' "$wt"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -843,7 +863,7 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
 # onward, so this test fails loudly if the PROJ_ABS/PROJ_ABS_REAL
 # canonicalization in bin/fm-spawn.sh ever regresses.
 make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> -> echoes fakebin dir
-  local dir=$1 initial_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
+  local dir=$1 initial_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count" holder_file="$1/holder"
   mkdir -p "$fb"
   : > "$counter"
   cat > "$fb/tmux" <<SH
@@ -862,12 +882,32 @@ case "\${1:-}" in
       exit 0
     ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
+  send-keys)
+    for a in "\$@"; do case "\$a" in *"treehouse get --lease --lease-holder "*)
+      holder=\$(printf '%s\\n' "\$a" | sed -n "s/.*treehouse get --lease --lease-holder '\\([^']*\\)'.*/\\1/p")
+      [ -z "\$holder" ] || printf '%s\\n' "\$holder" > "$holder_file"
+    ;; esac; done
+    exit 0 ;;
   list-windows) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  status)
+    holder=
+    [ ! -f "$holder_file" ] || holder=\$(cat "$holder_file")
+    [ -n "\$holder" ] || exit 1
+    printf '1  leased  %s  (held by %s)\\n' "$wt" "\$holder"
+    exit 0 ;;
+  get) printf '%s\\n' "$wt"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -918,7 +958,7 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
 }
 
 test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
-  local dir proj invalid data state config log fb out status id kill_line return_line lease_recheck_line
+  local dir proj invalid data state config log fb out status id kill_line return_line lease_recheck_line holder_file returned_file
   dir="$TMP_ROOT/spawn-invalid-treehouse"
   proj="$dir/project"
   invalid="$dir/not-a-worktree"
@@ -927,6 +967,8 @@ test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
   config="$dir/config"
   log="$dir/log"
   id=invalidtreehousez7
+  holder_file="$dir/holder"
+  returned_file="$dir/returned"
   fm_git_init_commit "$proj"
   mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
   printf 'brief\n' > "$data/$id/brief.md"
@@ -940,6 +982,12 @@ case "\${1:-}" in
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
     printf 'firstmate\\n'
     ;;
+  send-keys)
+    for a in "\$@"; do case "\$a" in *"treehouse get --lease --lease-holder "*)
+      holder=\$(printf '%s\\n' "\$a" | sed -n "s/.*treehouse get --lease --lease-holder '\\([^']*\\)'.*/\\1/p")
+      [ -z "\$holder" ] || printf '%s\\n' "\$holder" > "$holder_file"
+    ;; esac; done
+    ;;
   list-windows) exit 0 ;;
 esac
 exit 0
@@ -948,7 +996,16 @@ SH
 #!/usr/bin/env bash
 { printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 case "\${1:-}" in
-  status) printf '1  available  %s\\n' "$invalid" ;;
+  status)
+    if [ -f "$holder_file" ] && [ ! -f "$returned_file" ]; then
+      printf '1  leased  %s  (held by %s)\\n' "$invalid" "\$(cat "$holder_file")"
+    else
+      printf '1  available  %s\\n' "$invalid"
+    fi
+    ;;
+  return)
+    [ "\${2:-}" = --force ] && [ "\${3:-}" = "$invalid" ] && : > "$returned_file"
+    ;;
 esac
 exit 0
 SH
@@ -972,7 +1029,7 @@ SH
 }
 
 test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed() {
-  local dir proj invalid data state config log fb out status id
+  local dir proj invalid data state config log fb out status id holder_file
   dir="$TMP_ROOT/spawn-unconfirmed-endpoint"
   proj="$dir/project"
   invalid="$dir/not-a-worktree"
@@ -981,6 +1038,7 @@ test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed() {
   config="$dir/config"
   log="$dir/log"
   id=unconfirmedendpointz8
+  holder_file="$dir/holder"
   fm_git_init_commit "$proj"
   mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
   printf 'brief\n' > "$data/$id/brief.md"
@@ -994,6 +1052,12 @@ case "\${1:-}" in
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$invalid"; exit 0 ;; esac; done
     printf 'firstmate\\n'
     ;;
+  send-keys)
+    for a in "\$@"; do case "\$a" in *"treehouse get --lease --lease-holder "*)
+      holder=\$(printf '%s\\n' "\$a" | sed -n "s/.*treehouse get --lease --lease-holder '\\([^']*\\)'.*/\\1/p")
+      [ -z "\$holder" ] || printf '%s\\n' "\$holder" > "$holder_file"
+    ;; esac; done
+    ;;
   new-window) printf '@9\\n' ;;
   list-windows)
     case " \$* " in *' -a '*) printf 'firstmate:fm-$id\\n' ;; esac
@@ -1001,9 +1065,17 @@ case "\${1:-}" in
 esac
 exit 0
 SH
-  cat > "$fb/treehouse" <<'SH'
+  cat > "$fb/treehouse" <<SH
 #!/usr/bin/env bash
-{ printf 'treehouse'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+case "\${1:-}" in
+  status)
+    holder=
+    [ ! -f "$holder_file" ] || holder=\$(cat "$holder_file")
+    [ -n "\$holder" ] || exit 1
+    printf '1  leased  %s  (held by %s)\\n' "$invalid" "\$holder"
+    ;;
+esac
 exit 0
 SH
   chmod +x "$fb/tmux" "$fb/treehouse"

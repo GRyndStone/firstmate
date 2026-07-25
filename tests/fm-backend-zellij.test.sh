@@ -885,6 +885,10 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "$ROOT/bin/fm-teardown.sh" zghost 2>&1 )
   status=$?
   expect_code 0 "$status" "fm-teardown should succeed for a zellij scout whose worktree is already gone: $out"
+  assert_not_contains "$out" "MISMATCH:" \
+    "fm-teardown must not report an absent zellij worktree as an ownership mismatch"
+  assert_not_contains "$out" "REFUSED:" \
+    "fm-teardown must keep the absent zellij worktree cleanup path open"
   zellij_assert_call_order "$dir/log" $'\x1f''list-panes'$'\x1f''--json' $'\x1f''list-tabs'$'\x1f''--json' \
     "fm-teardown did not verify the recorded zellij_tab_id against the task label"
   assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''3' \

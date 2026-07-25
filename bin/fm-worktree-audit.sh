@@ -20,10 +20,18 @@ for meta in "$STATE"/*.meta; do
   id=$(basename "$meta" .meta)
   out=$(fm_worktree_validate_task_ownership "$id" "$meta" audit 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ]; then
-    [ -n "$out" ] && printf '%s\n' "$out"
-    found=1
-  fi
+  case "$rc" in
+    0|2) ;;
+    1)
+      [ -n "$out" ] && printf '%s\n' "$out"
+      found=1
+      ;;
+    *)
+      printf 'error: ownership check for task %s returned unexpected status %s\n' "$id" "$rc"
+      [ -n "$out" ] && printf '%s\n' "$out"
+      found=1
+      ;;
+  esac
 done
 
 if [ "$found" -eq 0 ]; then

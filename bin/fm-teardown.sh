@@ -1060,7 +1060,7 @@ remove_secondmate_registry_entry() {
 }
 
 validate_current_task_teardown() {
-  local child_meta safety_rc ownership_out
+  local child_meta safety_rc ownership_out ownership_rc
   if [ "$KIND" = secondmate ]; then
     [ -n "$HOME_PATH" ] || HOME_PATH=$WT
     validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || return 1
@@ -1086,9 +1086,17 @@ validate_current_task_teardown() {
       return 1
     fi
   fi
-  if ! ownership_out=$(fm_worktree_validate_task_ownership "$ID" "$META" strict 2>&1); then
+  set +e
+  ownership_out=$(fm_worktree_validate_task_ownership "$ID" "$META" strict 2>&1)
+  ownership_rc=$?
+  set -e
+  if [ "$ownership_rc" -eq 1 ]; then
     [ -n "$ownership_out" ] && printf '%s\n' "$ownership_out" >&2
     echo "REFUSED: recorded worktree for task $ID is not the task's own; preserving metadata." >&2
+    return 1
+  elif [ "$ownership_rc" -ne 0 ] && [ "$ownership_rc" -ne 2 ]; then
+    [ -n "$ownership_out" ] && printf '%s\n' "$ownership_out" >&2
+    echo "REFUSED: ownership check for task $ID returned unexpected status $ownership_rc; preserving metadata." >&2
     return 1
   fi
   if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
