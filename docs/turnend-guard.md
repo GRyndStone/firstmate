@@ -26,7 +26,9 @@ For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
 If work is in flight, the durable wake queue must be empty and `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh` must succeed.
 Queue emptiness is the existing mechanical receipt that wake handling reached `bin/fm-wake-drain.sh`.
-The live watcher lock must also name a live identity-matched owner declared by its wrapper and recorded by `bin/fm-watch.sh`.
+The live watcher lock must also name a live identity-matched owner declared by its wrapper.
+A `daemon` or `checkpoint` owner is declared through the environment and recorded by `bin/fm-watch.sh` from its own parent.
+An `arm` owner is recorded into the lock by `bin/fm-watch-arm.sh` itself, because that watcher is deliberately not the arm's child (see "Detached supervision watcher" below) and so cannot derive the arm from its own `PPID`.
 Claude and Grok normal supervision require an `arm` owner.
 Codex normal supervision requires a `daemon` owner with mode `normal-inject`; that owner remains valid if `.afk` later appears, while an `away-inject` owner is accepted only while `.afk` is active.
 Both daemon modes must match `state/.supervise-daemon.pid` and the live identity recorded in `state/.supervise-daemon.lock`.
@@ -47,6 +49,86 @@ It also blocks after an actionable watcher exit until queued wakes are drained a
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
 Hook input and `stop_hook_active` are diagnostic only.
 Missing `jq`, malformed input, empty input, or a forced-continuation retry cannot bypass the shared predicate.
+
+## Detached supervision watcher
+
+This guard is push-based and fires at turn end.
+The mid-turn window it does not cover was the one that hurt: on 2026-07-25, between 08:45 and 08:55, the harness stopped the background task running `bin/fm-watch-arm.sh` four times, and each stop took the real watcher process down with it, so the fleet ran unsupervised until firstmate happened to see the kill notification and re-arm by hand.
+A kill whose notification does not arrive during a long turn leaves crewmates working with nobody watching.
+The arm's `watcher: started pid=NNNNN (beacon fresh)` line is not evidence against this, because it describes a moment already past by the time the kill lands.
+
+### How the harness actually kills a background task
+
+Measured on macOS (Darwin 27.0.0) on 2026-07-25, before any fix existed, by launching one background task that forked three differently-isolated children and then stopping that task through the harness's own stop path.
+
+The launcher and its three children:
+
+```
+launcher pid=42840 ppid=42835 pgid=42835
+DD       pid=42865 ppid=1     pgid=42865   # double-forked: reparented to init
+EE       pid=42866 ppid=42840 pgid=42866   # own process group AND own session
+```
+
+An earlier run of the same probe also covered a plain child sharing the launcher's process group, and a child in its own process group but the launcher's session.
+
+After the harness stop, with beat files written every 0.5s:
+
+```
+launcher pid=42840 DEAD  beat=1784995474
+DD       pid=42865 ALIVE beat=1784995482   # still beating 8s after the kill
+EE       pid=42866 DEAD  beat=1784995474
+```
+
+Every child that was still a descendant of the launcher at kill time died, including the one in its own session, and only the process that had been reparented off the launcher survived.
+So the harness stop is a **descendant-tree walk**, not a process-group or session signal.
+`setsid` alone is therefore not a fix, and a test that kills only a process group would pass while production still failed.
+
+### What the fix is
+
+`bin/fm-detach.sh` starts the watcher with a double fork, so the intermediate exits at once and the watcher is reparented to init before the walk could ever enumerate it.
+It also calls `POSIX::setsid()` when perl is available, as defence against a harness that signals a process group instead, and rebinds stdin/stdout/stderr away from the launcher's pipes so a dying harness pipe cannot deliver SIGPIPE to the survivor.
+`bin/fm-watch-arm.sh` no longer kills the watcher on `HUP`/`TERM`/`INT`; it just stops reporting for it.
+Nothing is lost by that, because every wake reason is appended to `state/.wake-queue` before the watcher prints it.
+
+The second-order hazard is duplicates: once watchers outlive their launchers, a careless re-arm strands two.
+Three things prevent that, and none of them identify a watcher by process name, because sibling firstmate homes run the same `bin/fm-watch.sh`.
+A re-arm that finds a live identity-matched holder attaches to it and re-points the ownership record at itself rather than starting a second watcher.
+An arm that fails to confirm its own watcher stops the exact pid it launched, and only after checking that pid is not the lock holder.
+`--restart` still signals only the pid recorded in this home's own `state/.watch.lock`.
+
+### Detecting the absence from durable state
+
+`fm_watcher_state` in `bin/fm-wake-lib.sh` classifies the watcher from the singleton lock, the recorded exit disposition, and the beacon alone, so no kill notification has to be delivered for the absence to be seen.
+`bin/fm-guard.sh` and this guard both read it through `fm_supervision_status`.
+
+- `dead`: the watcher is provably gone, in either of two shapes. Reported immediately in both, because each is proof rather than a timeout, where beacon age alone stays silent for the whole `FM_GUARD_GRACE` window.
+- `wedged`: the lock names a live, identity-matched watcher whose beacon stopped advancing. Named separately because a liveness check on the pid alone calls this healthy, and because only `bin/fm-watch-arm.sh --restart` can displace a live lock holder.
+- `absent`: nothing proves a watcher died - a deliberate wake exit, a duplicate standing down, none ever armed, or the sub-second window where one is still furnishing a lock it just took.
+- `live`: live, identity-matched, and beating inside the grace window.
+
+### Why the lock alone is not enough
+
+The first `dead` shape is a lock left behind naming an exited or recycled pid.
+That only happens when no trap ran: a `SIGKILL`, or a crash.
+
+The second shape is the one that mattered and was missed at first.
+`bin/fm-watch.sh` sets an `EXIT` trap, and bash runs that trap when the shell terminates on a signal too, so a plain `SIGTERM` releases the lock on the way out exactly like a deliberate wake exit does.
+Durable state was then identical for both: no lock, and a beacon that merely ages.
+A watcher signalled out from under a live fleet was therefore invisible for the whole grace window, which is precisely the mid-turn blind gap this whole section exists to close.
+
+So the watcher records WHY it exited, at trap time, in `state/.watcher-exit`: `wake` (this exit IS the wake being delivered, already durable in `state/.wake-queue`), `stood-down` (a duplicate yielding to the rightful singleton), `signalled:<SIG>`, or `error`.
+The first two are legitimate and stay silent inside grace; the last two are `dead` with no grace.
+
+Attribution is explicit rather than assumed, so a stale record can never alarm about a healthy watcher:
+
+- Only the process that actually held the singleton writes a record, so a watcher that stood down on a collision cannot file a report about the real one.
+- The record names the home, the watcher path, and the pid it describes.
+- A fresh watcher deletes the record when it acquires the lock, so a record only ever describes the most recent holder, and only after that holder is gone.
+- The lock is consulted first and wins outright: a live, identity-matched holder is never overruled by any record.
+
+One platform note that shapes the tests: a shell starting a background job in a non-interactive script sets `SIGINT` to `SIG_IGN` for that job, and bash will not install a trap for a signal it inherited as ignored.
+A background watcher therefore cannot be interrupted at all, and the `INT` trap matters for the foreground checkpoint run (`bin/fm-watch-checkpoint.sh`).
+`tests/fm-watch-detach.test.sh` resets the disposition through perl before exec so its `SIGINT` case exercises the trap rather than proving nothing.
 
 ## Harness Integrations
 
@@ -136,5 +218,7 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 `tests/fm-turnend-guard.test.sh` covers the shared predicate, durable owner provenance, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-closed behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 `tests/fm-supervision-substrate-hotfix.test.sh` is the bounded live-Herdr end-to-end regression for the 2026-07-18 incident sequence.
+`tests/fm-watch-detach.test.sh` is the regression for the 2026-07-25 incident: it kills a real arm the way the harness does, by walking the arm's descendant tree, then requires the watcher to still be alive and to RECREATE a deleted `state/.last-watcher-beat`, so a surviving-but-wedged process cannot pass it.
+It also covers the durable-state `dead` and `wedged` classifications behind deliberately misleading beacons, and the idempotent re-arm that adopts an orphaned watcher rather than racing a second one.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

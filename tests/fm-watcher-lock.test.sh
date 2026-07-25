@@ -613,13 +613,19 @@ test_arm_starts_and_self_heals() {
   pass "arm starts+confirms a fresh watcher on a clean lock and self-heals a dead-pid lock (never healthy off a dead pid)"
 }
 
-test_arm_hup_cleans_child_and_temp_output() {
-  local dir state fakebin armout i armpid lock_pid status
-  dir=$(make_case arm-hup-cleanup)
+test_arm_hup_leaves_the_detached_watcher_running() {
+  # HUP of the arm used to tear its watcher down with it, which is exactly how a
+  # harness stop of the arm took supervision off a live fleet. The watcher must
+  # now outlive the arm. Its capture file is deliberately left behind, because
+  # that still-running watcher is writing to it; the next arm sweeps captures
+  # whose owning arm pid is gone.
+  local dir state fakebin armout armout2 i armpid armpid2 lock_pid status
+  dir=$(make_case arm-hup-detached)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  armout2="$dir/arm2.out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   armpid=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -627,20 +633,37 @@ test_arm_hup_cleans_child_and_temp_output() {
     sleep 0.1
     i=$((i + 1))
   done
-  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP cleanup check"
+  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP survival check"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -eq 129 ] || fail "arm did not exit with HUP status (got $status)"
+  # Beacon deleted, not just sampled: only a watcher still running its poll loop
+  # recreates it, so a wedged survivor cannot satisfy this.
+  rm -f "$state/.last-watcher-beat"
   i=0
-  while [ "$i" -lt 80 ] && is_live_non_zombie "$lock_pid"; do
+  while [ "$i" -lt 100 ] && [ ! -e "$state/.last-watcher-beat" ]; do
     sleep 0.1
     i=$((i + 1))
   done
-  ! is_live_non_zombie "$lock_pid" || fail "HUP cleanup left watcher child running"
-  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP cleanup left temp output behind"
-  pass "arm cleans child watcher and temp output on HUP"
+  is_live_non_zombie "$lock_pid" || fail "HUP of the arm killed the detached watcher"
+  [ -e "$state/.last-watcher-beat" ] || fail "watcher survived HUP but stopped freshening its beacon"
+  [ -e "$state/.watch-arm-output.$armpid" ] || fail "arm did not leave its capture for the surviving watcher"
+  # The next arm sweeps the dead arm's capture, so nothing accumulates.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" > "$armout2" &
+  armpid2=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$lock_pid" "$armout2" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$lock_pid" "$armout2" || fail "re-arm did not adopt the survivor: $(cat "$armout2")"
+  [ ! -e "$state/.watch-arm-output.$armpid" ] || fail "re-arm did not sweep the dead arm's capture"
+  kill "$armpid2" "$lock_pid" 2>/dev/null || true
+  wait "$armpid2" 2>/dev/null || true
+  pass "HUP of the arm leaves its detached watcher running and the next arm sweeps the stale capture"
 }
 
 test_arm_propagates_immediate_wake_before_confirmation() {
@@ -779,7 +802,7 @@ test_watch_restart_reports_healthy_peer_without_attaching
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_starts_and_self_heals
-test_arm_hup_cleans_child_and_temp_output
+test_arm_hup_leaves_the_detached_watcher_running
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_recovers_missing_identity_after_grace

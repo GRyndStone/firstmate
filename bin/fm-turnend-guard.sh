@@ -66,7 +66,7 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-fm_supervision_status "$STATE" "$GRACE"
+fm_supervision_status "$STATE" "$GRACE" "$WATCH" "$FM_HOME"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 
 daemon_owner_is_active() {
@@ -83,7 +83,20 @@ daemon_owner_is_active() {
   return 0
 }
 
-WATCH_OWNER_DESC="no healthy watcher"
+# Name WHY there is no healthy watcher from the durable classification, so a
+# forced continuation reads as "the watcher died" or "the watcher wedged" rather
+# than the same generic line for every cause.
+case "$FM_SUP_WATCHER_STATE" in
+  dead)
+    if [ -n "$FM_SUP_WATCHER_CAUSE" ]; then
+      WATCH_OWNER_DESC="watcher pid $FM_SUP_WATCHER_PID stopped without delivering a wake (recorded cause: $FM_SUP_WATCHER_CAUSE)"
+    else
+      WATCH_OWNER_DESC="the recorded watcher (pid $FM_SUP_WATCHER_PID) is provably dead"
+    fi
+    ;;
+  wedged) WATCH_OWNER_DESC="the recorded watcher (pid $FM_SUP_WATCHER_PID) is wedged - alive, but its beacon stopped" ;;
+  *) WATCH_OWNER_DESC="no healthy watcher" ;;
+esac
 if [ "$FM_SUP_QUEUE_PENDING" = true ]; then
   WATCH_OWNER_DESC="queued wakes are not drained"
 elif fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
