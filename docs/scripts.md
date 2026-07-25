@@ -84,5 +84,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
 | `fm-kuru-organ-lib.sh`   | Goal↔task linkage and evidence-only organ helpers for the KURU orchestration seam  |
 | `fm-kuru-organ.sh`       | Link FM tasks to KURU goals; organ call surface (bind-only spawn, evidence return)   |
+| `fm-kuru-home-read.sh`   | Run KURU observational reads against a copied home and verify the source home stayed unchanged |
+| `fm-kuru-product-check.sh` | Verify KURU changes against repository and copied lived-home surfaces before reporting product green |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
 | `fm-cleanup-stale-test-roots.sh` | Guarded dry-run-first cleanup of leaked test fixture roots under TMPDIR (safety gates + manifest) |

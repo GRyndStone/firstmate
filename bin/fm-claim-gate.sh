@@ -29,6 +29,10 @@
 #     malformed payload. A guard that breaks the session is worse than no guard.
 #   * Kill switch: FM_CLAIM_GATE_OFF=1.
 #
+# KURU has one extra product-truth rule: a claim that a KURU change is verified
+# must be backed by firstmate's repo-plus-lived-home verifier, not by repository
+# checks alone. The repository is not the product the captain lives in.
+#
 # Ships as TRACKED material, so this file is checked out into every worktree of
 # this repo. It must scope itself to the PRIMARY at runtime and stay a fast,
 # silent no-op everywhere else, exactly as bin/fm-turnend-guard.sh does.
@@ -76,7 +80,7 @@ MSG_LC=$(lower "$MESSAGE")
 # the result itself, is already compliant with hard rule 5 and must pass
 # untouched. This escape is deliberately generous: the gate exists to make
 # honesty cheaper than assertion, not to make disclosure risky.
-DOWNGRADES='reports that|reported that|the report says|according to the report|per the report|the verifier|claims to|claims that|i have not confirmed|i have not independently|not independently confirmed|not independently verified|unverified|unconfirmed|have not verified|without independent|on their report|on its report|taking .* at face value|evidence i have not'
+DOWNGRADES='reports that|reported that|the report says|according to the report|per the report|the verifier|claims to|claims that|i have not confirmed|i have not independently|not independently confirmed|not independently verified|unverified|unconfirmed|have not verified|without independent|on their report|on its report|taking .* at face value|evidence i have not|repository-only|repo-only|only the repository|lived home failed|home failed|not the lived home|without lived-home|without the lived home'
 if printf '%s' "$MSG_LC" | grep -Eq "$DOWNGRADES"; then
   exit 0
 fi
@@ -100,7 +104,73 @@ TRANSCRIPT=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // empty' 2>/dev/n
 [ -n "$TRANSCRIPT" ] || exit 0
 [ -r "$TRANSCRIPT" ] || exit 0
 
-RAN_COMMAND=$(tail -n 600 "$TRANSCRIPT" 2>/dev/null | jq -rs '
+TRANSCRIPT_TAIL=$(tail -n 900 "$TRANSCRIPT" 2>/dev/null || true)
+[ -n "$TRANSCRIPT_TAIL" ] || exit 0
+
+kuru_context=no
+if printf '%s' "$MSG_LC" | grep -Eq 'kuru' || printf '%s\n' "$TRANSCRIPT_TAIL" | grep -Eiq 'kuru|fm-kuru-product-check'; then
+  kuru_context=yes
+fi
+
+kuru_product_claim=no
+if [ "$kuru_context" = yes ] && printf '%s' "$MSG_LC" | grep -Eq "$CLAIMS"; then
+  kuru_product_claim=yes
+fi
+
+kuru_marker() {
+  printf '%s\n' "$TRANSCRIPT_TAIL" | grep -Fq "$1"
+}
+
+kuru_marker_status() {
+  local surface=$1
+  if kuru_marker "surface=$surface result=PASS"; then
+    printf 'PASS\n'
+  elif kuru_marker "surface=$surface result=FAIL"; then
+    printf 'FAIL\n'
+  else
+    printf 'not-covered\n'
+  fi
+}
+
+if [ "$kuru_product_claim" = yes ]; then
+  kuru_product_command=no
+  kuru_verified=no
+  if kuru_marker 'fm-kuru-product-check.sh'; then
+    kuru_product_command=yes
+  fi
+  if [ "$kuru_product_command" = yes ] && kuru_marker 'FM_KURU_PRODUCT_CHECK_RESULT=verified'; then
+    kuru_verified=yes
+  fi
+
+  if [ "$kuru_verified" != yes ]; then
+    repo_status=$(kuru_marker_status repository)
+    home_status=$(kuru_marker_status lived-home-copy)
+    if [ "$kuru_product_command" != yes ]; then
+      repo_status=repository-only
+      home_status=not-covered
+    fi
+
+    rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+    {
+      printf '●%s\n' "$rule"
+      printf '●  KURU PRODUCT VERIFICATION REQUIRED - REPOSITORY GREEN IS NOT PRODUCT GREEN\n'
+      printf '●  The reply claims a KURU verified end state, but this turn did not establish\n'
+      printf '●  firstmate product coverage with bin/fm-kuru-product-check.sh.\n'
+      printf '●\n'
+      printf '●  Covered surfaces this turn: repository=%s lived-home-copy=%s\n' "$repo_status" "$home_status"
+      printf '●  A KURU change is verified only when repository and lived-home-copy both PASS.\n'
+      printf '●\n'
+      printf '●  Two ways past this:\n'
+      printf '●    run product check - bin/fm-kuru-product-check.sh --repo <repo> --home <lived-home>\n'
+      printf '●    downgrade honestly - say repository-only checks passed and the lived home\n'
+      printf '●                         was not verified or failed.\n'
+      printf '●%s\n' "$rule"
+    } >&2
+    exit 2
+  fi
+fi
+
+RAN_COMMAND=$(printf '%s\n' "$TRANSCRIPT_TAIL" | tail -n 600 | jq -rs '
   # Locate the last genuine captain prompt. Tool results also arrive as "user"
   # entries, so a genuine prompt is one whose content is a bare string or whose
   # content array carries a text block and no tool_result block.
