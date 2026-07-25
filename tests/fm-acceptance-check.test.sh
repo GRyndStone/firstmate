@@ -2,10 +2,11 @@
 # Behavior tests for criterion-to-evidence acceptance
 # (bin/fm-acceptance-check.sh + bin/fm-acceptance-lib.sh).
 #
-# Covers: full direct-evidence pass, missing handoff, incomplete fields,
-# wrong-surface proxy rejection, bare done: cannot advance without a map,
-# proportional none: for briefs without AC-*, and the Gryndstone regression
-# (Grok active + in catalog but absent from user-facing chooser must fail).
+# Covers: full direct-evidence pass, declared result verdicts, missing handoff,
+# incomplete fields, wrong-surface proxy rejection, bare done: cannot advance
+# without a map, proportional none: for briefs without AC-*, and the
+# Gryndstone regression (Grok active + in catalog but absent from user-facing
+# chooser must fail).
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -49,6 +50,7 @@ test_help_renders() {
   local help
   help=$("$CHECK" --help)
   assert_contains "$help" "Exit codes:" "help omitted exit-code contract"
+  assert_contains "$help" "declares PASS" "help omitted result-verdict contract"
   assert_contains "$help" "docs/acceptance-evidence.md" "help must name the contract owner"
   pass "fm-acceptance-check.sh: --help renders header"
 }
@@ -103,19 +105,59 @@ EOF
 - surface: tests/fm-acceptance-check.test.sh
 - class: unit
 - command: bash tests/fm-acceptance-check.test.sh
-- result: all assertions pass
+- result: PASS - all assertions pass
 
 ## AC-2
 - statement: docs pointer names the contract owner
 - surface: docs/acceptance-evidence.md
 - class: code
 - command: rg -n 'fm-acceptance-check' docs/acceptance-evidence.md
-- result: file documents the gate and CLI
+- result: PASS - file documents the gate and CLI
 EOF
   out=$(run_check "$brief" "$evidence") || status=$?
   expect_code 0 "$status" "full direct evidence must pass"
   assert_contains "$out" "PASS: all criteria mapped" "pass message missing"
   pass "full direct evidence passes"
+}
+
+test_declared_nonpassing_and_ambiguous_verdicts_fail() {
+  local brief evidence out shape_out status shape_status result expected_message label case_count=0
+  brief="$TMP_ROOT/verdict-brief.md"
+  evidence="$TMP_ROOT/verdict-evidence.md"
+  write_brief "$brief" "- AC-1: the focused test succeeds"
+
+  while IFS='|' read -r label result expected_message; do
+    case_count=$((case_count + 1))
+    cat > "$evidence" <<EOF
+## AC-1
+- surface: tests/example.test.sh
+- class: unit
+- command: bash tests/example.test.sh
+- result: $result
+EOF
+
+    # This direct library call recreates the old shape-only checker.
+    shape_status=0
+    shape_out=$(fm_acceptance_check "$brief" "$evidence" 2>&1) || shape_status=$?
+    expect_code 0 "$shape_status" "$label must demonstrate the verdict-blind shape gate"
+    assert_contains "$shape_out" "PASS AC-1" "$label shape gate did not reach its blind pass"
+
+    status=0
+    out=$(run_check "$brief" "$evidence") || status=$?
+    expect_code 1 "$status" "$label must fail the verdict-aware checker"
+    assert_contains "$out" "$expected_message" "$label verdict failure was not distinguished"
+    assert_contains "$out" "repair AC-1:" "$label verdict repair guidance missing"
+    assert_not_contains "$out" "PASS AC-1" "$label must never report the failed criterion PASS"
+    assert_not_contains "$out" "PASS: all criteria" "$label must never report aggregate PASS"
+  done <<'EOF'
+self-declared partial|PARTIAL - two platforms succeeded, but the compatibility run did not finish cleanly|verdict not achieved (declared=PARTIAL)
+self-declared failure|FAIL - the release probe returned a nonzero status|verdict not achieved (declared=FAIL)
+self-declared unknown|UNKNOWN - the observation ended without a decisive outcome|verdict not achieved (declared=UNKNOWN)
+ambiguous near-success|completed every check except the final cross-version scenario|verdict ambiguous
+EOF
+
+  expect_code 4 "$case_count" "anti-vacuity requires every planted negative to run"
+  pass "declared nonpassing and ambiguous verdicts fail after shape validation"
 }
 
 test_missing_evidence_fails() {
@@ -129,6 +171,7 @@ test_missing_evidence_fails() {
   assert_contains "$out" "acceptance evidence handoff missing" "missing-file message absent"
   assert_contains "$out" "repair:" "missing repair direction"
   assert_contains "$out" "bare done:" "must state bare done cannot advance"
+  assert_not_contains "$out" "verdict" "missing handoff must retain its own failure class"
   pass "missing evidence fails with repair"
 }
 
@@ -146,6 +189,7 @@ EOF
   expect_code 1 "$status" "incomplete fields must fail"
   assert_contains "$out" "incomplete evidence" "incomplete message missing"
   assert_contains "$out" "repair AC-1:" "precise per-id repair missing"
+  assert_not_contains "$out" "verdict" "incomplete fields must retain their own failure class"
   pass "incomplete fields fail"
 }
 
@@ -186,6 +230,7 @@ EOF
   assert_contains "$out" "proxy rejected" "proxy rejection missing"
   assert_contains "$out" "required_class=ui" "required class should be ui"
   assert_contains "$out" "offered_class=catalog" "offered class should be catalog"
+  assert_not_contains "$out" "verdict" "proxy rejection must retain its own failure class"
   pass "wrong-surface proxy fails"
 }
 
@@ -236,7 +281,7 @@ EOF
 - surface: Hermes Telegram model switcher (user-facing)
 - class: ui
 - command: open existing model chooser; list selectable entries; select grok-4.5
-- result: xai-oauth / grok-4.5 listed and selectable; selection applies
+- result: PASS - xai-oauth / grok-4.5 listed and selectable; selection applies
 - head: abcdef1 2026-07-18T13:00:00Z
 
 ## AC-2
@@ -244,7 +289,7 @@ EOF
 - surface: live Hermes after reload via chooser-selected default
 - class: live
 - command: reload service; open chooser; confirm default and send probe message
-- result: default remains grok-4.5; probe answers as Grok
+- result: PASS - default remains grok-4.5; probe answers as Grok
 - head: abcdef1 2026-07-18T13:10:00Z
 EOF
   status=0
@@ -328,7 +373,7 @@ test_task_id_path_resolution() {
 - surface: tests/example.test.sh
 - class: unit
 - command: bash tests/example.test.sh
-- result: pass
+- result: PASS
 EOF
   out=$(FM_HOME="$home" "$CHECK" "$id" 2>&1) || status=$?
   expect_code 0 "$status" "task-id resolution should find data/<id> paths"
@@ -340,6 +385,7 @@ test_script_parses
 test_help_renders
 test_extract_ids_from_task_only
 test_full_direct_evidence_passes
+test_declared_nonpassing_and_ambiguous_verdicts_fail
 test_missing_evidence_fails
 test_incomplete_fields_fail
 test_status_claim_class_rejected

@@ -419,6 +419,10 @@ test_ship_acceptance_evidence_contract() {
     "ship brief missing proportional none: declaration guidance"
   assert_grep "config/catalog/API does not satisfy a UI" "$brief" \
     "ship brief missing proxy-rejection guidance"
+  assert_grep "one declared verdict" "$brief" \
+    "ship brief missing result-verdict declaration guidance"
+  assert_grep "free-form result text without one of these exact prefixes fails as ambiguous" "$brief" \
+    "ship brief missing fail-closed ambiguous-result guidance"
 
   id="brief-accept-scout"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
