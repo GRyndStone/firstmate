@@ -8,13 +8,19 @@
 #   S = max(0, spendable - B*T)
 #   required_rate = S/T
 #   urgency = clamp(1 - T/W, 0, 1) when W is observed or learned
-#   pressure = 1 + K*urgency^2 when S > 0 and W is known, otherwise 1
+#   base_pressure = 1 + K*urgency^2 when S > 0 and W is known, otherwise 1
+#   for provider=codex only:
+#     reset_factor = F^N where N = available rate-limit reset credits
+#     (F defaults to 1.5; compounding). Other providers use reset_factor = 1.
+#   pressure = base_pressure * reset_factor
 #   score = required_rate * pressure
 #
 # B estimates consumption while this provider was not selected at a routing
 # decision. It never extrapolates the routed provider's own burst or snapshot
 # usage. W comes from the meter or a change in observed resetsAt; it is never a
-# provider constant. Full rationale: docs/usage-burndown-dispatch.md.
+# provider constant. Codex N is a real observation of rateLimitResetCredits;
+# unreadable N is an error, never a silent zero. Full rationale:
+# docs/usage-burndown-dispatch.md.
 #
 # Sourced only; not executed as a main program.
 
@@ -27,6 +33,8 @@ FM_BURNDOWN_PRESSURE_K=${FM_BURNDOWN_PRESSURE_K:-4}
 FM_BURNDOWN_HISTORY_MAX=${FM_BURNDOWN_HISTORY_MAX:-200}
 FM_BURNDOWN_SPEND_FLOOR=${FM_BURNDOWN_SPEND_FLOOR:-5}
 FM_BURNDOWN_RATE_FLOOR=${FM_BURNDOWN_RATE_FLOOR:-0}
+# Compounding per-available-reset multiplier for provider=codex only.
+FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR=${FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR:-1.5}
 
 fm_usage_burndown_numeric_or_default() { # <value> <default> <min> <max>
   local value=$1 fallback=$2 minimum=$3 maximum=$4
@@ -46,6 +54,8 @@ FM_BURNDOWN_PRESSURE_K=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_PRES
 FM_BURNDOWN_HISTORY_MAX=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_HISTORY_MAX" 200 1 10000)
 FM_BURNDOWN_SPEND_FLOOR=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_SPEND_FLOOR" 5 0 100)
 FM_BURNDOWN_RATE_FLOOR=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_RATE_FLOOR" 0 0 100)
+FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR=$(fm_usage_burndown_numeric_or_default \
+  "$FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR" 1.5 1 10)
 
 fm_usage_burn_history_path() {
   if [ -n "${FM_USAGE_BURN_HISTORY:-}" ]; then
@@ -213,6 +223,11 @@ fm_usage_burndown_score_one() { # <observation_json>
       spendable_surplus:null,
       required_rate:null,
       pressure:null,
+      pressure_source:null,
+      base_pressure:null,
+      reset_available_count:(.rate_limit_reset_credits.available_count // null),
+      reset_pressure_factor:null,
+      reset_pressure_source:(.rate_limit_reset_credits.source // null),
       urgency:null,
       score:null,
       posture:"unknown",
@@ -225,6 +240,9 @@ fm_usage_burndown_score_one() { # <observation_json>
     }'
     return 0
   fi
+  # Codex reset-count handling is part of scoring below. An unreadable count is
+  # a loud, named diagnostic with neutral factor 1 - never a silent zero and
+  # never a poison of otherwise-valid window evidence (AC-2).
   provider=$(printf '%s\n' "$obs" | jq -r '.provider')
   window_id=$(printf '%s\n' "$obs" | jq -r '.binding.id')
   R=$(printf '%s\n' "$obs" | jq -r '.binding.remaining')
@@ -239,7 +257,8 @@ fm_usage_burndown_score_one() { # <observation_json>
     --argjson period "$period_json" \
     --argjson K "$FM_BURNDOWN_PRESSURE_K" \
     --argjson floor "$FM_BURNDOWN_SPEND_FLOOR" \
-    --argjson gate_floor "$FM_BURNDOWN_RATE_FLOOR" '
+    --argjson gate_floor "$FM_BURNDOWN_RATE_FLOOR" \
+    --argjson reset_factor_base "$FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR" '
     $obs as $o
     | $o.binding.remaining as $R
     | $o.binding.T as $T
@@ -259,7 +278,34 @@ fm_usage_burndown_score_one() { # <observation_json>
           1 + ($K * ($urgency * $urgency))
         else 1
         end
-      ) as $pressure
+      ) as $base_pressure
+    | (($o.rate_limit_reset_credits // {}) ) as $reset
+    | ($reset.evidence // "fresh") as $reset_evidence
+    | (
+        # Unreadable reset count: neutral factor 1 with an explicit unreadable
+        # source so it cannot be mistaken for a genuine zero (AC-2). Windows
+        # remain scorable so an otherwise-valid dispatch is not poisoned.
+        if $o.provider != "codex" then
+          {n:null, factor:1, source:null, unreadable:false}
+        elif $reset_evidence == "unreadable" then
+          {n:null, factor:1, source:($reset.source // "unreadable"), unreadable:true}
+        elif (($reset.available_count? | type) == "number") and ($reset.available_count >= 0) then
+          ($reset.available_count | floor) as $n
+          | {
+              n:$n,
+              # Compounding F^N via iterative multiply (jq has no pow).
+              factor:(reduce range(0; $n) as $_ (1; . * $reset_factor_base)),
+              source:($reset.source // "available-count"),
+              unreadable:false
+            }
+        else
+          # Missing observation fragment: genuine zero, not an error.
+          {n:0, factor:1, source:($reset.source // "absent-as-zero"), unreadable:false}
+        end
+      ) as $reset_state
+    | $reset_state.factor as $reset_factor
+    | $reset_state.n as $reset_n
+    | ($base_pressure * $reset_factor) as $pressure
     | ($required_rate * $pressure) as $score
     | (100 - $R) as $used
     | (($o.gate_windows // []) | all(.remaining > $gate_floor)) as $eligible
@@ -270,18 +316,32 @@ fm_usage_burndown_score_one() { # <observation_json>
         else "normal"
         end
       ) as $posture
+    | (
+        if ($urgency | type) == "number" then "window-urgency" else "neutral-missing-window-period" end
+      ) as $base_source
     | $o + {
         B:$B,
         B_source:$burn.source,
         S:$S,
         spendable_surplus:$S,
         required_rate:$required_rate,
+        base_pressure:$base_pressure,
         pressure:$pressure,
         pressure_source:(
-          if ($urgency | type) == "number" then "window-urgency"
-          else "neutral-missing-window-period"
+          if $o.provider != "codex" then
+            $base_source
+          elif $reset_state.unreadable then
+            $base_source + "+codex-reset-unreadable"
+          elif ($reset_factor != 1) then
+            $base_source + "+codex-reset-" + ($reset_factor_base | tostring) + "^" + (($reset_n | floor) | tostring)
+          else
+            $base_source + "+codex-reset-1"
           end
         ),
+        reset_available_count:$reset_n,
+        reset_pressure_factor:$reset_factor,
+        reset_pressure_source:$reset_state.source,
+        reset_count_unreadable:$reset_state.unreadable,
         urgency:$urgency,
         score:$score,
         posture:$posture,
@@ -292,7 +352,18 @@ fm_usage_burndown_score_one() { # <observation_json>
         W:$period.W,
         W_source:$period.source,
         spend_floor:$floor,
-        rate_floor:$gate_floor
+        rate_floor:$gate_floor,
+        diagnostics:(
+          ($o.diagnostics // [])
+          + (
+              if $reset_state.unreadable then
+                ["codex rate-limit reset credits unreadable: "
+                  + ($reset.error // "unknown cause")
+                  + "; scored windows with neutral reset factor 1 (not a silent zero)"]
+              else []
+              end
+            )
+        )
       }
   '
 }
@@ -350,6 +421,11 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
         required_rate:($observation.required_rate // null),
         pressure:($observation.pressure // null),
         pressure_source:($observation.pressure_source // null),
+        base_pressure:($observation.base_pressure // null),
+        reset_available_count:($observation.reset_available_count // null),
+        reset_pressure_factor:($observation.reset_pressure_factor // null),
+        reset_pressure_source:($observation.reset_pressure_source // null),
+        reset_count_unreadable:($observation.reset_count_unreadable // false),
         urgency:($observation.urgency // null),
         score:($observation.score // null),
         posture:($observation.posture // "unknown"),
@@ -511,7 +587,15 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
                 + "R=\($chosen.R) T=\($chosen.T)s W=\($chosen.W)/\($chosen.W_source) "
                 + "B=\($chosen.B)/\($chosen.B_source) S=\($chosen.S) "
                 + "required_rate=\($chosen.required_rate) urgency=\($chosen.urgency) "
-                + "pressure=\($chosen.pressure) score=\($chosen.score); "
+                + "pressure=\($chosen.pressure)"
+                + (
+                    if $chosen.provider == "codex" then
+                      " (base=\($chosen.base_pressure) reset_factor=\($chosen.reset_pressure_factor)"
+                      + " resets=\($chosen.reset_available_count)/\($chosen.reset_pressure_source))"
+                    else ""
+                    end
+                  )
+                + " score=\($chosen.score); "
                 + "binding_reason=\($chosen.binding_reason)"
               ) as $why
             | {
@@ -629,7 +713,15 @@ fm_usage_burndown_format_explain() { # <selection_json>
         + "posture=\(.posture) budget=\(.window_id) binding_reason=\(.binding_reason) "
         + "R=\(.R) T=\(.T) W=\(.W)/\(.W_source) "
         + "B=\(.B)/\(.B_source) S=\(.S) required_rate=\(.required_rate) "
-        + "urgency=\(.urgency) pressure=\(.pressure) score=\(.score) "
+        + "urgency=\(.urgency) pressure=\(.pressure)/\(.pressure_source) "
+        + (
+            if .provider == "codex" then
+              "base_pressure=\(.base_pressure) reset_factor=\(.reset_pressure_factor) "
+              + "resets=\(.reset_available_count)/\(.reset_pressure_source) "
+            else ""
+            end
+          )
+        + "score=\(.score) "
         + "window_roles=\(.window_roles | tojson)")
   '
 }

@@ -349,6 +349,15 @@ else
   fi
   [ "$quota_status" -eq 0 ] \
     || usage_evidence_error "quota-axi exited $quota_status while reading live usage"
+  # Live meter path: quota-axi drops rateLimitResetCredits. When codex is a
+  # candidate, observe it read-only via the app-server and attach it before
+  # scoring (never redeem/consume a reset).
+  if printf '%s\n' "$profiles_json" | jq -e '
+    [.[] | (.provider // .harness // empty)] | index("codex")
+  ' >/dev/null 2>&1; then
+    quota_json=$(fm_usage_source_enrich_codex_reset_credits "$quota_json" "$NOW_EPOCH") \
+      || usage_evidence_error "failed to observe codex rate-limit reset credits"
+  fi
 fi
 
 printf '%s\n' "$quota_json" | jq -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1 \
@@ -404,6 +413,22 @@ while IFS= read -r obs_line; do
     --argjson acc "$unreadable_providers_json" \
     --arg p "$obs_provider" \
     '$acc + [$p] | unique')
+done < <(printf '%s\n' "$observations" | jq -c '.[]')
+
+# Codex rate-limit reset credits can fail independently of window evidence.
+# Loud named error (never silent zero); does NOT mark the provider unreadable
+# or set dispatch_error when windows themselves are scorable (AC-2 interaction).
+while IFS= read -r obs_line; do
+  [ -n "$obs_line" ] || continue
+  printf '%s\n' "$obs_line" | jq -e '
+    .provider == "codex"
+    and (.rate_limit_reset_credits.evidence // "") == "unreadable"
+  ' >/dev/null 2>&1 || continue
+  reset_reason=$(printf '%s\n' "$obs_line" | jq -r '
+    def one_line: tostring | gsub("[\\r\\n\\t]+"; " ");
+    (.rate_limit_reset_credits.error // "unknown cause") | one_line
+  ')
+  log "error: unreadable rate-limit reset credits for provider 'codex': $reset_reason; windows remain scorable with neutral reset factor 1 (not a silent zero)"
 done < <(printf '%s\n' "$observations" | jq -c '.[]')
 
 # Inspectable explanation on stderr.
