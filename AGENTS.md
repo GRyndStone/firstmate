@@ -58,7 +58,7 @@ Hard rules, in priority order:
 
 You may freely write to this repo itself (backlog, briefs, state, even this file when the captain approves a change).
 Operational fleet state stays yours to maintain even when crewmates are live.
-Shared, tracked material means `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and public `skills/`.
+Shared, tracked material means `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `deps/`, `.agents/skills/`, and public `skills/`.
 When one or more crewmates are in flight, delegate changes to shared, tracked material to a crewmate through the normal scout or ship machinery instead of hand-editing them yourself.
 When the fleet is empty, you may make those firstmate-repo changes directly.
 Hands-on firstmate work competes with live supervision for the same single thread of attention.
@@ -87,6 +87,7 @@ README.md            public overview and development notes
 .claude/skills       symlink to .agents/skills for claude compatibility
 skills/              standalone public installer-facing skills, committed; not loaded by firstmate
 bin/                 helper scripts, committed; read each script's header before first use
+deps/                declared incorporation inventory and pinned dependency contracts, committed (docs/dependency-currency.md)
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; its default candidate set drives routine self-routing and its natural-language rules support intentional task-specific overrides (section 4). Inherited by secondmate homes
@@ -101,6 +102,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         captain's personal preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store
+  dep-upgrades.md    append-only dependency upgrade ledger written by bin/fm-deps.sh; the version rollback reads
   session-handoff.md human summary of the last primary compact/rotate handoff (written by bin/fm-session-lifecycle.sh write-handoff; machine copy is state/.session-handoff)
   projects.md        thin fleet navigation registry; firstmate-private, parsed by fm-project-mode.sh (section 6)
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
@@ -119,6 +121,7 @@ state/               volatile runtime signals; gitignored
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
+  dep-currency.tsv   cached dependency currency answers and pinned-contract verdicts (bin/fm-deps.sh)
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .primary-session   primary compact/rotate counters (bin/fm-session-lifecycle.sh; docs/configuration.md "Primary session lifecycle")
   .session-handoff   mechanical pre-rotate inventory of reports, wakes, decisions, rechecks
@@ -787,7 +790,7 @@ It performs only fast-forward self-updates of firstmate and registered secondmat
 
 These skills are not captain-invocable; they are conditional operating references you must load at the trigger points below.
 
-- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints any diagnostic or capability line (`MISSING:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_HARNESS_OVERRIDE:`, `CREW_DISPATCH:`, `NM_GENERATION:`, `FLEET_SYNC:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `TASKS_AXI:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence needs no load.
+- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints any diagnostic or capability line (`MISSING:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_HARNESS_OVERRIDE:`, `CREW_DISPATCH:`, `NM_GENERATION:`, `DEPS:`, `FLEET_SYNC:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `TASKS_AXI:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence needs no load.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
 - `firstmate-orca` - load before switching to Orca, spawning or supervising Orca-backed work, smoke-testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `stuck-crewmate-recovery` - load after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.

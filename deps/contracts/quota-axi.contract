@@ -1,0 +1,49 @@
+# What firstmate relies on quota-axi to keep meaning.
+#
+# Consumers: bin/fm-usage-source-lib.sh (parses the provider/window document)
+# and bin/fm-dispatch-select.sh (gates on the root shape, reads state.status).
+#
+# This file exists because of an observed failure mode: between 0.1.5 and
+# 0.1.13 the grok window identifiers were renamed (product:grokbuild ->
+# product:grok_build, product:grokimagine -> product:imagine) and two windows
+# appeared. A consumer keyed on a renamed identifier reads nothing, and reading
+# nothing is indistinguishable from a legitimate absence - no error, exit 0,
+# valid JSON. A version comparison cannot see that. These assertions can.
+#
+# Deliberately NOT pinned: the full window inventory. Windows come and go with
+# the upstream provider's own plan changes (codex genuinely lost its five_hour
+# window), so pinning the inventory would be a permanent false alarm. What is
+# pinned is the FIELD vocabulary firstmate parses and the guarantee that a
+# fresh metered provider still yields something firstmate's own filter accepts.
+
+probe json = quota-axi --json
+
+#: root is an object with a providers array (the shape fm-dispatch-select.sh gates on)
+json json  (type == "object") and ((.providers | type) == "array")
+
+#: schemaVersion is still the version the parser in fm-usage-source-lib.sh was written against
+json json  .schemaVersion == 2
+
+#: every provider entry carries the string .provider key that profile matching indexes on
+json json  ([.providers[]? | select((.provider | type) != "string")] | length) == 0
+
+#: every provider entry carries the string .state.status that gates fresh/stale handling
+json json  ([.providers[]? | select((.state.status? | type) != "string")] | length) == 0
+
+#: any provider reporting fresh or stale carries the string .state.refreshedAt that stale-window currentness needs
+json json  ([.providers[]? | select((.state.status? // "") == "fresh" or (.state.status? // "") == "stale") | select((.state.refreshedAt? | type) != "string")] | length) == 0
+
+#: every window of a fresh provider carries string .id and .kind - the keys the general-window filter reads
+json json  ([.providers[]? | select((.state.status? // "") == "fresh") | .windows[]? | select((.id? | type) != "string" or (.kind? | type) != "string")] | length) == 0
+
+#: non-model windows of a fresh provider still report percentRemaining as a 0-100 number, not a renamed or restyled field
+json json  ([.providers[]? | select((.state.status? // "") == "fresh") | .windows[]? | select((.kind? // "") != "model") | select((.percentRemaining? | type) != "number" or .percentRemaining < 0 or .percentRemaining > 100)] | length) == 0
+
+#: resetsAt, where present, still parses as the ISO8601 timestamp fm-usage-source-lib.sh converts to an epoch
+json json  ([.providers[]? | .windows[]? | select(.resetsAt? != null) | select((.resetsAt | type) != "string" or ((try (.resetsAt | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch null) == null))] | length) == 0
+
+#: every fresh provider still yields at least one window firstmate's own general-window filter accepts - the "silently reads nothing" catch
+json json  ([.providers[]? | select((.state.status? // "") == "fresh") | select(([.windows[]? | select((.kind? // "") != "model") | select((.percentRemaining? | type) == "number")] | length) == 0)] | length) == 0
+
+#: claude, when fresh, still emits the five_hour window id fm-usage-source-lib.sh restricts its general list to (parity asserted by tests/fm-deps.test.sh)
+json json  ([.providers[]? | select(.provider == "claude") | select((.state.status? // "") == "fresh")] | length) == 0 or (([.providers[]? | select(.provider == "claude") | .windows[]? | .id] | index("five_hour")) != null)

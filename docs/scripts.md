@@ -9,6 +9,8 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
 | `fm-session-lifecycle.sh` | Primary compact/rotate thresholds, counter state, stow handoff inventory, and restart-preservation checks |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
+| `fm-deps.sh`             | Declared incorporation inventory: currency, artifact identity, ownership and fallback ladder, pinned-contract verification, verified upstream access, and deliberate approved upgrade/rollback (docs/dependency-currency.md) |
+| `fm-deps-lib.sh`         | Inventory and contract parsing, currency adapters, artifact-identity readings, contract verification, and the currency cache |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
 | `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
 | `fm-fleet-view.sh`       | Render the fleet snapshot as a human Markdown view                                   |

@@ -67,11 +67,13 @@ See the private [`GRyndStone/no-mistakes`](https://github.com/GRyndStone/no-mist
 
 ## Development
 
-Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/` - ship on a feature branch via the default direct-PR path (or explicit no-mistakes when opted in) and require an explicit merge approval.
+Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `deps/`, `.agents/skills/`, and `skills/` - ship on a feature branch via the default direct-PR path (or explicit no-mistakes when opted in) and require an explicit merge approval.
 Before making any such change, load the agent-only `firstmate-coding-guidelines` skill (`.agents/skills/firstmate-coding-guidelines/SKILL.md`).
 It has the knowledge-placement rules that keep `AGENTS.md` from regrowing after each diet pass.
 There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task's repo is firstmate itself, so firstmate adds this skill's load line to firstmate-repo briefs by hand.
 A crewmate picking up such a brief should load the skill even if the brief predates this instruction.
+Adding a tool firstmate depends on also means declaring it in `deps/incorporations.conf` with what it is relied upon to do, a currency source or a stated reason there is none, and either a pinned contract under `deps/contracts/` or a stated reason it does not need one.
+This is enforced, not encouraged: an undeclared required tool is reported at every session start and fails `tests/fm-deps.test.sh` (`docs/dependency-currency.md`).
 When supervising live crewmates, keep firstmate's own long validation or build commands in the background so watcher wakes can still be handled.
 Crewmate validation follows the installed no-mistakes version's SKILL.md and live `axi` help instead of duplicating gate mechanics in firstmate docs.
 Firstmate's wrapper still matters: `ask-user` findings route to the captain through firstmate, `AGENTS.md` section 1 owns the required independent analysis and captain-facing response shape, and crewmates avoid `--yes` because it silently resolves captain-owned decisions without escalation.

@@ -10,6 +10,7 @@
 #                 "NM_GENERATION: active|invalid|unhealthy config/no-mistakes-generation ...",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
+#                 "DEPS: <component> behind|sibling ahead|CONTRACT BROKEN|... ",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
@@ -57,6 +58,13 @@
 #          quota data is unusable for a metered provider, fm-dispatch-select.sh
 #          surfaces a loud usage-evidence-unreadable error (exit 70 when no live
 #          candidate remains) rather than silently retaining a profile.
+#          DEPS lines come from bin/fm-deps.sh report, which reads the declared
+#          inventory in deps/incorporations.conf plus the cached currency and
+#          pinned-contract verdicts. They are silent when every component is
+#          current and every pinned contract holds. A locked run first does a
+#          rate-limited refresh (bin/fm-deps.sh refresh --if-due); a detect-only
+#          run reports from the cache without any network or write, so a second
+#          concurrent session never races the lock holder's refresh.
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
@@ -707,6 +715,16 @@ fm_nm_generation_bootstrap_report "$CONFIG"
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi
+# Dependency currency and pinned-contract verdicts (bin/fm-deps.sh,
+# deps/incorporations.conf, docs/dependency-currency.md). Silent when every
+# declared component is current and every pinned contract holds. In a locked
+# session the refresh runs first so the verdicts are this session's; a
+# detect-only session reports from the cache and never touches the network,
+# because the session holding the lock owns that write.
+if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+  "$SCRIPT_DIR/fm-deps.sh" refresh --if-due >/dev/null 2>&1 || true
+fi
+"$SCRIPT_DIR/fm-deps.sh" report 2>/dev/null || true
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
   secondmate_liveness_sweep
