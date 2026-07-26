@@ -416,19 +416,25 @@ clear_pause_tracking() {  # <window>
 # fm_backend_capture fail, and the old loop silently `continue`d past every
 # classification - including the pause re-surface - for hours). Called when a
 # crew capture fails, and per poll for non-paused secondmates (whose stale
-# detection is skipped). Corroborates the failure with the read-only existence
-# probe (fm_backend_target_exists, which never starts a server), so a transient
-# capture hiccup on a live endpoint is not misread as death. A confirmed-gone
-# endpoint surfaces ONCE per disappearance - the .endpoint-gone-<key> marker
+# detection is skipped). Corroborates the failure with the read-only tri-state
+# observation (fm_backend_target_state, which never starts a server), so a
+# transient capture hiccup or unreadable backend is not misread as death.
+# A confirmed-gone endpoint surfaces ONCE per disappearance - the
+# .endpoint-gone-<key> marker
 # dedupes until the endpoint reads alive again - regardless of any declared
 # pause and regardless of afk. docs/architecture.md ("Event-driven supervision")
 # owns the classification rule.
 handle_gone_endpoint() {  # <window>
-  local w=$1 key marker reason meta tomb tomb_age task
+  local w=$1 key marker reason meta tomb tomb_age task endpoint_state
   key=$(window_key "$w")
   marker="$STATE/.endpoint-gone-$key"
-  if fm_backend_target_exists "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null; then
+  endpoint_state=$(fm_backend_target_state "$(window_backend "$w")" "$w" "$(window_label "$w")" 2>/dev/null || printf 'unknown')
+  if [ "$endpoint_state" = alive ]; then
     rm -f "$marker"
+    return 0
+  fi
+  if [ "$endpoint_state" != dead ]; then
+    triage_log "absorbed unreadable endpoint observation (not death proof): $w"
     return 0
   fi
   # Teardown kills the endpoint moments before removing the task's meta

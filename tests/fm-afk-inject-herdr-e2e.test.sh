@@ -12,10 +12,9 @@
 # PATH redirection is needed for the happy path - the daemon is simply pointed
 # at FM_SUPERVISOR_BACKEND=herdr, FM_SUPERVISOR_TARGET="<session>:<pane-id>",
 # and HERDR_SESSION="<the isolated session>". A thin herdr SHIM is still used,
-# but only to simulate a swallowed Enter (Scenario B) - herdr's real CLI has no
-# built-in way to drop a keystroke, so the shim intercepts exactly one
-# `pane send-keys <pane> enter` call and forwards everything else to the real
-# binary untouched.
+# but only to simulate one server-reported `agent_prompt_stalled` result
+# (Scenario B); it intercepts exactly one `agent prompt` call and forwards
+# everything else to the real binary untouched.
 #
 # The "supervisor pane" is a tiny deterministic bash loop (not a real harness
 # binary): it draws a bordered composer row ("│ > <buf> │") that exercises the
@@ -24,12 +23,9 @@
 # tests/fm-afk-inject-e2e.test.sh uses for its tmux supervisor pane, so this
 # test asserts on submitted CONTENT, not pane appearance. It ALSO registers
 # itself as a real herdr agent via `herdr pane report-agent` and reports an
-# idle/working/idle cycle around each submission, because
-# fm_backend_herdr_send_text_submit's confirmation is native agent-state
-# (agent get), not composer content, since the 2026-07-07 incident fix
-# (docs/herdr-backend.md "Native agent-state submit confirmation") - a pane
-# that only draws composer text without being a registered agent would read
-# agent_not_found forever and never confirm a submission.
+# idle/working/idle cycle around each submission, because protocol-17
+# `agent prompt` requires a live registered agent and waits for its observed
+# state change.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -106,19 +102,9 @@ EOF
 # fm_backend_herdr_composer_state recognizes it, exactly like a bordered-TUI
 # harness composer. ALSO registers itself as a real herdr agent via `herdr
 # pane report-agent` and reports idle/working transitions around each
-# submission: fm_backend_herdr_send_text_submit's confirmation is now native
-# agent-state (agent get), not composer content (docs/herdr-backend.md
-# "Native agent-state submit confirmation"), so a synthetic pane that only
-# draws composer TEXT but is never registered as an agent would report
-# agent_not_found forever - every confirmation attempt would read 'unknown',
-# never 'empty', and the daemon would treat every injection as unconfirmed and
-# keep retyping it on every housekeeping tick (the exact duplicate-send
-# failure mode this whole change exists to prevent) - discovered by this very
-# test regressing when the composer-only version of this fixture was run
-# against the new confirmation code. `herdr pane report-agent` is herdr's own
-# documented integration-protocol primitive for a non-built-in-harness process
-# to report its own agent state, verified empirically against real herdr 0.7.1
-# in an isolated session.
+# submission so protocol-17 `agent prompt --wait` can confirm the transition.
+# `herdr pane report-agent` is Herdr's documented integration-protocol
+# primitive for a non-built-in-harness process to report its own agent state.
 LOOP_SCRIPT="$STATE_DIR/supervisor-loop.sh"
 cat > "$LOOP_SCRIPT" <<'LOOP'
 #!/usr/bin/env bash
@@ -173,10 +159,8 @@ submit_line() {
   printf '\r\033[K\n'
   redraw
   # Report a real idle->working->idle cycle around the submission, exactly
-  # like a real harness's agent_status - this is the signal
-  # fm_backend_herdr_send_text_submit now confirms against. The 0.6s "working"
-  # window comfortably covers the daemon's FM_INJECT_CONFIRM_SLEEP=0.5
-  # per-attempt budget used by the scenarios below.
+  # like a real harness's agent_status - this is the signal the server-owned
+  # atomic prompt waits for.
   report_agent_state working
   sleep 0.6
   report_agent_state idle
@@ -201,18 +185,15 @@ fm_backend_herdr_send_text_line "$SUPERVISOR_TARGET" "bash '$LOOP_SCRIPT' '$LOG_
   || fail "could not start the supervisor-loop script in the scratch herdr pane"
 sleep 1  # let the loop start and settle
 
-# --- herdr shim: forwards to the real binary, optionally swallows one Enter --
+# --- herdr shim: forwards to real binary, optionally reports one prompt stall -
 REAL_HERDR=$(command -v herdr)
 fm_test_tmproot HERDR_SHIM_DIR fm-herdr-shim
 cat > "$HERDR_SHIM_DIR/herdr" <<SHIM
 #!/usr/bin/env bash
-if [ "\${1:-}" = "pane" ] && [ "\${2:-}" = "send-keys" ] && [ -f "$STATE_DIR/.swallow-enter" ]; then
-  found_enter=0
-  for _a in "\$@"; do [ "\$_a" = "enter" ] && found_enter=1; done
-  if [ "\$found_enter" = 1 ]; then
-    rm -f "$STATE_DIR/.swallow-enter"
-    exit 0
-  fi
+if [ "\${1:-}" = "agent" ] && [ "\${2:-}" = "prompt" ] && [ -f "$STATE_DIR/.stall-prompt" ]; then
+  rm -f "$STATE_DIR/.stall-prompt"
+  printf '%s\n' '{"error":{"code":"agent_prompt_stalled","message":"fixture: no observed state change"}}' >&2
+  exit 1
 fi
 exec "$REAL_HERDR" "\$@"
 SHIM
@@ -280,7 +261,7 @@ reset_state() {
          "$STATE_DIR"/.stale-* \
          "$STATE_DIR"/.seen-* \
          "$STATE_DIR"/.heartbeat-streak \
-         "$STATE_DIR"/.swallow-enter \
+         "$STATE_DIR"/.stall-prompt \
          2>/dev/null || true
   : > "$LOG_FILE"
 }
@@ -362,13 +343,13 @@ test_scenario_a() {
   pass "real herdr Scenario A: partial input defers injection; digest arrives clean after idle"
 }
 
-# --- Scenario B: swallowed-Enter --------------------------------------------
+# --- Scenario B: server-reported stalled prompt -----------------------------
 
 test_scenario_b() {
   reset_state
   afk_enter "$STATE_DIR"
 
-  touch "$STATE_DIR/.swallow-enter"
+  touch "$STATE_DIR/.stall-prompt"
 
   start_daemon
 
@@ -399,7 +380,7 @@ test_scenario_b() {
     || fail "Scenario B: expected 0 user lines, got $user_count (spurious Enter submitted an empty line?)"
 
   stop_daemon
-  pass "real herdr Scenario B: swallowed Enter (via the herdr shim) produces exactly one clean digest"
+  pass "real herdr Scenario B: one agent_prompt_stalled result preserves and later delivers exactly one clean digest"
 }
 
 # --- Scenario C: normal digest -----------------------------------------------

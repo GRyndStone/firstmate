@@ -174,19 +174,34 @@ SH
   chmod +x "$fakebin/tmux"
 }
 
-# make_fake_herdr <fakebin> <live-pane>: `herdr pane get <pane>` succeeds only
-# for the given pane id - the exact primitive fm_backend_target_exists uses
-# for a herdr endpoint liveness read. No version/server-start calls: a
-# liveness check must never auto-start a server (fm-backend.sh's contract).
+# make_fake_herdr <fakebin> <live-pane>: `herdr pane get <pane>` returns a
+# structured matching pane for the live id and pane_not_found for any other
+# id, the exact tri-state primitive fm_backend_target_state uses.
+# No version/server-start calls: a liveness check must never auto-start a
+# server (fm-backend.sh's contract).
 make_fake_herdr() {
   local fakebin=$1 live=$2
   cat > "$fakebin/herdr" <<SH
 #!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = pane ] && [ "\${2:-}" = get ]; then
-  [ "\${3:-}" = "$live" ] && exit 0
+  if [ "\${3:-}" = "$live" ]; then
+    printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$live"
+    exit 0
+  fi
+  printf '{"error":{"code":"pane_not_found","message":"pane not found"}}\n' >&2
   exit 1
 fi
+exit 1
+SH
+  chmod +x "$fakebin/herdr"
+}
+
+make_fake_herdr_protocol_mismatch() {
+  local fakebin=$1
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+printf '{"error":{"code":"protocol_mismatch","message":"client 17 server 16"}}\n' >&2
 exit 1
 SH
   chmod +x "$fakebin/herdr"
@@ -491,6 +506,25 @@ EOF
   pass "herdr endpoint liveness is reported per task: alive for a live pane, dead for a gone one"
 }
 
+test_endpoint_liveness_herdr_protocol_mismatch_is_unknown() {
+  local rec root home fakebin out
+  rec=$(new_world liveness-herdr-protocol-mismatch)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_herdr_protocol_mismatch "$fakebin"
+  printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-live.meta"
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "endpoint: unknown (backend=herdr window=sess:p-live; observation unavailable)" \
+    "protocol mismatch was not preserved as an unavailable observation"
+  case "$out" in
+    *"endpoint: dead (backend=herdr window=sess:p-live)"*) fail "protocol mismatch was falsely reported as endpoint dead" ;;
+  esac
+  pass "herdr protocol mismatch is reported unknown, never dead, in the session digest"
+}
+
 # --- composition: real scripts run, not reimplemented ------------------------
 
 test_composition_invokes_real_scripts() {
@@ -715,6 +749,7 @@ test_status_tail_bounding
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
+test_endpoint_liveness_herdr_protocol_mismatch_is_unknown
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_next_step_sources_x_mode_cadence

@@ -56,9 +56,9 @@ case "${1:-} ${2:-}" in
   "status --json")
     if [ "${FM_FAKE_SERVER_RESTART:-0}" = 1 ]; then
       if grep -q $'\x1fpane\x1fget' "$LOG" 2>/dev/null; then pid=222; else pid=111; fi
-      printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true,"pid":%s}}\n' "$pid"
+      printf '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true,"pid":%s}}\n' "$pid"
     else
-      printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
+      printf '{"client":{"version":"0.7.5","protocol":17},"server":{"running":true}}\n'
     fi
     ;;
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
