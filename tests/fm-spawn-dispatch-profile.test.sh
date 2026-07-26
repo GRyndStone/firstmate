@@ -317,7 +317,7 @@ test_active_dispatch_profile_cannot_bypass_freeze() {
     --quota-posture normal --quota-used 10 --override-reason "captain pinned codex")
   status=$?
   expect_code 75 "$status" "caller-supplied quota fields must not bypass current freeze"
-  assert_contains "$out" "reached the 5% budget spend floor" \
+  assert_contains "$out" "reached the 5% provider target floor" \
     "spawn did not surface the mechanically rechecked freeze"
   assert_absent "$HOME_DIR/state/$id.meta" "frozen new work must not receive an admitted profile pin"
   pass "spawn mechanically rechecks admission and refuses caller attempts to bypass freeze"

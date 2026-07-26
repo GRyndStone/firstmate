@@ -5,8 +5,15 @@ This document is the full statement of the policy.
 Script headers own flags and wire shapes.
 `AGENTS.md` section 4 keeps only the operating trigger and a pointer here.
 
-Date: 2026-07-25.
+Date: 2026-07-26 (formula revision).
 Captain commission: route agents by remaining durable budget per remaining reset time, preferentially burn capacity that would otherwise expire unused, and make the mechanism run without an agent remembering to invoke it.
+
+Captain formula (verbatim, 2026-07-26):
+
+1. Default target for known providers is 5 percent remaining (safe minimum); claude is 10 percent.
+2. Score each provider as `(remaining usage % - target %) / remaining time`.
+3. Codex gets a 1.5x multiplier per available rate-limit reset, compounding.
+4. Highest result is the routing target unless manually specified.
 
 ## Two window roles
 
@@ -17,15 +24,23 @@ When the gate has capacity, its remaining amount and reset time have no effect o
 
 The durable budget window is the only scored window.
 Its remaining capacity is genuinely lost at reset, and spending from a short window also consumes this longer budget.
-The spend floor applies to this budget, not to the rate gate.
+The per-provider target floor applies to this budget, not to the rate gate.
 
-`bin/fm-usage-source-lib.sh` stores role classification as provider-registry data:
+`bin/fm-usage-source-lib.sh` stores role classification and target floors as provider-registry data:
 
-| Provider | Gate windows | Scored budget | Ignored windows |
-| --- | --- | --- | --- |
-| `claude` | `five_hour` | `seven_day` | none |
-| `codex` | `five_hour` | `weekly` | none |
-| `grok` | `grokbuild` or `product:grokbuild` when reported | `credits` | `api`, `grokimagine`, `chat`, `voice`, and their `product:` forms |
+| Provider | Gate windows | Scored budget | Target floor | Ignored windows |
+| --- | --- | --- | ---: | --- |
+| `claude` | `five_hour` | `seven_day` | **10** | none |
+| `codex` | `five_hour` | `weekly` | 5 | none |
+| `grok` | `grokbuild` or `product:grokbuild` when reported | `credits` | 5 | `api`, `grokimagine`, `chat`, `voice`, and their `product:` forms |
+| `gemini` | (unmetered) | — | 5 | — |
+| `openrouter` | (unmetered) | — | 5 | — |
+| `cursor` | (policy empty until wired) | — | 5 | — |
+| `copilot` | (policy empty until wired) | — | 5 | — |
+
+Targets are registry column data next to window-role policy, not a special-case branch inside the scoring expression.
+A known provider without an explicit numeric target falls back to 5 (never 0 or 10 by invention).
+Unrecognized provider tokens are caller input failure, not a fabricated target.
 
 The Grok `credits` pool is weekly, and the meter contract reports its true `windowSeconds` as `604800`.
 Older observations that omit the field and observations that report explicit `null` remain unknown rather than inheriting that number from provider identity.
@@ -39,74 +54,56 @@ Missing gate evidence cannot prove that a provider is rate-limited.
 
 ## Objective
 
-For each eligible provider, the budget window supplies:
+For each eligible provider, the budget window and registry supply:
 
 | Symbol | Meaning |
 | --- | --- |
 | `R` | Budget percent remaining |
 | `T` | Seconds until the budget resets |
-| `W` | Observed or reset-history-derived budget period in seconds |
-| `B` | Counterfactual non-preferential burn rate in percent per second |
-| `F` | Protected budget floor in percent remaining |
-| `S` | Spendable capacity projected to expire without preferential routing |
+| `F` | Per-provider target floor (percent remaining) |
+| `H` | Headroom above target: `max(0, R - F)` |
+| `score_base` | `H / T` when `T > 0`, else 0 |
+| `N` | Available Codex rate-limit resets (codex only) |
+| `C` | Codex reset factor base (default 1.5) |
+| `reset_factor` | `C^N` for codex; `1` for every other provider |
+| `score` | `score_base * reset_factor` |
 
 The equations are:
 
 ```text
-spendable = max(0, R - F)
-S = max(0, spendable - B*T)
-required_rate = S/T
-urgency = clamp(1 - T/W, 0, 1)       when W is known
-base_pressure = 1 + K*urgency^2      when S > 0 and W is known
-base_pressure = 1                    otherwise
-reset_factor = C^N                   provider=codex only; N available rate-limit resets
-reset_factor = 1                     every other provider
-pressure = base_pressure * reset_factor
-score = required_rate * pressure
+H = max(0, R - F)
+score_base = H / T                 when T > 0, else 0
+reset_factor = C^N                 provider=codex only; N available rate-limit resets
+reset_factor = 1                   every other provider
+score = score_base * reset_factor
 ```
 
-`required_rate` implements "most remaining usage per remaining time."
-`base_pressure` is a modifier that makes a nearly ended budget window more urgent when its true period is known.
-`K` defaults to 4 and is configurable with `FM_BURNDOWN_PRESSURE_K`.
-`F` defaults to 5 and is configurable with `FM_BURNDOWN_SPEND_FLOOR`.
-The rate-gate boundary defaults to 0 and is configurable with `FM_BURNDOWN_RATE_FLOOR`.
+This is exactly the captain's formula: `(remaining_usage_percent - target_percent) / remaining_time`, times the codex reset multiplier.
+Dividing by remaining time already carries urgency linearly.
+
+**Removed from the score path** (do not reintroduce as a second opinion, tiebreak, or env-gated alternate mode):
+
+- `B*T` counterfactual burn-rate subtraction
+- `urgency = 1 - T/W` and the squared amplifier `1 + K*urgency^2`
+
+Burn-history samples may still be recorded for observational analysis; they never multiply or subtract on the score path.
+`W` (window period) may still be resolved for the decision record; it does not amplify score.
+
 `C` defaults to 1.5 and is configurable with `FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR`.
+The rate-gate boundary defaults to 0 and is configurable with `FM_BURNDOWN_RATE_FLOOR`.
 Only the registry provider id `codex` receives the reset factor (not class tokens such as `openai`).
 
 Higher score wins.
-The complete deterministic order is score descending, `S` descending, `R` descending, `T` ascending, then configured profile index ascending.
+The complete deterministic order is score descending, headroom (`H`/`S`) descending, `R` descending, `T` ascending, then configured profile index ascending.
 The last step is a total tie-break because every candidate has one unique index.
 
 Posture remains observational.
-Budget usage at 60 percent is `conserve`, usage at 80 percent is `protect`, and budget remaining at or below `F` is `freeze`.
+Budget usage at 60 percent is `conserve`, usage at 80 percent is `protect`, and budget remaining at or below that provider's target `F` is `freeze`.
 Multi-candidate routing excludes a frozen budget when any live candidate exists.
 An explicit pin at the floor refuses in place with exit 75 and never substitutes another provider.
 An exhausted rate gate also refuses an explicit pin in place with exit 75.
 
-## What `B` means
-
-`B` means how much budget is expected to be consumed before reset if the next dispatch does not preferentially route to this provider.
-It is a counterfactual baseline, not an extrapolation of consumption that routing itself caused.
-
-The previous implementation used `percentUsed / elapsed`.
-That snapshot prior was circular because a routed burst increased projected future burn, collapsed that provider's surplus to zero, and caused routing to stop using the budget that needed burn-down.
-The same problem affected history because only selected-provider samples were recorded.
-
-Every scored decision now records a sample for every candidate with an explicit `selected` boolean.
-For one provider and reset window, `B` divides total positive depletion by total time across intervals whose opening decision did not select that provider.
-Qualifying zero-depletion intervals count as zero background demand rather than disappearing from the estimate.
-Intervals opened by selecting the provider and legacy samples without `selected` are ignored.
-If no qualifying interval exists, `B=0` with source `counterfactual-zero`.
-
-The available evidence cannot identify a perfect causal counterfactual.
-An already-running task can continue consuming after a later decision routes elsewhere, and unrelated clients can consume the same quota.
-The estimate assumes consumption observed after a non-selection decision is the best available proxy for background demand that does not require the next preferential route.
-This is deliberately conservative: when that evidence is absent, all spendable budget is treated as at risk.
-
-History lives at `data/usage-burn-history.json` under the active home.
-`FM_USAGE_BURN_HISTORY` overrides the path for fixtures.
-
-## What `W` means
+## What `W` means (record only)
 
 `W` is accepted from a meter only when the meter actually reports a positive `windowSeconds`; the updated `quota-axi` contract reports Grok's real weekly value as `604800`.
 An explicit `null` is unknown, and an absent field from an older meter is also unknown.
@@ -115,15 +112,14 @@ In particular, `credits` never implies 24 hours.
 
 When the meter omits `W`, the engine compares distinct recorded `resetsAt` values for the same provider and window id.
 A positive change supplies `W` with source `history-reset-period`.
-This assumes the two recorded reset boundaries are successive; a missed whole period can make the learned period too large, and the explanation exposes the source so that assumption is auditable.
-Until a period is observed, `W` and urgency remain null and pressure stays neutral at 1.
-The provider may still compete on the directly observed `R`, `T`, and counterfactual `B`; the engine never fabricates urgency.
+Until a period is observed, `W` remains null.
+Under the captain formula, missing `W` does not change score; the provider competes on the directly observed `R`, `T`, and `F`.
 
-## Codex rate-limit reset pressure
+## Codex rate-limit reset multiplier
 
 ChatGPT/Codex accounts can hold **rate-limit reset credits**: free one-shot grants that fully refill Codex rate limits.
 They are a wasting asset: each credit expires if the account never burns enough Codex usage to need it.
-The captain's rule therefore multiplies **codex pressure only** by `C^N` for each genuinely available reset (`C=1.5` by default, compounding).
+The captain's rule therefore multiplies **codex score only** by `C^N` for each genuinely available reset (`C=1.5` by default, compounding).
 
 ### Observed source shape (live)
 
@@ -166,20 +162,20 @@ Window-level unreadable usage (missing meters, exhausted evidence) is unchanged 
 
 ### Worked example
 
-Two live candidates, same `T` and `W`, counterfactual `B=0`, spend floor 5%, `K=4`, `C=1.5`:
+Two live candidates, same `T`, `C=1.5`:
 
-| Provider | `R` | base pressure | `N` | `reset_factor` | pressure | wins? |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| claude | 90 | ~1.64 | n/a | 1 | ~1.64 | no |
-| codex | 60 | ~1.64 | 2 | 2.25 | ~3.69 | **yes** |
+| Provider | `R` | `F` | headroom | `score_base` | `N` | `reset_factor` | `score` | wins? |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| claude | 90 | 10 | 80 | 80/T | n/a | 1 | 80/T | no |
+| codex | 60 | 5 | 55 | 55/T | 2 | 2.25 | 123.75/T | **yes** |
 
-Without the reset rule, claude's higher remaining budget would win on `required_rate`.
-With two available Codex resets, codex pressure is multiplied by `1.5^2 = 2.25`, so the decision prefers burning Codex while the wasting resets still exist.
-The selection explanation and each candidate line surface `reset_factor`, `resets=N/source`, and `pressure_source` so a surprising ranking is auditable six months later.
+Without the reset rule, claude's higher headroom would win on `score_base`.
+With two available Codex resets, codex score is multiplied by `1.5^2 = 2.25`, so the decision prefers burning Codex while the wasting resets still exist.
+The selection explanation and each candidate line surface `target`, `headroom`, `score_base`, `reset_factor`, `resets=N/source`, and `score` so a surprising ranking is auditable six months later.
 
 ## Missing evidence and loud errors
 
-Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `W`, `B`, freeze, rate exhaustion, or a Codex reset count.
+Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `F`, freeze, rate exhaustion, or a Codex reset count.
 A known scorable candidate outranks an unknown candidate during normal scoring.
 
 Metered providers (adapter meter kind `quota-axi`) must yield readable usage.
@@ -234,7 +230,8 @@ dispatch_tie_break=profile-order
 dispatch_order=score-desc,S-desc,R-desc,T-asc,index-asc
 ```
 
-`dispatch_candidates_json` includes evidence, eligibility, window roles, binding reason, `R`, `T`, `W` and its source, `B` and its source, `S`, required rate, urgency, pressure, score, posture, and floors.
+`dispatch_candidates_json` includes evidence, eligibility, window roles, binding reason, `R`, `T`, `target_percent`, `headroom`, `score_base`, `reset_pressure_factor`, `reset_available_count`, score, posture, and floors.
+A reader can reconstruct `score = (R - target_percent) / T * reset_pressure_factor` from those fields alone.
 This record makes "the algorithm chose this" distinguishable from "a human overrode it for this reason" without reconstructing logs.
 
 ## Configuration and compatibility
@@ -252,7 +249,7 @@ Bootstrap validates both rule candidate sets and default candidate sets.
 ## Inspectability
 
 Every decision prints one stderr line per candidate.
-Each line includes provider, harness, evidence, gate eligibility, posture, budget id and binding reason, window roles, `R`, `T`, `W` and source, `B` and source, `S`, required rate, urgency, pressure, and score.
+Each line includes provider, harness, evidence, gate eligibility, posture, budget id and binding reason, window roles, `R`, `T`, target, headroom, score_base, codex reset factor when applicable, score, and the formula label `(R-target)/T` (plus `*C^N` for codex).
 The selected profile carries the same candidate array in `dispatch_candidates`.
 Spawn persists that array in task metadata.
 
@@ -260,8 +257,8 @@ Spawn persists that array in task metadata.
 
 | Path | Role |
 | --- | --- |
-| `bin/fm-usage-source-lib.sh` | Provider registry, role classification, and observation adapter |
-| `bin/fm-usage-burndown-lib.sh` | Counterfactual history, period learning, scoring, selection, and explanation |
+| `bin/fm-usage-source-lib.sh` | Provider registry (window roles + per-provider targets) and observation adapter |
+| `bin/fm-usage-burndown-lib.sh` | Target-rate scoring, selection, explanation, observational history |
 | `bin/fm-dispatch-select.sh` | Selector and admission CLI |
 | `bin/fm-spawn.sh` | Automatic default routing, explicit override boundary, and metadata record |
 | `docs/configuration.md` | Config schema and operational flags |

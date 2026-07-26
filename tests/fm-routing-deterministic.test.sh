@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Frozen-fixture acceptance suite for deterministic self-routing policy.
+# Formula: score = (R - target) / T * (1.5^N for codex only); targets per registry.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -12,7 +13,6 @@ fm_test_tmproot TMP_ROOT fm-routing-deterministic-tests
 mkdir -p "$TMP_ROOT"
 export FM_USAGE_BURN_HISTORY="$TMP_ROOT/burn-history.json"
 export FM_DISPATCH_NOW_EPOCH=2000000000
-export FM_BURNDOWN_SPEND_FLOOR=5
 
 ASSERTIONS=0
 FAILURES=0
@@ -101,23 +101,26 @@ fixture_nearly_exhausted_budget_soon() {
   local profiles claude codex quota selection
   reset_history
   profiles='[{"provider":"claude","harness":"claude"},{"provider":"codex","harness":"codex"}]'
+  # Claude above its 10% target with tiny T; codex rich and far.
+  # score claude = (15-10)/60 = 5/60 ≈ 0.0833; codex = (95-5)/604800 ≈ 0.000149
   claude=$(provider_json claude \
     "$(window_json five_hour session 100 3600 18000)" \
-    "$(window_json seven_day weekly 7 60 604800)")
+    "$(window_json seven_day weekly 15 60 604800)")
   codex=$(provider_json codex \
     "$(window_json five_hour session 100 3600 18000)" \
     "$(window_json weekly weekly 95 604800 604800)")
   quota=$(quota_json "$claude" "$codex")
   selection=$(select_from_quota "$profiles" "$quota")
   printf 'fixture=nearly-exhausted-budget-soon %s\n' \
-    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,spendable_surplus,required_rate}]}' <<< "$selection")"
+    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,target_percent,headroom,score_base,score}]}' <<< "$selection")"
   check_jq "$selection" '.profile.provider == "claude" and .frozen == false' \
-    "a 7% budget resetting in 60s remains selectable and outranks rich far capacity"
+    "a 15% claude budget resetting in 60s remains selectable and outranks rich far capacity"
   check_jq "$selection" '
     [.candidates[] | select(.provider == "claude")][0]
-    | .R == 7 and .T == 60 and .spendable_surplus == 2
-      and .required_rate > 0.0333 and .required_rate < 0.0334
-  ' "the spend floor leaves exactly 2% to burn at the computed required rate"
+    | .R == 15 and .T == 60 and .target_percent == 10 and .headroom == 5
+      and .score_base > 0.0833 and .score_base < 0.0834
+      and .urgency == null
+  ' "claude target 10 leaves exactly 5% headroom at the computed score_base"
 }
 
 fixture_equal_remaining_different_horizons() {
@@ -133,19 +136,20 @@ fixture_equal_remaining_different_horizons() {
   quota=$(quota_json "$claude" "$codex")
   selection=$(select_from_quota "$profiles" "$quota")
   printf 'fixture=equal-remaining-different-horizons %s\n' \
-    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,required_rate}]}' <<< "$selection")"
+    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,target_percent,score_base,score}]}' <<< "$selection")"
   check_jq "$selection" '.profile.provider == "claude"' \
     "equal remaining capacity prefers the budget with less time before reset"
   check_jq "$selection" '
-    ([.candidates[] | select(.provider == "claude")][0].required_rate)
+    ([.candidates[] | select(.provider == "claude")][0].score)
     >
-    ([.candidates[] | select(.provider == "codex")][0].required_rate)
-  ' "required burn per remaining second explains the horizon preference"
+    ([.candidates[] | select(.provider == "codex")][0].score)
+  ' "score (R-target)/T explains the horizon preference"
 }
 
 fixture_routed_burst_is_not_baseline() {
   local profiles claude codex quota selection
   reset_history
+  # History that old B*T would have used; captain formula ignores B entirely.
   printf '%s\n' '{"samples":[
     {"provider":"claude","window_id":"seven_day","remaining":100,"at":1999992800,"selected":true,"resets_at_epoch":2000086400},
     {"provider":"claude","window_id":"seven_day","remaining":50,"at":1999996400,"selected":true,"resets_at_epoch":2000086400}
@@ -160,13 +164,14 @@ fixture_routed_burst_is_not_baseline() {
   quota=$(quota_json "$claude" "$codex")
   selection=$(select_from_quota "$profiles" "$quota")
   printf 'fixture=routed-burst-is-not-baseline %s\n' \
-    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,B,B_source,S,required_rate}]}' <<< "$selection")"
-  check_jq "$selection" '.profile.provider == "claude"' \
-    "a routed consumption burst does not penalize the first deterministic tie candidate"
+    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,B,B_source,headroom,score}]}' <<< "$selection")"
+  # Equal T; codex headroom 45 > claude 40 → codex wins on pure target-rate.
+  check_jq "$selection" '.profile.provider == "codex"' \
+    "with equal T, lower target floor yields higher headroom and wins"
   check_jq "$selection" '
     [.candidates[] | {provider,B,B_source}]
-    | all(.B == 0 and .B_source == "counterfactual-zero")
-  ' "routing-caused burn is excluded from the counterfactual baseline"
+    | all(.B == null and .B_source == "not-used-in-score")
+  ' "B is not an input to score under the captain formula"
 }
 
 fixture_rate_window_is_gate_only() {
@@ -222,36 +227,48 @@ fixture_grok_period_is_observed_not_fabricated() {
   quota=$(quota_json "$grok")
   selection=$(select_from_quota "$profiles" "$quota")
   printf 'fixture=grok-period-is-observed-not-fabricated %s\n' \
-    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,W,W_source,urgency,B,B_source,S,required_rate}]}' <<< "$selection")"
+    "$(jq -c '{selected:.profile.provider,candidates:[.candidates[]|{provider,R,T,W,W_source,target_percent,headroom,score_base,urgency,score}]}' <<< "$selection")"
   check_jq "$selection" '
     [.candidates[] | select(.provider == "grok")][0]
     | .W == 604800
       and .W_source == "history-reset-period"
-      and .urgency > 0.86
-      and .urgency < 0.88
-  ' "a Grok reset period is learned as weekly and produces high near-reset urgency"
+      and .urgency == null
+      and .target_percent == 5
+      and .headroom == 6
+  ' "a Grok reset period is learned as weekly; W does not amplify score"
   check_jq "$selection" '
     [.candidates[] | select(.provider == "grok")][0]
-    | .W != 86400 and .B_source == "counterfactual-zero"
-  ' "missing Grok window length never fabricates a 24-hour denominator or circular prior"
+    | .W != 86400
+      and .B_source == "not-used-in-score"
+      and (.score_base - (6/79678) | fabs) < 1e-12
+  ' "missing Grok window length never fabricates a 24-hour denominator; score is (R-target)/T"
 }
 
-fixture_seven_percent_is_selectable() {
+fixture_above_target_is_selectable() {
   local profiles claude codex quota selection
   reset_history
   profiles='[{"provider":"claude","harness":"claude"},{"provider":"codex","harness":"codex"}]'
+  # Claude at 12 > target 10; codex at 6 > target 5. Claude wins on headroom/T.
   claude=$(provider_json claude \
     "$(window_json five_hour session 100 3600 18000)" \
-    "$(window_json seven_day weekly 7 3600 604800)")
+    "$(window_json seven_day weekly 12 3600 604800)")
   codex=$(provider_json codex \
     "$(window_json five_hour session 100 3600 18000)" \
     "$(window_json weekly weekly 6 7200 604800)")
   quota=$(quota_json "$claude" "$codex")
   selection=$(select_from_quota "$profiles" "$quota")
-  printf 'fixture=seven-percent-is-selectable %s\n' \
-    "$(jq -c '{selected:.profile.provider,frozen,candidates:[.candidates[]|{provider,posture,R,spendable_surplus,required_rate}]}' <<< "$selection")"
+  printf 'fixture=above-target-is-selectable %s\n' \
+    "$(jq -c '{selected:.profile.provider,frozen,candidates:[.candidates[]|{provider,posture,R,target_percent,headroom,score}]}' <<< "$selection")"
   check_jq "$selection" '.profile.provider == "claude" and .frozen == false' \
-    "default 5% floor leaves a source at 7% eligible for routing"
+    "claude above its 10% target remains eligible for routing"
+  check_jq "$selection" '
+    [.candidates[] | select(.provider == "claude")][0]
+    | .target_percent == 10 and .headroom == 2 and .posture != "freeze"
+  ' "claude target 10 yields headroom 2 at R=12"
+  check_jq "$selection" '
+    [.candidates[] | select(.provider == "codex")][0]
+    | .target_percent == 5 and .headroom == 1 and .posture != "freeze"
+  ' "codex target 5 yields headroom 1 at R=6"
 }
 
 fixture_unavailable_evidence_refuses_loudly() {
@@ -286,30 +303,31 @@ fixture_unavailable_evidence_refuses_loudly() {
 }
 
 fixture_total_tie_is_stable() {
-  local profiles claude codex quota selection providers run
+  local profiles codex_a codex_b quota selection providers run
   reset_history
-  profiles='[{"provider":"codex","harness":"codex"},{"provider":"claude","harness":"claude"}]'
-  claude=$(provider_json claude \
-    "$(window_json five_hour session 100 3600 18000)" \
-    "$(window_json seven_day weekly 50 86400 604800)")
-  codex=$(provider_json codex \
+  # Same provider twice with identical R/T so score, headroom, R, and T all match;
+  # only profile index differs. Two different providers cannot fully tie under
+  # per-provider targets (equal headroom forces unequal R, and R-desc decides first).
+  profiles='[{"provider":"codex","harness":"codex","model":"a"},{"provider":"codex","harness":"codex","model":"b"}]'
+  codex_a=$(provider_json codex \
     "$(window_json five_hour session 100 3600 18000)" \
     "$(window_json weekly weekly 50 86400 604800)")
-  quota=$(quota_json "$claude" "$codex")
+  # observe_profiles dedupes by provider, so both profiles share one observation.
+  quota=$(quota_json "$codex_a")
   providers=
   selection=
   run=0
   while [ "$run" -lt 25 ]; do
     selection=$(select_from_quota "$profiles" "$quota")
-    providers="${providers}$(jq -r '.profile.provider' <<< "$selection")"$'\n'
+    providers="${providers}$(jq -r '.profile.model // .profile.provider' <<< "$selection")"$'\n'
     run=$((run + 1))
   done
   printf 'fixture=total-tie-is-stable %s\n' \
-    "$(jq -c '{selected:.profile.provider,tie_break:.profile.dispatch_tie_break,candidates:[.candidates[]|{provider,index,required_rate}]}' <<< "$selection")"
-  check_equal "$(printf '%s' "$providers" | sort -u)" codex \
-    "an exact tie resolves to the same provider across 25 runs"
-  check_jq "$selection" '.profile.dispatch_tie_break == "profile-order"' \
-    "the total tie-break is machine-recorded"
+    "$(jq -c '{selected:.profile,tie_break:.profile.dispatch_tie_break,candidates:[.candidates[]|{provider,index,model:.profile.model,target_percent,headroom,score}]}' <<< "$selection")"
+  check_equal "$(printf '%s' "$providers" | sort -u)" a \
+    "an exact score/headroom/R/T tie resolves to the same first-index profile across 25 runs"
+  check_jq "$selection" '.profile.dispatch_tie_break == "profile-order" and .profile.model == "a"' \
+    "the total tie-break is machine-recorded as profile-order"
 }
 
 fixture_nearly_exhausted_budget_soon
@@ -317,7 +335,7 @@ fixture_equal_remaining_different_horizons
 fixture_routed_burst_is_not_baseline
 fixture_rate_window_is_gate_only
 fixture_grok_period_is_observed_not_fabricated
-fixture_seven_percent_is_selectable
+fixture_above_target_is_selectable
 fixture_unavailable_evidence_refuses_loudly
 fixture_total_tie_is_stable
 

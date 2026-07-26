@@ -26,20 +26,28 @@
 _FM_USAGE_SOURCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_USAGE_SOURCE_LIB_DIR="."
 
 # Registry columns:
-#   provider, adapter class, meter kind, compact window-role policy JSON.
+#   provider, adapter class, meter kind, compact window-role policy JSON,
+#   target_percent (safe budget floor for scoring; default known-provider floor 5,
+#   claude 10 so that provider keeps a larger buffer).
 # A provider with no role policy uses the single-window fallback: exactly one
 # usable non-model window is both gate and budget. Multiple unclassified windows
 # degrade to unknown rather than guessing which pool is durable.
+# Per-provider target floors sit here next to window-role policy so they are
+# registry data, not a special-case branch inside the scoring expression.
 fm_usage_source_registry() {
-  printf '%s\t%s\t%s\t%s\n' \
-    claude anthropic-class quota-axi '{"budget":["seven_day"],"gate":["five_hour"],"ignore":[]}' \
-    codex openai-class quota-axi '{"budget":["weekly"],"gate":["five_hour"],"ignore":[]}' \
-    grok grok-class quota-axi '{"budget":["credits"],"gate":["grokbuild","product:grokbuild"],"ignore":["api","product:api","grokimagine","product:grokimagine","chat","product:chat","voice","product:voice"]}' \
-    gemini gemini-class unmetered '{"budget":[],"gate":[],"ignore":[]}' \
-    openrouter openrouter-class unmetered '{"budget":[],"gate":[],"ignore":[]}' \
-    cursor cursor-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' \
-    copilot copilot-class quota-axi '{"budget":[],"gate":[],"ignore":[]}'
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    claude anthropic-class quota-axi '{"budget":["seven_day"],"gate":["five_hour"],"ignore":[]}' 10 \
+    codex openai-class quota-axi '{"budget":["weekly"],"gate":["five_hour"],"ignore":[]}' 5 \
+    grok grok-class quota-axi '{"budget":["credits"],"gate":["grokbuild","product:grokbuild"],"ignore":["api","product:api","grokimagine","product:grokimagine","chat","product:chat","voice","product:voice"]}' 5 \
+    gemini gemini-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 \
+    openrouter openrouter-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 \
+    cursor cursor-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5 \
+    copilot copilot-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5
 }
+
+# Known-provider default when a registry row omits an explicit target (must stay 5,
+# never 0 or 10 — those would invent a constant the captain did not name).
+FM_USAGE_SOURCE_DEFAULT_TARGET_PERCENT=${FM_USAGE_SOURCE_DEFAULT_TARGET_PERCENT:-5}
 
 _fm_usage_source_registry_field() { # <provider> <field-number>
   local provider=${1:-} field=${2:-} value
@@ -52,6 +60,27 @@ _fm_usage_source_registry_field() { # <provider> <field-number>
 
 fm_usage_source_provider_ids() {
   fm_usage_source_registry | awk -F '\t' 'NF >= 4 { print $1 }'
+}
+
+# Per-provider target floor in percent remaining. Declared beside window-role
+# policy in the registry. Unrecognized providers fail closed (return 64).
+# A known provider row without a numeric target uses the stated default of 5.
+fm_usage_source_target_percent() { # <provider>
+  local provider=${1:-} value
+  if ! fm_usage_source_provider_known "$provider"; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
+  value=$(_fm_usage_source_registry_field "$provider" 5 2>/dev/null) || value=
+  if printf '%s\n' "$value" | awk '
+    BEGIN { ok = 0 }
+    $0 ~ /^[0-9]+([.][0-9]+)?$/ && $0 + 0 >= 0 && $0 + 0 <= 100 { ok = 1 }
+    END { exit !ok }
+  '; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  printf '%s\n' "$FM_USAGE_SOURCE_DEFAULT_TARGET_PERCENT"
 }
 
 fm_usage_source_provider_ids_csv() {
@@ -473,6 +502,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   class=$(fm_usage_source_class "$provider") || return $?
   meter_kind=$(fm_usage_source_meter_kind "$provider") || return $?
   role_policy=$(fm_usage_source_window_policy "$provider") || return $?
+  target_percent=$(fm_usage_source_target_percent "$provider") || return $?
 
   case "$meter_kind" in
     unmetered)
@@ -480,6 +510,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
         --arg source_id "$provider" \
         --arg class "$class" \
         --arg provider "$provider" \
+        --argjson target_percent "$target_percent" \
         '{
           source_id:$source_id,
           class:$class,
@@ -488,6 +519,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           unit:"percent",
           windows:[],
           gate_windows:[],
+          target_percent:$target_percent,
           diagnostics:["no usage meter wired for this recognized provider yet; see docs/usage-burndown-dispatch.md"]
         }'
       return 0
@@ -503,6 +535,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
     --arg provider "$provider" \
     --arg class "$class" \
     --argjson policy "$role_policy" \
+    --argjson target_percent "$target_percent" \
     --argjson now "$now_epoch" '
     # quota-axi emits fractional seconds and +00:00 offsets.
     # fromdateiso8601 only accepts whole-second ...Z forms; normalize both.
@@ -563,6 +596,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           unit:"percent",
           windows:[],
           gate_windows:[],
+          target_percent:$target_percent,
           diagnostics:["provider absent from quota evidence"]
         }
       else
@@ -616,6 +650,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
               unit:"percent",
               windows:$classified,
               gate_windows:$gates,
+              target_percent:$target_percent,
               diagnostics:(
                 if ($raw | length) == 0 then
                   ["no usable non-model windows"]
@@ -637,6 +672,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
                 unit:"percent",
                 windows:$classified,
                 gate_windows:$gates,
+                target_percent:$target_percent,
                 binding: {
                   id:$budget.id,
                   role:"budget",
@@ -708,10 +744,12 @@ fm_usage_source_observe_profiles() { # <profiles_json> <quota_json> <now_epoch>
     fi
     if ! obs=$(fm_usage_source_observe "$p" "$quota_json" "$now_epoch"); then
       class=$(fm_usage_source_class "$p") || return $?
+      target_percent=$(fm_usage_source_target_percent "$p") || return $?
       obs=$(jq -cn \
         --arg provider "$p" \
         --arg class "$class" \
-        '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],gate_windows:[],diagnostics:["adapter failed"]}')
+        --argjson target_percent "$target_percent" \
+        '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],gate_windows:[],target_percent:$target_percent,diagnostics:["adapter failed"]}')
     fi
     out=$(jq -cn --argjson acc "$out" --argjson o "$obs" '$acc + [$o]')
   done <<< "$providers"

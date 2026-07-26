@@ -77,7 +77,8 @@ test_posture_boundaries() {
   assert_posture 40 conserve at-60
   assert_posture 20.1 conserve below-80
   assert_posture 20 protect at-80
-  assert_posture 5.1 protect above-floor
+  # Claude target is 10%; 10.1 remaining is still protect (used ~89.9).
+  assert_posture 10.1 protect above-claude-target
 
   quota="$TMP_ROOT/at-floor.json"
   write_quota "$quota" fresh 100 5 fresh 100 100
@@ -85,29 +86,31 @@ test_posture_boundaries() {
     '{"provider":"claude","harness":"claude"}' 2>"$TMP_ROOT/at-90.err")
   status=$?
   err=$(cat "$TMP_ROOT/at-90.err")
-  expect_code 75 "$status" "the 5% remaining spend floor must freeze admission"
+  expect_code 75 "$status" "claude at/below its 10% target floor must freeze admission"
   [ -z "$out" ] || fail "freeze must not print an admitted profile: $out"
-  assert_contains "$err" "reached the 5% budget spend floor" "freeze reason must name provider and boundary"
+  assert_contains "$err" "reached the 10% provider target floor" "freeze reason must name claude's 10% target"
   assert_contains "$err" "retry after quota clears" "freeze reason must be actionable"
-  pass "provider postures preserve 60/80 bands and freeze at the 5% budget floor"
+  pass "provider postures preserve 60/80 bands and freeze at each provider's target floor"
 }
 
 test_usage_burndown_multiple_candidates() {
   local quota out err
-  # Equal windows/time: higher binding remaining wins via surplus when B is similar.
+  # Equal windows/time: higher headroom (R - target) wins under the captain formula.
   quota="$TMP_ROOT/higher.json"
   write_quota "$quota" fresh 80 30 fresh 70 60
   out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>"$TMP_ROOT/higher.err")
   err=$(cat "$TMP_ROOT/higher.err")
   jq -e '.provider == "codex" and .harness == "codex" and .model == "gpt-5.5" and .quota_posture == "normal" and .dispatch_strategy == "usage-burndown"' \
-    <<< "$out" >/dev/null || fail "higher surplus provider should win, got: $out"
-  assert_contains "$err" "highest expiry burn requirement" "stderr must explain the choice"
+    <<< "$out" >/dev/null || fail "higher headroom provider should win, got: $out"
+  assert_contains "$err" "highest target-rate score" "stderr must explain the choice"
+  assert_contains "$err" "(R-target)/T" "stderr must state the captain formula"
 
-  # Exact tie on binding remaining: stable first-index order.
-  write_quota "$quota" fresh 90 50 fresh 60 50
+  # Exact equal headroom and T: claude H=40 (R=50, target 10), codex H=40 (R=45, target 5).
+  # Profile order puts claude first → stable first-index win.
+  write_quota "$quota" fresh 90 50 fresh 60 45
   out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
   jq -e '.provider == "claude" and .harness == "claude"' <<< "$out" >/dev/null \
-    || fail "exact tie should use first ordered profile, got: $out"
+    || fail "exact score/headroom/T tie should use first ordered profile, got: $out"
 
   # Legacy alias routes to the same engine.
   write_quota "$quota" fresh 80 30 fresh 70 60
@@ -163,7 +166,7 @@ test_explicit_frozen_provider_never_chooses_alternate() {
   err=$(cat "$TMP_ROOT/explicit-freeze.err")
   expect_code 75 "$status" "explicit frozen provider must refuse admission"
   [ -z "$out" ] || fail "explicit freeze must not output the alternate candidate: $out"
-  assert_contains "$err" "provider 'claude' reached the 5% budget spend floor" "freeze refusal must retain explicit provider identity"
+  assert_contains "$err" "provider 'claude' reached the 10% provider target floor" "freeze refusal must retain explicit provider identity and claude's 10% target"
   assert_not_contains "$err" "provider 'codex' reached" "freeze refusal must not claim an alternate provider freeze"
   pass "explicit frozen provider refuses new work without selecting an available alternate"
 }
