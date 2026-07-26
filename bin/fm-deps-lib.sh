@@ -44,16 +44,24 @@
 #   failure output. Assertions with no label fall back to the raw expression.
 #
 # CACHE
-#   One TSV row per component in $STATE/dep-currency.tsv, seven fields:
+#   One TSV row per component in $STATE/dep-currency.tsv, twelve fields:
 #     id  installed  latest  latest_epoch  contract_version  contract_verdict
 #     contract_detail  artifact_version  artifact_reading  provenance_observed
+#     artifact_detail  contract_reading
 #   Empty fields are written as `-`. The cache exists so the ordinary session
 #   path can report currency and contract verdicts WITHOUT a network call or a
-#   probe run on every start. `contract_version` is the installed version the
-#   recorded verdict was produced against: when the installed version moves, the
-#   verdict is stale by construction and the contract is re-verified. That is
-#   what makes an upgrade re-check its own contract automatically instead of
-#   relying on someone remembering to.
+#   probe run on every start.
+#   `contract_version` and `contract_reading` together are what the recorded
+#   verdict was produced against, and the verdict is re-verified when EITHER
+#   moves. Keying only on the version string was a real defect: the same string
+#   names two different builds routinely (a local build of a fork, a republished
+#   artifact, a hand-patched install), so a same-version swap that broke the
+#   contract stayed cached as `ok` and the break was invisible - which is the
+#   exact failure class this tool exists to catch. It fails the other way too:
+#   a verdict latched `broken` at version X never cleared while installed stayed
+#   X, so a same-version repair left a permanent false alarm, and a stuck alarm
+#   destroys the trust that makes silence meaningful. `contract_reading` is the
+#   identity from fm_deps_contract_identity, so both directions re-verify.
 #   Fields 8-10 hold artifact identity: file count, byte total, and a fingerprint
 #   of the installed package. A VERSION NUMBER IS NOT IDENTITY - the same string
 #   can name two different builds - so currency alone cannot tell whether what is
@@ -287,7 +295,7 @@ fm_deps_validate_inventory() {
     esac
     fm_deps_field_into value "$id" currency || true
     case "$value" in
-      npm:?*) ;;
+      npm:?* | brew:?*) ;;
       none:*[![:space:]]*) ;;
       none | none:*) printf '%s: currency none must state a reason\n' "$id" ;;
       '') ;;
@@ -373,10 +381,30 @@ fm_deps_env_override() { # <prefix> <id> [suffix]
 # must keep those apart, because "cannot be established" and "could not reach
 # the registry today" are different facts about the world.
 fm_deps_lookup_latest() { # <id>
-  local id=${1:-} source pkg out status npm_cmd
+  local id=${1:-} source pkg out status npm_cmd brew_cmd
   source=$(fm_deps_field "$id" currency 2>/dev/null || true)
   case "$source" in
     npm:?*) pkg=${source#npm:} ;;
+    brew:?*)
+      # A homebrew formula is a real registry answer, so a component installed
+      # that way gets a currency verdict rather than a `none:` opt-out. The
+      # formula name is declared explicitly and never guessed from the id: the
+      # npm registry has an unrelated `herdr` at 0.0.0, and keying on the id
+      # would have compared the installed tool against a stranger's package and
+      # called the result currency.
+      pkg=${source#brew:}
+      brew_cmd=${FM_DEPS_BREW:-brew}
+      command -v "$brew_cmd" >/dev/null 2>&1 || return 2
+      command -v jq >/dev/null 2>&1 || return 2
+      out=$(fm_deps_run_bounded "$FM_DEPS_LOOKUP_TIMEOUT" "$brew_cmd" info --json=v2 --formula "$pkg" 2>/dev/null)
+      status=$?
+      [ "$status" -eq 0 ] || return 2
+      out=$(printf '%s' "$out" | jq -r '.formulae[0].versions.stable // empty' 2>/dev/null)
+      out=$(printf '%s\n' "$out" | fm_deps_extract_semver)
+      [ -n "$out" ] || return 2
+      printf '%s\n' "$out"
+      return 0
+      ;;
     *) return 1 ;;
   esac
   npm_cmd=${FM_DEPS_NPM:-npm}
@@ -464,6 +492,43 @@ fm_deps_artifact_reading() { # <dir>
     printf '%s\n' "$list" | tr '\n' '\0' | xargs -0 cat 2>/dev/null
   } | cksum | awk '{ print $1 }')
   printf '%s %s %s\n' "$count" "$bytes" "$fingerprint"
+}
+
+# "1 <bytes> <fingerprint>" for a single file, same shape as an artifact reading.
+fm_deps_file_reading() { # <file>
+  local f=${1:-} bytes sum
+  [ -f "$f" ] || return 1
+  bytes=$(wc -c < "$f" 2>/dev/null | tr -d '[:space:]') || return 1
+  [ -n "$bytes" ] || return 1
+  sum=$(cksum < "$f" 2>/dev/null | awk '{ print $1 }') || return 1
+  [ -n "$sum" ] || return 1
+  printf '1 %s %s\n' "$bytes" "$sum"
+}
+
+# The identity a contract verdict is keyed to. Prefer the npm package tree - the
+# same reading the provenance check uses - and fall back to the resolved
+# executable, so a same-version swap is caught for a binary component too and
+# not just for an npm one. Prints nothing when neither can be read; the caller
+# then has only the version string to key on, which is the weaker behavior this
+# function exists to avoid, so that case is deliberately visible rather than
+# silently equivalent.
+fm_deps_contract_identity() { # <id>
+  local id=${1:-} pkg dir bin out
+  pkg=$(fm_deps_field "$id" currency 2>/dev/null || true)
+  case "$pkg" in npm:?*) pkg=${pkg#npm:} ;; *) pkg= ;; esac
+  if [ -n "$pkg" ]; then
+    dir=$(fm_deps_npm_prefix "$pkg" 2>/dev/null || true)
+    if [ -n "$dir" ]; then
+      out=$(fm_deps_artifact_reading "$dir" 2>/dev/null || true)
+      if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+      fi
+    fi
+  fi
+  bin=$(command -v "$id" 2>/dev/null) || return 1
+  [ -n "$bin" ] || return 1
+  fm_deps_file_reading "$bin"
 }
 
 # "<file-count> <byte-total>" the registry reports for an exact published version.

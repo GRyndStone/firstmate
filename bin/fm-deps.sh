@@ -118,6 +118,7 @@ refresh() { # [--offline|--if-due]
   local contract_decl contract_version contract_verdict contract_detail status out budget_end
   local prev_artifact_version prev_reading artifact_version artifact_reading
   local provenance_observed artifact_detail pkg pkg_dir new_reading published_reading
+  local current_identity contract_reading
   case "${1:-}" in
     --offline) offline=1 ;;
     # The cheap half - reading installed versions and re-verifying any contract
@@ -166,23 +167,40 @@ refresh() { # [--offline|--if-due]
       esac
     fi
 
-    # Contract. Re-verified only when the installed version differs from the one
-    # the cached verdict was produced against - an upgrade therefore re-checks
-    # its own contract automatically, and an unchanged install costs nothing.
+    # Artifact identity is read BEFORE the contract decision, because the
+    # contract gate is keyed on it. Reading it after would leave the gate with
+    # only the version string to compare, which is the defect this ordering
+    # exists to prevent. Only a pinned component pays for it: nothing else has a
+    # verdict to keep honest, and the identity that feeds the provenance check
+    # below is read separately from the npm tree.
     contract_decl=$(fm_deps_field "$id" contract 2>/dev/null || true)
+    current_identity=
+    [ "$contract_decl" = pinned ] &&
+      current_identity=$(fm_deps_contract_identity "$id" 2>/dev/null || true)
+
+    # Contract. Re-verified when the installed version moves OR the installed
+    # artifact changes under an unchanged version - so an upgrade re-checks its
+    # own contract automatically, a silent same-version swap cannot keep a stale
+    # `ok`, and a same-version repair clears a latched `broken` without anyone
+    # having to know an environment variable exists. An install that has not
+    # moved at all still costs nothing.
     contract_version=$(fm_deps_cache_get "$id" 5 2>/dev/null || true)
     contract_verdict=$(fm_deps_cache_get "$id" 6 2>/dev/null || true)
     contract_detail=$(fm_deps_cache_get "$id" 7 2>/dev/null || true)
+    contract_reading=$(fm_deps_cache_get "$id" 12 2>/dev/null || true)
     if [ "$contract_decl" = pinned ]; then
       if [ -z "$installed" ]; then
         contract_version=
+        contract_reading=
         contract_verdict=unknown
         contract_detail="not installed"
       elif [ "$installed" != "$contract_version" ] || [ -z "$contract_verdict" ] ||
+        [ "$current_identity" != "$contract_reading" ] ||
         [ "${FM_DEPS_FORCE_CONTRACT:-0}" = 1 ]; then
         out=$(fm_deps_contract_check "$id")
         status=$?
         contract_version=$installed
+        contract_reading=$current_identity
         case "$status" in
           0)
             contract_verdict=ok
@@ -195,12 +213,14 @@ refresh() { # [--offline|--if-due]
           *)
             contract_verdict=unknown
             contract_version=
+            contract_reading=
             contract_detail="contract could not be evaluated"
             ;;
         esac
       fi
     else
       contract_version=
+      contract_reading=
       contract_verdict=
       contract_detail=
     fi
@@ -255,7 +275,8 @@ refresh() { # [--offline|--if-due]
 
     fm_deps_cache_put "$id" "$installed" "$latest" "$latest_epoch" \
       "$contract_version" "$contract_verdict" "$contract_detail" \
-      "$artifact_version" "$artifact_reading" "$provenance_observed" "$artifact_detail"
+      "$artifact_version" "$artifact_reading" "$provenance_observed" "$artifact_detail" \
+      "$contract_reading"
   done < <(refresh_order)
 }
 
@@ -313,8 +334,25 @@ report() {
         printf 'DEPS: %s upstream released %s while this home runs a local build of %s (see deps/incorporations.conf before upgrading; upgrading discards the local build)\n' \
           "$id" "$latest" "$installed"
       else
-        printf 'DEPS: %s behind: installed %s, latest %s (upgrade: bin/fm-deps.sh upgrade %s --approve)\n' \
-          "$id" "$installed" "$latest" "$id"
+        # The hint must name a path that actually works. `upgrade` automates npm
+        # components only and refuses everything else, so offering it for a
+        # brew-installed or hand-installed component would send the operator to
+        # a command that declines - a small dishonesty that teaches them to stop
+        # trusting the hints.
+        case "$currency" in
+          npm:?*)
+            printf 'DEPS: %s behind: installed %s, latest %s (upgrade: bin/fm-deps.sh upgrade %s --approve)\n' \
+              "$id" "$installed" "$latest" "$id"
+            ;;
+          brew:?*)
+            printf 'DEPS: %s behind: installed %s, latest %s (upgrade: brew upgrade %s - not automated by firstmate)\n' \
+              "$id" "$installed" "$latest" "${currency#brew:}"
+            ;;
+          *)
+            printf 'DEPS: %s behind: installed %s, latest %s (upgrade it the way bin/fm-bootstrap.sh documents; not automated by firstmate)\n' \
+              "$id" "$installed" "$latest"
+            ;;
+        esac
       fi
     fi
 
@@ -386,7 +424,12 @@ report() {
 
     case "$verdict" in
       broken)
-        printf 'DEPS: %s CONTRACT BROKEN at installed %s: %s (recover: bin/fm-deps.sh rollback %s --approve)\n' \
+        # The verdict re-verifies itself whenever the installed artifact changes,
+        # so a repair clears this line on the next refresh without anyone knowing
+        # an environment variable exists. The force flag is named anyway: an
+        # operator staring at an alarm they believe they already fixed needs to
+        # be told how to make it re-check now, not left to guess.
+        printf 'DEPS: %s CONTRACT BROKEN at installed %s: %s (recover: bin/fm-deps.sh rollback %s --approve; re-check now: FM_DEPS_FORCE_CONTRACT=1 bin/fm-deps.sh check)\n' \
           "$id" "${installed:-unknown}" "${detail:-unspecified}" "$id"
         ;;
       unknown)

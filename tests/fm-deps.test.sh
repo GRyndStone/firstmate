@@ -406,9 +406,13 @@ version=$(cat "$FM_FAKE_WIDGET_VERSION_FILE" 2>/dev/null || echo 1.0.0)
 case "${1:-}" in
   --version) printf '%s\n' "$version" ;;
   # 3.0.0 is the fixture's "upstream renamed the thing" release: same exit
-  # status, same valid JSON, a different key.
+  # status, same valid JSON, a different key. FM_FAKE_WIDGET_SHAPE forces that
+  # same rename WITHOUT a version change, which is what a same-version swap
+  # actually looks like: a local build, a republish, a hand-patched install.
   --json)
-    if [ "$version" = 3.0.0 ]; then printf '%s\n' '{"gadgets":[]}'
+    [ -n "${FM_FAKE_PROBE_LOG:-}" ] && printf 'json\n' >> "$FM_FAKE_PROBE_LOG"
+    if [ "${FM_FAKE_WIDGET_SHAPE:-}" = gadgets ] || [ "$version" = 3.0.0 ]; then
+      printf '%s\n' '{"gadgets":[]}'
     else printf '%s\n' '{"widgets":[]}'
     fi
     ;;
@@ -451,6 +455,8 @@ deps() { # run bin/fm-deps.sh against the fixture inventory and fixture home
     FM_FAKE_PUBLISHED_FILES="${FM_FAKE_PUBLISHED_FILES:-$PUB_FILES}" \
     FM_FAKE_PUBLISHED_BYTES="${FM_FAKE_PUBLISHED_BYTES:-$PUB_BYTES}" \
     FM_FAKE_REGISTRY_VERSION="${FM_FAKE_REGISTRY_VERSION:-1.0.0}" \
+    FM_FAKE_WIDGET_SHAPE="${FM_FAKE_WIDGET_SHAPE:-}" \
+    FM_FAKE_PROBE_LOG="${FM_FAKE_PROBE_LOG:-}" \
     "$ROOT/bin/fm-deps.sh" "$@"
 }
 
@@ -626,6 +632,136 @@ assert_not_contains "$out" "upgrade widget-axi --approve" \
   "the report must not hand over a command that would silently discard the local build"
 check "an upstream release is reported for a local build without offering to discard it"
 : > "$CACHE"
+
+# --- the same-version contract regression -----------------------------------
+#
+# This is the defect the first version of this tool shipped with, and it defeated
+# the tool's core purpose. Re-verification was keyed on the version STRING alone
+# (installed != contract_version), so once a verdict was cached at version X the
+# contract was never re-checked while installed stayed X. Both directions failed:
+#   * a same-version swap that BROKE the contract stayed cached as `ok`, and the
+#     break was invisible - the exact rename class the contract exists to catch
+#   * a verdict latched `broken` never cleared after a same-version repair, and
+#     a stuck alarm destroys the trust that makes silence meaningful
+# The fix keys re-verification on artifact identity, so both directions re-verify.
+#
+# verdict_now: read the cached contract verdict (cache field 6) directly, so each
+# planted state is OBSERVED rather than inferred from a report line.
+verdict_now() { awk -F '\t' '$1 == "widget-axi" { print $6 }' "$CACHE"; }
+# The installed artifact, mutated in place. Version string never changes.
+swap_artifact() { printf '%s\n' "$1" > "$NPM_ROOT/widget-axi/dist/index.js"; }
+
+: > "$CACHE"
+swap_artifact 'published-body'
+FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+state_ok=$(verdict_now)
+version_at_ok=$(awk -F '\t' '$1 == "widget-axi" { print $2 }' "$CACHE")
+
+# Same version, different build, contract-breaking shape.
+swap_artifact 'swapped-body-that-is-a-different-length-entirely'
+FM_FAKE_WIDGET_SHAPE=gadgets FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+state_broken=$(verdict_now)
+version_at_broken=$(awk -F '\t' '$1 == "widget-axi" { print $2 }' "$CACHE")
+out=$(FM_FAKE_WIDGET_SHAPE=gadgets FM_FAKE_REGISTRY_VERSION=1.0.0 deps report 2>&1)
+
+# Anti-vacuity: both planted states must actually have been observed, and the
+# version must genuinely have been unchanged across the swap. Without this the
+# case could pass while the fixture never reached `ok` at all, or while the
+# "swap" quietly moved the version and re-verified for the old reason.
+[ "$state_ok" = ok ] ||
+  fail "anti-vacuity: the pre-swap state must have been observed as ok, got '$state_ok'"
+[ "$state_broken" = broken ] ||
+  fail "anti-vacuity: the post-swap state must have been observed as broken, got '$state_broken'"
+[ -n "$version_at_ok" ] && [ "$version_at_ok" = "$version_at_broken" ] ||
+  fail "anti-vacuity: the version must be unchanged across the swap (ok=$version_at_ok broken=$version_at_broken)"
+assert_contains "$out" "widget-axi CONTRACT BROKEN"   "a same-version swap that breaks the contract must be reported, not absorbed"
+assert_not_contains "$out" "widget-axi behind"   "the version comparison stays healthy across the swap - that is why it cannot be the key"
+check "a contract-breaking swap under an UNCHANGED version is re-verified and caught"
+
+# The other direction: repair it, still without moving the version.
+swap_artifact 'repaired-body'
+FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+state_repaired=$(verdict_now)
+version_at_repaired=$(awk -F '\t' '$1 == "widget-axi" { print $2 }' "$CACHE")
+out=$(FM_FAKE_REGISTRY_VERSION=1.0.0 deps report 2>&1)
+
+[ "$version_at_repaired" = "$version_at_ok" ] ||
+  fail "anti-vacuity: the repair must not have moved the version (was $version_at_ok, now $version_at_repaired)"
+[ "$state_repaired" = ok ] ||
+  fail "a same-version repair must clear the latched broken verdict, got '$state_repaired'"
+assert_not_contains "$out" "CONTRACT BROKEN" \
+  "a same-version repair must clear the latched broken verdict from the report"
+# The report is deliberately NOT silent here, and that is correct: the artifact
+# really did change under an unchanged version, and saying so is the identity
+# finding doing its job. Silence would mean the swap went unnoticed - the very
+# thing this section exists to prevent. So the assertion is "the stale alarm
+# cleared", not "everything went quiet".
+assert_contains "$out" "widget-axi artifact changed under an unchanged version" \
+  "the identity finding must still report the swap the repair did not undo"
+check "a same-version repair clears a latched broken verdict without FM_DEPS_FORCE_CONTRACT"
+
+# The operator is told how to force a re-check even so, because someone staring
+# at an alarm they believe they already fixed should not have to find this in a
+# source file.
+swap_artifact 'broken-again-body'
+FM_FAKE_WIDGET_SHAPE=gadgets FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+out=$(FM_FAKE_WIDGET_SHAPE=gadgets FM_FAKE_REGISTRY_VERSION=1.0.0 deps report 2>&1)
+assert_contains "$out" "FM_DEPS_FORCE_CONTRACT=1"   "a broken verdict must name the way to re-check it now"
+check "a broken contract line tells the operator how to force re-verification"
+
+# Keying on identity must not degrade into "re-probe every time". The cache
+# exists so the ordinary session-start path costs nothing when nothing moved,
+# and an identity that is never RECORDED alongside the verdict would compare
+# against an empty value forever - re-running the probe on every refresh while
+# still passing every case above. Counting probes is what tells those apart.
+PROBE_LOG="$TMP_ROOT/probe-log"
+: > "$CACHE"
+swap_artifact 'published-body'
+: > "$PROBE_LOG"
+FM_FAKE_PROBE_LOG="$PROBE_LOG" FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+probes_after_first=$(wc -l < "$PROBE_LOG" | tr -d '[:space:]')
+FM_FAKE_PROBE_LOG="$PROBE_LOG" FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+probes_after_second=$(wc -l < "$PROBE_LOG" | tr -d '[:space:]')
+swap_artifact 'moved-again-body'
+FM_FAKE_PROBE_LOG="$PROBE_LOG" FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+probes_after_swap=$(wc -l < "$PROBE_LOG" | tr -d '[:space:]')
+
+[ "$probes_after_first" -gt 0 ] ||
+  fail "anti-vacuity: the first refresh must actually have run the contract probe"
+[ "$probes_after_second" = "$probes_after_first" ] ||
+  fail "an unchanged install must not re-run the contract probe (ran $probes_after_first then $probes_after_second)"
+[ "$probes_after_swap" -gt "$probes_after_second" ] ||
+  fail "anti-vacuity: a changed artifact must re-run the probe (stayed at $probes_after_swap)"
+check "an unchanged install costs no probe, while a changed one is re-verified"
+
+# Restore the fixture tree for the cases that follow.
+swap_artifact 'published-body'
+: > "$CACHE"
+
+# A behind-hint must name a path that actually works. `upgrade` automates npm
+# components only, so offering it for a brew or hand-installed component would
+# send the operator to a command that declines - and hints that decline teach
+# operators to ignore hints.
+BREW_DEPS="$TMP_ROOT/brew-deps"
+mkdir -p "$BREW_DEPS/contracts"
+sed -e 's/^currency  = npm:widget-axi/currency  = brew:widgetformula/' \
+  -e 's/^contract  = pinned/contract  = none: fixture component, hint shape is what is under test/' \
+  "$FIXTURE_DEPS/incorporations.conf" > "$BREW_DEPS/incorporations.conf"
+cat > "$FAKEBIN/brew" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = info ] && printf '{"formulae":[{"versions":{"stable":"9.9.9"}}]}\n'
+exit 0
+SH
+chmod +x "$FAKEBIN/brew"
+FM_DEPS_DIR="$BREW_DEPS" FM_DEPS_CACHE="$TMP_ROOT/brew.tsv" deps refresh >/dev/null 2>&1
+out=$(FM_DEPS_DIR="$BREW_DEPS" FM_DEPS_CACHE="$TMP_ROOT/brew.tsv" deps report 2>&1)
+assert_contains "$out" "widget-axi behind" \
+  "anti-vacuity: the brew-sourced component must actually be reported behind"
+assert_contains "$out" "brew upgrade widgetformula" \
+  "a brew-sourced component must be pointed at the command that actually upgrades it"
+assert_not_contains "$out" "fm-deps.sh upgrade widget-axi --approve" \
+  "it must not offer an automated upgrade path that install_version refuses"
+check "a behind-hint names the upgrade path that actually applies to that component"
 
 # --- part C: upgrade is deliberate, recorded, and recoverable ---------------
 

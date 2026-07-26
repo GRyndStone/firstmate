@@ -77,6 +77,14 @@ An entirely offline machine therefore degrades to "currency unchecked for N days
 Both declare `currency = none: <reason>` and are never nagged about.
 For those components a capability check is not a supplement to a currency check - it is the entire guard, which is why both of them have one: `no-mistakes` through the pin in `deps/contracts/`, and `treehouse` through bootstrap's existing `treehouse_supports_lease` probe, which the inventory names as its owner.
 
+A component installed from a package manager firstmate can query is a different case and does not get a `none:` opt-out.
+`herdr` is a homebrew formula, so it declares `currency = brew:herdr` and gets a real verdict - which immediately reported it two releases behind at 0.7.3 against 0.7.5.
+The formula name is declared explicitly and never inferred from the component id: the npm registry contains an unrelated package also called `herdr` sitting at `0.0.0`, and guessing the source from the name would have compared the installed tool against a stranger's package and called the result currency.
+That is the same mistake as trusting a version string, one level up.
+
+Being able to report on a component is not the same as being able to upgrade it.
+`upgrade` automates npm components only and refuses everything else, so the `behind` hint names the path that actually applies - `brew upgrade herdr` for a formula, the bootstrap-documented install for a hand-installed binary - rather than offering a command that would decline.
+
 ### The captain's own sibling projects
 
 Yes, the inventory covers them, and `quota-axi` is the reason: it is his own repository, which is exactly how it drifted.
@@ -136,6 +144,20 @@ Three findings come out of this:
 3. The artifact **changing under an unchanged version**, caught offline.
 
 Currency for a declared local build is also reported differently: it says what upstream released without offering an upgrade command that would silently discard the local build.
+
+### Identity is what re-verification is keyed on
+
+The first version of this tool read identity and then ignored it where it mattered most.
+Contract re-verification was keyed on the version **string** alone: a cached verdict was only re-checked when the installed version differed from the version it was produced against.
+That defeated the tool's core purpose in both directions.
+
+A same-version swap that **broke** the contract stayed cached as `ok`, and the break was invisible - the exact rename class the pin exists to catch, sitting behind a healthy version comparison and a zero exit status, which is the entire failure this system was built after.
+It failed the other way too: a verdict latched `broken` at version X never cleared while installed stayed X, so a same-version repair left a permanent false alarm that could only be cleared by knowing `FM_DEPS_FORCE_CONTRACT=1` existed.
+A stuck alarm is not a conservative failure - it destroys the trust that makes silence meaningful, and silence is the whole product here.
+
+So the verdict is keyed to the artifact identity it was produced against, not to the version string, and re-verification happens when **either** moves.
+An unchanged install still costs nothing, which is what the cache is for; a component whose identity cannot be read at all falls back to the version string, and that is a stated weakness rather than a silent equivalence.
+The broken line names the force flag anyway, because an operator staring at an alarm they believe they already fixed should not have to find it in a source file.
 
 ## Contract pinning, not version pinning
 
