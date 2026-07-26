@@ -20,13 +20,16 @@
 #   - Multi-candidate selection strategy: `usage-burndown` (canonical).
 #     Legacy alias: `quota-balanced` (same engine; existing configs keep working).
 #   - Short rate windows are eligibility gates only. The provider's durable
-#     budget window supplies remaining R, time-to-reset T, learned
-#     counterfactual burn B, and an observed or reset-history-derived period W.
-#     Spendable expiry surplus S = max(0, R - spend_floor - B*T);
-#     score = (S/T) * pressure. Highest score wins.
+#     budget window supplies remaining R, time-to-reset T, and period W.
+#     Per-provider target floors live in bin/fm-usage-source-lib.sh (default 5%,
+#     claude 10%). Captain formula:
+#       score = ((R - target) / T) * (1 + K*urgency^2) * reset_factor
+#     with urgency = clamp(1 - T/W, 0, 1), K default 4, and reset_factor = C^N
+#     for codex only (C defaults to 1.5). Highest score wins. B*T burn-rate
+#     subtraction is not part of the score path; the urgency amplifier is.
 #   - Observational postures remain normal/conserve/protect. Freeze begins when
-#     budget remaining reaches FM_BURNDOWN_SPEND_FLOOR (default 5%). An
-#     exhausted rate gate or a frozen explicit pin exits 75 without substitution.
+#     budget remaining reaches that provider's target floor. An exhausted rate
+#     gate or a frozen explicit pin exits 75 without substitution.
 #   - Stale-but-current general-window numbers remain usable under adapter rules
 #     (refreshedAt/resetsAt prove the window is still current). Stale status is
 #     always logged on stderr so cached-vs-live cannot pass unnoticed.
@@ -58,10 +61,12 @@
 # unless --quota-json supplies a fixture. FM_DISPATCH_QUOTA_AXI overrides the
 # quota command. The keychain flag is always passed so macOS Claude reads succeed;
 # on non-macOS it is a no-op. FM_DISPATCH_NOW_EPOCH overrides the clock for frozen
-# fixtures. FM_BURNDOWN_PRESSURE_K overrides the expiry-pressure coefficient
-# (default 4). FM_BURNDOWN_SPEND_FLOOR overrides the budget remaining floor
-# (default 5). FM_BURNDOWN_RATE_FLOOR overrides the gate exhaustion boundary
-# (default 0). FM_USAGE_BURN_HISTORY overrides the burn-sample history path.
+# fixtures. FM_BURNDOWN_PRESSURE_K overrides the near-expiry urgency coefficient
+# (default 4). FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR overrides the codex
+# per-reset multiplier C (default 1.5). FM_BURNDOWN_RATE_FLOOR overrides the
+# gate exhaustion boundary (default 0). FM_USAGE_BURN_HISTORY overrides the
+# observational burn-sample history path (not a score input). Per-provider
+# target floors are registry data in fm-usage-source-lib.sh, not a global env.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -440,11 +445,16 @@ if [ "$(printf '%s\n' "$selection" | jq -r '.frozen')" = true ]; then
   frozen_provider=$(printf '%s\n' "$selection" | jq -r '.provider')
   frozen_used=$(printf '%s\n' "$selection" | jq -r '.used')
   frozen_remaining=$(printf '%s\n' "$selection" | jq -r '.min')
+  frozen_target=$(printf '%s\n' "$selection" | jq -r '
+    (.candidates // []) as $c
+    | (.provider // "") as $p
+    | ([$c[] | select(.provider == $p)][0].target_percent // .min // "unknown")
+  ')
   block_reason=$(printf '%s\n' "$selection" | jq -r '.block_reason // "budget-spend-floor"')
   if [ "$block_reason" = rate-window-exhausted ]; then
     log "admission refused: provider '$frozen_provider' has no rate-window capacity; keep the selected task/profile and retry after the rate window clears"
   else
-    log "admission refused: provider '$frozen_provider' reached the ${FM_BURNDOWN_SPEND_FLOOR}% budget spend floor (${frozen_used}% used, ${frozen_remaining}% remaining); keep the selected task/profile and retry after quota clears"
+    log "admission refused: provider '$frozen_provider' reached the ${frozen_target}% provider target floor (${frozen_used}% used, ${frozen_remaining}% remaining); keep the selected task/profile and retry after quota clears"
   fi
   exit 75
 fi
@@ -466,7 +476,7 @@ if [ "$unreadable_count" -gt 0 ] && { [ "$selection_unavailable" = true ] || [ "
     "$unreadable_providers_json"
 fi
 
-# Record burn sample so B adapts after every scored dispatch with evidence.
+# Record observational burn sample (not a score input under the captain formula).
 fm_usage_burndown_record_choice "$selection" "$NOW_EPOCH"
 
 # Emit profile. Partial unreadable metered providers keep the live winner but

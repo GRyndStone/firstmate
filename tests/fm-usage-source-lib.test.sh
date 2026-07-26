@@ -403,8 +403,32 @@ JSON
   pass "codex observe attaches reset credits; unreadable is loud without demoting windows"
 }
 
+test_per_provider_target_floors() {
+  local quota obs
+  [ "$(fm_usage_source_target_percent claude)" = 10 ] || fail "claude target must be 10"
+  [ "$(fm_usage_source_target_percent codex)" = 5 ] || fail "codex target must be 5"
+  [ "$(fm_usage_source_target_percent grok)" = 5 ] || fail "grok target must be 5"
+  [ "$(fm_usage_source_target_percent gemini)" = 5 ] || fail "gemini target must be 5"
+  [ "$(fm_usage_source_target_percent openrouter)" = 5 ] || fail "openrouter target must be 5"
+  [ "$(fm_usage_source_target_percent cursor)" = 5 ] || fail "cursor target must be 5"
+  [ "$(fm_usage_source_target_percent copilot)" = 5 ] || fail "copilot target must be 5"
+  if fm_usage_source_target_percent openai 2>/dev/null; then
+    fail "unrecognized provider must not invent a target"
+  fi
+  write_quota "$TMP_ROOT/targets.json"
+  quota=$(cat "$TMP_ROOT/targets.json")
+  obs=$(fm_usage_source_observe claude "$quota" "$TEST_NOW")
+  jq -e '.target_percent == 10' <<< "$obs" >/dev/null \
+    || fail "observe must carry claude registry target 10: $obs"
+  obs=$(fm_usage_source_observe codex "$quota" "$TEST_NOW")
+  jq -e '.target_percent == 5' <<< "$obs" >/dev/null \
+    || fail "observe must carry codex registry target 5: $obs"
+  pass "per-provider target floors are registry data and ride on observations"
+}
+
 test_class_map
 test_provider_registry_distinguishes_unknown_tokens
+test_per_provider_target_floors
 test_quota_backed_adapters
 test_missing_window_period_is_not_fabricated
 test_unconfigured_role_fallback_is_bounded
