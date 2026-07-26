@@ -39,7 +39,7 @@
 #   3  the contract broke after the upgrade (the upgrade happened; recover)
 #
 # Test seams (all default to the real thing):
-#   FM_DEPS_DIR, FM_DEPS_CACHE, FM_DEPS_LEDGER, FM_DEPS_NPM,
+#   FM_DEPS_DIR, FM_DEPS_CACHE, FM_DEPS_LEDGER, FM_DEPS_NPM, FM_DEPS_GH_AXI,
 #   FM_DEPS_NOW_EPOCH, FM_DEPS_NOW_ISO, FM_DEPS_PROBE_<ID>_<NAME>,
 #   FM_DEPS_VERSION_<ID>
 set -u
@@ -87,6 +87,8 @@ lookup_tool_available() { # <id>
   source=$(fm_deps_field "${1:-}" currency 2>/dev/null || true)
   case "$source" in
     npm:?*) command -v "${FM_DEPS_NPM:-npm}" >/dev/null 2>&1 ;;
+    brew:?*) command -v "${FM_DEPS_BREW:-brew}" >/dev/null 2>&1 ;;
+    github:?*/?*) command -v "${FM_DEPS_GH_AXI:-gh-axi}" >/dev/null 2>&1 ;;
     *) return 0 ;;
   esac
 }
@@ -119,6 +121,7 @@ refresh() { # [--offline|--if-due]
   local prev_artifact_version prev_reading artifact_version artifact_reading
   local provenance_observed artifact_detail pkg pkg_dir new_reading published_reading
   local current_identity contract_reading
+  local provenance_decl artifact_baseline expected_version expected_reading
   # A refresh must never be able to hang a caller that did not ask for network.
   # bin/fm-bootstrap.sh calls this on the ordinary session-start path, and the
   # test suite invokes bootstrap dozens of times against fresh state dirs, where
@@ -244,6 +247,9 @@ refresh() { # [--offline|--if-due]
     artifact_reading=$prev_reading
     provenance_observed=$(fm_deps_cache_get "$id" 10 2>/dev/null || true)
     artifact_detail=$(fm_deps_cache_get "$id" 11 2>/dev/null || true)
+    provenance_decl=$(fm_deps_field "$id" provenance 2>/dev/null || true)
+    case "$provenance_decl" in local-build:*) provenance_decl=local-build ;; *) provenance_decl=published ;; esac
+    artifact_baseline=$(fm_deps_field "$id" artifact-baseline 2>/dev/null || true)
     pkg=$(fm_deps_field "$id" currency 2>/dev/null || true)
     case "$pkg" in npm:?*) pkg=${pkg#npm:} ;; *) pkg= ;; esac
     if [ -n "$pkg" ] && [ -n "$installed" ]; then
@@ -251,7 +257,37 @@ refresh() { # [--offline|--if-due]
       if [ -n "$pkg_dir" ]; then
         new_reading=$(fm_deps_artifact_reading "$pkg_dir" 2>/dev/null || true)
         if [ -n "$new_reading" ]; then
-          if [ -n "$prev_reading" ] && [ "$prev_artifact_version" = "$installed" ] &&
+          if [ "$provenance_decl" = local-build ] && [ -n "$artifact_baseline" ]; then
+            expected_version=${artifact_baseline%% *}
+            expected_reading=${artifact_baseline#* }
+            if [ "$installed" = "$expected_version" ] && [ "$new_reading" = "$expected_reading" ]; then
+              # Continuity answers "did it move"; the declared baseline answers
+              # the more important question "is this the expected local build".
+              # Returning to known-good must clear an old continuity finding.
+              provenance_observed=local-build
+              artifact_detail=
+            else
+              if [ "$installed" = "$expected_version" ]; then
+                provenance_observed=changed
+                artifact_detail="expected declared local-build baseline ${expected_reading% *}, observed ${new_reading% *} under an unchanged version $installed"
+              else
+                provenance_observed=baseline-mismatch
+                artifact_detail="expected declared local-build baseline $expected_version ${expected_reading% *}, observed $installed ${new_reading% *}"
+              fi
+              # Preserve the strongest existing diagnosis. A plain npm install
+              # can replace the local build under the same version; when the
+              # registry is reachable, recognize that exact published reading
+              # instead of reducing it to generic baseline drift.
+              if [ "$offline" -eq 0 ]; then
+                published_reading=$(fm_deps_published_reading "$pkg" "$installed" 2>/dev/null || true)
+                if [ -n "$published_reading" ] &&
+                  [ "${new_reading% *}" = "$published_reading" ]; then
+                  provenance_observed=published
+                  artifact_detail=
+                fi
+              fi
+            fi
+          elif [ -n "$prev_reading" ] && [ "$prev_artifact_version" = "$installed" ] &&
             [ "$prev_reading" != "$new_reading" ]; then
             # Same version string, different bytes. Whatever else is true, this
             # is the fact worth surfacing: the code moved and nothing else would
@@ -411,6 +447,10 @@ report() {
     case "$provenance_obs" in
       changed)
         printf 'DEPS: %s artifact changed under an unchanged version: %s (a version number is not identity; confirm what is installed)\n' \
+          "$id" "${artifact_detail:-no detail recorded}"
+        ;;
+      baseline-mismatch)
+        printf 'DEPS: %s artifact diverges from its declared local-build baseline: %s (confirm the build, then update deps/incorporations.conf only if this is the new expected identity)\n' \
           "$id" "${artifact_detail:-no detail recorded}"
         ;;
       local-build)

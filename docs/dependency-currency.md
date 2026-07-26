@@ -71,11 +71,15 @@ A failed lookup never overwrites a good cached answer with nothing.
 The cache keeps the last known `latest` and the epoch it was learned at, which is precisely what lets the report distinguish a short outage (silent) from a component nobody has been able to check in a week (loud).
 An entirely offline machine therefore degrades to "currency unchecked for N days" rather than to false confidence.
 
-### A tool with no registry entry
+### A tool with no package-registry entry
 
-`treehouse` is installed by a shell script from GitHub Pages and `no-mistakes` is built from an authenticated private checkout; neither has a registry to query.
-Both declare `currency = none: <reason>` and are never nagged about.
-For those components a capability check is not a supplement to a currency check - it is the entire guard, which is why both of them have one: `no-mistakes` through the pin in `deps/contracts/`, and `treehouse` through bootstrap's existing `treehouse_supports_lease` probe, which the inventory names as its owner.
+`treehouse` is installed by a shell script from GitHub Pages, but the project publishes versioned GitHub releases.
+It therefore declares `currency = github:kunchenguid/treehouse`; `gh-axi release list` is a working currency source even though no package registry is involved.
+Its existing `treehouse_supports_lease` probe remains the separate owner of the capability firstmate relies on.
+
+`no-mistakes` is built from an authenticated private checkout and has no external release source this ledger can query.
+It declares `currency = none: <reason>`, so the lack of currency coverage is explicit rather than an unexplained `n/a`.
+Its pinned contract remains a capability guard, not a currency verdict.
 
 A component installed from a package manager firstmate can query is a different case and does not get a `none:` opt-out.
 `herdr` is a homebrew formula, so it declares `currency = brew:herdr` and gets a real verdict - which immediately reported it two releases behind at 0.7.3 against 0.7.5.
@@ -97,9 +101,10 @@ This costs no network at all, because fleet sync already keeps those clones fres
 Currency and contracts both assume the same thing: that when something is wrong, it can be fixed at the source.
 That assumption is worth checking, and for firstmate it does not hold.
 
-All five `-axi` tools firstmate depends on - `gh-axi`, `chrome-devtools-axi`, `lavish-axi`, `tasks-axi`, `quota-axi` - are published by one third party, `kunchenguid`, and so is `treehouse`.
-Neither of the captain's GitHub accounts has push on any of them.
-The projects are actively maintained with near-daily releases, but across the last twenty upstream pull requests every merged one came from the maintainer or the release bot, and every outside contributor's PR is unmerged - firstmate's #43 among them.
+All five `-axi` tools firstmate depends on - `gh-axi`, `chrome-devtools-axi`, `lavish-axi`, `tasks-axi`, `quota-axi` - are published upstream by one third party, `kunchenguid`, and so is `treehouse`.
+The captain does not have push to those upstream repositories.
+For `quota-axi`, the captain closed upstream PR #43 unmerged on 2026-07-25 and moved the change into the maintained `GRyndStone/quota-axi` fork.
+The installed build and access record therefore point at that captain-owned fork, while currency still follows the published npm package.
 
 So the exposure is not "unmaintained upstream".
 It is "actively maintained, does not take outside patches", which for a dependency in the routing critical path has the same practical consequence, and it applies to a whole tool family rather than to one package.
@@ -114,28 +119,33 @@ Each non-system stanza therefore records four more facts:
 ### The answer is not "fork everything"
 
 These tools reverse-engineer six vendors' billing APIs, including protobuf decoding.
-Owning that permanently is a larger maintenance burden than the problem it solves, and it would duplicate work a fast-moving maintainer is already doing.
+That makes a fork a deliberate maintenance commitment rather than a reflex.
 
-The cheap resilience is different: run our own build of the fork **only while a needed fix is actually blocked**, keep the upstream PR open, and make the dependency non-blocking so a stale or broken one costs accuracy rather than function.
-That last part is the point.
+For `quota-axi`, that commitment is now explicit: run the maintained captain-owned fork and make the dependency non-blocking so a stale or broken build costs accuracy rather than function.
 An evidence source that cannot be trusted to move must degrade honestly rather than silently - which is why `quota-axi` going wrong costs dispatch quality (`quota_posture=unknown`) and never stops work.
 
-The ladder is a per-dependency decision, and the inventory shows it being made differently for tools from the same publisher: `quota-axi` runs an own build because its blocked fix sits in the routing critical path, while `tasks-axi` waits upstream because hand-editing `data/backlog.md` is a first-class degraded mode, and `treehouse` would simply be dropped.
+The ladder is a per-dependency decision, and the inventory shows it being made differently for tools from the same publisher: `quota-axi` runs the maintained fork because its fixes sit in the routing critical path, while `tasks-axi` waits upstream because hand-editing `data/backlog.md` is a first-class degraded mode, and `treehouse` would simply be dropped.
 
 ## A version number is not identity
 
 The installed `quota-axi` on the captain's machine is no longer the published package.
-It is a local build packed from his fork carrying the unmerged fix, and **it reports `0.1.13`, the same string as the published release, while containing different code.**
+It is a local build packed from the maintained fork, and **it reports `0.1.13`, the same string as the published release, while containing different code.**
 
 A currency system that compares version strings calls that install current and identical to upstream, and is wrong about what is actually running.
 It is the same class of defect as the identifier rename: the signal everyone looks at is intact while the thing underneath has moved.
 
-So identity is read from the artifact, not from the version string, two independent ways:
+So identity is read from the artifact, not from the version string, three complementary ways:
 
-- **Divergence** - the installed tree's file count and byte total against the registry's own `dist` metadata for that exact version. One cheap metadata call, no download. On the captain's machine this reads 76 files / 397,795 bytes installed against 76 / 392,427 published: **5,368 bytes of different code under an identical version string.** Matching sizes are not proof of identity; differing sizes are proof of difference, which is the direction that matters.
-- **Continuity** - a fingerprint of the installed tree against the one recorded for the same version. Needs no network at all, and catches the code moving under an unchanged version in either direction.
+- **Divergence** - the installed tree's file count and byte total against the registry's own `dist` metadata for that exact version.
+  One cheap metadata call is enough; no download is needed.
+  On the captain's machine the maintained build reads 61 files / 250,651 bytes against 76 / 392,427 published, proving that the artifacts differ under an identical version string.
+  Matching sizes are not proof of identity; differing sizes are proof of difference, which is the direction that matters.
+- **Continuity** - a fingerprint of the installed tree against the one recorded for the same version.
+  This needs no network and catches the code moving under an unchanged version in either direction.
+- **Declared local-build baseline** - the inventory's `artifact-baseline = <version> <file-count> <byte-total> <fingerprint>` records the expected local tree.
+  Matching it clears stale continuity noise; diverging from it remains loud even offline.
 
-The inventory declares what should be there (`provenance = published` or `local-build: <what and why>`), and only a mismatch is reported.
+The inventory declares what should be there (`provenance = published` or `local-build: <what and why>` plus its required baseline), and only a mismatch is reported.
 A declared local build is the known truth and says nothing.
 Three findings come out of this:
 
@@ -175,8 +185,8 @@ text  help  --some-flag
 min-version version  1.31.2
 ```
 
-A contract verdict is cached against the installed version it was produced against.
-When the installed version moves, the verdict is stale by construction and the contract is re-verified.
+A contract verdict is cached against the installed version and artifact identity it was produced against.
+When either moves, the verdict is stale by construction and the contract is re-verified.
 That is what makes an upgrade re-check its own contract automatically instead of relying on anyone remembering to, and it is also why an unchanged install costs nothing.
 
 An unrunnable check reports `unknown`, never `ok` and never `broken`.
