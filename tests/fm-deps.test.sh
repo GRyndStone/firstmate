@@ -245,15 +245,35 @@ expect_code 1 "$status" "percentRemaining changing type must break the contract"
 assert_contains "$out" "percentRemaining" "the failure must name the restyled field"
 check "restyled percentRemaining breaks the shipped quota-axi contract"
 
-# The contract pins `five_hour` because bin/fm-usage-source-lib.sh restricts
-# claude's general window list to it. Two files naming the same identifier can
-# drift; this asserts they cannot drift silently.
+# A window id pinned in the contract must still be one the source library
+# actually keys on. Two files naming the same identifier can drift, and this
+# asserts they cannot drift silently.
+#
+# The library's owner of that fact moved: window classification is now a
+# per-provider role policy in fm_usage_source_registry rather than a general-id
+# list. The point matters MORE under role policy, because the policy names ids
+# explicitly - an id pinned here but absent from the policy is a window the
+# contract guards and the router never classifies.
+#
+# The pinned ids are read out of the contract file rather than repeated here, so
+# changing either side alone breaks this.
 # shellcheck source=bin/fm-usage-source-lib.sh disable=SC1091
 . "$ROOT/bin/fm-usage-source-lib.sh"
-general=$(fm_usage_source_general_ids_json claude)
-assert_contains "$general" "five_hour" \
-  "deps/contracts/quota-axi.contract pins five_hour; fm-usage-source-lib.sh must still key on it"
-check "pinned claude window id matches the usage-source general list"
+pinned_ids=$(sed -n 's/.*index("\([A-Za-z0-9_]*\)").*/\1/p' \
+  "$ROOT/deps/contracts/quota-axi.contract" | sort -u)
+[ -n "$pinned_ids" ] ||
+  fail "anti-vacuity: no pinned window id could be read out of the quota-axi contract"
+claude_policy=$(fm_usage_source_window_policy claude) ||
+  fail "fm_usage_source_window_policy claude must resolve (the library surface this pin depends on)"
+[ -n "$claude_policy" ] ||
+  fail "anti-vacuity: claude's window role policy must not be empty"
+for wid in $pinned_ids; do
+  case "$claude_policy" in
+    *"\"$wid\""*) ;;
+    *) fail "deps/contracts/quota-axi.contract pins $wid, but claude's role policy does not name it: $claude_policy" ;;
+  esac
+done
+check "every window id the contract pins is named in the provider role policy"
 
 # The shipped no-mistakes contract pins the axi subcommand vocabulary
 # bin/fm-crew-state.sh reads. It deliberately does NOT pin the version floor,
