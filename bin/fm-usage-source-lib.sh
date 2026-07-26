@@ -84,6 +84,32 @@ fm_usage_source_window_policy() { # <provider>
   fi
 }
 
+# Fetch live multi-provider quota JSON from the configured meter command.
+# Always passes --allow-keychain-prompt so macOS uses Keychain credentials for
+# Claude (and other providers that store tokens there) instead of falling back
+# to the file credential store under ~/.claude/.credentials.json, which can
+# hold a non-refreshable sentinel shape and yield 401 "Claude sign-in required".
+# On non-macOS hosts the flag is accepted by quota-axi and is a no-op when no
+# Keychain is present. Callers must never print credential values.
+# Args: optional override command (default FM_DISPATCH_QUOTA_AXI or quota-axi).
+# Prints JSON on stdout. Returns the meter command's exit status, or 127 if missing.
+fm_usage_source_fetch_quota_json() {
+  local cmd=${1:-${FM_DISPATCH_QUOTA_AXI:-quota-axi}}
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    return 127
+  fi
+  "$cmd" --allow-keychain-prompt --json
+}
+
+# True when the provider is expected to yield scorable meter evidence.
+# Unmetered recognized providers (no adapter wired yet) may honestly report
+# evidence=unknown without it being a read failure.
+fm_usage_source_provider_is_metered() { # <provider>
+  local kind
+  kind=$(fm_usage_source_meter_kind "${1:-}" 2>/dev/null) || return 1
+  [ "$kind" = quota-axi ]
+}
+
 # Build one observation object for provider from a full quota-axi JSON blob.
 # now_epoch is required for T and stale-window currentness.
 fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
@@ -127,9 +153,23 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
     --arg class "$class" \
     --argjson policy "$role_policy" \
     --argjson now "$now_epoch" '
+    # quota-axi emits fractional seconds and +00:00 offsets.
+    # fromdateiso8601 only accepts whole-second ...Z forms; normalize both.
     def iso_epoch:
       if type != "string" then null
-      else try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null
+      else
+        try (
+          sub("\\.[0-9]+"; "") as $s
+          | if ($s | test("Z$")) then
+              $s | fromdateiso8601
+            elif ($s | test("[+-][0-9]{2}:?[0-9]{2}$")) then
+              ($s | capture("(?<base>.*)(?<sign>[+-])(?<hh>[0-9]{2}):?(?<mm>[0-9]{2})$")) as $m
+              | (($m.base + "Z") | fromdateiso8601) as $naive
+              | ((($m.hh | tonumber) * 3600) + (($m.mm | tonumber) * 60)) as $off
+              | if $m.sign == "+" then $naive - $off else $naive + $off end
+            else null
+            end
+        ) catch null
       end;
     def general_window_ok:
       ((.kind? // "") != "model")

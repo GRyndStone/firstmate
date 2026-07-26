@@ -254,8 +254,8 @@ fixture_seven_percent_is_selectable() {
     "default 5% floor leaves a source at 7% eligible for routing"
 }
 
-fixture_unavailable_evidence_dispatches() {
-  local quota profiles output
+fixture_unavailable_evidence_refuses_loudly() {
+  local quota profiles output status err
   reset_history
   quota="$TMP_ROOT/unavailable.json"
   printf '%s\n' '{"providers":"unusable"}' > "$quota"
@@ -263,16 +263,26 @@ fixture_unavailable_evidence_dispatches() {
     {"provider":"claude","harness":"claude"},
     {"provider":"codex","harness":"codex"}
   ]'
+  status=0
   output=$("$ROOT/bin/fm-dispatch-select.sh" \
-    --select usage-burndown --quota-json "$quota" "$profiles" 2>/dev/null)
-  printf 'fixture=unavailable-evidence-dispatches %s\n' \
-    "$(jq -c '{selected:.provider,quota_posture,dispatch_candidates}' <<< "$output")"
+    --select usage-burndown --quota-json "$quota" "$profiles" 2>"$TMP_ROOT/unavailable.err") || status=$?
+  err=$(cat "$TMP_ROOT/unavailable.err")
+  printf 'fixture=unavailable-evidence-refuses-loudly status=%s %s\n' \
+    "$status" \
+    "$(jq -c '{selected:.provider,dispatch_error,unreadable_providers}' <<< "$output" 2>/dev/null || true)"
+  check_equal "$status" 70 \
+    "unusable meter evidence refuses with exit 70 rather than silently dispatching"
   check_jq "$output" '
-    .provider == "claude"
-    and .quota_posture == "unknown"
-    and (.dispatch_candidates | length) == 2
-    and (.dispatch_candidates | all(.evidence == "unknown"))
-  ' "unusable evidence launches the deterministic first default and records all unknown candidates"
+    .dispatch_error == "usage-evidence-unreadable"
+  ' "unusable evidence is machine-marked as usage-evidence-unreadable"
+  ASSERTIONS=$((ASSERTIONS + 1))
+  if printf '%s\n' "$err" | grep -q "error:"; then
+    printf 'ok %d - %s\n' "$ASSERTIONS" "unusable evidence prints an error line on stderr"
+  else
+    printf 'not ok %d - %s\n%s\n' "$ASSERTIONS" \
+      "unusable evidence prints an error line on stderr" "$err" >&2
+    FAILURES=$((FAILURES + 1))
+  fi
 }
 
 fixture_total_tie_is_stable() {
@@ -308,7 +318,7 @@ fixture_routed_burst_is_not_baseline
 fixture_rate_window_is_gate_only
 fixture_grok_period_is_observed_not_fabricated
 fixture_seven_percent_is_selectable
-fixture_unavailable_evidence_dispatches
+fixture_unavailable_evidence_refuses_loudly
 fixture_total_tie_is_stable
 
 printf '# assertions=%d failures=%d\n' "$ASSERTIONS" "$FAILURES"

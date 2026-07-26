@@ -202,6 +202,8 @@ test_stale_usable_evidence_competes_by_burndown() {
   expect_code 75 "$status" "usable stale cached data at freeze must refuse admission"
   assert_contains "$err" "cached snapshot refreshed at $VALID_REFRESHED_AT" \
     "stale admission did not surface cached snapshot use"
+  assert_contains "$err" "reading cached snapshot" \
+    "stale admission must say it is using cache rather than a live refresh"
   assert_contains "$err" "refresh error: oauth refresh failed" \
     "stale admission did not surface the refresh failure"
   assert_contains "$err" "remedy: quota-axi --allow-keychain-prompt" \
@@ -209,8 +211,8 @@ test_stale_usable_evidence_competes_by_burndown() {
   pass "current stale quota remains usable and its refresh failure stays observable"
 }
 
-test_expired_or_unverifiable_stale_data_degrades_to_unknown() {
-  local quota updated out err
+test_expired_or_unverifiable_stale_data_is_loud_error() {
+  local quota updated out err status
   quota="$TMP_ROOT/stale-expired.json"
   write_quota "$quota" stale 1 1 fresh 100 100
   updated="$quota.updated"
@@ -220,11 +222,15 @@ test_expired_or_unverifiable_stale_data_degrades_to_unknown() {
   mv "$updated" "$quota"
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
     '{"provider":"claude","harness":"claude"}' 2>"$TMP_ROOT/stale-expired.err")
+  status=$?
   err=$(cat "$TMP_ROOT/stale-expired.err")
-  jq -e '.provider == "claude" and .harness == "claude" and .quota_posture == "unknown" and (has("quota_percent_used") | not)' \
-    <<< "$out" >/dev/null || fail "expired stale quota did not degrade to unknown: $out"
+  expect_code 70 "$status" "expired stale metered evidence must refuse admission"
+  jq -e '.provider == "claude" and .dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null || fail "expired stale quota did not emit unreadable error profile: $out"
+  assert_contains "$err" "error: unreadable usage evidence for provider 'claude'" \
+    "expired stale quota did not loud-error the provider"
   assert_contains "$err" "no usable" \
-    "expired stale quota did not explain why it degraded"
+    "expired stale quota did not explain why it is unreadable"
 
   write_quota "$quota" stale 1 1 fresh 100 100
   updated="$quota.updated"
@@ -232,9 +238,11 @@ test_expired_or_unverifiable_stale_data_degrades_to_unknown() {
     "$quota" > "$updated"
   mv "$updated" "$quota"
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
-    '{"provider":"claude","harness":"claude"}' 2>/dev/null)
-  jq -e '.quota_posture == "unknown" and (has("quota_percent_used") | not)' \
-    <<< "$out" >/dev/null || fail "unverifiable stale quota did not degrade to unknown: $out"
+    '{"provider":"claude","harness":"claude"}' 2>"$TMP_ROOT/stale-unverifiable.err")
+  status=$?
+  expect_code 70 "$status" "unverifiable stale metered evidence must refuse admission"
+  jq -e '.dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null || fail "unverifiable stale quota did not emit unreadable error: $out"
 
   write_quota "$quota" stale 1 1 fresh 100 100
   updated="$quota.updated"
@@ -242,13 +250,15 @@ test_expired_or_unverifiable_stale_data_degrades_to_unknown() {
     "$quota" > "$updated"
   mv "$updated" "$quota"
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
-    '{"provider":"claude","harness":"claude"}' 2>/dev/null)
-  jq -e '.quota_posture == "unknown" and (has("quota_percent_used") | not)' \
-    <<< "$out" >/dev/null || fail "over-age stale quota did not degrade to unknown: $out"
-  pass "expired, timestamp-less, and over-age stale windows cannot prove freeze"
+    '{"provider":"claude","harness":"claude"}' 2>"$TMP_ROOT/stale-overage.err")
+  status=$?
+  expect_code 70 "$status" "over-age stale metered evidence must refuse admission"
+  jq -e '.dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null || fail "over-age stale quota did not emit unreadable error: $out"
+  pass "expired, timestamp-less, and over-age stale windows refuse as loud unreadable errors"
 }
 
-test_malformed_or_missing_quota_retains_selected_provider() {
+test_malformed_or_missing_quota_is_loud_error() {
   local quota fakebin out err status
   quota="$TMP_ROOT/bad.json"
   printf '%s\n' 'not-json' > "$quota"
@@ -256,33 +266,105 @@ test_malformed_or_missing_quota_retains_selected_provider() {
     '{"provider":"claude","harness":"opencode","model":"anthropic/sonnet"}' 2>"$TMP_ROOT/bad.err")
   status=$?
   err=$(cat "$TMP_ROOT/bad.err")
-  expect_code 0 "$status" "malformed quota cannot prove freeze"
-  jq -e '.provider == "claude" and .harness == "opencode" and .quota_posture == "unknown"' \
-    <<< "$out" >/dev/null || fail "malformed quota changed selected provider/profile: $out"
+  expect_code 70 "$status" "malformed quota must refuse, not silently retain"
+  jq -e '.provider == "claude" and .dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null || fail "malformed quota did not emit error profile: $out"
+  assert_contains "$err" "error:" "malformed quota must be loud on stderr"
   assert_contains "$err" "unparseable JSON" "malformed quota must stay observable"
 
   fakebin=$(fm_fakebin "$TMP_ROOT/missing")
   out=$(PATH="$fakebin:$BASE_PATH" "$ROOT/bin/fm-dispatch-select.sh" --admit \
     '{"provider":"codex","harness":"codex"}' 2>"$TMP_ROOT/missing.err")
   status=$?
-  expect_code 0 "$status" "missing quota-axi cannot prove freeze"
-  jq -e '.provider == "codex" and .harness == "codex" and .quota_posture == "unknown"' \
-    <<< "$out" >/dev/null || fail "missing quota-axi changed selected provider/profile: $out"
-  assert_grep "quota-axi missing" "$TMP_ROOT/missing.err" "missing quota-axi must stay observable"
-  pass "malformed or missing quota retains the selected provider with unknown posture"
+  err=$(cat "$TMP_ROOT/missing.err")
+  expect_code 70 "$status" "missing quota-axi must refuse, not silently retain"
+  jq -e '.provider == "codex" and .dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null || fail "missing quota-axi did not emit error profile: $out"
+  assert_contains "$err" "error:" "missing quota-axi must be loud on stderr"
+  assert_contains "$err" "quota-axi missing" "missing quota-axi must stay observable as an error"
+  pass "malformed or missing quota refuses with a loud usage-evidence error"
 }
 
 test_unavailable_provider_does_not_trigger_admission_fallback() {
-  local quota out err
+  local quota out err status
   quota="$TMP_ROOT/unavailable.json"
   printf '%s\n' '{"providers":[{"provider":"codex","state":{"status":"fresh"},"windows":[{"id":"five_hour","percentRemaining":100,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":18000},{"id":"weekly","percentRemaining":100,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":604800}]}]}' > "$quota"
+  # Admit pin on absent metered provider: refuse, never fall through to codex.
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
     '[{"provider":"claude","harness":"claude"},{"provider":"codex","harness":"codex"}]' 2>"$TMP_ROOT/unavailable.err")
+  status=$?
   err=$(cat "$TMP_ROOT/unavailable.err")
-  jq -e '.provider == "claude" and .harness == "claude" and .quota_posture == "unknown"' \
-    <<< "$out" >/dev/null || fail "unavailable explicit provider silently fell back: $out"
-  assert_contains "$err" "no usable" "unavailable provider must be observable"
-  pass "unavailable explicit provider never silently selects another candidate"
+  expect_code 70 "$status" "unavailable admit pin must refuse"
+  jq -e '
+    .provider == "claude"
+    and .dispatch_error == "usage-evidence-unreadable"
+    and .harness == "claude"
+  ' <<< "$out" >/dev/null || fail "unavailable explicit provider did not refuse cleanly: $out"
+  assert_contains "$err" "error: unreadable usage evidence for provider 'claude'" \
+    "unavailable provider must be a loud error"
+  # Admit pin keeps claude as the selected identity; must not rewrite to codex.
+  jq -e '.provider != "codex"' <<< "$out" >/dev/null \
+    || fail "unavailable explicit provider silently selected codex: $out"
+  pass "unavailable explicit provider refuses without selecting another candidate"
+}
+
+test_partial_unreadable_routes_live_with_dispatch_error() {
+  local quota out err status
+  quota="$TMP_ROOT/partial-unreadable.json"
+  # Claude absent (unreadable); codex live. Multi-select must pick codex and mark error.
+  printf '%s\n' '{"providers":[{"provider":"codex","state":{"status":"fresh","refreshedAt":"'"$VALID_REFRESHED_AT"'"},"windows":[{"id":"five_hour","kind":"session","percentRemaining":100,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":18000},{"id":"weekly","kind":"weekly","percentRemaining":80,"resetsAt":"'"$VALID_RESET_AT"'","windowSeconds":604800}]}]}' > "$quota"
+  out=$("$ROOT/bin/fm-dispatch-select.sh" --select usage-burndown --quota-json "$quota" \
+    "$profiles" 2>"$TMP_ROOT/partial-unreadable.err")
+  status=$?
+  err=$(cat "$TMP_ROOT/partial-unreadable.err")
+  expect_code 0 "$status" "partial unreadable with a live candidate must still route"
+  jq -e '
+    .provider == "codex"
+    and .dispatch_error == "usage-evidence-unreadable"
+    and (.unreadable_providers | index("claude")) != null
+  ' <<< "$out" >/dev/null || fail "partial unreadable did not route live with error mark: $out"
+  assert_contains "$err" "error: unreadable usage evidence for provider 'claude'" \
+    "partial unreadable must name the failed provider on stderr"
+  assert_contains "$err" "error: routing with partial unreadable usage evidence" \
+    "partial unreadable must say the decision is not clean success"
+  pass "partial unreadable routes live candidates under a named dispatch_error"
+}
+
+test_live_quota_fetch_passes_keychain_flag() {
+  local fakebin marker out status
+  fakebin=$(fm_fakebin "$TMP_ROOT/keychain-flag")
+  marker="$TMP_ROOT/quota-argv"
+  cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > '$marker'
+cat <<'JSON'
+{
+  "generatedAt": "2099-01-01T00:00:00Z",
+  "providers": [
+    {
+      "provider": "claude",
+      "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 100, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 18000 },
+        { "id": "seven_day", "kind": "weekly", "percentRemaining": 90, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 }
+      ]
+    }
+  ]
+}
+JSON
+SH
+  chmod +x "$fakebin/quota-axi"
+  out=$(PATH="$fakebin:$BASE_PATH" "$ROOT/bin/fm-dispatch-select.sh" --admit \
+    '{"provider":"claude","harness":"claude"}' 2>/dev/null)
+  status=$?
+  expect_code 0 "$status" "live quota fetch with keychain flag must admit"
+  jq -e '.provider == "claude" and .quota_posture == "normal"' \
+    <<< "$out" >/dev/null || fail "live keychain-flagged fetch did not admit: $out"
+  assert_grep '--allow-keychain-prompt' "$marker" \
+    "live quota fetch must pass --allow-keychain-prompt"
+  assert_grep '--json' "$marker" \
+    "live quota fetch must still request JSON"
+  pass "live quota-axi invocation always passes --allow-keychain-prompt"
 }
 
 test_unrecognized_provider_is_a_distinct_machine_error() {
@@ -343,7 +425,7 @@ test_recognized_unmetered_provider_degrades_honestly() {
 }
 
 test_nonfresh_provider_surfaces_actionable_diagnostics() {
-  local quota out err
+  local quota out err status
   quota="$TMP_ROOT/auth-required.json"
   cat > "$quota" <<'JSON'
 {
@@ -371,9 +453,14 @@ test_nonfresh_provider_surfaces_actionable_diagnostics() {
 JSON
   out=$("$ROOT/bin/fm-dispatch-select.sh" --admit --quota-json "$quota" \
     '{"provider":"claude","harness":"claude"}' 2>"$TMP_ROOT/auth-required.err")
+  status=$?
   err=$(cat "$TMP_ROOT/auth-required.err")
-  jq -e '.provider == "claude" and .quota_posture == "unknown"' <<< "$out" >/dev/null \
-    || fail "auth-required provider changed the selected profile: $out"
+  expect_code 70 "$status" "auth-required metered admit must refuse"
+  jq -e '.provider == "claude" and .dispatch_error == "usage-evidence-unreadable"' \
+    <<< "$out" >/dev/null \
+    || fail "auth-required provider did not emit unreadable error profile: $out"
+  assert_contains "$err" "error: unreadable usage evidence for provider 'claude'" \
+    "auth-required must be a loud unreadable error"
   assert_contains "$err" "provider 'claude' quota status is auth_required" \
     "non-fresh admission did not surface provider status"
   assert_contains "$err" "refresh error: credentials expired" \
@@ -382,7 +469,7 @@ JSON
     "non-fresh admission did not surface provider reason"
   assert_contains "$err" "remedy: quota-axi --allow-keychain-prompt" \
     "non-fresh admission did not surface provider remedy"
-  pass "non-fresh provider states retain their actionable diagnostics"
+  pass "non-fresh provider states refuse with actionable diagnostics"
 }
 
 test_resume_meta_retains_pinned_profile() {
@@ -447,9 +534,11 @@ run_isolated test_prefers_near_expiry_surplus_over_static_remaining
 run_isolated test_explicit_frozen_provider_never_chooses_alternate
 run_isolated test_multi_select_skips_freeze_for_live_capacity
 run_isolated test_stale_usable_evidence_competes_by_burndown
-run_isolated test_expired_or_unverifiable_stale_data_degrades_to_unknown
-run_isolated test_malformed_or_missing_quota_retains_selected_provider
+run_isolated test_expired_or_unverifiable_stale_data_is_loud_error
+run_isolated test_malformed_or_missing_quota_is_loud_error
 run_isolated test_unavailable_provider_does_not_trigger_admission_fallback
+run_isolated test_partial_unreadable_routes_live_with_dispatch_error
+run_isolated test_live_quota_fetch_passes_keychain_flag
 run_isolated test_unrecognized_provider_is_a_distinct_machine_error
 run_isolated test_recognized_unmetered_provider_degrades_honestly
 run_isolated test_nonfresh_provider_surfaces_actionable_diagnostics

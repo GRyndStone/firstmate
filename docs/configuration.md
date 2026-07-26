@@ -320,7 +320,7 @@ When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispat
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.
 An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available` and firstmate uses its verbs for routine backlog mutations, otherwise it hand-edits `data/backlog.md` until installation is approved and completed.
-An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; at admission time, unusable quota evidence retains the selected provider/profile with `quota_posture=unknown` rather than silently switching profiles (see `bin/fm-dispatch-select.sh`).
+An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; at admission time, unreadable metered usage evidence is a loud error (`dispatch_error=usage-evidence-unreadable`, exit 70 when no live candidate remains) rather than a silent first-profile retain (see `bin/fm-dispatch-select.sh` and `docs/usage-burndown-dispatch.md`).
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.

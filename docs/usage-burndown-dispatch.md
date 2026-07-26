@@ -114,16 +114,36 @@ This assumes the two recorded reset boundaries are successive; a missed whole pe
 Until a period is observed, `W` and urgency remain null and pressure stays neutral at 1.
 The provider may still compete on the directly observed `R`, `T`, and counterfactual `B`; the engine never fabricates urgency.
 
-## Missing evidence and fail-safe dispatch
+## Missing evidence and loud errors
 
 Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `W`, `B`, freeze, or rate exhaustion.
-A known candidate outranks an unknown candidate during normal scoring.
-When no known live candidate remains, the first unknown candidate is retained with `quota_posture=unknown`.
-Missing `quota-axi`, malformed JSON, an unwired recognized provider, and an unclassifiable window shape therefore do not refuse routine work.
-The emitted profile still carries one unknown row for every configured candidate.
+A known scorable candidate outranks an unknown candidate during normal scoring.
+
+Metered providers (adapter meter kind `quota-axi`) must yield readable usage.
+When they do not, that is an ERROR, not a silent degradation:
+
+- stderr prints `error: unreadable usage evidence for provider '<name>': <reason>` so an operator sees it without inspecting JSON
+- the profile carries `dispatch_error=usage-evidence-unreadable` and `unreadable_providers`
+- when at least one live scorable candidate remains, the engine still selects among live candidates so one down provider does not strand the fleet, but the decision is marked with the error fields and cannot look like clean success
+- when no live scorable candidate remains, the selector refuses with exit 70
+
+Missing `quota-axi`, malformed meter JSON, and total meter failure refuse the same way (exit 70).
+They never silently retain the first configured profile.
+
+Unmetered recognized providers (no meter wired yet, such as `gemini` and `openrouter`) may still report honest `evidence=unknown` and remain admissible with `quota_posture=unknown`.
+That path is distinct from a metered read failure.
+
+Stale-but-current general-window numbers remain scorable under adapter rules, and the selector always logs a stderr warning naming the provider and that a cached snapshot is being used, so cached-vs-live cannot pass unnoticed.
 
 An unrecognized provider token is caller input failure rather than missing evidence.
 It emits `provider_recognition=unrecognized`, `dispatch_error=unrecognized-provider`, the bad and recognized provider sets, and exits 64.
+
+### Live meter fetch
+
+`bin/fm-usage-source-lib.sh` owns `fm_usage_source_fetch_quota_json`.
+It is the only path that invokes the live meter for dispatch, and it always passes `--allow-keychain-prompt` so macOS Claude (and other Keychain-backed providers) refresh from Keychain rather than a broken file credential store.
+On non-macOS hosts the flag is accepted and is a no-op when no Keychain exists.
+Fixtures use `--quota-json` and never call the live meter.
 
 ## Self-routing spawn and overrides
 
