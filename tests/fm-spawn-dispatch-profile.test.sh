@@ -58,6 +58,14 @@ SH
 #!/usr/bin/env bash
 set -u
 [ "${FM_FAKE_QUOTA_EXIT:-0}" -eq 0 ] || exit "$FM_FAKE_QUOTA_EXIT"
+# Default: carry an explicit rateLimitResetCredits observation so live enrich
+# does not shell out to a real codex app-server. Set FM_FAKE_CODEX_RESET_UNREADABLE=1
+# to inject a deliberately unreadable count (AC-2 loud-error path).
+if [ "${FM_FAKE_CODEX_RESET_UNREADABLE:-0}" = 1 ]; then
+  codex_reset='"rateLimitResetCredits": { "availableCount": "bogus-not-a-number" }'
+else
+  codex_reset='"rateLimitResetCredits": { "availableCount": '"${FM_FAKE_CODEX_RESET_COUNT:-0}"', "credits": [] }'
+fi
 cat <<JSON
 {
   "providers": [
@@ -75,7 +83,8 @@ cat <<JSON
       "windows": [
         { "id": "five_hour", "kind": "session", "percentRemaining": ${FM_FAKE_CODEX_REMAINING:-100}, "resetsAt": "2099-01-01T00:00:00Z", "windowSeconds": 18000 },
         { "id": "weekly", "kind": "weekly", "percentRemaining": ${FM_FAKE_CODEX_BUDGET_REMAINING:-100}, "resetsAt": "2099-01-01T00:00:00Z", "windowSeconds": 604800 }
-      ]
+      ],
+      ${codex_reset}
     },
     {
       "provider": "grok",
@@ -170,6 +179,8 @@ run_spawn() {
     FM_FAKE_CODEX_BUDGET_REMAINING="${FM_FAKE_CODEX_BUDGET_REMAINING:-100}" \
     FM_FAKE_GROK_REMAINING="${FM_FAKE_GROK_REMAINING:-100}" \
     FM_FAKE_QUOTA_EXIT="${FM_FAKE_QUOTA_EXIT:-0}" \
+    FM_FAKE_CODEX_RESET_UNREADABLE="${FM_FAKE_CODEX_RESET_UNREADABLE:-0}" \
+    FM_FAKE_CODEX_RESET_COUNT="${FM_FAKE_CODEX_RESET_COUNT:-0}" \
     FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
@@ -634,6 +645,41 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_unreadable_codex_reset_is_loud_without_poisoning_dispatch() {
+  local rec id out status meta candidates
+  id=profile-codex-reset-unreadable-z20
+  rec=$(make_spawn_case profile-codex-reset-unreadable claude "$id")
+  read_case_record "$rec"
+  enable_dispatch_profile "$HOME_DIR"
+
+  # Deliberate AC-2 case: reset count is unreadable, windows are valid.
+  # Must loud-error the reset without dispatch_error / selecting grok.
+  out=$(
+    FM_FAKE_CODEX_RESET_UNREADABLE=1 \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR"
+  )
+  status=$?
+  expect_code 0 "$status" "unreadable codex reset must not fail an otherwise-valid spawn"
+  assert_contains "$out" "spawned $id harness=codex" \
+    "unreadable reset poisoned dispatch away from codex windows: $out"
+  assert_contains "$out" "error: unreadable rate-limit reset credits for provider 'codex'" \
+    "unreadable reset must be a loud named error: $out"
+  assert_not_contains "$out" "dispatch_error=usage-evidence-unreadable" \
+    "unreadable reset must not mark whole usage evidence unreadable: $out"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_meta_profile "$meta" codex gpt-5 medium
+  assert_grep "dispatch_origin=algorithm" "$meta" "algorithm origin missing under unreadable reset"
+  candidates=$(sed -n 's/^dispatch_candidates_json=//p' "$meta")
+  jq -e '
+    length == 2
+    and (map(select(.provider == "codex")) | length) == 1
+    and (map(select(.provider == "codex" and .scorable == true)) | length) == 1
+    and (map(select(.provider == "codex" and (.reset_count_unreadable == true or (.pressure_source // "" | test("codex-reset-unreadable"))))) | length) == 1
+  ' <<< "$candidates" >/dev/null \
+    || fail "codex must stay scorable with unreadable reset surface: $candidates"
+  pass "unreadable codex reset is loud and does not poison an otherwise-valid dispatch"
+}
+
 test_no_profile_keeps_claude_launch_unchanged
 test_active_dispatch_profile_self_routes_ship
 test_active_dispatch_profile_self_routes_scout
@@ -655,5 +701,6 @@ test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_unreadable_codex_reset_is_loud_without_poisoning_dispatch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

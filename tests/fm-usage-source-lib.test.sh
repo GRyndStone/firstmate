@@ -376,7 +376,8 @@ JSON
     and .rate_limit_reset_credits.source == "credits-array-filtered"
   ' <<< "$obs" >/dev/null || fail "observe must attach filtered reset count: $obs"
 
-  # Unreadable count demotes evidence so dispatch treats it as a loud error.
+  # Unreadable count is a loud named diagnostic; window evidence stays fresh so
+  # an otherwise-valid dispatch is not poisoned (AC-2 interaction).
   cat > "$quota" <<JSON
 {
   "providers": [
@@ -394,11 +395,12 @@ JSON
 JSON
   obs=$(fm_usage_source_observe codex "$(cat "$quota")" "$TEST_NOW")
   jq -e '
-    .evidence == "unknown"
+    .evidence == "fresh"
+    and .binding.remaining == 60
     and .rate_limit_reset_credits.evidence == "unreadable"
     and (.diagnostics | any(test("unreadable"; "i")))
-  ' <<< "$obs" >/dev/null || fail "unreadable reset credits must demote evidence: $obs"
-  pass "codex observe attaches reset credits and demotes unreadable counts"
+  ' <<< "$obs" >/dev/null || fail "unreadable reset credits must stay loud without poisoning windows: $obs"
+  pass "codex observe attaches reset credits; unreadable is loud without demoting windows"
 }
 
 test_class_map

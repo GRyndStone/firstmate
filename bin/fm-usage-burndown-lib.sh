@@ -240,56 +240,9 @@ fm_usage_burndown_score_one() { # <observation_json>
     }'
     return 0
   fi
-  # Codex requires a readable rate-limit reset count. Unreadable is an error
-  # path (evidence already demoted by the source adapter); refuse to invent 0.
-  if printf '%s\n' "$obs" | jq -e '
-    .provider == "codex"
-    and (
-      (.rate_limit_reset_credits? == null)
-      or (.rate_limit_reset_credits.evidence == "unreadable")
-      or ((.rate_limit_reset_credits.available_count? | type) != "number")
-    )
-  ' >/dev/null 2>&1; then
-    printf '%s\n' "$obs" | jq -c '
-      . as $o
-      | ($o.rate_limit_reset_credits // {}) as $r
-      | $o + {
-          B:null,
-          B_source:"none",
-          S:null,
-          spendable_surplus:null,
-          required_rate:null,
-          pressure:null,
-          pressure_source:null,
-          base_pressure:null,
-          reset_available_count:($r.available_count // null),
-          reset_pressure_factor:null,
-          reset_pressure_source:($r.source // "missing"),
-          urgency:null,
-          score:null,
-          posture:"unknown",
-          percent_used:null,
-          eligible:true,
-          ineligible_reason:null,
-          scorable:false,
-          W:null,
-          W_source:"missing",
-          diagnostics:(
-            ($o.diagnostics // [])
-            + (
-                if ($r.evidence // "") == "unreadable" then
-                  ["codex reset count unreadable: " + ($r.error // "unknown")]
-                elif $o.rate_limit_reset_credits == null then
-                  ["codex reset count missing from observation"]
-                else
-                  ["codex reset count is not a number"]
-                end
-              )
-          )
-        }
-    '
-    return 0
-  fi
+  # Codex reset-count handling is part of scoring below. An unreadable count is
+  # a loud, named diagnostic with neutral factor 1 - never a silent zero and
+  # never a poison of otherwise-valid window evidence (AC-2).
   provider=$(printf '%s\n' "$obs" | jq -r '.provider')
   window_id=$(printf '%s\n' "$obs" | jq -r '.binding.id')
   R=$(printf '%s\n' "$obs" | jq -r '.binding.remaining')
@@ -326,17 +279,32 @@ fm_usage_burndown_score_one() { # <observation_json>
         else 1
         end
       ) as $base_pressure
+    | (($o.rate_limit_reset_credits // {}) ) as $reset
+    | ($reset.evidence // "fresh") as $reset_evidence
     | (
-        if $o.provider == "codex" then
-          (($o.rate_limit_reset_credits // {}).available_count // 0) as $n
-          | if ($n | type) == "number" and $n >= 0 then
+        # Unreadable reset count: neutral factor 1 with an explicit unreadable
+        # source so it cannot be mistaken for a genuine zero (AC-2). Windows
+        # remain scorable so an otherwise-valid dispatch is not poisoned.
+        if $o.provider != "codex" then
+          {n:null, factor:1, source:null, unreadable:false}
+        elif $reset_evidence == "unreadable" then
+          {n:null, factor:1, source:($reset.source // "unreadable"), unreadable:true}
+        elif (($reset.available_count? | type) == "number") and ($reset.available_count >= 0) then
+          ($reset.available_count | floor) as $n
+          | {
+              n:$n,
               # Compounding F^N via iterative multiply (jq has no pow).
-              reduce range(0; ($n | floor)) as $_ (1; . * $reset_factor_base)
-            else 1
-            end
-        else 1
+              factor:(reduce range(0; $n) as $_ (1; . * $reset_factor_base)),
+              source:($reset.source // "available-count"),
+              unreadable:false
+            }
+        else
+          # Missing observation fragment: genuine zero, not an error.
+          {n:0, factor:1, source:($reset.source // "absent-as-zero"), unreadable:false}
         end
-      ) as $reset_factor
+      ) as $reset_state
+    | $reset_state.factor as $reset_factor
+    | $reset_state.n as $reset_n
     | ($base_pressure * $reset_factor) as $pressure
     | ($required_rate * $pressure) as $score
     | (100 - $R) as $used
@@ -349,12 +317,6 @@ fm_usage_burndown_score_one() { # <observation_json>
         end
       ) as $posture
     | (
-        if $o.provider == "codex" then
-          (($o.rate_limit_reset_credits // {}).available_count // 0)
-        else null
-        end
-      ) as $reset_n
-    | (
         if ($urgency | type) == "number" then "window-urgency" else "neutral-missing-window-period" end
       ) as $base_source
     | $o + {
@@ -366,22 +328,20 @@ fm_usage_burndown_score_one() { # <observation_json>
         base_pressure:$base_pressure,
         pressure:$pressure,
         pressure_source:(
-          if $o.provider == "codex" and ($reset_factor != 1) then
-            $base_source + "+codex-reset-" + ($reset_factor_base | tostring) + "^" + (($reset_n | floor) | tostring)
-          elif $o.provider == "codex" then
-            $base_source + "+codex-reset-1"
-          else
+          if $o.provider != "codex" then
             $base_source
+          elif $reset_state.unreadable then
+            $base_source + "+codex-reset-unreadable"
+          elif ($reset_factor != 1) then
+            $base_source + "+codex-reset-" + ($reset_factor_base | tostring) + "^" + (($reset_n | floor) | tostring)
+          else
+            $base_source + "+codex-reset-1"
           end
         ),
         reset_available_count:$reset_n,
         reset_pressure_factor:$reset_factor,
-        reset_pressure_source:(
-          if $o.provider == "codex" then
-            ($o.rate_limit_reset_credits // {}).source // "absent-as-zero"
-          else null
-          end
-        ),
+        reset_pressure_source:$reset_state.source,
+        reset_count_unreadable:$reset_state.unreadable,
         urgency:$urgency,
         score:$score,
         posture:$posture,
@@ -392,7 +352,18 @@ fm_usage_burndown_score_one() { # <observation_json>
         W:$period.W,
         W_source:$period.source,
         spend_floor:$floor,
-        rate_floor:$gate_floor
+        rate_floor:$gate_floor,
+        diagnostics:(
+          ($o.diagnostics // [])
+          + (
+              if $reset_state.unreadable then
+                ["codex rate-limit reset credits unreadable: "
+                  + ($reset.error // "unknown cause")
+                  + "; scored windows with neutral reset factor 1 (not a silent zero)"]
+              else []
+              end
+            )
+        )
       }
   '
 }
@@ -454,6 +425,7 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
         reset_available_count:($observation.reset_available_count // null),
         reset_pressure_factor:($observation.reset_pressure_factor // null),
         reset_pressure_source:($observation.reset_pressure_source // null),
+        reset_count_unreadable:($observation.reset_count_unreadable // false),
         urgency:($observation.urgency // null),
         score:($observation.score // null),
         posture:($observation.posture // "unknown"),

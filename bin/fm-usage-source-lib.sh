@@ -664,15 +664,16 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
       end
     ') || return $?
 
-  # Codex alone carries rate-limit reset credits. Attach a real observation;
-  # unreadable counts demote evidence to unknown so dispatch treats them as
-  # loud errors rather than a silent N=0 (see docs/usage-burndown-dispatch.md).
+  # Codex alone carries rate-limit reset credits. Attach a real observation.
+  # An unreadable count is a loud, named diagnostic - never a silent N=0 - but
+  # it must not poison otherwise-valid window evidence (see
+  # docs/usage-burndown-dispatch.md "Codex rate-limit reset pressure").
   if [ "$provider" = codex ]; then
     reset_credits=$(fm_usage_source_codex_reset_credits_from_quota_json \
       "$quota_json" "$now_epoch")
     obs=$(jq -cn --argjson o "$obs" --argjson r "$reset_credits" '
       $o as $base
-      | ($base + {
+      | $base + {
           rate_limit_reset_credits:$r,
           diagnostics:(
             ($base.diagnostics // [])
@@ -684,11 +685,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
                 end
               )
           )
-        })
-      | if $r.evidence == "unreadable" then
-          . + {evidence:"unknown"}
-        else .
-        end
+        }
     ')
   fi
   printf '%s\n' "$obs"

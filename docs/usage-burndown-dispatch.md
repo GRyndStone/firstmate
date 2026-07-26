@@ -158,9 +158,11 @@ Firstmate's live path observes the app-server object read-only (never redeems or
 | only `availableCount` / `available_count` present | that non-negative integer | `C^N` | HTTP shape; no per-item expiry filter possible |
 | successful read, section absent | `0` | `1` | genuine zero |
 | all credits expired or consumed | `0` | `1` | source `credits-array-all-expired` is distinct from absent |
-| malformed count / probe failure | unreadable | n/a | ERROR: demotes codex evidence to unknown; never silent zero |
+| malformed count / probe failure | unreadable (`null`) | `1` (neutral) | ERROR on stderr; **not** a silent zero; windows stay scorable |
 
-Unreadable reset evidence for `codex` is the same class of error as unreadable usage: stderr names the provider and cause, the candidate is not scorable, and the selector continues among remaining live candidates or refuses with exit 70 when none remain.
+Unreadable reset evidence for `codex` is a **loud named error**, never a silent zero: stderr prints `error: unreadable rate-limit reset credits for provider 'codex': <cause>`, `pressure_source` includes `codex-reset-unreadable`, and `reset_available_count` stays null so it cannot be mistaken for a genuine zero.
+It does **not** poison otherwise-valid window evidence: the budget/gate windows remain scorable with neutral reset factor 1, and the provider is not added to `unreadable_providers` / `dispatch_error=usage-evidence-unreadable` solely because the reset probe failed.
+Window-level unreadable usage (missing meters, exhausted evidence) is unchanged and still uses that stricter path.
 
 ### Worked example
 

@@ -214,21 +214,33 @@ test_codex_unreadable_reset_is_loud_error() {
       }
     }')
   scored=$(fm_usage_burndown_score_one "$bad")
-  jq -e '.scorable == false and .pressure == null and .score == null' \
-    <<< "$scored" >/dev/null \
-    || fail "unreadable codex reset count must not score: $scored"
+  # Windows remain scorable with neutral factor 1; unreadable is never a silent zero.
+  jq -e '
+    .scorable == true
+    and .reset_count_unreadable == true
+    and .reset_available_count == null
+    and .reset_pressure_factor == 1
+    and (.pressure_source | test("codex-reset-unreadable"))
+    and (.score | type) == "number"
+  ' <<< "$scored" >/dev/null \
+    || fail "unreadable reset must keep windows scorable with neutral factor: $scored"
   jq -e '
     (.diagnostics // [])
     | map(tostring)
     | any(test("unreadable"; "i"))
   ' <<< "$scored" >/dev/null \
     || fail "unreadable path must name the cause in diagnostics: $scored"
-  # Genuine zero is not an error.
+  # Genuine zero is not an error and is distinct from unreadable.
   zero=$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 0)")
-  jq -e '.scorable == true and .reset_available_count == 0 and .reset_pressure_factor == 1' \
-    <<< "$zero" >/dev/null \
-    || fail "genuine zero resets must remain scorable with factor 1: $zero"
-  pass "unreadable codex reset count is a loud error; genuine zero is not"
+  jq -e '
+    .scorable == true
+    and .reset_available_count == 0
+    and .reset_pressure_factor == 1
+    and (.reset_count_unreadable != true)
+    and (.pressure_source | test("codex-reset-1"))
+  ' <<< "$zero" >/dev/null \
+    || fail "genuine zero resets must remain scorable with factor 1 and not look unreadable: $zero"
+  pass "unreadable codex reset is a loud named error with neutral factor; genuine zero is not"
 }
 
 test_codex_resets_can_outrank_more_headroom() {

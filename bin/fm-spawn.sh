@@ -194,25 +194,27 @@ for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
-    --provider) want_value=provider ;;
+    # Quote every want_value assignment: bare words like override-reason are
+    # arithmetic under SC2100 (ShellCheck 0.11+).
+    --provider) want_value="provider" ;;
     --provider=*) PROVIDER=${a#--provider=}; PROVIDER_SET=1 ;;
-    --harness) want_value=harness ;;
+    --harness) want_value="harness" ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
-    --model) want_value=model ;;
+    --model) want_value="model" ;;
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
-    --effort) want_value=effort ;;
+    --effort) want_value="effort" ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
-    --quota-posture) want_value=quota-posture ;;
+    --quota-posture) want_value="quota-posture" ;;
     --quota-posture=*) QUOTA_POSTURE=${a#--quota-posture=}; QUOTA_POSTURE_SET=1 ;;
-    --quota-used) want_value=quota-used ;;
+    --quota-used) want_value="quota-used" ;;
     --quota-used=*) QUOTA_USED=${a#--quota-used=}; QUOTA_USED_SET=1 ;;
-    --override-reason) want_value=override-reason ;;
+    --override-reason) want_value="override-reason" ;;
     --override-reason=*) OVERRIDE_REASON=${a#--override-reason=}; OVERRIDE_REASON_SET=1 ;;
-    --backend) want_value=backend ;;
+    --backend) want_value="backend" ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
-    --parent) want_value=parent ;;
+    --parent) want_value="parent" ;;
     --parent=*) PARENT_ID=${a#--parent=}; PARENT_SET=1 ;;
-    --lane-kind) want_value=lane-kind ;;
+    --lane-kind) want_value="lane-kind" ;;
     --lane-kind=*) LANE_KIND=${a#--lane-kind=}; LANE_KIND_SET=1 ;;
     *) POS+=("$a") ;;
   esac

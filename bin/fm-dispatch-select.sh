@@ -415,6 +415,22 @@ while IFS= read -r obs_line; do
     '$acc + [$p] | unique')
 done < <(printf '%s\n' "$observations" | jq -c '.[]')
 
+# Codex rate-limit reset credits can fail independently of window evidence.
+# Loud named error (never silent zero); does NOT mark the provider unreadable
+# or set dispatch_error when windows themselves are scorable (AC-2 interaction).
+while IFS= read -r obs_line; do
+  [ -n "$obs_line" ] || continue
+  printf '%s\n' "$obs_line" | jq -e '
+    .provider == "codex"
+    and (.rate_limit_reset_credits.evidence // "") == "unreadable"
+  ' >/dev/null 2>&1 || continue
+  reset_reason=$(printf '%s\n' "$obs_line" | jq -r '
+    def one_line: tostring | gsub("[\\r\\n\\t]+"; " ");
+    (.rate_limit_reset_credits.error // "unknown cause") | one_line
+  ')
+  log "error: unreadable rate-limit reset credits for provider 'codex': $reset_reason; windows remain scorable with neutral reset factor 1 (not a silent zero)"
+done < <(printf '%s\n' "$observations" | jq -c '.[]')
+
 # Inspectable explanation on stderr.
 while IFS= read -r explain_line; do
   [ -z "$explain_line" ] || log "$explain_line"
