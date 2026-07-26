@@ -99,6 +99,10 @@ make_scratch_project() {  # <dir>
 
 PROJ1="$TMP_ROOT/scratch-project-1"; make_scratch_project "$PROJ1"
 PROJ2="$TMP_ROOT/scratch-project-2"; make_scratch_project "$PROJ2"
+printf '%s\n' '- scratch-project-1 [local-only] - explicit scratch running-product fixture (added 2026-07-26)' \
+  > "$PRIMARY_HOME/data/projects.md"
+printf '%s\n' '- scratch-project-2 [local-only] - explicit scratch running-product fixture (added 2026-07-26)' \
+  > "$SM_HOME/data/projects.md"
 
 # --- 1. primary-shaped home: a crewmate spawns into the "firstmate" space ---
 
