@@ -318,3 +318,18 @@ assert_absent() {
 assert_present() {
   [ -e "$1" ] || fail "$2"
 }
+
+# No test may reach the package registry. bin/fm-bootstrap.sh runs the currency
+# refresh on the ordinary session-start path, and the suite shells out to
+# bootstrap ~56 times against fresh state dirs where "no cache yet" reads as "a
+# lookup is due" every time. Left on, that is 12s per invocation with the
+# registry up and 18s with it stalled - enough to push the CI behavior-tests job
+# past its 15-minute cap while asserting nothing. The cached half still runs, so
+# every DEPS: assertion keeps working; a test that genuinely needs lookup
+# behavior drives it through a fake npm with FM_DEPS_OFFLINE=0.
+export FM_DEPS_OFFLINE=1
+# ...and the currency step is off entirely for suites that merely shell out to
+# bootstrap, because even fully offline it spawns a --version probe per declared
+# component (~6s a call, ~56 calls). Suites that assert DEPS: behaviour set
+# FM_DEPS_SKIP=0 for the specific invocation under test.
+export FM_DEPS_SKIP=1

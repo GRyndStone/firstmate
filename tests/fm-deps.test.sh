@@ -475,6 +475,7 @@ deps() { # run bin/fm-deps.sh against the fixture inventory and fixture home
     FM_FAKE_PUBLISHED_FILES="${FM_FAKE_PUBLISHED_FILES:-$PUB_FILES}" \
     FM_FAKE_PUBLISHED_BYTES="${FM_FAKE_PUBLISHED_BYTES:-$PUB_BYTES}" \
     FM_FAKE_REGISTRY_VERSION="${FM_FAKE_REGISTRY_VERSION:-1.0.0}" \
+    FM_DEPS_OFFLINE="${FM_DEPS_OFFLINE_OVERRIDE:-0}" \
     FM_FAKE_WIDGET_SHAPE="${FM_FAKE_WIDGET_SHAPE:-}" \
     FM_FAKE_PROBE_LOG="${FM_FAKE_PROBE_LOG:-}" \
     "$ROOT/bin/fm-deps.sh" "$@"
@@ -783,6 +784,46 @@ assert_not_contains "$out" "fm-deps.sh upgrade widget-axi --approve" \
   "it must not offer an automated upgrade path that install_version refuses"
 check "a behind-hint names the upgrade path that actually applies to that component"
 
+# The session-start currency step must never reach the registry in test context.
+# This is a real defect that shipped: bootstrap calls `refresh --if-due`, and
+# "no cache yet" reads as "a lookup is due", which is true for every test's
+# fresh state dir. Across ~56 bootstrap invocations in tests/*.test.sh that was
+# 12s each with the registry up and 18s with it stalled - it pushed the CI
+# behavior-tests job past its 15-minute cap and got it killed four times, while
+# asserting nothing. A network call counter is what tells "offline" apart from
+# "happened to be fast".
+NETLOG="$TMP_ROOT/netlog"
+: > "$NETLOG"
+cat > "$FAKEBIN/npm-counting" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_NETLOG"
+exec "$FM_REAL_FAKE_NPM" "$@"
+SH
+chmod +x "$FAKEBIN/npm-counting"
+
+: > "$CACHE"
+FM_NETLOG="$NETLOG" FM_REAL_FAKE_NPM="$FAKEBIN/npm" \
+  FM_DEPS_NPM="$FAKEBIN/npm-counting" FM_DEPS_OFFLINE_OVERRIDE=1 deps refresh >/dev/null 2>&1
+views_offline=$(grep -c '^view ' "$NETLOG" 2>/dev/null) || views_offline=0
+
+: > "$NETLOG"
+: > "$CACHE"
+FM_NETLOG="$NETLOG" FM_REAL_FAKE_NPM="$FAKEBIN/npm" \
+  FM_DEPS_NPM="$FAKEBIN/npm-counting" FM_DEPS_OFFLINE_OVERRIDE=0 deps refresh >/dev/null 2>&1
+views_online=$(grep -c '^view ' "$NETLOG" 2>/dev/null) || views_online=0
+
+[ "$views_online" -gt 0 ] ||
+  fail "anti-vacuity: the counting npm must record a lookup when the refresh IS allowed to look up"
+[ "$views_offline" -eq 0 ] ||
+  fail "FM_DEPS_OFFLINE=1 must perform NO registry lookup, got $views_offline"
+check "the currency refresh performs no registry lookup when offline is forced"
+
+# And the whole suite runs under that seam, so no test can shell out to
+# bootstrap and silently pay for the network.
+[ "${FM_DEPS_OFFLINE:-}" = 1 ] ||
+  fail "tests/lib.sh must export FM_DEPS_OFFLINE=1 so every suite is offline-safe by default"
+check "the shared test harness forces offline currency for every suite"
+
 # --- part C: upgrade is deliberate, recorded, and recoverable ---------------
 
 printf '1.0.0\n' > "$WIDGET_VERSION_FILE"
@@ -923,7 +964,7 @@ bootstrap_deps_lines() { # runs the real bootstrap and keeps only its DEPS lines
     FM_FAKE_INSTALL_LOG="$INSTALL_LOG" \
     FM_FAKE_REGISTRY_VERSION="${FM_FAKE_REGISTRY_VERSION:-1.4.0}" \
     FM_BOOTSTRAP_DETECT_ONLY=1 \
-    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null | grep '^DEPS: ' || true
+    FM_DEPS_SKIP=0 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null | grep '^DEPS: ' || true
 }
 
 # Positive control first: with a stale cache, session start MUST speak. Only
@@ -971,7 +1012,8 @@ PATH="$FAKEBIN:$BASE_PATH" \
   FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" \
   FM_FAKE_WIDGET_VERSION_FILE="$WIDGET_VERSION_FILE" FM_FAKE_INSTALL_LOG="$INSTALL_LOG" \
   FM_FAKE_REGISTRY_VERSION=2.5.0 \
-  "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1 || true
+  FM_DEPS_OFFLINE=0 \
+  FM_DEPS_SKIP=0 "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1 || true
 cached_latest=$(awk -F '\t' '$1 == "widget-axi" { print $3 }' "$CACHE")
 [ "$cached_latest" = 2.5.0 ] ||
   fail "a locked bootstrap must refresh the due currency answer (cache says $cached_latest)"

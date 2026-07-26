@@ -119,6 +119,15 @@ refresh() { # [--offline|--if-due]
   local prev_artifact_version prev_reading artifact_version artifact_reading
   local provenance_observed artifact_detail pkg pkg_dir new_reading published_reading
   local current_identity contract_reading
+  # A refresh must never be able to hang a caller that did not ask for network.
+  # bin/fm-bootstrap.sh calls this on the ordinary session-start path, and the
+  # test suite invokes bootstrap dozens of times against fresh state dirs, where
+  # "no cache yet" reads as "a lookup is due" every single time. That turned a
+  # ~1s bootstrap into a 12s one with the registry up and 18s with it stalled -
+  # minutes of network tax across a suite run, for answers no test asserts.
+  # FM_DEPS_OFFLINE=1 forces the cheap half only; tests/lib.sh sets it globally
+  # so every suite that shells out to bootstrap is offline-safe by default.
+  [ "${FM_DEPS_OFFLINE:-0}" = 1 ] && offline=1
   case "${1:-}" in
     --offline) offline=1 ;;
     # The cheap half - reading installed versions and re-verifying any contract
@@ -126,7 +135,7 @@ refresh() { # [--offline|--if-due]
     # an upgrade someone performed outside this script. Only the registry
     # lookups are rate-limited, so a session start does not pay for the network
     # every time.
-    --if-due) network_lookup_due || offline=1 ;;
+    --if-due) [ "$offline" -eq 1 ] || network_lookup_due || offline=1 ;;
   esac
   budget_end=$(( $(fm_deps_now_epoch) + ${FM_DEPS_REFRESH_BUDGET:-12} ))
   while read -r id; do

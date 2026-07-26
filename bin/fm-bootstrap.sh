@@ -721,10 +721,19 @@ fi
 # session the refresh runs first so the verdicts are this session's; a
 # detect-only session reports from the cache and never touches the network,
 # because the session holding the lock owns that write.
-if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
-  "$SCRIPT_DIR/fm-deps.sh" refresh --if-due >/dev/null 2>&1 || true
+# FM_DEPS_SKIP=1 turns the whole currency step off. The refresh reads an
+# installed version per declared component, which is a process spawn each and
+# costs ~6s even with the network forced off, and the test suite shells out to
+# this script ~56 times against fresh state dirs. Left on it added minutes to a
+# suite run that asserts none of it, and killed the CI behavior-tests job
+# against its 15-minute cap. tests/lib.sh sets it for every suite; the tests
+# that genuinely assert DEPS: behavior clear it deliberately.
+if [ "${FM_DEPS_SKIP:-0}" != 1 ]; then
+  if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+    "$SCRIPT_DIR/fm-deps.sh" refresh --if-due >/dev/null 2>&1 || true
+  fi
+  "$SCRIPT_DIR/fm-deps.sh" report 2>/dev/null || true
 fi
-"$SCRIPT_DIR/fm-deps.sh" report 2>/dev/null || true
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
   secondmate_liveness_sweep
