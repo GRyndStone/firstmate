@@ -161,10 +161,15 @@ For each tool, in order:
      be removed.)
    - *Capability survives but the tool is firstmate-shaped* → **do not fold.** The
      successor implements the capability in its own idiom. (`treehouse`.)
-   - *Capability is already in KURU's specification* → **absorb the capability
-     natively in Python**, never vendor the TypeScript. Check first whether KURU
-     already implements it: for usage/quota routing it already did, and the real
-     gap was the contract at the boundary. (`quota-axi`.)
+   - *Capability is already in KURU's specification* → **absorb it in KURU's own
+     idiom, which is TypeScript on Bun** (captain decision). Because the axi
+     family is already TypeScript and shares one `axi-sdk-js`, absorbing the
+     existing implementation is now a real option rather than a rewrite; the
+     remaining constraint is architectural, not linguistic — see
+     docs/capability-map.md "Re-derivation under the Bun/TypeScript destination".
+     Check first whether KURU already implements the capability: for usage/quota
+     routing it already did, and the real gap was the contract at the boundary.
+     (`quota-axi`.)
    - *Unevidenced* → **no action; re-evaluate when KURU's specification asks.**
      (`gh-axi`, `lavish-axi`, `chrome-devtools-axi`.)
 4. **If and only if the fleet is blocked**, apply the carry workflow above. A
@@ -179,8 +184,9 @@ Recorded because these are the steps a later repetition gets wrong:
   reported `treehouse` = 7 and `quota-axi` = 1; both were undercounts (28 and 14).
   The conclusions survived, the numbers did not.
 - **Check whether the capability already exists before absorbing it.** KURU's
-  `tools/usage-burndown` is 1,028 lines of native Python with registered adapters.
-  Absorbing quota-axi's routing would have re-implemented working code.
+  `tools/usage-burndown` is ~1,028 lines with registered adapters (Python today,
+  a port item under the Bun/TypeScript decision). Absorbing quota-axi's routing
+  would have re-implemented working code either way.
 - **Read the specification for prohibitions, not just requirements.** Decision
   0028 forbids the selector from shelling out to quota-axi and puts evidence on
   the organ relationship. That prohibition, not a preference, is what makes

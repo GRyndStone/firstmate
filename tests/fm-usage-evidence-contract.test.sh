@@ -137,8 +137,10 @@ test_makes_no_subprocess_call() {
   pass "the mechanism makes no subprocess call (KURU decision 0028)"
 }
 
-# KURU's measured minimum is Python 3.10 + PyYAML. This mechanism must not widen
-# it: any third-party import here would make absorption cost a new dependency.
+# Dependency-free is the property under test. KURU's destination idiom is now
+# TypeScript on Bun (captain decision), so this file is a port item - but a
+# reference implementation that pulls in third-party packages would carry that
+# cost across the port, so the constraint is kept rather than relaxed.
 test_stdlib_only() {
   local bad
   bad=$(grep -E '^(import|from) ' "$CONTRACT" |

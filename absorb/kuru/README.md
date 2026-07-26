@@ -6,15 +6,23 @@ Nothing here is wired into firstmate at runtime.
 
 ## What this is, and why it is not what was originally asked for
 
-The brief asked to prove native Python absorption of **usage/quota evidence** into
-KURU. Reading KURU's own specification first changed the answer, and the evidence
-is worth stating plainly because it saved building the wrong thing.
+The brief asked to prove native absorption of **usage/quota evidence** into KURU.
+Reading KURU's own specification first changed the answer, and the evidence is
+worth stating plainly because it saved building the wrong thing.
 
-**KURU already has the capability.** `tools/usage-burndown` is 1,028 lines of
-native Python 3 with no third-party imports, carrying registered adapters for
-anthropic-class, openai-class, grok-class, gemini-class, and openrouter-class
-through one plug surface. Absorbing quota-axi's routing would re-implement working
-code.
+> **Premise update (captain decision, authoritative):** KURU unifies on
+> **TypeScript running on Bun**. The original framing of this work was
+> Python-plus-PyYAML. The conclusion below is unchanged, but one of its two
+> supporting arguments is void under the new destination. See
+> "Re-derivation under the Bun/TypeScript destination" at the end of this file
+> before relying on it.
+
+**KURU already has the capability.** `tools/usage-burndown` is ~1,028 lines with
+no third-party imports, carrying registered adapters for anthropic-class,
+openai-class, grok-class, gemini-class, and openrouter-class through one plug
+surface. Absorbing quota-axi's routing would re-implement working code. (It is
+Python today, behind a `#!/bin/sh` polyglot entrypoint added in `0b315e6`, and is
+therefore itself a port item under the Bun/TypeScript decision.)
 
 **And the specification forbids absorbing the rest.** Decision
 `0028-usage-burndown-routing.md` states the selector:
@@ -67,10 +75,11 @@ That capture is frozen, scrubbed to structural fields only, as
 | `usage_evidence_contract.py` | the mechanism: judges organ evidence against a pinned contract, exits 12 on violation |
 | `usage-evidence-contract.json` | the pinned contract; every id observed from live output, none invented |
 
-Both are **stdlib-only Python 3**, so absorbing them adds nothing to KURU's
-measured minimum of Python 3.10 plus PyYAML. Tests assert that property rather
-than trusting it, and assert the no-subprocess prohibition from 0028 against the
-source.
+Both are **dependency-free**: no third-party imports at all. Tests assert that
+property rather than trusting it, and assert the no-subprocess prohibition from
+0028 against the source. The mechanism is Python and runs on 3.9+ (verified in a
+clean `env -i` shell), but under the Bun/TypeScript decision it is a reference
+implementation to port, not the shipping form — see the re-derivation below.
 
 ```sh
 python3 absorb/kuru/usage_evidence_contract.py check \
@@ -123,3 +132,56 @@ contract prevents that. What a contract changes is *when you find out*: on the d
 it ships, as a red check naming the field, instead of months later as routing that
 was quietly wrong. That is the whole claim, and it is worth being precise that it
 is the only one being made.
+
+## Re-derivation under the Bun/TypeScript destination
+
+The captain's decision that KURU unifies on TypeScript running on Bun changes one
+of the two arguments above. Stating plainly which:
+
+**Void: the idiom argument.** "Never vendor TypeScript into a Python base" was a
+real constraint and it is gone. The axi family is already TypeScript and now
+shares the destination runtime, so absorbing quota-axi wholesale is no longer
+blocked by language, and `axi-sdk-js` would be absorbed once for five dependents
+rather than five times. This was the stronger of the two arguments.
+
+**Holds: the architectural argument.** `docs/specification/product.md` line 713 —
+"The Brain owns routing; organs report windows only" — is language-independent.
+It still forbids KURU base from decoding vendor quota APIs, in TypeScript exactly
+as in Python. That clause, and only that clause, is now what separates "absorb the
+contract" from "absorb quota-axi entirely."
+
+**So the recommendation stands on a narrower base than it did.** It is now a
+single architectural decision the captain can revisit, not a language constraint
+that decides itself. If the captain rules that the Brain may decode vendor
+evidence directly, absorbing quota-axi's decoders becomes the cheaper answer and
+this contract becomes an internal invariant of that code rather than a boundary
+check between two systems. Either way the *rules* below are what is worth keeping.
+
+### Specification items this creates
+
+Named rather than worked around:
+
+1. **`docs/specification/decisions/0028-usage-burndown-routing.md`, lines 64-65**
+   prohibits "**no subprocess call at all** (no external-organ-dispatch shell-out,
+   no quota-axi shell-out)". Once both sides share one runtime, the natural
+   integration is an in-process import, which this text does not address. Not
+   contradicted — bypassed. 0028 should state its position on in-process import.
+2. **`docs/specification/product.md`, line 713** is the clause that would actually
+   have to change for KURU to absorb the decoders. A genuine architectural
+   decision, so it is the captain's.
+3. **`tools/usage-burndown` and its `python-entrypoint` shim need a TypeScript/Bun
+   target.** Not this lane's work; recorded because the absorption question sits
+   directly on top of that file.
+
+### What ports, and what does not
+
+| Piece | Under Bun/TS |
+|---|---|
+| `usage-evidence-contract.json` (the pins) | **ports unchanged** — it is data |
+| `tests/fixtures/usage-evidence/*.json` | **port unchanged** — captured evidence |
+| the rules (drift, partial rename, window length, fresh-but-empty) | **port unchanged** — logic, not syntax |
+| `usage_evidence_contract.py` | **needs rewriting in TypeScript** — ~250 lines |
+
+The valuable part — which regressions to catch, which identifiers to pin, and why
+a partial rename defeats a naive check — is idiom-neutral. Only the file it is
+spelled in changes.
