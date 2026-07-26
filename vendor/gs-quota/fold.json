@@ -1,0 +1,86 @@
+{
+  "fold": "gs-quota",
+  "command": "gs-quota",
+  "upstreamCommand": "quota-axi",
+  "umbrella": "GRyndStone",
+  "role": "usage evidence source for the usage-burndown dispatch engine",
+  "consequence": "degrades: bin/fm-dispatch-select.sh retains the selected profile with quota_posture=unknown when evidence is missing, so a break misroutes rather than halts",
+  "upstream": {
+    "repo": "kunchenguid/quota-axi",
+    "url": "https://github.com/kunchenguid/quota-axi.git",
+    "baseTag": "0.1.13",
+    "baseCommit": "a9ca3e16a41376d9e9952e85898dae1393025948",
+    "license": "MIT; retained in the seed tree",
+    "write_access": "none (push=false); a public GitHub fork GRyndStone/quota-axi exists - see docs/folding-tools.md 'The fork question'"
+  },
+  "ours": {
+    "repo": "GRyndStone/gs-quota",
+    "visibility": "private",
+    "relationship": "independent",
+    "not_a_github_fork": true,
+    "status": "PROPOSED - not created; repository creation is the captain's outward-facing call"
+  },
+  "build": {
+    "kind": "node",
+    "entry": "dist/bin/quota-axi.js",
+    "artifact": "gs-quota",
+    "packageName": "@gryndstone/gs-quota",
+    "published": false,
+    "note": "the npm scope is reserved, not published; scope ownership is what makes an upstream package unable to occupy our name"
+  },
+  "install": {
+    "prefix": "~/.local/bin",
+    "rationale": "matches the GRyndStone/no-mistakes precedent; deliberately NOT an npm global prefix, so `npm i -g` cannot reach our binary at all"
+  },
+  "replacementVectors": [
+    "npm install -g quota-axi (reclaims the upstream binary name in the npm prefix)",
+    "npm update -g",
+    "a fresh machine setup that installs the published package"
+  ],
+  "carriedFixes": [
+    {
+      "id": "grok-window-seconds",
+      "summary": "derive every Grok window's windowSeconds from the decoded current-period boundaries instead of decoding the period, using it for validation, and discarding it",
+      "upstreamState": "PR 43 closed unmerged",
+      "sourceBranch": "fm/qa-grok-period-truth-w7",
+      "whyItMatters": "without windowSeconds, bin/fm-usage-source-lib.sh falls through to default_secs(), which returns 0 for every Grok window id, so the window is dropped and Grok reports evidence:unknown"
+    },
+    {
+      "id": "grok-product-ids",
+      "summary": "restore the published normalized product ids product:grokbuild and product:grokimagine",
+      "upstreamState": "renamed upstream between 0.1.5 and 0.1.13 to grok_build / imagine",
+      "whyItMatters": "a silent contract break: a consumer keyed on the published ids reads nothing, with no error and no failed exit"
+    }
+  ],
+  "measuredUsage": {
+    "method": "grep over bin/ for every quota-axi invocation",
+    "invocations": ["quota-axi --json"],
+    "note": "firstmate's ENTIRE quota dependency is one command producing one JSON shape (.providers[].windows[]); see bin/fm-dispatch-select.sh:291"
+  },
+  "trim": [
+    {
+      "keep": "--json output path and the claude, codex, grok, cursor, copilot provider decoders",
+      "why": "bin/fm-usage-source-lib.sh registers exactly these five as quota-axi-metered"
+    },
+    {
+      "drop": "kimi provider and its credential helpers (kimi.ts, kimi-code-cli-credential.ts, pi-kimi-credential.ts)",
+      "why": "not in fm_usage_source_registry; firstmate never meters kimi",
+      "burden_removed": "1333 of 4680 provider LOC (28%), including two credential-discovery paths that read local auth stores"
+    },
+    {
+      "drop": "human render/TOON dashboard, advice, and interpretation-hint surfaces",
+      "why": "firstmate consumes --json only; the human surfaces have zero firstmate callers"
+    },
+    {
+      "drop": "the bundled skill payload",
+      "why": "firstmate loads its own skills from .agents/skills; a vendored tool skill is dead weight here"
+    }
+  ],
+  "declined": [],
+  "contractTests": [
+    "--json must emit .providers[] with .provider, .state.status, .state.refreshedAt",
+    "each window must carry id, kind, percentRemaining, resetsAt AND windowSeconds",
+    "Grok normalized product ids must remain product:grokbuild and product:grokimagine",
+    "a provider decoder that stops decoding must fail loudly, never emit an empty window list that reads as 'no quota pressure'"
+  ]
+}

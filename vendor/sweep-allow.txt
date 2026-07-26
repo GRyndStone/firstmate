@@ -1,0 +1,16 @@
+# Surfaces allowed to name an upstream command in an executable or directive
+# context, one "<path>  <reason>" per line.
+#
+# bin/fm-fold-sweep.sh reports an allowlisted site as ALLOWED rather than hiding
+# it, so a permitted dependency stays visible instead of disappearing.
+#
+# This file is deliberately near-empty. Per docs/capability-map.md, firstmate is
+# transitional and its tools are NOT being renamed, so today every upstream name
+# in bin/ is a legitimate live dependency rather than a migration leftover. The
+# sweep is run to SEE that surface (8 sites for the quota record, 31 across both),
+# not to enforce zero. Enforcement (--strict) becomes meaningful only if a
+# custody artifact is ever actually adopted, which the capability map recommends
+# against for these tools.
+
+bin/fm-fold-sweep.sh  the sweep names every upstream command by definition
+bin/fm-fold-lib.sh    manifest access reads upstreamCommand from fold.json

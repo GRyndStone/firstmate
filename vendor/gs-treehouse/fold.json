@@ -1,0 +1,102 @@
+{
+  "fold": "gs-treehouse",
+  "command": "gs-treehouse",
+  "upstreamCommand": "treehouse",
+  "umbrella": "GRyndStone",
+  "role": "worktree pool every crewmate spawn leases from",
+  "consequence": "critical: if it breaks or changes contract, the fleet cannot dispatch at all",
+  "upstream": {
+    "repo": "kunchenguid/treehouse",
+    "url": "https://github.com/kunchenguid/treehouse.git",
+    "baseTag": "v2.0.0",
+    "baseCommit": "68fa3d2556542add76bf80255787b8625a5041a6",
+    "baseRationale": "v2.0.0 is the version actually running the captain's fleet, not upstream head (v2.1.0). A fold exists to stop the ground moving; adopting an unvalidated newer release at the moment of folding imports a change nothing here has tested. The v2.0.0..v2.1.0 delta becomes the first triage decision instead, which is the divergence machinery working as intended.",
+    "license": "see upstream LICENSE; retained in the seed tree",
+    "write_access": "none (push=false, no fork)"
+  },
+  "ours": {
+    "repo": "GRyndStone/gs-treehouse",
+    "visibility": "private",
+    "relationship": "independent",
+    "not_a_github_fork": true,
+    "status": "PROPOSED - not created; repository creation is the captain's outward-facing call"
+  },
+  "build": {
+    "kind": "go",
+    "entry": ".",
+    "artifact": "gs-treehouse",
+    "versionSymbol": "main.version",
+    "note": "upstream Makefile sets -X main.version; an unset symbol yields a Go pseudo-version, which is why identity must not rest on the version string"
+  },
+  "install": {
+    "prefix": "~/.local/bin",
+    "rationale": "matches the GRyndStone/no-mistakes precedent; deliberately NOT an npm global prefix"
+  },
+  "replacementVectors": [
+    "treehouse update (built-in self-updater)",
+    "upstream install script or release artifact on a fresh machine",
+    "Homebrew or any future package-manager route"
+  ],
+  "measuredUsage": {
+    "method": "grep -rhno 'treehouse <subcommand>' over bin/ .agents/ AGENTS.md docs/",
+    "get": 41,
+    "return": 18,
+    "status": 4,
+    "prune": 0,
+    "destroy": 0,
+    "init": 0,
+    "update": 0,
+    "completion": 0
+  },
+  "trim": [
+    {
+      "keep": "get, return, status",
+      "why": "the only subcommands any automated firstmate path invokes (measured above)"
+    },
+    {
+      "keep": "prune, destroy, init",
+      "why": "operator-facing safety valves and first-run setup; zero automated callers but a human needs them, and they share the pool code already kept"
+    },
+    {
+      "drop": "update",
+      "why": "the self-updater IS a replacement vector; our build must fail closed exactly as GRyndStone/no-mistakes does",
+      "burden_removed": "release discovery, download, and signature handling we would otherwise own"
+    },
+    {
+      "drop": "completion",
+      "why": "cobra shell completion is human ergonomics with zero firstmate callers"
+    }
+  ],
+  "declined": [
+    {
+      "commit": "81cc001",
+      "subject": "Add 'enter' command to open a subshell in an existing worktree (#42)",
+      "why": "scope trim: firstmate never opens an interactive subshell in an existing worktree; it leases with get and releases with return. Taking this adds a command surface with zero callers."
+    },
+    {
+      "commit": "f31e04e",
+      "subject": "docs: define Treehouse product vision (#65)",
+      "why": "upstream product positioning; not applicable to a private fold"
+    },
+    {
+      "commit": "056b19f",
+      "subject": "docs: document agent-guide maintenance policy (#60)",
+      "why": "upstream contributor policy; the fold's policy is docs/folding-tools.md"
+    },
+    {
+      "commit": "5b8ecde",
+      "subject": "chore(main): release 2.0.1",
+      "why": "upstream release plumbing (release-please); the fold does not use upstream's release channel"
+    },
+    {
+      "commit": "c0b7f68",
+      "subject": "chore(main): release 2.1.0 (#69)",
+      "why": "upstream release plumbing; see above"
+    }
+  ],
+  "untriagedNote": "c76015d (atomic pool state persistence) and e914cca (stable lease identities) are deliberately left UNTRIAGED: both touch pool state and lease identity, which is exactly the code firstmate's spawn/teardown lease handling depends on, so they need a real ruling with test evidence rather than a rubber stamp in this PR.",
+  "contractTests": [
+    "get --lease must keep advertising --lease (bootstrap probes it)",
+    "status must keep emitting per-worktree state firstmate's reconcile path parses"
+  ]
+}

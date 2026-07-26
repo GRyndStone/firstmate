@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "Pinned organ->Brain usage-evidence contract for KURU decision 0028.",
+    "Every id below was observed from live organ output, not invented. Changing a",
+    "pin is a deliberate act: it means the organ's published contract really did",
+    "change and every consumer keyed on the old name must be updated in the same",
+    "commit. That is the whole point - an identifier rename should cost a reviewed",
+    "edit here, not eight releases of silently empty routing."
+  ],
+  "defaults": {
+    "requireWindows": true,
+    "requireWindowFields": ["id", "kind", "percentRemaining", "resetsAt", "windowSeconds"]
+  },
+  "requiredProviders": ["claude", "codex", "grok"],
+  "providers": {
+    "claude": {
+      "knownWindowIds": ["five_hour", "seven_day"],
+      "_why": "the account-level session and weekly windows that bound every model"
+    },
+    "codex": {
+      "knownWindowIds": ["five_hour", "weekly"],
+      "_why": "five_hour is emitted on some plans and weekly on others; either satisfies the pin"
+    },
+    "grok": {
+      "knownWindowIds": [
+        "credits",
+        "product:api",
+        "product:grokbuild",
+        "product:grokimagine",
+        "product:chat",
+        "product:voice"
+      ],
+      "requiredWindowIds": ["product:grokbuild", "product:grokimagine"],
+      "_why_required": [
+        "These are the exact two ids upstream renamed. They are pinned as REQUIRED,",
+        "not merely known, because the realized failure was a PARTIAL rename: four",
+        "of six ids survived, so any check asking only 'did some pinned id survive'",
+        "would have passed the very regression it existed to catch."
+      ],
+      "_why": [
+        "These are the PUBLISHED normalized ids. Upstream renamed two of them",
+        "between 0.1.5 and 0.1.13 (product:grokbuild -> product:grok_build,",
+        "product:grokimagine -> product:imagine) with no major version change and",
+        "no deprecation. That rename is the realized failure this contract exists",
+        "to catch: identifier-drift fires the moment none of these appear."
+      ]
+    },
+    "cursor": { "requireWindows": false, "_why": "commonly auth_required; absence of windows is not a decoder fault" },
+    "copilot": { "requireWindows": false, "_why": "commonly auth_required" },
+    "kimi": { "requireWindows": false, "_why": "not metered by any consumer here" }
+  }
+}
