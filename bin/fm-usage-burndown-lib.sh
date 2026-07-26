@@ -244,7 +244,7 @@ fm_usage_burndown_resolve_target() { # <observation_json>
 }
 
 fm_usage_burndown_score_one() { # <observation_json>
-  local obs=$1 provider window_id R T reset_epoch reported_W period_json target
+  local obs=$1 provider window_id reset_epoch reported_W period_json target
   if ! printf '%s\n' "$obs" | jq -e '
     (.evidence == "fresh" or .evidence == "stale")
     and ((.binding.remaining? | type) == "number")
@@ -285,8 +285,9 @@ fm_usage_burndown_score_one() { # <observation_json>
   # never a poison of otherwise-valid window evidence (AC-3).
   provider=$(printf '%s\n' "$obs" | jq -r '.provider')
   window_id=$(printf '%s\n' "$obs" | jq -r '.binding.id')
-  R=$(printf '%s\n' "$obs" | jq -r '.binding.remaining')
-  T=$(printf '%s\n' "$obs" | jq -r '.binding.T')
+  # R and T are read only inside the jq score expression below (from $obs.binding);
+  # shell-side copies would be dead after the formula change that stopped passing
+  # them as --argjson.
   reset_epoch=$(printf '%s\n' "$obs" | jq -r '.binding.resets_at_epoch')
   reported_W=$(printf '%s\n' "$obs" | jq -c '.binding.window_seconds // null')
   period_json=$(fm_usage_window_period "$provider" "$window_id" "$reset_epoch" "$reported_W")
