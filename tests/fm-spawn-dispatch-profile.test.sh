@@ -26,6 +26,7 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
+  capture-pane) printf '%s\n' "${FM_FAKE_TMUX_CAPTURE:-}"; exit 0 ;;
   send-keys)
     for a in "$@"; do case "$a" in *"treehouse get --lease --lease-holder "*)
       fake_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -234,6 +235,8 @@ run_spawn() {
     FM_FAKE_QUOTA_EXIT="${FM_FAKE_QUOTA_EXIT:-0}" \
     FM_FAKE_CODEX_RESET_UNREADABLE="${FM_FAKE_CODEX_RESET_UNREADABLE:-0}" \
     FM_FAKE_CODEX_RESET_COUNT="${FM_FAKE_CODEX_RESET_COUNT:-0}" \
+    FM_FAKE_TMUX_CAPTURE="${FM_FAKE_TMUX_CAPTURE:-}" \
+    FM_AGY_MODEL_WARNING_CHECK_POLLS="${FM_AGY_MODEL_WARNING_CHECK_POLLS:-1}" \
     FM_USAGE_ANTIGRAVITY_QUOTA_JSON="${FM_USAGE_ANTIGRAVITY_QUOTA_JSON:-}" \
     FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
@@ -681,6 +684,29 @@ test_agy_existing_hook_is_refused() {
   pass "agy spawn refuses to replace a project-owned .agents/hooks.json"
 }
 
+test_agy_unavailable_model_warning_fails_spawn() {
+  local rec id out status
+  id=profile-agy-model-sub-z35
+  rec=$(make_spawn_case profile-agy-model-sub agy "$id")
+  read_case_record "$rec"
+
+  out=$(
+    FM_FAKE_TMUX_CAPTURE=$'Warning\n  "gemini-3.1-pro-high" is no longer available. Using "Gemini 3.6 Flash\n  (High)."' \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+        "$id" "$PROJ_DIR" --provider antigravity --harness agy \
+        --model gemini-3.1-pro-high --override-reason "probe agy stale catalog"
+  )
+  status=$?
+  expect_code 1 "$status" "agy unavailable model warning must fail spawn"
+  assert_contains "$out" "agy model 'gemini-3.1-pro-high' was not honored" \
+    "agy substitution warning did not become a loud spawn error: $out"
+  assert_contains "$out" "refusing spawn to avoid a silent model downgrade" \
+    "agy substitution refusal did not explain the downgrade risk: $out"
+  assert_not_contains "$out" "spawned $id" "agy substitution failure must not report a successful spawn"
+  assert_absent "$HOME_DIR/state/$id.meta" "agy substitution failure must remove published meta"
+  pass "agy pane warning for unavailable model fails spawn instead of silently downgrading"
+}
+
 test_antigravity_default_dispatch_selects_agy_when_gate_opens() {
   local rec id out status meta launch candidates
   id=profile-agy-dispatch-z34
@@ -854,6 +880,7 @@ test_pi_omits_invalid_max_effort
 test_agy_threads_model_and_baked_effort
 test_agy_effort_only_flag
 test_agy_existing_hook_is_refused
+test_agy_unavailable_model_warning_fails_spawn
 test_antigravity_default_dispatch_selects_agy_when_gate_opens
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk

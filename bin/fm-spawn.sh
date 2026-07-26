@@ -1511,6 +1511,36 @@ spawn_send_key() {  # <target> <key>
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
 }
+agy_refuse_model_substitution() {  # <warning-line>
+  local warning_line=${1:-}
+  echo "error: agy model '${MODEL:-default}' was not honored; Antigravity reported it is no longer available and substituted another model" >&2
+  [ -z "$warning_line" ] || echo "error: agy warning: $warning_line" >&2
+  echo "error: refusing spawn to avoid a silent model downgrade; re-probe a live agy launch and update the dispatch profile" >&2
+  rm -f "$STATE/$ID.meta" 2>/dev/null || true
+  SPAWN_META_PUBLISHED=0
+  return 1
+}
+agy_check_model_substitution() {
+  local polls delay i cap warning_line
+  [ "$HARNESS" = agy ] || return 0
+  [ -n "${MODEL:-}" ] && [ "$MODEL" != default ] || return 0
+  polls=${FM_AGY_MODEL_WARNING_CHECK_POLLS:-8}
+  delay=${FM_AGY_MODEL_WARNING_CHECK_DELAY:-0.5}
+  case "$polls" in ''|*[!0-9]*) polls=8 ;; esac
+  i=0
+  while [ "$i" -lt "$polls" ]; do
+    cap=$(fm_backend_capture "$BACKEND" "$T" 80 "$W" 2>/dev/null || true)
+    if printf '%s\n' "$cap" | grep -F "$MODEL" >/dev/null 2>&1 \
+      && printf '%s\n' "$cap" | grep -F "no longer available" >/dev/null 2>&1; then
+      warning_line=$(printf '%s\n' "$cap" | grep -F "$MODEL" | grep -F "no longer available" | head -1 || true)
+      agy_refuse_model_substitution "$warning_line"
+      return 1
+    fi
+    i=$((i + 1))
+    [ "$i" -ge "$polls" ] || sleep "$delay"
+  done
+  return 0
+}
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   lease_path=
   lease_path_seen=
@@ -1843,6 +1873,7 @@ sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
+agy_check_model_substitution || exit 1
 
 if [ -n "${FM_NM_GEN_BINARY:-}" ]; then
   echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT nm_generation=${FM_NM_GEN_ID:-}"
