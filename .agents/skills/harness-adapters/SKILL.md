@@ -87,7 +87,7 @@ The supported launch-profile flags below were verified locally on 2026-06-30 wit
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high\|xhigh>` | Verified on grok 0.2.73. `--effort` parses too, but firstmate's profile axis is reasoning effort. `--reasoning-effort max` is rejected, so `max` is omitted. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on pi 0.80.2. `max` prints an invalid-thinking warning, so firstmate omits Pi effort when the requested effort is `max`. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
-| agy | `--model <model>` | `--effort <low\|medium\|high>` only when the model token does not already end in `-low`, `-medium`, or `-high` | Verified on agy 1.1.7. `agy models` lists baked-effort model ids, and the baked effort suffix wins when both `--model` and `--effort` are supplied. The captain-selected profile is `gemini-3.1-pro-high`; live agy 1.1.7 accepts that token but currently opens Gemini 3.6 Flash High, while `gemini-3.1-pro-low` opens Gemini 3.1 Pro Low. |
+| agy | `--model <model>` | `--effort <low\|medium\|high>` only when the model token does not already end in `-low`, `-medium`, or `-high` | Verified on agy 1.1.7. `agy models` lists baked-effort model ids, and the baked effort suffix wins when both `--model` and `--effort` are supplied. Use `gemini-3.1-pro-low` for the current best CLI-reachable Pro-tier profile. `gemini-3.1-pro-high` is advertised but live agy warns it is no longer available and opens Gemini 3.6 Flash High instead. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
@@ -296,4 +296,5 @@ Model/effort behavior, verified live:
 - `--effort low` opens Gemini 3.6 Flash Low.
 - `--model gemini-3.6-flash-high --effort low` opens Gemini 3.6 Flash High, so the baked model suffix wins.
 - `--model gemini-3.1-pro-low` and `--model gemini-3.1-pro --effort low` open Gemini 3.1 Pro Low.
-- `--model gemini-3.1-pro-high`, `--model=gemini-3.1-pro-high`, and `--model gemini-3.1-pro --effort high` all resolve through the CLI but open Gemini 3.6 Flash High in agy 1.1.7. Record the captain's requested `gemini-3.1-pro-high` profile, but treat live launch verification as the authority on what agy actually selected.
+- `--model gemini-3.1-pro-high`, `--model=gemini-3.1-pro-high`, and `--model gemini-3.1-pro --effort high` all resolve through the CLI but open Gemini 3.6 Flash High in agy 1.1.7; an idle TUI probe prints the warning `"gemini-3.1-pro-high" is no longer available. Using "Gemini 3.6 Flash (High)."`.
+- Effective current profile: `gemini-3.1-pro-low`, because it is the strongest Pro-tier token the CLI actually honors. Do not configure `gemini-3.1-pro-high` unless a future live footer/log probe proves it launches Pro High again.

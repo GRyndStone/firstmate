@@ -156,7 +156,7 @@ enable_dispatch_profile() {
 
 enable_antigravity_dispatch_profile() {
   local home=$1
-  printf '%s\n' '{"rules":[],"default":{"select":"usage-burndown","use":[{"provider":"claude","harness":"claude","model":"claude-opus-5","effort":"xhigh"},{"provider":"codex","harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"},{"provider":"grok","harness":"grok","model":"grok-4.5","effort":"high"},{"provider":"antigravity","harness":"agy","model":"gemini-3.1-pro-high"}]}}' \
+  printf '%s\n' '{"rules":[],"default":{"select":"usage-burndown","use":[{"provider":"claude","harness":"claude","model":"claude-opus-5","effort":"xhigh"},{"provider":"codex","harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"},{"provider":"grok","harness":"grok","model":"grok-4.5","effort":"high"},{"provider":"antigravity","harness":"agy","model":"gemini-3.1-pro-low"}]}}' \
     > "$home/config/crew-dispatch.json"
 }
 
@@ -626,15 +626,15 @@ test_agy_threads_model_and_baked_effort() {
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
     "$id" "$PROJ_DIR" --provider antigravity --harness agy \
-    --model gemini-3.1-pro-high --effort high \
-    --override-reason "captain set antigravity profile")
+    --model gemini-3.1-pro-low --effort high \
+    --override-reason "captain set best reachable antigravity profile")
   status=$?
-  expect_code 0 "$status" "agy spawn should accept the captain's antigravity profile"
+  expect_code 0 "$status" "agy spawn should accept the best reachable antigravity profile"
   assert_contains "$out" "spawned $id harness=agy" "spawn did not report agy harness"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" agy gemini-3.1-pro-high high
+  assert_meta_profile "$HOME_DIR/state/$id.meta" agy gemini-3.1-pro-low high
   assert_grep "provider=antigravity" "$HOME_DIR/state/$id.meta" "meta missing antigravity provider pin"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-high' --prompt-interactive" \
+  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-low' --prompt-interactive" \
     "agy launch did not pass the model token or prompt-interactive path: $launch"
   assert_not_contains "$launch" "--effort" \
     "agy launch must omit --effort when the model token already carries low/medium/high: $launch"
@@ -701,11 +701,11 @@ test_antigravity_default_dispatch_selects_agy_when_gate_opens() {
   expect_code 0 "$status" "antigravity default profile should route when full-trust providers are at floor"
   assert_contains "$out" "spawned $id harness=agy" "default dispatch did not select agy when its gate opened: $out"
   meta="$HOME_DIR/state/$id.meta"
-  assert_meta_profile "$meta" agy gemini-3.1-pro-high default
+  assert_meta_profile "$meta" agy gemini-3.1-pro-low default
   assert_grep "provider=antigravity" "$meta" "meta missing antigravity provider"
   assert_grep "dispatch_origin=algorithm" "$meta" "meta missing algorithm dispatch origin"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-high' --prompt-interactive" \
+  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-low' --prompt-interactive" \
     "selected antigravity launch did not use the agy harness/model: $launch"
   assert_not_contains "$launch" "--effort" "baked antigravity model must not also pass an effort flag: $launch"
   candidates=$(sed -n 's/^dispatch_candidates_json=//p' "$meta")

@@ -110,7 +110,7 @@ harness + model -> model only^claude opus^claude^opus^
 harness + model + effort -> both^claude opus high^claude^opus^high
 default harness token -> falls back to crew, empty model/effort^default^claude^^
 extra whitespace between tokens is tolerated^grok   grok-4    xhigh^grok^grok-4^xhigh
-agy model token may carry effort in the model field^agy gemini-3.1-pro-high^agy^gemini-3.1-pro-high^
+agy model token may carry effort in the model field^agy gemini-3.1-pro-low^agy^gemini-3.1-pro-low^
 leading/trailing blank lines and a comment are skipped^# a comment\n\nclaude opus low\n^claude^opus^low
 ROWS
   pass "C1 fm-harness.sh secondmate-model/secondmate-effort resolve the optional tokens; bare harness stays empty (backward-compat)"
