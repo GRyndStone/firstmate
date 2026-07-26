@@ -46,20 +46,39 @@ make_fixture() { # <dir>
 JSON
   printf '# demo\n' > "$dir/docs/notes.md"
   : > "$dir/vendor/sweep-allow.txt"
-  ( cd "$dir" && git init -q . && fm_git_identity . && git add -A && git commit -qm init )
+  ( cd "$dir" && git init -q . ) || fail "could not init the fixture repo"
+  fixture_commit "$dir" init
 }
 
-# The fixture's own surface classes must cover its own tracked files, or the
-# coverage gate would fail for reasons unrelated to what is under test. The
-# sweep's real class list already covers bin/, docs/, and vendor/.
-FIX="$TMP_ROOT/repo"
-make_fixture "$FIX"
+# Commit inside a fixture with an EXPLICIT identity, and fail loudly if it does
+# not take. fm_git_identity exports environment variables, so calling it inside a
+# subshell never reaches later commands - and a developer machine hides that
+# because a global gitconfig supplies an identity anyway. CI has none, so the
+# commit silently failed there, the stray file stayed tracked, and this suite
+# went red for a reason that had nothing to do with the sweep.
+fixture_commit() { # <dir> <message>
+  local dir=$1 msg=$2
+  git -C "$dir" add -A || fail "git add failed in the fixture"
+  git -C "$dir" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm "$msg" || fail "fixture commit '$msg' failed"
+}
+
+# Each scenario builds its OWN fixture. An earlier version mutated one shared
+# fixture and then undid the mutation; the undo failed on CI and every later
+# assertion inherited the broken state, so the suite reported a failure that had
+# nothing to do with the sweep. Independent fixtures cannot do that.
+FIX=""
+new_fixture() { # <name>
+  FIX="$TMP_ROOT/repo-$1"
+  make_fixture "$FIX"
+}
 
 sweep() { # <args...>
   ( cd "$FIX" && ./bin/fm-fold-sweep.sh "$@" ) 2>"$TMP_ROOT/err.txt"
 }
 
 test_coverage_passes_when_every_tracked_file_is_classified() {
+  new_fixture complete
   sweep --coverage >"$TMP_ROOT/out.txt" || fail "coverage must pass on a fully classified repo: $(cat "$TMP_ROOT/err.txt")"
   assert_grep 'enumeration complete' "$TMP_ROOT/out.txt" "coverage must state completeness explicitly"
   pass "coverage passes when every tracked file is reached by a surface class"
@@ -69,19 +88,18 @@ test_coverage_passes_when_every_tracked_file_is_classified() {
 # succeeds, and the completeness claim would rest on nothing.
 test_coverage_fails_on_an_unclassified_tracked_file() {
   local out status
+  new_fixture stray
   printf 'stray\n' > "$FIX/UNCLASSIFIED.md"
-  ( cd "$FIX" && git add -A && git commit -qm stray ) >/dev/null 2>&1
+  fixture_commit "$FIX" stray
   out=$(sweep --coverage) && status=0 || status=$?
   [ "$status" -ne 0 ] || fail "coverage must fail when a tracked file is reached by no surface class"
   assert_contains "$out" "UNCLASSIFIED.md" "the uncovered file must be named, not just counted"
   assert_contains "$out" "UNCOVERED" "the failure must say what kind of gap it is"
-  # Restore the fixture to a complete state for the enforcement tests below.
-  ( cd "$FIX" && git rm -q UNCLASSIFIED.md && git commit -qm unstray ) >/dev/null 2>&1
-  sweep --coverage >/dev/null || fail "fixture should be complete again after removing the stray file"
   pass "coverage fails, and names the file, when a tracked file is unclassified"
 }
 
 test_strict_passes_when_every_reach_site_is_accounted_for() {
+  new_fixture baseline
   sweep --strict >/dev/null || fail "strict must pass when no un-accounted reach site exists"
   pass "strict passes on a baseline with every reach site accounted for"
 }
@@ -89,11 +107,12 @@ test_strict_passes_when_every_reach_site_is_accounted_for() {
 # The enforcement half of AC-2, shown failing rather than asserted.
 test_strict_fails_on_a_newly_introduced_reach_site() {
   local out status
+  new_fixture newreach
   cat > "$FIX/bin/fm-new-dependency.sh" <<'SH'
 #!/usr/bin/env bash
 demotool get --lease
 SH
-  ( cd "$FIX" && git add -A && git commit -qm newdep ) >/dev/null 2>&1
+  fixture_commit "$FIX" newdep
   out=$(sweep --strict) && status=0 || status=$?
   [ "$status" -eq 1 ] || fail "strict must exit 1 on a new un-accounted reach site; got $status"
   assert_contains "$out" "REACH" "the new site must be classified as REACH"
@@ -104,6 +123,13 @@ SH
 
 test_strict_passes_once_the_new_site_is_accounted_for() {
   local out
+  new_fixture accounted
+  cat > "$FIX/bin/fm-new-dependency.sh" <<'SH'
+#!/usr/bin/env bash
+demotool get --lease
+SH
+  fixture_commit "$FIX" newdep
+  sweep --strict >/dev/null && fail "precondition: the new site must be un-accounted first"
   printf '%s\n' "bin/fm-new-dependency.sh  accounted for by this test" >> "$FIX/vendor/sweep-allow.txt"
   out=$(sweep --strict) || fail "strict must pass once the new reach site is accounted for"
   assert_contains "$out" "ALLOWED" "an accounted site must be reported as ALLOWED"
@@ -113,7 +139,7 @@ test_strict_passes_once_the_new_site_is_accounted_for() {
 #!/usr/bin/env bash
 demotool status
 SH
-  ( cd "$FIX" && git add -A && git commit -qm seconddep ) >/dev/null 2>&1
+  fixture_commit "$FIX" seconddep
   sweep --strict >/dev/null && fail "accounting for one site must not exempt another"
   pass "strict passes once accounted for, and still catches the next new site"
 }
