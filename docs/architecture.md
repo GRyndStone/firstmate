@@ -231,6 +231,15 @@ Fetches blocked by an orphaned `.git/packed-refs.lock` use bounded retries and r
 Local-only projects, clones without an origin remote, and fetch failures remain benign skips.
 The refresh also prunes local branches whose remote is gone and that no worktree still needs.
 
+## Incorporated dependencies stay known
+
+Clone freshness answers "is our copy of the code current". The same question about the tools firstmate itself runs on is answered by a declared inventory in `deps/incorporations.conf` rather than by an agent remembering to look, because the failure that prompted it ran seven releases deep without anything reporting it.
+Session start reports a component that has fallen behind its published release, one whose sibling clone the captain owns has moved ahead of what is installed, and one whose installed build no longer honors a pinned contract - and stays silent when everything is current.
+Contract verification is the half a version comparison cannot do: it checks the fields, identifiers, and flags firstmate actually consumes, so a rename that makes a consumer silently read nothing is caught rather than absorbed.
+The inventory also records who controls each dependency, whether a fix could actually be landed there (verified, not assumed), which rung of the fallback ladder was chosen, and what degrades if it is wrong - because a dependency nobody can patch is a different risk from a stale one, and it is knowable before the moment a fix is needed.
+Identity is read from the installed artifact rather than its version string, since the same version can name two different builds and a fork build carrying an unlanded fix is exactly what this home runs today.
+Upgrading is a deliberate, captain-approved, ledgered operation that refuses under a running fleet by default and is reversible from its own record; [dependency-currency.md](dependency-currency.md) owns the whole contract.
+
 ## Self-updates stay safe
 
 `/updatefirstmate` fast-forwards the running firstmate repo and registered secondmate homes from `origin`, then re-reads updated instructions and nudges updated secondmates without touching project clones.

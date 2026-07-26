@@ -1,0 +1,26 @@
+# What firstmate relies on no-mistakes to keep meaning.
+#
+# Consumer: bin/fm-crew-state.sh, which judges a validating crewmate by the run
+# step reported by `no-mistakes axi status` rather than by pane liveness. If the
+# axi surface were renamed, fm-crew-state.sh would fall through to the pane and
+# silently downgrade to the exact stale-status reading the run-step read exists
+# to replace.
+#
+# Deliberately NOT pinned: the version floor, which bin/fm-bootstrap.sh's
+# no_mistakes_compatible already owns and reports as MISSING: no-mistakes - a
+# second copy here would report the same fact twice. Also not pinned: the TOON
+# field names inside a status document. They
+# are read with tolerant greps rather than a strict parser, and pinning the full
+# document would be maintenance against a surface firstmate reads loosely on
+# purpose. The subcommand vocabulary is what a rename would break.
+
+probe axi = no-mistakes axi --help
+
+#: `axi status` is the run-step source of truth fm-crew-state.sh reads
+text axi  status
+
+#: `axi run` is the validation entrypoint the ship brief points crewmates at
+text axi  run
+
+#: `axi respond` is the gate-answer path firstmate routes captain decisions back through
+text axi  respond

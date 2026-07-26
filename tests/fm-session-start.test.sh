@@ -74,6 +74,13 @@ if [ "${1:-}" = --version ]; then
   printf '%s\n' 'no-mistakes version v1.31.2 (fake) 2026-06-27T00:02:18Z'
   exit 0
 fi
+# A healthy no-mistakes exposes the axi subcommands firstmate's pinned contract
+# checks for (deps/contracts/no-mistakes.contract); a stub without them is an
+# incomplete fixture, not a finding.
+if [ "${1:-}" = axi ] && [ "${2:-}" = --help ]; then
+  printf '%s\n' 'Available Commands:' '  respond  Answer the current approval gate' '  run      Validate your code changes' '  status   Show the active run in detail'
+  exit 0
+fi
 exit 0
 SH
   chmod +x "$fakebin/no-mistakes"

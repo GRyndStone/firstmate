@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, NM_GENERATION, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, NM_GENERATION, DEPS, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -32,6 +32,25 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
   Record silently unless the captain asks.
 - `NM_GENERATION: invalid|unhealthy config/no-mistakes-generation - <reason>` - the selected generation cannot be used; fix the config or restore the generation before dispatching validation work.
   Spawn fails closed rather than falling back to the ambient install.
+- `DEPS: <component> behind: installed <a>, latest <b> (upgrade: ...)` - a declared incorporation has published releases nobody installed.
+  Upgrading is deliberate and captain-approved, never something to do silently under a running fleet: relay the gap in outcome language, and run the printed `bin/fm-deps.sh upgrade <id> --approve` only on the captain's word (`docs/dependency-currency.md`).
+- `DEPS: <component> sibling ahead: installed <a>, own clone <dir> tagged <b>` - the captain's own repository for a component has moved past what is installed, whether or not a release was published.
+  Same rule: relay it, upgrade only on the captain's word.
+- `DEPS: <component> CONTRACT BROKEN at installed <v>: <what> (recover: ...)` - an installed component no longer honors something firstmate parses or keys on, so the consuming code path is reading nothing while every ordinary signal looks healthy.
+  Treat it as a blocker for the work that depends on that component, escalate with the named assertion, and recover with the printed `bin/fm-deps.sh rollback` when the captain approves.
+- `DEPS: <component> is NOT the published package it claims to be: <readings>` - the installed artifact differs from what the registry published for that exact version, so the version string is not telling the truth about what is running.
+  Either it is an undeclared local build (declare it as `provenance = local-build` with what it carries and why) or something replaced it; do not treat a matching version number as evidence of identity.
+- `DEPS: <component> local build has been replaced by the published package` - a deliberate local build carrying a fix was overwritten, usually by a plain `npm install -g`, without the version string moving.
+  The fix is no longer installed; escalate it, because nothing else would have caught it and the behavior it fixed will quietly return.
+- `DEPS: <component> artifact changed under an unchanged version` - the installed code moved while its version stayed put.
+  Confirm what is installed before trusting any currency verdict for that component.
+- `DEPS: <component> upstream released <v> while this home runs a local build of <v>` - informational: upgrading would discard the local build and the fix it carries, so it deliberately does not offer an upgrade command.
+  Read `deps/incorporations.conf`'s `fallback` reason for that component before acting, and prefer landing the fix upstream over discarding it.
+- `DEPS: <component> contract unverified: <reason>` / `currency never established|unchecked for N days` - the check could not run or has not been able to reach the registry.
+  Not a break and not a pass: it means nothing is currently watching that component, so fix the reachability or note the gap rather than reading it as health.
+- `DEPS: undeclared: <tool> is required by bin/fm-bootstrap.sh but has no stanza in deps/incorporations.conf` - a dependency was added without being declared.
+  File it as a firstmate-repo work item to add the stanza (with its purpose, what it is relied upon to do, and a currency source or a stated reason there is none).
+- `DEPS: inventory invalid: <problem>` - `deps/incorporations.conf` itself is malformed or an opt-out lost its reason; fix the file before trusting any other DEPS verdict.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (offline, no origin, local-only); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.
 - `FLEET_SYNC: <repo>: recovered: <detail>` - the clone had drifted onto a clean detached HEAD holding no unique commits and the sync self-healed it (re-attached the default branch and fast-forwarded); no action needed, it is reported only so the self-heal is visible.
