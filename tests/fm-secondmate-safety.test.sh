@@ -15,7 +15,7 @@ export FM_BACKEND=tmux
 
 
 test_fm_home_parameterization() {
-  local brief home_one home_two out
+  local brief home_one home_two out status=0
   home_one="$TMP_ROOT/home one"
   home_two="$TMP_ROOT/home-two"
   mkdir -p "$home_one/data" "$home_one/state" "$home_two/data" "$home_two/state"
@@ -23,8 +23,11 @@ test_fm_home_parameterization() {
 
   out=$(FM_HOME="$home_one" "$ROOT/bin/fm-project-mode.sh" app)
   [ "$out" = "local-only on" ] || fail "fm-project-mode did not read projects.md from FM_HOME"
-  out=$(FM_HOME="$home_two" "$ROOT/bin/fm-project-mode.sh" app 2>/dev/null)
-  [ "$out" = "direct-PR off" ] || fail "fm-project-mode did not isolate missing registry by home"
+  out=$(FM_HOME="$home_two" "$ROOT/bin/fm-project-mode.sh" app 2>"$home_two/mode.err") || status=$?
+  expect_code 2 "$status" "fm-project-mode should isolate and reject another home's missing registry"
+  [ -z "$out" ] || fail "fm-project-mode emitted a fallback mode for another home's missing registry"
+  assert_grep "reference repository or a running local instance" "$home_two/mode.err" \
+    "fm-project-mode missing-registry refusal lost the deliverable question"
 
   FM_HOME="$home_one" "$ROOT/bin/fm-brief.sh" task-a app >/dev/null || fail "brief scaffold failed under FM_HOME"
   brief="$home_one/data/task-a/brief.md"
@@ -693,6 +696,25 @@ test_home_seed_refuses_local_only_project() {
     || fail "seed did not explain local-only project rejection"
   [ ! -e "$subhome" ] || fail "seed created a subhome before rejecting a local-only project"
   pass "home seeding refuses local-only projects"
+}
+
+test_home_seed_refuses_local_first_project() {
+  local home subhome err
+  home="$TMP_ROOT/local-first-seed-home"
+  subhome="$TMP_ROOT/local-first-seed-subhome"
+  err="$TMP_ROOT/local-first-seed.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/local-first-alpha.git"
+  printf '%s\n' '- alpha [local-first] - running local product (added 2026-07-26)' > "$home/data/projects.md"
+
+  if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
+    fail "seed allowed a local-first project into a secondmate clone"
+  fi
+  grep -F 'project alpha is local-first; its running local product belongs to the main firstmate home, not a secondmate clone' "$err" >/dev/null \
+    || fail "seed did not explain local-first project rejection"
+  [ ! -e "$subhome" ] || fail "seed created a subhome before rejecting a local-first project"
+  pass "home seeding keeps local-first products in the main firstmate home"
 }
 
 test_home_seed_refuses_registry_delimiter_home() {
@@ -2121,6 +2143,7 @@ test_home_seed_refuses_projectless_home_with_non_directory_projects
 test_home_seed_refuses_projectless_home_with_uninspectable_registry
 test_home_seed_refuses_missing_projects_without_signal
 test_home_seed_refuses_local_only_project
+test_home_seed_refuses_local_first_project
 test_home_seed_refuses_registry_delimiter_home
 test_home_seed_refuses_active_home_and_root
 test_home_seed_refuses_home_marked_for_another_id

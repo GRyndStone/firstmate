@@ -94,10 +94,11 @@
 #   generation pin is resolved from config/no-mistakes-generation (or preserved
 #   from existing task meta on recovery), snapshotted into meta as
 #   nm_generation=/nm_binary=/nm_home=, and exported into the worker pane as
-#   NM_HOME plus a PATH prefix for that binary. direct-PR and local-only tasks
-#   never resolve or inject generation routing; an absent or invalid generation
-#   config does not affect them. For opted-in no-mistakes tasks, invalid or
-#   unhealthy configured generations fail closed and never fall back to ambient.
+#   NM_HOME plus a PATH prefix for that binary. direct-PR, local-first, and
+#   local-only tasks never resolve or inject generation routing; an absent or
+#   invalid generation config does not affect them. For opted-in no-mistakes
+#   tasks, invalid or unhealthy configured generations fail closed and never
+#   fall back to ambient.
 #   Firstmate does not export NO_MISTAKES_RUN_AGENTS from the crewmate harness;
 #   no-mistakes selects validation agents from its own quota evidence.
 #   See bin/fm-nm-generation-lib.sh and docs/configuration.md.
@@ -1196,6 +1197,23 @@ if [ "$KIND" != "secondmate" ] && [ -x "$SCRIPT_DIR/fm-criteria-check.sh" ]; the
   fi
 fi
 
+# Resolve the explicit project delivery mode before any backend endpoint or
+# worktree creation. fm-project-mode.sh fails closed when the registry does not
+# answer the deliverable question, so a missing choice can never consume a
+# resource and then silently become direct-PR.
+SECONDMATE_PROJECTS=
+if [ "$KIND" = secondmate ]; then
+  MODE=secondmate
+  YOLO=off
+  SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
+else
+  PROJ_NAME=$(basename "$PROJ_ABS")
+  MODE_LINE=$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME") || exit $?
+  read -r MODE YOLO <<EOF
+$MODE_LINE
+EOF
+fi
+
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
 # Every backend's own current-path read (tmux's pane_current_path, herdr's
@@ -1733,26 +1751,11 @@ EOF
   esac
 fi
 
-# Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; AGENTS.md project management and task lifecycle).
-# Recorded in meta so fm-teardown's safety check and the validate/merge stages can
-# branch on them. Mode governs ship tasks; a scout's deliverable is a report, not a
-# merge, so scout teardown ignores mode.
-SECONDMATE_PROJECTS=
-if [ "$KIND" = secondmate ]; then
-  MODE=secondmate
-  YOLO=off
-  SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
-else
-  PROJ_NAME=$(basename "$PROJ_ABS")
-  read -r MODE YOLO <<EOF
-$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
-EOF
-fi
-
 # No-mistakes generation pin: only for ship tasks with explicit mode=no-mistakes.
-# Prefer an existing task meta pin (recovery continuity). direct-PR, local-only,
-# scout, and secondmate launches never resolve config/no-mistakes-generation, so
-# a missing/invalid generation config cannot break ordinary direct-PR work.
+# Prefer an existing task meta pin (recovery continuity). direct-PR, local-first,
+# local-only, scout, and secondmate launches never resolve
+# config/no-mistakes-generation, so a missing/invalid generation config cannot
+# break ordinary non-pipeline work.
 if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
   if ! fm_nm_generation_resolve_for_spawn "$CONFIG" "$STATE/$ID.meta"; then
     echo "error: no-mistakes generation routing failed: ${FM_NM_GEN_ERR:-unknown error}" >&2

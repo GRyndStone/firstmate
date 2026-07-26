@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# Perform the approved local merge for a local-only ship task: fast-forward the
-# project's default branch to the crewmate's fm/<id> branch.
+# Perform the approved local merge for a local-first or local-only ship task:
+# fast-forward the project's checked-out default branch to the crewmate's
+# fm/<id> branch.
 #
 # This is firstmate's merge gate-action (the captain's merge authority applied
 # locally instead of via a GitHub PR). It is the one sanctioned exception to hard
 # rule #1 "never run state-changing git in projects/", and it is narrow: it only
-# runs for mode=local-only tasks, only after the captain approves (or yolo=on
-# auto-approves), and only as a clean fast-forward - it refuses a diverged branch
-# and tells you to have the crewmate rebase. See AGENTS.md prime directives,
-# project management, and task lifecycle.
+# runs for mode=local-first or mode=local-only tasks, only after the captain
+# approves (or yolo=on auto-approves), and only as a clean fast-forward.
+# It refuses a diverged branch and tells you to have the crewmate rebase.
+#
+# local-first ordering is deliberate and fail-visible:
+#   1. Fast-forward the checked-out local product first.
+#   2. Push that local default branch to origin as its backup.
+# A backup rejection never rolls the local product back. The command exits
+# non-zero with a loud BACKUP FAILED message that says the local merge already
+# happened and can be retried safely; a later retry re-runs the no-op
+# fast-forward, then retries the backup. It never fetches or merges remote work
+# down into the local product.
+# local-only stops after the local fast-forward because it has no remote.
+# See AGENTS.md prime directives, project management, and task lifecycle.
 # Usage: fm-merge-local.sh <task-id>
 set -eu
 
@@ -23,7 +34,10 @@ META="$STATE/$ID.meta"
 
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
-[ "$MODE" = local-only ] || { echo "error: task $ID is mode=$MODE, not local-only; merge PR tasks with bin/fm-pr-merge.sh <id> <PR url> after approval" >&2; exit 1; }
+case "$MODE" in
+  local-first|local-only) ;;
+  *) echo "error: task $ID is mode=$MODE, not local-first or local-only; merge PR tasks with bin/fm-pr-merge.sh <id> <PR url> after approval" >&2; exit 1 ;;
+esac
 
 default_branch() {
   local ref branch
@@ -66,3 +80,14 @@ before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"
+
+if [ "$MODE" = local-first ]; then
+  backup_out=
+  if ! backup_out=$(git -C "$PROJ" push origin "refs/heads/$DEFAULT:refs/heads/$DEFAULT" 2>&1); then
+    echo "BACKUP FAILED: local $DEFAULT already carries $after in $PROJ, but origin/$DEFAULT was not updated." >&2
+    [ -z "$backup_out" ] || printf '%s\n' "$backup_out" >&2
+    echo "Fix the origin push failure and rerun bin/fm-merge-local.sh $ID; do not sync remote changes down." >&2
+    exit 1
+  fi
+  echo "backup pushed: local $DEFAULT $after -> origin/$DEFAULT"
+fi

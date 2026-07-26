@@ -74,6 +74,8 @@ git -C "$PROJ" init -q
 printf '# scratch\n' > "$PROJ/README.md"
 git -C "$PROJ" add README.md
 git -C "$PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+printf '%s\n' '- scratch-project [local-only] - explicit scratch running-product fixture (added 2026-07-26)' \
+  > "$DATA/projects.md"
 
 # --- spawn with NO explicit backend config; HERDR_ENV=1 is the only marker --
 

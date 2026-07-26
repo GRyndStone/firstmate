@@ -16,9 +16,15 @@ set -u
 
 fm_test_tmproot TMP_ROOT fm-brief
 
+register_project() {
+  local home=$1 name=$2 mode=${3:-direct-PR}
+  mkdir -p "$home/data"
+  printf -- '- %s [%s] - explicit test fixture (added 2026-07-26)\n' "$name" "$mode" >> "$home/data/projects.md"
+}
+
 # The script itself must always parse. This is the direct regression test for
-# issue #166: a stray apostrophe in any of the three DOD heredoc bodies
-# (no-mistakes/direct-PR/local-only) breaks `bash -n` on the whole file.
+# issue #166: a stray apostrophe in any of the four DOD heredoc bodies
+# (no-mistakes/direct-PR/local-first/local-only) breaks `bash -n` on the whole file.
 test_script_parses() {
   bash -n "$ROOT/bin/fm-brief.sh" 2>&1 || fail "bin/fm-brief.sh fails bash -n (heredoc/quote regression)"
   pass "fm-brief.sh: bash -n succeeds"
@@ -32,13 +38,14 @@ test_help_includes_entire_header() {
 }
 
 # Registry with one project per delivery mode, so each ship-mode DOD branch is
-# exercised. A project absent from the registry defaults to direct-PR.
+# exercised.
 write_registry() {
   local home=$1
   mkdir -p "$home/data"
   cat > "$home/data/projects.md" <<'EOF'
 - nm-proj [no-mistakes] - fixture for explicit no-mistakes mode (added 2026-07-01)
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
+- local-first-proj [local-first] - fixture for local-first mode (added 2026-07-26)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 EOF
 }
@@ -53,7 +60,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:nm-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj" "brief-unknown-a4:no-registry-proj"; do
+  for id_proj in "brief-nomistakes-a1:nm-proj" "brief-directpr-a2:direct-proj" "brief-localfirst-a3:local-first-proj" "brief-localonly-a4:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -67,9 +74,28 @@ test_ship_modes_generate_clean_briefs() {
   assert_grep "ships **no-mistakes**" "$home/data/brief-nomistakes-a1/brief.md" "explicit no-mistakes brief missing mode label"
   assert_grep "ships **direct-PR**" "$home/data/brief-directpr-a2/brief.md" "direct-PR brief missing mode label"
   assert_grep "focused tests and lint" "$home/data/brief-directpr-a2/brief.md" "direct-PR brief missing focused tests/lint"
-  assert_grep "ships **local-only**" "$home/data/brief-localonly-a3/brief.md" "local-only brief missing mode label"
-  assert_grep "ships **direct-PR**" "$home/data/brief-unknown-a4/brief.md" "unknown project must default to direct-PR brief"
-  pass "fm-brief.sh: no-mistakes/direct-PR/local-only/unknown briefs generate cleanly"
+  assert_grep "ships **local-first**" "$home/data/brief-localfirst-a3/brief.md" "local-first brief missing mode label"
+  assert_grep "deliverable is the running local product" "$home/data/brief-localfirst-a3/brief.md" \
+    "local-first brief does not define delivery as the running local product"
+  assert_grep "fast-forwards the local product first and pushes that local default branch to origin as its backup" "$home/data/brief-localfirst-a3/brief.md" \
+    "local-first brief lost local-first backup ordering"
+  assert_grep "Remote patches and task branches are not delivery." "$home/data/brief-localfirst-a3/brief.md" \
+    "local-first brief lets remote work substitute for local delivery"
+  assert_grep "ships **local-only**" "$home/data/brief-localonly-a4/brief.md" "local-only brief missing mode label"
+  pass "fm-brief.sh: all explicit ship modes generate clean briefs"
+}
+
+test_unresolved_mode_refuses_brief() {
+  local home status=0 err
+  home="$TMP_ROOT/unresolved-home"
+  err="$home/unresolved.err"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-unresolved no-registry-proj >"$home/out" 2>"$err" || status=$?
+  expect_code 2 "$status" "unknown project brief should fail closed"
+  assert_absent "$home/data/brief-unresolved/brief.md" "unresolved mode still produced a ship brief"
+  assert_grep "reference repository or a running local instance" "$err" \
+    "unresolved ship brief did not surface the deliverable question"
+  pass "fm-brief.sh: unresolved delivery mode refuses to scaffold a ship brief"
 }
 
 # Pin the specific line the bug lived on: the no-mistakes DOD's no-mistakes
@@ -93,7 +119,7 @@ test_no_mistakes_dod_wording() {
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
-  mkdir -p "$home/data"
+  register_project "$home" some-proj
   id="brief-memory-c1"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
@@ -110,7 +136,7 @@ test_ship_project_memory_wording() {
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
-  mkdir -p "$home/data"
+  register_project "$home" firstmate
   id="brief-herdr-lab-d1"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --herdr-lab >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
@@ -158,7 +184,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path() {
 test_herdr_lab_omission_is_loud_for_ship_and_scout() {
   local home id brief
   home="$TMP_ROOT/herdr-gate-home"
-  mkdir -p "$home/data"
+  register_project "$home" firstmate
   for kind in ship scout; do
     id="brief-herdr-gate-$kind"
     if [ "$kind" = scout ]; then
@@ -234,7 +260,7 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
 test_pause_verb_override_renders_all_brief_scaffolds() {
   local home kind id brief
   home="$TMP_ROOT/pause-verb-home"
-  mkdir -p "$home/data"
+  register_project "$home" firstmate
 
   for kind in ship scout secondmate gsd; do
     id="brief-pause-verb-$kind"
@@ -286,7 +312,7 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
 test_external_wait_registration_renders_all_brief_scaffolds() {
   local home kind id brief
   home="$TMP_ROOT/external-wait-home"
-  mkdir -p "$home/data"
+  register_project "$home" firstmate
   for kind in ship scout secondmate gsd; do
     id="brief-external-wait-$kind"
     case "$kind" in
@@ -407,7 +433,7 @@ test_gsd_rejects_secondmate_and_scout() {
 test_ship_acceptance_evidence_contract() {
   local home id brief
   home="$TMP_ROOT/acceptance-home"
-  mkdir -p "$home/data"
+  register_project "$home" some-proj
   id="brief-accept-e1"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
@@ -435,6 +461,7 @@ test_ship_acceptance_evidence_contract() {
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
+test_unresolved_mode_refuses_brief
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_ship_acceptance_evidence_contract

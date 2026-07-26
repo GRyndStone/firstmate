@@ -8,6 +8,12 @@ set -u
 
 fm_test_tmproot TMP_ROOT fm-backend-orca-tests
 
+register_orca_spawn_project() {
+  local data=$1 project=$2 name
+  name=$(basename "$project")
+  printf -- '- %s [direct-PR] - explicit reference fixture (added 2026-07-26)\n' "$name" > "$data/projects.md"
+}
+
 make_orca_fakebin() {  # <dir> -> echoes fakebin dir
   local fb="$1/fakebin"
   mkdir -p "$fb"
@@ -567,6 +573,7 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case pathless-cleanup-fail
@@ -605,6 +612,7 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case spawn
@@ -671,6 +679,7 @@ test_spawn_refuses_orca_when_runtime_not_ready() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case runtime-down-spawn
@@ -701,6 +710,7 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   fm_git_init_commit "$proj"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case bad-spawn
@@ -738,6 +748,7 @@ test_spawn_preserves_orca_rescue_when_terminal_create_is_unconfirmed() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case terminal-fail
@@ -775,6 +786,7 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case cleanup-fail
@@ -813,6 +825,7 @@ test_spawn_rolls_back_orca_resources_when_teardown_claims_lifecycle() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
+  register_orca_spawn_project "$data" "$proj"
   fm_write_criteria "$data" "$id"
   touch "$state/.last-watcher-beat"
   orca_case lifecycle-race

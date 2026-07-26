@@ -299,7 +299,7 @@ test_direct_pr_ignores_generation_config() {
   id=nm-direct-z8
   rec=$(make_spawn_case nm-direct claude "$id")
   read_case_record "$rec"
-  # Keep default direct-PR mode; install a healthy generation config that must
+  # Keep the fixture's explicit direct-PR mode; install a healthy generation config that must
   # not be applied.
   root="$CASE_DIR/gen-ignored"
   bin=$(make_fake_generation "$root" healthy)

@@ -11,8 +11,10 @@
 # is left untouched and reported as a quantified, loud "STUCK: ... N commits behind
 # ... - needs attention" warning rather than a quiet drift. Nothing is ever forced,
 # stashed, or discarded.
-# Still skips (benignly) local-only/no-origin projects, missing remotes/branches,
-# and fetch failures.
+# Still skips (benignly) local-first/local-only/no-origin projects, missing
+# remotes/branches, and fetch failures.
+# local-first is deliberately never fetched or fast-forwarded from origin:
+# its checked-out local product is authoritative and origin is only its backup.
 # Pruning never deletes the checked-out branch or a branch that still has a
 # worktree, so it cannot discard unlanded work; set FM_FLEET_PRUNE=0 to disable it.
 # When the fetch fails on an orphaned .git/packed-refs.lock (left by a ref rewrite
@@ -301,12 +303,21 @@ sync_project() {
     echo "$label: skipped: not a git repo"
     return 0
   fi
-  mode_line=$("$FM_ROOT/bin/fm-project-mode.sh" "$label" 2>/dev/null || echo "direct-PR off")
-  mode=${mode_line%% *}
-  if [ "$mode" = "local-only" ]; then
-    echo "$label: skipped: local-only project"
+  if ! mode_line=$("$FM_ROOT/bin/fm-project-mode.sh" "$label" 2>&1); then
+    echo "$label: skipped: delivery mode unresolved: $(first_line "$mode_line")"
     return 0
   fi
+  mode=${mode_line%% *}
+  case "$mode" in
+    local-first)
+      echo "$label: skipped: local-first project"
+      return 0
+      ;;
+    local-only)
+      echo "$label: skipped: local-only project"
+      return 0
+      ;;
+  esac
   if ! git -C "$PROJ" remote get-url origin >/dev/null 2>&1; then
     echo "$label: skipped: no origin remote"
     return 0

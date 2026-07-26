@@ -2,10 +2,9 @@
 # Tests for bin/fm-teardown.sh's landed-work safety and stale-lock recovery.
 #
 # The check refuses to tear down a worktree whose work has not LANDED, because
-# treehouse return hard-resets the worktree. "Landed" means reachable from a remote
-# OR - for a normal ship task whose commits are not so reachable - its PR is merged
-# and GitHub reports a PR head that contains the current local work, or its content
-# is already in the up-to-date default branch.
+# treehouse return hard-resets the worktree. Existing modes retain their remote,
+# merged-PR, content, and local-only proofs. local-first instead requires the
+# local default branch to carry the work; remote reachability never substitutes.
 #
 # Covers three fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
@@ -38,6 +37,11 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (lf1) local-first + branch merged locally + backup pushed   -> ALLOW end to end
+#   (lf2) local-first + branch pushed remotely but not local    -> REFUSE
+#   (lf3) local-first + backup push rejected                    -> local merge stays, failure loud
+#   (dp1) direct-PR + HEAD on origin remote-tracking branch     -> ALLOW unchanged
+#   (dp2) direct-PR + unpushed, no PR, absent from default      -> REFUSE unchanged
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -56,6 +60,7 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 fm_test_tmproot TMP_ROOT fm-teardown-tests
 REAL_GIT_FOR_TEST=$(command -v git)
@@ -503,6 +508,101 @@ run_teardown() {
     "$TEARDOWN" task-x1 "$@"
 }
 
+run_merge_local() {
+  local case_dir=$1
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  PATH="$case_dir/fakebin:$PATH" \
+    "$MERGE_LOCAL" task-x1
+}
+
+test_local_first_end_to_end_lands_locally_backs_up_then_tears_down() {
+  local case_dir rc wt_head local_head backup_head
+  case_dir=$(make_case local-first-e2e)
+  write_meta "$case_dir" local-first ship
+  wt_commit_file "$case_dir" feature.txt "running local product carries this" "local-first feature"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+
+  run_merge_local "$case_dir" >"$case_dir/merge.stdout" 2>"$case_dir/merge.stderr" \
+    || fail "local-first-e2e: guarded local merge and backup failed"
+
+  local_head=$(git -C "$case_dir/project" rev-parse main)
+  [ "$local_head" = "$wt_head" ] || fail "local-first-e2e: local product main does not carry task HEAD"
+  assert_grep "running local product carries this" "$case_dir/project/feature.txt" \
+    "local-first-e2e: checked-out local product does not contain the delivered feature"
+  backup_head=$(git --git-dir="$case_dir/origin.git" rev-parse refs/heads/main)
+  [ "$backup_head" = "$local_head" ] || fail "local-first-e2e: origin backup does not match local product"
+  assert_grep "backup pushed: local main" "$case_dir/merge.stdout" \
+    "local-first-e2e: successful backup was not reported"
+
+  set +e
+  run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "local-first-e2e: teardown should allow work carried by local main"
+  assert_absent "$case_dir/state/task-x1.meta" "local-first-e2e: teardown did not clear task metadata"
+  pass "local-first end to end lands in the local product, pushes its backup, and tears down safely"
+}
+
+test_local_first_remote_only_refuses() {
+  local case_dir rc
+  case_dir=$(make_case local-first-remote-only)
+  write_meta "$case_dir" local-first ship
+  wt_commit_file "$case_dir" remote-only.txt "remote is not the product" "remote-only patch"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "local-first-remote-only: teardown should refuse a remote-only patch"
+  assert_grep "not yet present in the local product" "$case_dir/stderr" \
+    "local-first-remote-only: refusal did not identify the missing local delivery"
+  assert_grep "A remote branch or PR is not landing proof for local-first." "$case_dir/stderr" \
+    "local-first-remote-only: remote reachability still substitutes for local landing"
+  assert_present "$case_dir/state/task-x1.meta" "local-first-remote-only: refused teardown removed task metadata"
+  pass "local-first teardown refuses remote patches that are absent from the local product"
+}
+
+test_local_first_backup_failure_is_loud_and_retryable() {
+  local case_dir rc wt_head baseline
+  case_dir=$(make_case local-first-backup-failure)
+  write_meta "$case_dir" local-first ship
+  wt_commit_file "$case_dir" backup.txt "backup me after local delivery" "backup failure fixture"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  baseline=$(git --git-dir="$case_dir/origin.git" rev-parse refs/heads/main)
+  cat >"$case_dir/origin.git/hooks/pre-receive" <<'SH'
+#!/usr/bin/env bash
+echo "test backup rejection" >&2
+exit 1
+SH
+  chmod +x "$case_dir/origin.git/hooks/pre-receive"
+
+  set +e
+  run_merge_local "$case_dir" >"$case_dir/merge-fail.stdout" 2>"$case_dir/merge-fail.stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "local-first-backup-failure: rejected backup must fail the helper"
+  [ "$(git -C "$case_dir/project" rev-parse main)" = "$wt_head" ] \
+    || fail "local-first-backup-failure: local product was not merged before backup attempt"
+  [ "$(git --git-dir="$case_dir/origin.git" rev-parse refs/heads/main)" = "$baseline" ] \
+    || fail "local-first-backup-failure: rejected backup unexpectedly changed origin"
+  assert_grep "BACKUP FAILED: local main already carries" "$case_dir/merge-fail.stderr" \
+    "local-first-backup-failure: failure did not preserve and report local truth"
+  assert_grep "do not sync remote changes down" "$case_dir/merge-fail.stderr" \
+    "local-first-backup-failure: retry guidance suggests the rejected sync-down bridge"
+
+  rm -f "$case_dir/origin.git/hooks/pre-receive"
+  run_merge_local "$case_dir" >"$case_dir/merge-retry.stdout" 2>"$case_dir/merge-retry.stderr" \
+    || fail "local-first-backup-failure: safe retry did not push the backup"
+  [ "$(git --git-dir="$case_dir/origin.git" rev-parse refs/heads/main)" = "$wt_head" ] \
+    || fail "local-first-backup-failure: retry did not update the backup"
+  pass "local-first backup rejection is loud after local landing and succeeds on safe retry"
+}
+
 test_local_only_fork_remote_allows() {
   local case_dir rc
   case_dir=$(make_case fork-allow)
@@ -631,6 +731,40 @@ test_no_mistakes_truly_unpushed_refuses() {
   expect_code 1 "$rc" "nm-unpushed: teardown should refuse"
   grep -q REFUSED "$case_dir/stderr" || fail "nm-unpushed: no REFUSED line in stderr"
   pass "no-mistakes worktree with genuinely unlanded work is refused (safety preserved)"
+}
+
+test_direct_pr_origin_remote_allows() {
+  local case_dir rc
+  case_dir=$(make_case direct-pr-origin)
+  write_meta "$case_dir" direct-PR ship
+  wt_commit "$case_dir" "direct PR work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "direct-pr-origin: teardown should still accept origin reachability"
+  assert_no_grep "REFUSED" "$case_dir/stderr" "direct-pr-origin: teardown unexpectedly refused"
+  pass "direct-PR remote-reachability teardown proof is unchanged"
+}
+
+test_direct_pr_truly_unpushed_refuses() {
+  local case_dir rc
+  case_dir=$(make_case direct-pr-unpushed)
+  write_meta "$case_dir" direct-PR ship
+  wt_commit_file "$case_dir" direct.txt "not delivered" "unlanded direct PR work"
+
+  set +e
+  run_teardown "$case_dir" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "direct-pr-unpushed: teardown should still refuse unlanded work"
+  assert_grep "REFUSED" "$case_dir/stderr" "direct-pr-unpushed: no refusal was reported"
+  pass "direct-PR unlanded-work refusal is unchanged"
 }
 
 test_squash_merged_branch_deleted_allows() {
@@ -1336,6 +1470,9 @@ SH
   pass "partial Herdr teardown closes recorded tabs and preserves unverifiable rescue state"
 }
 
+test_local_first_end_to_end_lands_locally_backs_up_then_tears_down
+test_local_first_remote_only_refuses
+test_local_first_backup_failure_is_loud_and_retryable
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1343,6 +1480,8 @@ test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
+test_direct_pr_origin_remote_allows
+test_direct_pr_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_partial_herdr_teardown_closes_recorded_tab_before_metadata

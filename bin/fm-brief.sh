@@ -41,8 +41,10 @@
 # For ship tasks, the definition of done is shaped by the project's delivery mode
 # (data/projects.md via fm-project-mode.sh; see AGENTS.md project management
 # and task lifecycle):
-#   direct-PR    implement -> focused tests/lint -> push + open PR via gh-axi (default)
+#   direct-PR    implement -> focused tests/lint -> push + open PR via gh-axi
 #   no-mistakes  implement -> /no-mistakes pipeline -> PR -> captain merge (explicit opt-in)
+#   local-first  implement on branch, stop and report ready; firstmate merges the
+#                local product first, then pushes its default branch as a backup
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                firstmate reviews, captain approves, firstmate merges to local main
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
@@ -433,10 +435,11 @@ echo "scaffolded: $BRIEF (gsd; replace {TASK})"
 exit 0
 fi
 
-# Ship task: shape Setup / Rule 1 / Definition of done by the project's delivery mode.
+# Ship task: shape Setup / Rule 1 / Definition of done by the project's explicit delivery mode.
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.
+MODE_LINE=$("$FM_ROOT/bin/fm-project-mode.sh" "$REPO") || exit $?
 read -r MODE _ <<EOF
-$("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
+$MODE_LINE
 EOF
 
 case "$MODE" in
@@ -464,6 +467,24 @@ After /no-mistakes reports CI green (the CI-ready return point - do not wait for
 EOF
 )
     ;;
+  local-first)
+    SETUP2=""
+    RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the local merge and backup push."
+    DOD=$(cat <<EOF
+# Definition of done
+This project ships **local-first** because its deliverable is the running local product, with GitHub as a backup of that local truth.
+Remote patches and task branches are not delivery.
+The task is delivered only after the local default branch carries the work and its resulting state has been pushed to origin as a backup.
+
+Your crewmate phase is complete when the implementation is committed on \`fm/$ID\`, tested, and ready for the guarded local merge.
+Do NOT push, open a PR, merge into the local default branch, or pull remote work down.
+Keep your branch a clean fast-forward onto the current local default branch.
+When ready, append \`done: ready for local-first merge fm/$ID\` to the status file and stop.
+Firstmate reviews the diff and obtains approval, then \`bin/fm-merge-local.sh $ID\` fast-forwards the local product first and pushes that local default branch to origin as its backup.
+A backup failure is a visible incomplete delivery, never a reason to sync remote changes down.
+EOF
+)
+    ;;
   local-only)
     SETUP2=""
     RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
@@ -477,7 +498,7 @@ Firstmate then reviews your branch diff, the captain approves, and firstmate mer
 EOF
 )
     ;;
-  *)  # direct-PR (default for omitted mode, unknown project, and explicit [direct-PR])
+  direct-PR)
     SETUP2=""
     RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
     DOD=$(cat <<EOF
@@ -488,6 +509,10 @@ When it is implemented and committed, run the project focused tests and lint (or
 Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
 )
+    ;;
+  *)
+    echo "error: unsupported delivery mode $MODE for $REPO" >&2
+    exit 2
     ;;
 esac
 

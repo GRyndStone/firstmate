@@ -24,7 +24,7 @@ On each explicit no-mistakes ship spawn:
 4. Snapshot the pin into meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into the worker pane only.
 5. Absent config keeps ambient PATH/`NM_HOME` for that opted-in task.
 6. Invalid or unhealthy configured generations fail closed with an actionable diagnostic and never fall back to the ambient install.
-7. `direct-PR`, `local-only`, scout, and secondmate spawns never resolve or inject generation routing.
+7. `direct-PR`, `local-first`, `local-only`, scout, and secondmate spawns never resolve or inject generation routing.
 
 A configuration change affects only future tasks.
 Live task metadata is never rewritten by a config edit, and no process is force-restarted to pick up a new generation.

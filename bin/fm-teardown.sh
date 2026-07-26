@@ -9,14 +9,27 @@
 # the teardown's own gone endpoint while the tombstone is fresh
 # (FM_TEARDOWN_TOMBSTONE_SECS) instead of waking on it as a crew death.
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
-# hard-resets/removes the worktree and kills its processes. Work has landed when it is
-# reachable from any remote-tracking branch (a fork counts as a remote, so
-# upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
-# squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
-# on a remote yet the change is fully in main.
+# hard-resets/removes the worktree and kills its processes.
+#
+# Landed proof is mode-specific:
+#   local-first  HEAD must be contained in the project's LOCAL default branch.
+#                Remote reachability, including a pushed task branch or merged
+#                PR, never substitutes for the running local product carrying
+#                the work. bin/fm-merge-local.sh performs that local
+#                fast-forward first and then pushes the local default branch to
+#                origin as a backup. The backup is additional delivery work and
+#                its push failure is loud, but it is not teardown's landing proof.
+#   existing PR modes and local-only
+#                Work is landed when reachable from any remote-tracking branch
+#                (a fork counts), OR - for a normal ship task whose commits are
+#                not so reachable - when its PR is merged and GitHub reports a
+#                PR head that contains the current local work, or its content is
+#                already present in the up-to-date default branch. local-only
+#                additionally accepts work merged into the local default branch
+#                when there is no remote proof.
+# The existing-mode fallback recognizes the common squash-merge-then-delete-
+# branch flow, where the branch's own commits live nowhere on a remote yet the
+# change is fully in main.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
@@ -26,9 +39,6 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
-# local-only projects additionally accept work merged into the local default
-# branch (firstmate performs that merge on the captain's approval) as a fallback
-# for the common case where there is no remote at all.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product - teardown proceeds once the report exists, and refuses without it.
@@ -390,16 +400,18 @@ backlog_refresh_reminder() {
         done_cmd="tasks-axi done $ID --report $report_path"
         ;;
       *)
-        if [ "$MODE" = local-only ]; then
-          done_cmd="tasks-axi done $ID --note \"local main\""
-        else
-          pr=$PR_URL
-          if [ -n "$pr" ]; then
-            done_cmd="tasks-axi done $ID --pr $pr"
-          else
-            done_cmd="tasks-axi done $ID --pr PR_URL"
-          fi
-        fi
+        case "$MODE" in
+          local-first) done_cmd="tasks-axi done $ID --note \"local main; backup pushed to origin\"" ;;
+          local-only) done_cmd="tasks-axi done $ID --note \"local main\"" ;;
+          *)
+            pr=$PR_URL
+            if [ -n "$pr" ]; then
+              done_cmd="tasks-axi done $ID --pr $pr"
+            else
+              done_cmd="tasks-axi done $ID --pr PR_URL"
+            fi
+            ;;
+        esac
         ;;
     esac
     printf '%s\n' "Backlog: $ID just finished. Run $done_cmd, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
@@ -653,7 +665,25 @@ validate_worktree_teardown_safety() {
   fi
   unpushed=$(printf '%s\n' "$unpushed_raw" | head -5)
 
-  if [ -n "$unpushed" ] && [ "$MODE" = local-only ]; then
+  if [ "$MODE" = local-first ]; then
+    DEFAULT=$(default_branch) || { echo "REFUSED: cannot determine local default branch for $PROJ; expected origin/HEAD, main, or master." >&2; return 1; }
+    if ! unmerged_raw=$(git -C "$WT" log --oneline HEAD --not "$DEFAULT" -- 2>/dev/null); then
+      if worktree_safety_blocked_by_lock "commits not on local $DEFAULT"; then
+        return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
+      fi
+      echo "REFUSED: cannot inspect worktree $WT for commits not on local $DEFAULT." >&2
+      echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    unmerged=$(printf '%s\n' "$unmerged_raw" | head -5)
+    if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
+      echo "REFUSED: local-first worktree $WT has work not yet present in the local product on $DEFAULT." >&2
+      [ -n "$dirty" ] && echo "uncommitted changes present" >&2
+      [ -n "$unmerged" ] && printf 'commits not yet on local %s:\n%s\n' "$DEFAULT" "$unmerged" >&2
+      echo "A remote branch or PR is not landing proof for local-first. Run bin/fm-merge-local.sh $ID after approval so it merges locally first and pushes the backup, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+  elif [ -n "$unpushed" ] && [ "$MODE" = local-only ]; then
     DEFAULT=$(default_branch) || { echo "REFUSED: cannot determine default branch for $PROJ; expected origin/HEAD, main, or master." >&2; return 1; }
     if ! unmerged_raw=$(git -C "$WT" log --oneline HEAD --not "$DEFAULT" -- 2>/dev/null); then
       if worktree_safety_blocked_by_lock "commits not on $DEFAULT"; then
@@ -1229,7 +1259,8 @@ if [ "$remove_rc" -eq 3 ]; then
   exit 1
 fi
 [ "$remove_rc" -eq 0 ] || exit "$remove_rc"
-if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
+if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+  && [ "$MODE" != local-first ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
