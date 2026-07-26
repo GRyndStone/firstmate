@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavior tests for Grok-harness hook authentication, teardown cleanup, and session-lock holder detection.
+# Behavior tests for Grok/Antigravity harness hooks, detection, and session-lock holder detection.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -173,6 +173,60 @@ SH
   pass "fm-lock recognizes grok harness processes"
 }
 
+test_fm_harness_detects_agy_env_and_process() {
+  local fakebin out
+  out=$(ANTIGRAVITY_AGENT=1 "$ROOT/bin/fm-harness.sh")
+  [ "$out" = agy ] || fail "ANTIGRAVITY_AGENT=1 should detect agy, got: $out"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/agy-detect-fake")
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"comm="*) printf '%s\n' '/Users/cal/.local/bin/agy'; exit 0 ;;
+  *"args="*) printf '%s\n' 'agy --prompt-interactive brief'; exit 0 ;;
+  *"ppid="*) printf '%s\n' '1'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  out=$(PATH="$fakebin:$PATH" "$ROOT/bin/fm-harness.sh")
+  [ "$out" = agy ] || fail "agy process ancestry should detect agy, got: $out"
+  pass "fm-harness detects agy through the live env marker and process ancestry"
+}
+
+test_fm_lock_recognizes_agy_holder() {
+  local home fakebin out
+  home="$TMP_ROOT/lock-agy-home"
+  fakebin=$(fm_fakebin "$TMP_ROOT/lock-agy-fake")
+  mkdir -p "$home/state"
+  printf '%s\n' "$$" > "$home/state/.lock"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"comm="*) printf '%s\n' '/Users/cal/.local/bin/agy'; exit 0 ;;
+  *"args="*) printf '%s\n' 'agy --prompt-interactive brief'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  out=$(FM_HOME="$home" PATH="$fakebin:$PATH" "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "lock: held by live harness pid" "fm-lock did not recognize agy as a live holder"
+  pass "fm-lock recognizes agy harness processes"
+}
+
+test_busy_regex_recognizes_agy_cancel_footer() {
+  # shellcheck source=bin/fm-tmux-lib.sh
+  . "$ROOT/bin/fm-tmux-lib.sh"
+  printf '%s\n' 'esc to cancel' | grep -qiE "$FM_TMUX_BUSY_REGEX_DEFAULT" \
+    || fail "tmux busy regex must match agy's mid-turn footer"
+  grep -F "esc to cancel" "$ROOT/bin/fm-watch.sh" >/dev/null \
+    || fail "watcher busy regex must include agy's mid-turn footer"
+  pass "busy regex recognizes agy's esc-to-cancel footer"
+}
+
 test_grok_hook_requires_registered_token
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder
+test_fm_harness_detects_agy_env_and_process
+test_fm_lock_recognizes_agy_holder
+test_busy_regex_recognizes_agy_cancel_footer

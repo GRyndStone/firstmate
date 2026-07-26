@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, and grok.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, grok, and agy.
 user-invocable: false
 metadata:
   internal: true
@@ -52,7 +52,7 @@ Use that value for interrupt, exit, resume, and skill-invocation facts.
 
 Every verified primary harness has an empirically validated hook path for the "no turn ends blind" guard.
 `claude` and `codex` block directly through Stop hooks that preserve exit status 2 and stderr from `bin/fm-turnend-guard.sh`.
-`opencode`, `pi`, and `grok` expose passive lifecycle callbacks for this purpose, so their tracked primary adapters force one bounded follow-up or resume when the shared predicate blocks.
+`opencode`, `pi`, and `grok` expose passive lifecycle callbacks for this purpose, so their tracked primary adapters force one bounded follow-up or resume when the shared predicate blocks. `agy` has only crewmate turn-end verification; do not run primary supervision on agy until its primary watcher/guard path is separately validated.
 The exact hook files, commands, validation transcripts, scoping rules, and fail-open tradeoffs are owned by `docs/turnend-guard.md`.
 When changing any primary turn-end hook, validate the real harness behavior in a scratch project or throwaway home before trusting it, then update that doc and the relevant concise fact below.
 
@@ -87,6 +87,7 @@ The supported launch-profile flags below were verified locally on 2026-06-30 wit
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high\|xhigh>` | Verified on grok 0.2.73. `--effort` parses too, but firstmate's profile axis is reasoning effort. `--reasoning-effort max` is rejected, so `max` is omitted. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on pi 0.80.2. `max` prints an invalid-thinking warning, so firstmate omits Pi effort when the requested effort is `max`. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
+| agy | `--model <model>` | `--effort <low\|medium\|high>` only when the model token does not already end in `-low`, `-medium`, or `-high` | Verified on agy 1.1.7. `agy models` lists baked-effort model ids, and the baked effort suffix wins when both `--model` and `--effort` are supplied. The captain-selected profile is `gemini-3.1-pro-high`; live agy 1.1.7 accepts that token but currently opens Gemini 3.6 Flash High, while `gemini-3.1-pro-low` opens Gemini 3.1 Pro Low. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
@@ -101,6 +102,7 @@ Natural language is acceptable if uncertain.
 - opencode: no separate verified skill invocation beyond normal slash-command behavior; use natural language if the exact skill command is uncertain.
 - pi: no separate verified skill invocation beyond normal command behavior; use natural language if the exact skill command is uncertain.
 - grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Verified end to end: grok discovers the user-level `no-mistakes` skill, `/no-mistakes` invokes it, and grok drives a real `no-mistakes axi run`. Like codex's `$`/`/` popups, typing `/<skill>` opens grok's slash-autocomplete, so a too-fast Enter selects the popup entry instead of sending, and for an argument-taking command (like `/no-mistakes`'s optional task-first argument) that first Enter only expands the popup selection into an argument-hint placeholder rather than submitting - a genuine second Enter is required (see the grok section below for the 2026-07-03 incident and fix). `fm_tmux_submit_core`'s retried Enter (used by `fm-send` on the tmux backend) already handles this correctly by reading the cursor row; the herdr backend needed a dedicated fix (`fm_backend_herdr_composer_state`, docs/herdr-backend.md) because its prior delta-based verification false-positived on that same popup-close content change.
+- agy: no separate verified skill invocation beyond normal prompt text; use natural language if the exact skill command is uncertain.
 
 ## claude (VERIFIED)
 
@@ -265,3 +267,33 @@ The adapter therefore runs the shared predicate and, when it returns 2, forces o
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.
+
+## agy (VERIFIED 2026-07-26, agy 1.1.7)
+
+Google Antigravity CLI (`agy`).
+Launch with an interactive prompt: `agy --dangerously-skip-permissions --prompt-interactive "$(cat <brief>)"`.
+
+| Fact | Value |
+|---|---|
+| Busy-pane signature | `esc to cancel` in the footer while a command/model turn is running; the spinner line may also show `Running...`. Idle footer shows `? for shortcuts`. |
+| Exit command | `/quit`, verified live. The CLI prints a resumable command using `agy --conversation=<conversation-id>`. |
+| Interrupt | single Escape. Verified while a `sleep 60` command was running; the pane printed `Interrupted` and returned to the prompt. |
+| Autonomy | `--dangerously-skip-permissions`, verified to run shell commands and file edits unattended after the workspace trust dialog was accepted. |
+| Env marker | `ANTIGRAVITY_AGENT=1`, observed inside an agy tool subprocess. |
+| Resume | `agy --conversation=<conversation-id>` or `-c` / `--continue`; the exact conversation id is printed by `/quit`. |
+
+Startup trust dialog: first launch in a workspace asks "Do you trust the contents of this project?" with "Yes, I trust this folder" selected by default. Accept with Enter, then verify the brief starts processing.
+
+Workdir quirk: agy can display the requested project as the workspace while initial shell tools run in `~/.gemini/antigravity-cli/scratch`. Supervised briefs and steers that need repository mutation should name the absolute worktree path or run `cd <worktree>` inside shell commands. The live smoke task completed only after a follow-up used the absolute worktree path and created the proof file in that tree.
+
+Turn-end hook: agy discovers workspace customizations under `.agents/`. A named `.agents/hooks.json` Stop hook with the flat Antigravity schema fired reliably in a trusted live worktree and touched the task turn-end marker after each completed turn. `fm-spawn` writes exactly one firstmate-owned `.agents/hooks.json` per agy worktree and refuses to replace an existing project-owned hook file; `fm-teardown` removes the file before returning the worktree.
+
+Model catalog and quota-accounting policy: `agy models` listed Gemini Flash tokens through 3.6, Pro only as `gemini-3.1-pro-high` and `gemini-3.1-pro-low`, plus `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, and `gpt-oss-120b-medium`. Do not route the Claude or GPT tokens through antigravity: that would spend Google quota on model families already metered under the Claude/Codex providers and corrupt firstmate's usage-burndown accounting.
+
+Model/effort behavior, verified live:
+
+- `--model gemini-3.6-flash-low` opens Gemini 3.6 Flash Low.
+- `--effort low` opens Gemini 3.6 Flash Low.
+- `--model gemini-3.6-flash-high --effort low` opens Gemini 3.6 Flash High, so the baked model suffix wins.
+- `--model gemini-3.1-pro-low` and `--model gemini-3.1-pro --effort low` open Gemini 3.1 Pro Low.
+- `--model gemini-3.1-pro-high`, `--model=gemini-3.1-pro-high`, and `--model gemini-3.1-pro --effort high` all resolve through the CLI but open Gemini 3.6 Flash High in agy 1.1.7. Record the captain's requested `gemini-3.1-pro-high` profile, but treat live launch verification as the authority on what agy actually selected.

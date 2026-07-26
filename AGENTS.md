@@ -195,7 +195,7 @@ If the captain expresses a standing dispatch preference such as "use grok for ne
 Crewmates default to the same harness you are running on.
 The captain may override the static default at any time, typically at bootstrap: record the choice in `config/crew-harness` (a single adapter name; absent or `default` means mirror your own harness).
 Resolve `default` with `bin/fm-harness.sh`; resolve the active static crewmate harness with `bin/fm-harness.sh crew`.
-Verified adapter names are `claude`, `codex`, `opencode`, `pi`, and `grok`.
+Verified adapter names are `claude`, `codex`, `opencode`, `pi`, `grok`, and `agy`.
 
 ### Crew dispatch profiles
 
@@ -433,7 +433,7 @@ Load `harness-adapters` before spawning or recovering any direct report so trust
 
 ```sh
 bin/fm-spawn.sh <id> projects/<repo>             # self-routes through the configured default candidate set when crew-dispatch.json is active
-bin/fm-spawn.sh <id> projects/<repo> --provider codex --harness codex --model gpt-5.5 --effort high --override-reason "captain requested Codex"   # explicit auditable override
+bin/fm-spawn.sh <id> projects/<repo> --provider codex --harness codex --model gpt-5.6-sol --effort xhigh --override-reason "captain requested Codex"   # explicit auditable override
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|orca|cmux>   # explicit runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
 bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch or recover a persistent secondmate in its home
