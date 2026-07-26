@@ -214,7 +214,7 @@ When the dispatch file is absent, `fm-spawn.sh` keeps resolving the crewmate har
 Secondmate launches are exempt because they resolve through `fm-harness.sh secondmate`, not the crewmate dispatch-profile rules.
 
 Routine multi-candidate routing is the usage-burndown engine owned by `bin/fm-dispatch-select.sh` with `bin/fm-usage-burndown-lib.sh` and `bin/fm-usage-source-lib.sh`; full policy, adapters, and recipe are in `docs/usage-burndown-dispatch.md`.
-Missing or unusable usage evidence stays observable and cannot prove freeze or rate exhaustion; routine routing launches the deterministic first default with `quota_posture=unknown`.
+Unreadable metered usage evidence is a loud error (`dispatch_error=usage-evidence-unreadable`, exit 70 when no live candidate remains); firstmate never silently picks a provider when the engine cannot read the numbers.
 
 Precedence, highest first:
 

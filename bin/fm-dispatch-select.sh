@@ -28,10 +28,18 @@
 #     budget remaining reaches FM_BURNDOWN_SPEND_FLOOR (default 5%). An
 #     exhausted rate gate or a frozen explicit pin exits 75 without substitution.
 #   - Stale-but-current general-window numbers remain usable under adapter rules
-#     (refreshedAt/resetsAt prove the window is still current).
-#   - Recognized providers with missing, failed, or unusable usage evidence stay
-#     observable on stderr but cannot prove freeze. Admission retains the selected
-#     profile with provider_recognition=recognized and quota_posture=unknown.
+#     (refreshedAt/resetsAt prove the window is still current). Stale status is
+#     always logged on stderr so cached-vs-live cannot pass unnoticed.
+#   - A metered provider whose usage cannot be read is an ERROR, not silent
+#     degradation: stderr names the provider and reason with an "error:" line,
+#     the profile carries dispatch_error=usage-evidence-unreadable, and when no
+#     live scorable candidate remains the selector exits 70. When other live
+#     candidates exist, routing continues to the engine winner but still emits
+#     the error fields so the decision cannot be mistaken for clean success.
+#     Unmetered recognized providers may still report honest unknown evidence.
+#   - Missing quota-axi, unparseable meter JSON, and total meter failure refuse
+#     with the same usage-evidence-unreadable contract (exit 70), never a silent
+#     first-profile retain.
 #   - Unrecognized provider tokens emit a machine-distinct error profile with
 #     provider_recognition=unrecognized and dispatch_error=unrecognized-provider,
 #     name the bad token and recognized set on stderr, and exit 64.
@@ -42,15 +50,18 @@
 #     Freeze pauses that pinned provider; once it clears, the same pin is output.
 #   - Captain per-task instructions outrank the engine: when firstmate passes a
 #     single explicit pin (admit without multi-select), the pin is admitted in
-#     place and dispatch_explain records that path.
+#     place and dispatch_explain records that path. Bypass of the engine without
+#     an explicit override is refused by fm-spawn.sh, not this selector.
 #
-# usage-burndown and --admit use quota-axi --json unless --quota-json supplies
-# a fixture. FM_DISPATCH_QUOTA_AXI overrides the quota command.
-# FM_DISPATCH_NOW_EPOCH overrides the clock for frozen fixtures.
-# FM_BURNDOWN_PRESSURE_K overrides the expiry-pressure coefficient (default 4).
-# FM_BURNDOWN_SPEND_FLOOR overrides the budget remaining floor (default 5).
-# FM_BURNDOWN_RATE_FLOOR overrides the gate exhaustion boundary (default 0).
-# FM_USAGE_BURN_HISTORY overrides the burn-sample history path.
+# usage-burndown and --admit fetch live usage via
+# fm_usage_source_fetch_quota_json (quota-axi --allow-keychain-prompt --json)
+# unless --quota-json supplies a fixture. FM_DISPATCH_QUOTA_AXI overrides the
+# quota command. The keychain flag is always passed so macOS Claude reads succeed;
+# on non-macOS it is a no-op. FM_DISPATCH_NOW_EPOCH overrides the clock for frozen
+# fixtures. FM_BURNDOWN_PRESSURE_K overrides the expiry-pressure coefficient
+# (default 4). FM_BURNDOWN_SPEND_FLOOR overrides the budget remaining floor
+# (default 5). FM_BURNDOWN_RATE_FLOOR overrides the gate exhaustion boundary
+# (default 0). FM_USAGE_BURN_HISTORY overrides the burn-sample history path.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -269,9 +280,14 @@ if [ "$(printf '%s\n' "$unrecognized_providers_json" | jq 'length')" -gt 0 ]; th
   exit 64
 fi
 
-quota_unavailable() {
-  log "$1; retaining selected provider with quota posture unknown"
-  printf '%s\n' "$profiles_json" | jq -c '
+# Emit a machine-distinct usage-evidence error profile and exit 70.
+# $1 = short reason for stderr; optional $2 = compact JSON array of unreadable provider names.
+usage_evidence_error() {
+  local reason=$1 unreadable_json=${2:-[]}
+  log "error: $reason"
+  printf '%s\n' "$profiles_json" | jq -c \
+    --arg reason "$reason" \
+    --argjson unreadable "$unreadable_json" '
     def clean($p):
       {provider: ($p.provider // $p.harness), harness: $p.harness}
       + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
@@ -309,30 +325,37 @@ quota_unavailable() {
         provider_recognition:"recognized",
         quota_posture:"unknown",
         dispatch_strategy:"usage-burndown",
-        dispatch_explain:"usage evidence unavailable; retained first profile",
+        dispatch_explain:("usage evidence unreadable: " + $reason),
+        dispatch_error:"usage-evidence-unreadable",
+        unreadable_providers:$unreadable,
         dispatch_candidates:$rows,
         dispatch_selected_index:0,
         dispatch_tie_break:"profile-order",
         dispatch_order:"score-desc,S-desc,R-desc,T-asc,index-asc"
       }
   '
-  exit 0
+  exit 70
 }
 
 if [ -n "$QUOTA_JSON_FILE" ]; then
-  quota_json=$(cat "$QUOTA_JSON_FILE" 2>/dev/null) || quota_unavailable "cannot read quota JSON"
+  quota_json=$(cat "$QUOTA_JSON_FILE" 2>/dev/null) \
+    || usage_evidence_error "cannot read quota JSON file '$QUOTA_JSON_FILE'"
 else
   quota_cmd=${FM_DISPATCH_QUOTA_AXI:-quota-axi}
-  command -v "$quota_cmd" >/dev/null 2>&1 || quota_unavailable "quota-axi missing"
-  quota_json=$("$quota_cmd" --json 2>/dev/null)
-  quota_status=$?
-  [ "$quota_status" -eq 0 ] || quota_unavailable "quota-axi exited $quota_status"
+  quota_status=0
+  quota_json=$(fm_usage_source_fetch_quota_json "$quota_cmd" 2>/dev/null) || quota_status=$?
+  if [ "$quota_status" -eq 127 ]; then
+    usage_evidence_error "quota-axi missing; install quota-axi before usage-burndown dispatch"
+  fi
+  [ "$quota_status" -eq 0 ] \
+    || usage_evidence_error "quota-axi exited $quota_status while reading live usage"
 fi
 
 printf '%s\n' "$quota_json" | jq -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1 \
-  || quota_unavailable "quota-axi returned unparseable JSON"
+  || usage_evidence_error "quota-axi returned unparseable JSON (expected object with providers array)"
 
-# Surface non-fresh provider diagnostics for profile providers (observable).
+# Surface non-fresh provider diagnostics for profile providers (operator-visible).
+# Stale cached snapshots are always named so they cannot be treated as silent live data.
 quota_notices=$(printf '%s\n' "$quota_json" | jq -r \
   --argjson profiles "$profiles_json" '
   def one_line: tostring | gsub("[\\r\\n\\t]+"; " ");
@@ -341,8 +364,9 @@ quota_notices=$(printf '%s\n' "$quota_json" | jq -r \
   | select(.provider as $provider | $profile_providers | index($provider))
   | (.state.status? // "unknown") as $status
   | select($status != "fresh")
-  | "provider '\''\(.provider)'\'' quota status is \($status)"
-    + (if $status == "stale" then "; cached snapshot refreshed at \(.state.refreshedAt // "unknown" | one_line)" else "" end)
+  | (if $status == "stale" then "warning: " else "error: " end)
+    + "provider '\''\(.provider)'\'' quota status is \($status)"
+    + (if $status == "stale" then "; reading cached snapshot refreshed at \(.state.refreshedAt // "unknown" | one_line), not a live refresh" else "" end)
     + (if (.state.error? | type) == "string" then "; refresh error: \(.state.error | one_line)" else "" end)
     + (if (.state.reason? | type) == "string" then "; reason: \(.state.reason | one_line)" else "" end)
     + (if (.state.remedyCommand? | type) == "string" then "; remedy: \(.state.remedyCommand | one_line)" else "" end)
@@ -352,13 +376,35 @@ while IFS= read -r quota_notice; do
 done <<< "$quota_notices"
 
 observations=$(fm_usage_source_observe_profiles "$profiles_json" "$quota_json" "$NOW_EPOCH") \
-  || quota_unavailable "usage source adapters failed"
+  || usage_evidence_error "usage source adapters failed while observing providers"
 
 scored=$(fm_usage_burndown_score_all "$observations") \
-  || quota_unavailable "usage burndown scoring failed"
+  || usage_evidence_error "usage burndown scoring failed"
 
 selection=$(fm_usage_burndown_select "$profiles_json" "$scored" "$mode") \
-  || quota_unavailable "usage burndown selection failed"
+  || usage_evidence_error "usage burndown selection failed"
+
+# Metered providers with evidence=unknown are read failures (not honest unmetered).
+# Collect names and surface one explicit error line per provider with reason text.
+unreadable_providers_json='[]'
+while IFS= read -r obs_line; do
+  [ -n "$obs_line" ] || continue
+  obs_provider=$(printf '%s\n' "$obs_line" | jq -r '.provider // empty')
+  obs_evidence=$(printf '%s\n' "$obs_line" | jq -r '.evidence // "unknown"')
+  [ -n "$obs_provider" ] || continue
+  [ "$obs_evidence" = unknown ] || continue
+  fm_usage_source_provider_is_metered "$obs_provider" || continue
+  obs_reason=$(printf '%s\n' "$obs_line" | jq -r '
+    def one_line: tostring | gsub("[\\r\\n\\t]+"; " ");
+    ((.diagnostics // []) | map(one_line) | join("; ")) as $diag
+    | if ($diag | length) > 0 then $diag else "no usable usage evidence" end
+  ')
+  log "error: unreadable usage evidence for provider '$obs_provider': $obs_reason"
+  unreadable_providers_json=$(jq -cn \
+    --argjson acc "$unreadable_providers_json" \
+    --arg p "$obs_provider" \
+    '$acc + [$p] | unique')
+done < <(printf '%s\n' "$observations" | jq -c '.[]')
 
 # Inspectable explanation on stderr.
 while IFS= read -r explain_line; do
@@ -378,8 +424,50 @@ if [ "$(printf '%s\n' "$selection" | jq -r '.frozen')" = true ]; then
   exit 75
 fi
 
+unreadable_count=$(printf '%s\n' "$unreadable_providers_json" | jq 'length')
+selection_unavailable=$(printf '%s\n' "$selection" | jq -r '.unavailable // false')
+chosen_scorable=$(printf '%s\n' "$selection" | jq -r '
+  (.candidates // []) as $cands
+  | (.profile.dispatch_selected_index // 0) as $idx
+  | ([$cands[] | select(.index == $idx)][0].scorable // false)
+')
+
+# No live scorable winner while a metered provider failed to read: refuse.
+# Partial failure with a live winner continues below with dispatch_error attached.
+if [ "$unreadable_count" -gt 0 ] && { [ "$selection_unavailable" = true ] || [ "$chosen_scorable" != true ]; }; then
+  unreadable_csv=$(printf '%s\n' "$unreadable_providers_json" | jq -r 'join(", ")')
+  usage_evidence_error \
+    "metered provider usage unreadable for: $unreadable_csv; refusing dispatch without live evidence" \
+    "$unreadable_providers_json"
+fi
+
 # Record burn sample so B adapts after every scored dispatch with evidence.
 fm_usage_burndown_record_choice "$selection" "$NOW_EPOCH"
 
-# Emit profile (unavailable still prints retained profile with unknown posture).
-printf '%s\n' "$selection" | jq -c '.profile + {provider_recognition:"recognized"}'
+# Emit profile. Partial unreadable metered providers keep the live winner but
+# attach dispatch_error so the decision is not a clean silent success.
+if [ "$unreadable_count" -gt 0 ]; then
+  unreadable_csv=$(printf '%s\n' "$unreadable_providers_json" | jq -r 'join(", ")')
+  log "error: routing with partial unreadable usage evidence for: $unreadable_csv; live candidates still scored"
+  printf '%s\n' "$selection" | jq -c \
+    --argjson unreadable "$unreadable_providers_json" \
+    --arg csv "$unreadable_csv" '
+    .profile as $p
+    | $p + {
+        provider_recognition:"recognized",
+        dispatch_error:"usage-evidence-unreadable",
+        unreadable_providers:$unreadable,
+        dispatch_explain:(
+          (
+            if ($p.dispatch_explain | type) == "string" and ($p.dispatch_explain | length) > 0
+            then $p.dispatch_explain
+            else "usage-burndown"
+            end
+          )
+          + "; ERROR unreadable metered providers: " + $csv
+        )
+      }
+  '
+else
+  printf '%s\n' "$selection" | jq -c '.profile + {provider_recognition:"recognized"}'
+fi

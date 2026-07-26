@@ -593,6 +593,8 @@ DISPATCH_CANDIDATES_JSON=
 DISPATCH_SELECTED_INDEX=
 DISPATCH_TIE_BREAK=
 DISPATCH_ORDER=
+DISPATCH_ERROR=
+UNREADABLE_PROVIDERS_JSON=
 
 spawn_meta_value() {
   sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
@@ -909,6 +911,13 @@ if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
   DISPATCH_SELECTED_INDEX=$(jq -r '.dispatch_selected_index // 0' <<< "$admission_json") || exit 1
   DISPATCH_TIE_BREAK=$(jq -r '.dispatch_tie_break // "profile-order"' <<< "$admission_json") || exit 1
   DISPATCH_ORDER=$(jq -r '.dispatch_order // "score-desc,S-desc,R-desc,T-asc,index-asc"' <<< "$admission_json") || exit 1
+  DISPATCH_ERROR=$(jq -r '.dispatch_error // ""' <<< "$admission_json") || exit 1
+  UNREADABLE_PROVIDERS_JSON=$(jq -c '.unreadable_providers // []' <<< "$admission_json") || exit 1
+  # Partial unreadable metered evidence still routes to a live winner but must
+  # never look like a clean algorithm success in task metadata or spawn logs.
+  if [ -n "$DISPATCH_ERROR" ]; then
+    echo "error: dispatch recorded dispatch_error=$DISPATCH_ERROR unreadable_providers=$UNREADABLE_PROVIDERS_JSON" >&2
+  fi
 fi
 
 secondmate_registry_value() {
@@ -1716,6 +1725,10 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
     echo "dispatch_selected_index=$DISPATCH_SELECTED_INDEX"
     echo "dispatch_tie_break=$DISPATCH_TIE_BREAK"
     echo "dispatch_order=$DISPATCH_ORDER"
+    [ -z "${DISPATCH_ERROR:-}" ] || echo "dispatch_error=$DISPATCH_ERROR"
+    if [ -n "${UNREADABLE_PROVIDERS_JSON:-}" ] && [ "$UNREADABLE_PROVIDERS_JSON" != "[]" ]; then
+      echo "unreadable_providers_json=$UNREADABLE_PROVIDERS_JSON"
+    fi
   fi
   # Finite-workflow budget fields (bin/fm-workflow-bound.sh). Secondmates are
   # persistent supervisors and do not carry a child budget pin.

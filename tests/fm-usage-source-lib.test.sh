@@ -215,6 +215,60 @@ test_absent_provider_unknown() {
   pass "provider absent from quota evidence is unknown, not fabricated"
 }
 
+test_offset_and_fractional_timestamps_parse() {
+  local quota obs
+  # Live quota-axi emits fractional seconds and +00:00; fromdateiso8601 needs Z.
+  quota="$TMP_ROOT/offset-ts.json"
+  cat > "$quota" <<JSON
+{
+  "providers": [
+    {
+      "provider": "claude",
+      "state": {
+        "status": "fresh",
+        "refreshedAt": "$(iso_at_epoch $((TEST_NOW - 60)) | sed 's/Z$/.383+00:00/')"
+      },
+      "windows": [
+        {
+          "id": "five_hour",
+          "kind": "session",
+          "percentRemaining": 81,
+          "resetsAt": "$(iso_at_epoch $((TEST_NOW + 3600)) | sed 's/Z$/.332186+00:00/')",
+          "windowSeconds": 18000
+        },
+        {
+          "id": "seven_day",
+          "kind": "weekly",
+          "percentRemaining": 67,
+          "resetsAt": "$(iso_at_epoch $((TEST_NOW + 500000)) | sed 's/Z$/.332205+00:00/')",
+          "windowSeconds": 604800
+        }
+      ]
+    }
+  ]
+}
+JSON
+  obs=$(fm_usage_source_observe claude "$(cat "$quota")" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .binding.id == "seven_day"
+    and .binding.remaining == 67
+    and (.binding.T | type) == "number"
+    and .binding.T > 0
+  ' <<< "$obs" >/dev/null || fail "offset/fractional timestamps did not score as fresh: $obs"
+  pass "fractional-second +00:00 timestamps parse into scorable Claude windows"
+}
+
+test_metered_predicate() {
+  fm_usage_source_provider_is_metered claude || fail "claude must be metered"
+  fm_usage_source_provider_is_metered codex || fail "codex must be metered"
+  fm_usage_source_provider_is_metered grok || fail "grok must be metered"
+  if fm_usage_source_provider_is_metered gemini; then
+    fail "gemini must not be treated as metered"
+  fi
+  pass "metered predicate separates quota-axi providers from unmetered stubs"
+}
+
 test_observe_profiles_dedupes() {
   local quota out
   quota="$TMP_ROOT/quota.json"
@@ -233,6 +287,8 @@ test_missing_window_period_is_not_fabricated
 test_unconfigured_role_fallback_is_bounded
 test_stubs_degrade_unknown
 test_absent_provider_unknown
+test_offset_and_fractional_timestamps_parse
+test_metered_predicate
 test_observe_profiles_dedupes
 
 echo "# all fm-usage-source-lib tests passed"
