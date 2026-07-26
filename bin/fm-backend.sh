@@ -58,8 +58,8 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # bin/backends/<name>.sh and empirical verification, mirroring AGENTS.md
 # section 4's harness-verification discipline. herdr is EXPERIMENTAL (P2;
 # data/fm-backend-design-d7/herdr-addendum.md) - verified against the real
-# v0.7.1/protocol-14 binary (data/fm-backend-design-d7/herdr-verification-p2.md)
-# but newer than tmux's long-proven default path. zellij is EXPERIMENTAL (P3;
+# v0.7.5/protocol-17 binary (docs/herdr-backend.md) but newer than tmux's
+# long-proven default path. zellij is EXPERIMENTAL (P3;
 # data/fm-backend-design-d7/report.md "Zellij Backend") - verified against the
 # real 0.44.0 binary (docs/zellij-backend.md). orca is EXPERIMENTAL and
 # spawn-capable; unlike tmux/herdr/zellij it is also the worktree provider.
@@ -912,25 +912,20 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   esac
 }
 
-# fm_backend_target_exists: cheap, READ-ONLY existence check - does the
-# recorded TARGET endpoint still exist on BACKEND? Never starts a server or
-# session: for herdr this deliberately queries the pane directly instead of
-# going through fm_backend_herdr_target_ready (which auto-starts the herdr
-# server as a side effect via fm_backend_herdr_server_ensure - fine for an
-# operation that is about to use the pane, wrong for a passive liveness
-# probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose. The tmux arm matches the target
+# fm_backend_target_exists: Boolean compatibility predicate for callers that
+# only authorize an operation on a positively alive target. Death-sensitive
+# callers MUST use fm_backend_target_state below because herdr distinguishes a
+# confirmed `pane_not_found` from an unreadable observation. Never starts a
+# server or session. The tmux arm matches the target
 # against the server's own window/pane inventory instead of probing tmux's
 # lenient target resolution, which reads a killed window as alive while its
 # session survives (fm_backend_tmux_target_exists, bin/backends/tmux.sh).
 # Same role as fm-crew-state.sh's pane_readable check (whose tmux arm keeps
 # the lenient read - its authoritative run-step path does not ride on it);
-# exists here as one shared primitive so callers that only need a fast
-# alive/dead read (recovery digests, the session-start fleet digest) do not
-# re-derive it inline.
+# exists here as one shared positive-alive predicate so operation-authorizing
+# callers do not re-derive it inline.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane
+  local backend=$1 target=$2 expected_label=${3:-}
   case "$backend" in
     tmux)
       fm_backend_source tmux || return 1
@@ -938,18 +933,7 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
       ;;
     herdr)
       fm_backend_source herdr || return 1
-      session=${target%%:*}
-      pane=${target#*:}
-      [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
-      # fm_backend_herdr_cli (not a raw HERDR_SESSION-only call): verified
-      # empirically (docs/herdr-backend.md "Session targeting") that the bare
-      # env var alone is NOT reliably honored once another herdr server is
-      # already bound on the machine - it silently queries whatever server IS
-      # running instead. fm_backend_herdr_cli appends the required --session
-      # flag on top, so this check is correctly scoped even when the caller's
-      # own ambient session (e.g. the primary firstmate's default session) is
-      # a DIFFERENT one than the target's.
-      fm_backend_herdr_cli "$session" pane get "$pane" >/dev/null 2>&1
+      [ "$(fm_backend_herdr_target_state "$target")" = alive ]
       ;;
     zellij)
       fm_backend_source zellij || return 1
@@ -967,6 +951,30 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
       return 1
       ;;
   esac
+}
+
+# fm_backend_target_state: cheap, READ-ONLY endpoint observation. Prints:
+#   alive   - the endpoint is positively present.
+#   dead    - the backend positively proved the endpoint is absent.
+#   unknown - the observation was unreadable, malformed, or unsupported.
+#
+# Herdr owns a true tri-state classifier because its routine client/server
+# protocol skew is observational failure, not death proof. Other backends keep
+# their established Boolean classifiers until equivalent error taxonomies are
+# independently verified.
+fm_backend_target_state() {  # <backend> <target> [expected-label]
+  local backend=$1
+  shift
+  if [ "$backend" = herdr ]; then
+    fm_backend_source herdr || { printf 'unknown'; return 0; }
+    fm_backend_herdr_target_state "$1"
+    return 0
+  fi
+  if fm_backend_target_exists "$backend" "$@"; then
+    printf 'alive'
+  else
+    printf 'dead'
+  fi
 }
 
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS

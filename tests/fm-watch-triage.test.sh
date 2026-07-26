@@ -1640,6 +1640,24 @@ test_gone_endpoint_without_meta_absorbed() {
   pass "a gone endpoint whose meta is already removed (teardown race) is absorbed, not surfaced"
 }
 
+test_unreadable_herdr_endpoint_is_never_classified_dead() {
+  local dir state window key
+  dir=$(make_case herdr-endpoint-unreadable); state="$dir/state"
+  window="fmtest:w1:p2"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  write_window_meta "$state/herdr-unreadable.meta" "$window" ship herdr
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_backend_target_state() { printf unknown; }
+    handle_gone_endpoint "fmtest:w1:p2"
+  ' _ "$WATCH" || fail "handle_gone_endpoint errored for an unreadable herdr observation"
+  [ ! -s "$state/.wake-queue" ] || fail "an unreadable herdr observation enqueued an endpoint-gone wake"
+  [ ! -e "$state/.endpoint-gone-$key" ] || fail "an unreadable herdr observation created a death marker"
+  grep -F "unreadable endpoint observation (not death proof)" "$state/.watch-triage.log" >/dev/null \
+    || fail "the watcher did not record its fail-closed unreadable classification"
+  pass "handle_gone_endpoint: an unreadable herdr observation never becomes endpoint-gone"
+}
+
 test_gone_endpoint_with_fresh_tombstone_absorbed() {
   local dir state fakebin window key
   dir=$(make_case gone-fresh-tombstone); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1833,6 +1851,7 @@ test_paused_crew_ambiguous_agent_liveness_absorbed
 test_secondmate_gone_endpoint_surfaced
 test_secondmate_dead_agent_not_probed
 test_gone_endpoint_without_meta_absorbed
+test_unreadable_herdr_endpoint_is_never_classified_dead
 test_gone_endpoint_with_fresh_tombstone_absorbed
 test_gone_endpoint_with_stale_tombstone_surfaced
 test_dead_agent_marker_survives_pane_redraw

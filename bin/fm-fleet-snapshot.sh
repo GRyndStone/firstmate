@@ -483,7 +483,7 @@ backlog_json() {
 
 task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
-  local pr pr_source event_json current_json prior_json wait_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json reconciled_json wait_path_json
+  local pr pr_source event_json current_json prior_json wait_json endpoint_exists endpoint_state agent_alive meta_json status_json report_json worktree_json home_json reconciled_json wait_path_json
   local last_event_raw current_state current_source current_freshness pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
@@ -558,11 +558,12 @@ task_json_lines() {
 
     endpoint_exists=null
     if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
-        endpoint_exists=true
-      else
-        endpoint_exists=false
-      fi
+      endpoint_state=$(fm_backend_target_state "$backend" "$target" "fm-$id" 2>/dev/null || printf unknown)
+      case "$endpoint_state" in
+        alive) endpoint_exists=true ;;
+        dead) endpoint_exists=false ;;
+        *) endpoint_exists=null ;;
+      esac
     fi
     agent_alive=not_checked
     if [ "$kind" = secondmate ] && [ -n "$target" ]; then
