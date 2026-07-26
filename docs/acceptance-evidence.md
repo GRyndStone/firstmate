@@ -42,8 +42,10 @@ Path: `data/<id>/acceptance.md` under the active firstmate home.
 ```
 
 Required fields per `## AC-N` entry: `surface`, `class`, `command`, `result`.
+Fields must be markdown bullets (`- surface: ...`); a present `## AC-N` heading with bare `key: value` lines is diagnosed as unparsed fields, not as a missing section.
 `head` (or `freshness`) is required when the required class is `ui` or `live`.
 Optional: `statement`, `required_class` (overrides keyword inference).
+`class` must be a known vocabulary token (`ui`, `live`, `unit`, `catalog`, `config`, `api`, `code`, `process`, `inference`); unknown tokens fail as unrecognised, not as proxy rejections.
 
 ### Result verdicts
 
@@ -80,15 +82,19 @@ none: no concrete acceptance criteria
 
 `status`, `claim`, `prose`, `authority`, and `done` are **never** evidence.
 
-Keyword inference (first match) from criterion statement text:
+Keyword inference (first match) from criterion statement text uses **whole tokens only** after non-alphanumeric runs are treated as separators.
+Substring hits inside ordinary English words do not count: `configured` is not `config`, and incidental vocabulary must not invent a stricter required class.
 
-- user-facing / chooser / switcher / menu / Telegram → `ui`
+- user-facing / chooser / switcher / menu / Telegram / ui → `ui`
 - security / destructive / live server / production → `live`
-- unit test / focused test → `unit`
-- catalog / provider list → `catalog`
-- config / configuration → `config`
-- api / endpoint → `api`
-- otherwise → `code`
+- unit test / focused test / regression test → `unit`
+- catalog / provider list / model list → `catalog`
+- config / configs / configuration / yaml / ini / json (not configured/configuring) → `config`
+- api / endpoint / http / https → `api`
+- no strong token match → `code` (honest default when inference is uncertain; stronger offered surfaces still satisfy `code`)
+
+Text inference cannot be made fully reliable for free-form English.
+When a criterion's required surface is high-stakes or the wording is ambiguous, set explicit `required_class` on the evidence entry (or on the criterion itself when authoring) so the worker cannot dilute it and incidental vocabulary cannot redirect the gate.
 
 Hard rule examples:
 

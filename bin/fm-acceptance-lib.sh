@@ -19,48 +19,124 @@
 
 _FM_ACCEPTANCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_ACCEPTANCE_LIB_DIR="."
 
-# Keywords that force a non-proxyable required class. Order matters: first match wins.
-# UI/live/security must never be satisfied by catalog/config/unit alone.
-fm_acceptance_required_class() {
+# Known evidence-class vocabulary (offered or required). Keep in sync with
+# fm_acceptance_class_compatible and docs/acceptance-evidence.md.
+fm_acceptance_known_classes() {
+  printf 'ui live unit catalog config api code process inference\n'
+}
+
+fm_acceptance_is_known_class() {
+  local token
+  token=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  [ -n "$token" ] || return 1
+  case " $(fm_acceptance_known_classes) " in
+    *" $token "*) return 0 ;;
+  esac
+  return 1
+}
+
+fm_acceptance_is_claim_class() {
+  local token
+  token=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+  case "$token" in
+    status|claim|prose|authority|done) return 0 ;;
+  esac
+  return 1
+}
+
+# Normalize criterion text for whole-token matching: lowercase, non-alnum runs
+# become spaces, result space-padded so " config " cannot match "configured".
+fm_acceptance_tokenize_padded() {
   local text
-  text=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
-  case "$text" in
-    *user-facing*|*user\ facing*|*chooser*|*switcher*|*menu*|*ui/*|*\ ui\ *|*telegram*|*click*|*screenshot*)
-      printf 'ui\n'
-      return 0
-      ;;
+  text=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+  printf ' %s \n' "$text"
+}
+
+# Return 0 when space-padded token text contains the whole multi-word phrase.
+fm_acceptance_tokens_has_phrase() {
+  local padded=$1 phrase=$2
+  case "$padded" in
+    *" $phrase "*) return 0 ;;
   esac
-  case "$text" in
-    *security*|*destructive*|*production*|*live\ server*|*live-server*|*on\ the\ live*|*against\ the\ live*)
-      printf 'live\n'
-      return 0
-      ;;
-  esac
-  case "$text" in
-    *unit\ test*|*unit-test*|*focused\ test*|*regression\ test*)
-      printf 'unit\n'
-      return 0
-      ;;
-  esac
-  case "$text" in
-    *catalog*|*provider\ list*|*model\ list*)
-      printf 'catalog\n'
-      return 0
-      ;;
-  esac
-  case "$text" in
-    *config*|*yaml*|*ini\ *|*.json*)
-      printf 'config\n'
-      return 0
-      ;;
-  esac
-  case "$text" in
-    *api\ *|*api/*|*endpoint*|*http*)
-      printf 'api\n'
-      return 0
-      ;;
-  esac
-  # Default: code-level evidence is acceptable for ordinary ship criteria.
+  return 1
+}
+
+# Keywords that force a non-proxyable required class. Order matters: first match wins.
+# Matching is whole-token only (see fm_acceptance_tokenize_padded): incidental English
+# such as "configured" must not force config. UI/live/security must never be
+# satisfied by catalog/config/unit alone.
+#
+# Text inference is best-effort. When no strong token match exists, this returns
+# code (ordinary ship criteria) rather than inventing a strict class from
+# substrings. For high-stakes criteria where English is ambiguous, set explicit
+# required_class on the criterion or evidence handoff so workers cannot dilute it.
+fm_acceptance_required_class() {
+  local padded
+  padded=$(fm_acceptance_tokenize_padded "${1:-}")
+
+  if fm_acceptance_tokens_has_phrase "$padded" "user facing" ||
+    fm_acceptance_tokens_has_phrase "$padded" "userfacing" ||
+    fm_acceptance_tokens_has_phrase "$padded" "chooser" ||
+    fm_acceptance_tokens_has_phrase "$padded" "switcher" ||
+    fm_acceptance_tokens_has_phrase "$padded" "menu" ||
+    fm_acceptance_tokens_has_phrase "$padded" "ui" ||
+    fm_acceptance_tokens_has_phrase "$padded" "telegram" ||
+    fm_acceptance_tokens_has_phrase "$padded" "click" ||
+    fm_acceptance_tokens_has_phrase "$padded" "screenshot"; then
+    printf 'ui\n'
+    return 0
+  fi
+
+  if fm_acceptance_tokens_has_phrase "$padded" "security" ||
+    fm_acceptance_tokens_has_phrase "$padded" "destructive" ||
+    fm_acceptance_tokens_has_phrase "$padded" "production" ||
+    fm_acceptance_tokens_has_phrase "$padded" "live server" ||
+    fm_acceptance_tokens_has_phrase "$padded" "on the live" ||
+    fm_acceptance_tokens_has_phrase "$padded" "against the live"; then
+    printf 'live\n'
+    return 0
+  fi
+
+  if fm_acceptance_tokens_has_phrase "$padded" "unit test" ||
+    fm_acceptance_tokens_has_phrase "$padded" "unit tests" ||
+    fm_acceptance_tokens_has_phrase "$padded" "focused test" ||
+    fm_acceptance_tokens_has_phrase "$padded" "focused tests" ||
+    fm_acceptance_tokens_has_phrase "$padded" "regression test" ||
+    fm_acceptance_tokens_has_phrase "$padded" "regression tests"; then
+    printf 'unit\n'
+    return 0
+  fi
+
+  if fm_acceptance_tokens_has_phrase "$padded" "catalog" ||
+    fm_acceptance_tokens_has_phrase "$padded" "provider list" ||
+    fm_acceptance_tokens_has_phrase "$padded" "model list"; then
+    printf 'catalog\n'
+    return 0
+  fi
+
+  # Whole tokens only: config/configs/configuration, not configured/configuring.
+  if fm_acceptance_tokens_has_phrase "$padded" "config" ||
+    fm_acceptance_tokens_has_phrase "$padded" "configs" ||
+    fm_acceptance_tokens_has_phrase "$padded" "configuration" ||
+    fm_acceptance_tokens_has_phrase "$padded" "yaml" ||
+    fm_acceptance_tokens_has_phrase "$padded" "ini" ||
+    fm_acceptance_tokens_has_phrase "$padded" "json"; then
+    printf 'config\n'
+    return 0
+  fi
+
+  if fm_acceptance_tokens_has_phrase "$padded" "api" ||
+    fm_acceptance_tokens_has_phrase "$padded" "endpoint" ||
+    fm_acceptance_tokens_has_phrase "$padded" "http" ||
+    fm_acceptance_tokens_has_phrase "$padded" "https"; then
+    printf 'api\n'
+    return 0
+  fi
+
+  # No strong class signal: default to ordinary code evidence (stronger surfaces
+  # still satisfy code via fm_acceptance_class_compatible). This is the honest
+  # uncertain path - it does not invent a stricter requirement from incidental
+  # vocabulary. Prefer explicit required_class when ambiguity would hurt.
   printf 'code\n'
 }
 
@@ -193,8 +269,26 @@ fm_acceptance_extract_statement() {
   return 0
 }
 
+# Return 0 when evidence contains a ## AC-N heading for want (same match rules as parse).
+fm_acceptance_heading_present() {
+  local evidence=$1 want=$2
+  local line
+  [ -f "$evidence" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "## $want"|"## $want:"*)
+        return 0
+        ;;
+    esac
+  done < "$evidence"
+  return 1
+}
+
 # Parse a single ## AC-N section from an evidence file into key=value lines on stdout.
 # Keys: statement, surface, class, command, result, head, required_class
+# Only markdown bullets ("- key: value") are fields. Bare "key: value" lines under a
+# present heading deliberately do not parse so the checker can diagnose malformed
+# sections separately from missing headings (see fm_acceptance_check).
 fm_acceptance_parse_entry() {
   local evidence=$1 want=$2
   local in=0 line key val
@@ -307,8 +401,13 @@ fm_acceptance_check() {
     missing=0
     entry=$(fm_acceptance_parse_entry "$evidence" "$id" || true)
     if [ -z "$entry" ]; then
-      printf 'FAIL %s: no ## %s section in evidence handoff\n' "$id" "$id"
-      repair+=("repair $id: add a ## $id section with surface, class, command, result")
+      if fm_acceptance_heading_present "$evidence" "$id"; then
+        printf 'FAIL %s: ## %s section present but fields did not parse (need - key: value bullets)\n' "$id" "$id"
+        repair+=("repair $id: under ## $id rewrite fields as markdown bullets (- surface:, - class:, - command:, - result:); bare key: value lines are not parsed")
+      else
+        printf 'FAIL %s: no ## %s section in evidence handoff\n' "$id" "$id"
+        repair+=("repair $id: add a ## $id section with surface, class, command, result")
+      fi
       rc=1
       continue
     fi
@@ -345,14 +444,34 @@ fm_acceptance_check() {
     fi
 
     # Status-class or claim-like results fail even if other fields exist.
-    case "$(printf '%s' "$offered" | tr '[:upper:]' '[:lower:]')" in
-      status|claim|prose|authority|done)
-        printf 'FAIL %s: class %s is a claim, not evidence\n' "$id" "$offered"
-        repair+=("repair $id: replace status/claim class with the real observation surface class")
-        rc=1
-        continue
-        ;;
-    esac
+    if fm_acceptance_is_claim_class "$offered"; then
+      printf 'FAIL %s: class %s is a claim, not evidence\n' "$id" "$offered"
+      repair+=("repair $id: replace status/claim class with the real observation surface class")
+      rc=1
+      continue
+    fi
+
+    # Unknown vocabulary is not a proxy failure: the worker named a class the
+    # gate does not know, so tell them the accepted set rather than implying
+    # their evidence is merely weaker than required.
+    if ! fm_acceptance_is_known_class "$offered"; then
+      printf 'FAIL %s: unrecognised class token %s (valid: %s)\n' \
+        "$id" "$offered" "$(fm_acceptance_known_classes | sed 's/ /, /g')"
+      printf '  statement: %s\n' "${statement:-"(none)"}"
+      printf '  surface: %s\n' "$surface"
+      repair+=("repair $id: set class to one of: $(fm_acceptance_known_classes | sed 's/ /, /g'); unknown tokens are not evidence classes")
+      rc=1
+      continue
+    fi
+
+    if ! fm_acceptance_is_known_class "$required"; then
+      printf 'FAIL %s: unrecognised required_class token %s (valid: %s)\n' \
+        "$id" "$required" "$(fm_acceptance_known_classes | sed 's/ /, /g')"
+      printf '  statement: %s\n' "${statement:-"(none)"}"
+      repair+=("repair $id: set required_class to one of: $(fm_acceptance_known_classes | sed 's/ /, /g') (or omit it and let inference choose)")
+      rc=1
+      continue
+    fi
 
     if ! fm_acceptance_class_compatible "$required" "$offered"; then
       printf 'FAIL %s: proxy rejected (required_class=%s offered_class=%s)\n' "$id" "$required" "$offered"
