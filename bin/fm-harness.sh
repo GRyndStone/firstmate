@@ -35,7 +35,9 @@ detect_own() {
   # It does NOT set CLAUDECODE despite being Claude-Code-compatible, so this marker
   # is unambiguous when firstmate runs natively on grok.
   [ "${GROK_AGENT:-}" = "1" ] && { echo grok; return; }
-  # agy sets ANTIGRAVITY_AGENT=1 for child/tool processes (verified, agy 1.1.7).
+  # agy sets ANTIGRAVITY_AGENT=1 and does not set CLAUDECODE for child/tool
+  # processes (verified, agy 1.1.7). Keep the shipped precedence; tests scrub
+  # every competing marker so ambient harness state cannot decide a fixture.
   [ "${ANTIGRAVITY_AGENT:-}" = "1" ] && { echo agy; return; }
   # Layer 2: walk the parent chain and match the command name.
   local pid=$$ comm args

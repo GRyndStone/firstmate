@@ -9,6 +9,13 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 fm_test_tmproot TMP_ROOT fm-grok-harness
 
+# Harness detection fixtures must own every marker that can outrank the case
+# under test. Without this boundary, running the suite from Claude Code makes an
+# agy fixture read as claude before the fixture's own marker is considered.
+run_harness_fixture() {
+  env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u ANTIGRAVITY_AGENT "$@"
+}
+
 make_spawn_fakebin() {
   local dir=$1 fakebin holder_file="$1/holder"
   fakebin=$(fm_fakebin "$dir")
@@ -175,7 +182,7 @@ SH
 
 test_fm_harness_detects_agy_env_and_process() {
   local fakebin out
-  out=$(ANTIGRAVITY_AGENT=1 "$ROOT/bin/fm-harness.sh")
+  out=$(run_harness_fixture ANTIGRAVITY_AGENT=1 "$ROOT/bin/fm-harness.sh")
   [ "$out" = agy ] || fail "ANTIGRAVITY_AGENT=1 should detect agy, got: $out"
 
   fakebin=$(fm_fakebin "$TMP_ROOT/agy-detect-fake")
@@ -189,9 +196,49 @@ esac
 exit 1
 SH
   chmod +x "$fakebin/ps"
-  out=$(PATH="$fakebin:$PATH" "$ROOT/bin/fm-harness.sh")
+  out=$(run_harness_fixture PATH="$fakebin:$PATH" "$ROOT/bin/fm-harness.sh")
   [ "$out" = agy ] || fail "agy process ancestry should detect agy, got: $out"
   pass "fm-harness detects agy through the live env marker and process ancestry"
+}
+
+test_fm_harness_detection_fixtures_are_isolated() {
+  local fakebin out expected marker
+
+  # Env-marker siblings have the same latent hazard as agy: a higher-precedence
+  # marker inherited from the harness running the suite can decide the result
+  # before the fixture is reached.
+  for expected in claude pi grok agy; do
+    case "$expected" in
+      claude) marker=CLAUDECODE=1 ;;
+      pi) marker=PI_CODING_AGENT=true ;;
+      grok) marker=GROK_AGENT=1 ;;
+      agy) marker=ANTIGRAVITY_AGENT=1 ;;
+    esac
+    out=$(run_harness_fixture "$marker" "$ROOT/bin/fm-harness.sh")
+    [ "$out" = "$expected" ] ||
+      fail "$expected env fixture must decide its own result, got: $out"
+  done
+
+  # Codex and OpenCode have no verified env marker, so their sibling fixtures
+  # exercise process ancestry. The same scrub boundary applies before ancestry.
+  fakebin=$(fm_fakebin "$TMP_ROOT/harness-matrix-fake")
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"comm="*) printf '/fixture/%s\n' "$FM_FAKE_HARNESS"; exit 0 ;;
+  *"args="*) printf '%s fixture\n' "$FM_FAKE_HARNESS"; exit 0 ;;
+  *"ppid="*) printf '%s\n' '1'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  for expected in claude pi grok agy codex opencode; do
+    out=$(run_harness_fixture FM_FAKE_HARNESS="$expected" \
+      PATH="$fakebin:$PATH" "$ROOT/bin/fm-harness.sh")
+    [ "$out" = "$expected" ] ||
+      fail "$expected ancestry fixture must decide its own result, got: $out"
+  done
+  pass "all harness-detection fixtures scrub competing ambient markers"
 }
 
 test_fm_lock_recognizes_agy_holder() {
@@ -228,5 +275,6 @@ test_grok_hook_requires_registered_token
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder
 test_fm_harness_detects_agy_env_and_process
+test_fm_harness_detection_fixtures_are_isolated
 test_fm_lock_recognizes_agy_holder
 test_busy_regex_recognizes_agy_cancel_footer

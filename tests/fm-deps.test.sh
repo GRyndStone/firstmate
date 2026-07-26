@@ -16,6 +16,16 @@
 #     exit status both look perfectly healthy
 #   * nothing upgrades without explicit approval, and a broken upgrade is
 #     recovered from
+#
+# Adversarial near-neighbours for the monitoring-integrity repair:
+#   * the declared local-build baseline itself is silent after a different
+#     same-version artifact was previously cached
+#   * a one-byte divergence from that baseline remains loud, and a published
+#     replacement retains its more specific alarm
+#   * a GitHub release lookup proves it ran and distinguishes no-source from a
+#     source that was attempted but failed
+#   * the live quota-axi ownership record cannot drift back to describing the
+#     closed upstream PR as open or the maintained fork as temporary
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -135,11 +145,11 @@ for dep_id in quota-axi tasks-axi treehouse no-mistakes gh-axi chrome-devtools-a
       fail "$dep_id must declare $dep_field in deps/incorporations.conf"
   done
 done
-# write-access must carry its verification. "none" on its own is an assumption,
-# and the assumption is what cost a merged fix.
+# write-access must carry its verification. A bare verdict is an assumption, and
+# the assumption is what this record exists to replace.
 out=$(fm_deps_field quota-axi write-access)
 assert_contains "$out" "verified" "write-access must record how and when it was checked, not just a verdict"
-assert_contains "$out" "none" "quota-axi write access is none on the captain's accounts"
+assert_contains "$out" "yes:" "quota-axi write access is present on the maintained fork"
 check "every non-system component declares verified ownership and a fallback rung"
 
 # The ladder rung must be a recorded decision, and the reflex answer is not it:
@@ -153,13 +163,49 @@ assert_contains "$(fm_deps_field lavish-axi fallback)" "upstream-and-wait" \
   "lavish-axi is not in a critical path, so a fork is not justified"
 check "the fallback ladder is a per-dependency decision, not fork-everything"
 
+# quota-axi now comes from a maintained captain-owned fork, not a temporary
+# build waiting on an open upstream PR. These assertions read the shipped record
+# so stale operational prose fails where the trusted ledger is validated.
+[ "$(fm_deps_field quota-axi control)" = captain ] ||
+  fail "quota-axi control must name the captain who maintains the fork"
+[ "$(fm_deps_field quota-axi repo)" = GRyndStone/quota-axi ] ||
+  fail "quota-axi access checks must target the maintained fork"
+assert_contains "$(fm_deps_field quota-axi write-access)" "yes:" \
+  "the maintained fork must record verified write access"
+assert_contains "$(fm_deps_field quota-axi write-access)" "GRyndStone/quota-axi" \
+  "the write-access evidence must name the repository it verified"
+assert_contains "$(fm_deps_field quota-axi fallback)" "own-build-of-fork" \
+  "the maintained fork remains the selected fallback rung"
+assert_contains "$(fm_deps_field quota-axi fallback)" "maintain" \
+  "the fallback must say that the fork is maintained rather than temporary"
+assert_contains "$(fm_deps_field quota-axi provenance)" "GRyndStone/quota-axi" \
+  "provenance must name the maintained source repository"
+stale_pr_claims=$(grep -ERn "keeps? #43 open|#43 among them|Not a permanent fork" \
+  "$ROOT/deps" "$ROOT/docs" 2>/dev/null || true)
+[ -z "$stale_pr_claims" ] ||
+  fail "the repo still describes closed quota-axi PR #43 as open or temporary:$stale_pr_claims"
+check "quota-axi ownership and provenance match the maintained fork"
+
+baseline=$(fm_deps_field quota-axi artifact-baseline 2>/dev/null || true)
+case "$baseline" in
+  0.1.13\ [0-9]*\ [0-9]*\ [0-9]*) ;;
+  *) fail "quota-axi local build must declare a versioned artifact-baseline, got '$baseline'" ;;
+esac
+[ "$(fm_deps_field treehouse currency)" = github:kunchenguid/treehouse ] ||
+  fail "treehouse must use its GitHub releases as a working currency source"
+check "local-build identity and treehouse currency coverage are explicit in the inventory"
+
 # The assertions above read the shipped file; this one proves the VALIDATOR is
 # what requires those fields, so a future stanza cannot be added without them.
 MISSING_OWN_DEPS="$TMP_ROOT/missing-ownership-deps"
 mkdir -p "$MISSING_OWN_DEPS/contracts"
 cp "$ROOT"/deps/contracts/*.contract "$MISSING_OWN_DEPS/contracts/"
-grep -v '^control      = third-party:kunchenguid$' "$ROOT/deps/incorporations.conf" \
-  > "$MISSING_OWN_DEPS/incorporations.conf"
+awk '
+  /^\[quota-axi\]/ { quota = 1 }
+  /^\[/ && $0 !~ /^\[quota-axi\]/ { quota = 0 }
+  quota && /^control[[:space:]]*=/ { next }
+  { print }
+' "$ROOT/deps/incorporations.conf" > "$MISSING_OWN_DEPS/incorporations.conf"
 out=$(FM_DEPS_DIR="$MISSING_OWN_DEPS" fm_deps_validate_inventory)
 assert_contains "$out" "quota-axi: missing required field control" \
   "the validator must require ownership on a non-system component"
@@ -174,7 +220,7 @@ check "the validator requires ownership on non-system components and exempts sys
 OWN_DEPS="$TMP_ROOT/ownership-deps"
 mkdir -p "$OWN_DEPS/contracts"
 cp "$ROOT"/deps/contracts/*.contract "$OWN_DEPS/contracts/"
-sed 's/^write-access = none: verified 2026-07-25 - neither captain.*$/write-access = none/' \
+sed 's|^write-access = yes: verified 2026-07-26 - gh-axi resolved the captain-owned GRyndStone/quota-axi.*$|write-access = yes|' \
   "$ROOT/deps/incorporations.conf" > "$OWN_DEPS/incorporations.conf"
 out=$(FM_DEPS_DIR="$OWN_DEPS" fm_deps_validate_inventory)
 assert_contains "$out" "quota-axi: write-access must state how it was verified" \
@@ -184,6 +230,19 @@ sed 's/^fallback     = own-build-of-fork:.*$/fallback     = invent-something/' \
 out=$(FM_DEPS_DIR="$OWN_DEPS" fm_deps_validate_inventory)
 assert_contains "$out" "unrecognized fallback rung" "the ladder rungs are a closed set"
 check "an assumed access answer or an invented ladder rung fails validation"
+
+# A local build without its expected artifact identity recreates the permanent
+# false-alarm defect: continuity can say that bytes moved, but cannot say that
+# they moved to the declared known-good build.
+NO_BASELINE_DEPS="$TMP_ROOT/no-local-baseline-deps"
+mkdir -p "$NO_BASELINE_DEPS/contracts"
+cp "$ROOT"/deps/contracts/*.contract "$NO_BASELINE_DEPS/contracts/"
+grep -v '^artifact-baseline' "$ROOT/deps/incorporations.conf" \
+  > "$NO_BASELINE_DEPS/incorporations.conf"
+out=$(FM_DEPS_DIR="$NO_BASELINE_DEPS" fm_deps_validate_inventory)
+assert_contains "$out" "quota-axi: provenance local-build requires artifact-baseline" \
+  "a declared local build without a baseline must fail inventory validation"
+check "the validator requires a recorded expected identity for every local build"
 
 # 0.1.5 -> 0.1.13 is the exact pair this system was built after. Compared as
 # strings rather than numbers, "5" sorts above "13" and the seven-release gap
@@ -420,6 +479,14 @@ esac
 exit 0
 SH
 chmod +x "$FAKEBIN/npm"
+cat > "$FAKEBIN/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s|%s\n' "${GH_REPO:-}" "$*" >> "$FM_FAKE_GH_LOG"
+[ "${FM_FAKE_GH_FAIL:-0}" = 1 ] && exit 1
+printf '%s\n' 'releases[1]{tag,name,draft,prerelease,published}:'
+printf '%s\n' '  v2.1.0,v2.1.0,no,no,5d ago'
+SH
+chmod +x "$FAKEBIN/gh-axi"
 cat > "$FAKEBIN/widget-axi" <<'SH'
 #!/usr/bin/env bash
 version=$(cat "$FM_FAKE_WIDGET_VERSION_FILE" 2>/dev/null || echo 1.0.0)
@@ -478,8 +545,35 @@ deps() { # run bin/fm-deps.sh against the fixture inventory and fixture home
     FM_DEPS_OFFLINE="${FM_DEPS_OFFLINE_OVERRIDE:-0}" \
     FM_FAKE_WIDGET_SHAPE="${FM_FAKE_WIDGET_SHAPE:-}" \
     FM_FAKE_PROBE_LOG="${FM_FAKE_PROBE_LOG:-}" \
+    FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-$TMP_ROOT/gh-lookups}" \
     "$ROOT/bin/fm-deps.sh" "$@"
 }
+
+# GitHub releases are a real currency source, not a `none:` opt-out. The fake
+# records both the repository selection and the command so the positive answer
+# cannot pass without exercising a lookup.
+GITHUB_DEPS="$TMP_ROOT/github-deps"
+mkdir -p "$GITHUB_DEPS/contracts"
+sed 's|currency  = none: fixture component with no registry to query|currency  = github:kunchenguid/treehouse|' \
+  "$FIXTURE_DEPS/incorporations.conf" > "$GITHUB_DEPS/incorporations.conf"
+cp "$FIXTURE_DEPS/contracts/widget-axi.contract" "$GITHUB_DEPS/contracts/"
+out=$(FM_DEPS_DIR="$GITHUB_DEPS" fm_deps_validate_inventory)
+[ -z "$out" ] || fail "a declared GitHub release source must validate; got:$out"
+GH_LOOKUPS="$TMP_ROOT/github-lookups"
+: > "$GH_LOOKUPS"
+status=0
+out=$(PATH="$FAKEBIN:$BASE_PATH" FM_DEPS_DIR="$GITHUB_DEPS" \
+  FM_FAKE_GH_LOG="$GH_LOOKUPS" fm_deps_lookup_latest anchor) || status=$?
+expect_code 0 "$status" "a GitHub release lookup must succeed"
+[ "$out" = 2.1.0 ] || fail "GitHub release lookup must return 2.1.0, got '$out'"
+assert_grep 'kunchenguid/treehouse|release list' "$GH_LOOKUPS" \
+  "anti-vacuity: the GitHub release source must actually invoke gh-axi against the declared repo"
+status=0
+PATH="$FAKEBIN:$BASE_PATH" FM_DEPS_DIR="$GITHUB_DEPS" \
+  FM_FAKE_GH_LOG="$GH_LOOKUPS" FM_FAKE_GH_FAIL=1 \
+  fm_deps_lookup_latest anchor >/dev/null 2>&1 || status=$?
+expect_code 2 "$status" "a failed GitHub release lookup must be attempted-but-unchecked, not no-source"
+check "GitHub release currency succeeds and fails with distinct, exercised states"
 
 # Everything current: the registry says exactly what is installed.
 status=0
@@ -607,17 +701,61 @@ check "an install that is not the published artifact is caught while its version
 LOCAL_DEPS="$TMP_ROOT/local-build-deps"
 mkdir -p "$LOCAL_DEPS/contracts"
 cp "$FIXTURE_DEPS/contracts/widget-axi.contract" "$LOCAL_DEPS/contracts/"
+printf 'fork-build-body-with-fix\n' > "$NPM_ROOT/widget-axi/dist/index.js"
+LOCAL_BASE_READING=$(FM_DEPS_NPM_ROOT="$NPM_ROOT" bash -c \
+  ". '$ROOT/bin/fm-deps-lib.sh'; fm_deps_artifact_reading '$NPM_ROOT/widget-axi'")
 sed 's|^contract  = pinned$|contract  = pinned\nprovenance = local-build: fixture fork build carrying an unmerged fix|' \
-  "$FIXTURE_DEPS/incorporations.conf" > "$LOCAL_DEPS/incorporations.conf"
+  "$FIXTURE_DEPS/incorporations.conf" |
+  sed "s|^provenance = local-build:.*$|&\\
+artifact-baseline = 1.0.0 $LOCAL_BASE_READING|" \
+    > "$LOCAL_DEPS/incorporations.conf"
+: > "$CACHE"
+FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
 status=0
 out=$(FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_REGISTRY_VERSION=1.0.0 deps report 2>&1) || status=$?
 assert_silent "$out" "$status" "a declared local build is the known truth and must not be reported"
+observed=$(awk -F '\t' '$1 == "widget-axi" { print $10 }' "$CACHE")
+[ "$observed" = local-build ] ||
+  fail "anti-vacuity: the matching baseline must be observed as local-build, got '$observed'"
 check "a declared local build is recorded rather than reported"
+
+# A previous same-version artifact is not the expected identity. Once the
+# installed tree returns to the declared baseline, continuity must not keep a
+# permanent changed-artifact alarm latched.
+: > "$CACHE"
+printf 'prior-local-build\n' > "$NPM_ROOT/widget-axi/dist/index.js"
+PRIOR_READING=$(FM_DEPS_NPM_ROOT="$NPM_ROOT" bash -c \
+  ". '$ROOT/bin/fm-deps-lib.sh'; fm_deps_artifact_reading '$NPM_ROOT/widget-axi'")
+FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
+printf 'fork-build-body-with-fix\n' > "$NPM_ROOT/widget-axi/dist/index.js"
+FM_DEPS_DIR="$LOCAL_DEPS" deps refresh --offline >/dev/null 2>&1
+status=0
+out=$(FM_DEPS_DIR="$LOCAL_DEPS" deps report 2>&1) || status=$?
+[ "$PRIOR_READING" != "$LOCAL_BASE_READING" ] ||
+  fail "anti-vacuity: the planted prior artifact must differ from the declared baseline"
+cached_reading=$(awk -F '\t' '$1 == "widget-axi" { print $9 }' "$CACHE")
+[ "$cached_reading" = "$LOCAL_BASE_READING" ] ||
+  fail "anti-vacuity: refresh must have read the restored baseline, got '$cached_reading'"
+assert_silent "$out" "$status" \
+  "returning to the declared local-build baseline must clear a continuity alarm"
+check "a matching declared local-build baseline clears stale continuity noise"
+
+# The near neighbour remains loud: same version, bytes that match neither the
+# declared baseline nor the published artifact.
+printf 'unexpected-local-build\n' > "$NPM_ROOT/widget-axi/dist/index.js"
+FM_DEPS_DIR="$LOCAL_DEPS" deps refresh --offline >/dev/null 2>&1
+out=$(FM_DEPS_DIR="$LOCAL_DEPS" deps report 2>&1)
+assert_contains "$out" "DEPS: widget-axi artifact changed under an unchanged version" \
+  "divergence from the declared local-build baseline must remain visible"
+assert_contains "$out" "expected declared local-build baseline" \
+  "the divergence alarm must name the stable identity it compared against"
+check "divergence from a declared local-build baseline still alarms"
 
 # THE REGRESSION THAT WOULD OTHERWISE BE INVISIBLE: `npm install -g` replaces the
 # local build with the published package, the version string does not move, and
 # the fix it carried is silently gone.
 : > "$CACHE"
+printf 'published-body\n' > "$NPM_ROOT/widget-axi/dist/index.js"
 FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_PUBLISHED_FILES="$PUB_FILES" FM_FAKE_PUBLISHED_BYTES="$published_bytes" \
   FM_FAKE_REGISTRY_VERSION=1.0.0 deps refresh >/dev/null 2>&1
 out=$(FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_REGISTRY_VERSION=1.0.0 deps report 2>&1)
@@ -644,6 +782,7 @@ printf 'published-body\n' > "$NPM_ROOT/widget-axi/dist/index.js"
 # Currency for a declared local build must not hand over an upgrade command that
 # would silently discard it.
 : > "$CACHE"
+printf 'fork-build-body-with-fix\n' > "$NPM_ROOT/widget-axi/dist/index.js"
 FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_PUBLISHED_FILES="$PUB_FILES" FM_FAKE_PUBLISHED_BYTES=$((published_bytes + 500)) \
   FM_FAKE_REGISTRY_VERSION=1.6.0 deps refresh >/dev/null 2>&1
 out=$(FM_DEPS_DIR="$LOCAL_DEPS" FM_FAKE_REGISTRY_VERSION=1.6.0 deps report 2>&1)

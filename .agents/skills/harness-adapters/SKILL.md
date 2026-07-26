@@ -279,7 +279,7 @@ Launch with an interactive prompt: `agy --dangerously-skip-permissions --prompt-
 | Exit command | `/quit`, verified live. The CLI prints a resumable command using `agy --conversation=<conversation-id>`. |
 | Interrupt | single Escape. Verified while a `sleep 60` command was running; the pane printed `Interrupted` and returned to the prompt. |
 | Autonomy | `--dangerously-skip-permissions`, verified to run shell commands and file edits unattended after the workspace trust dialog was accepted. |
-| Env marker | `ANTIGRAVITY_AGENT=1`, observed inside an agy tool subprocess. |
+| Env marker | `ANTIGRAVITY_AGENT=1`, observed inside an agy tool subprocess; the installed agy 1.1.7 binary contains that marker and no `CLAUDECODE` token, so agy does not inherit Claude detection merely because its interface is Claude-compatible. |
 | Resume | `agy --conversation=<conversation-id>` or `-c` / `--continue`; the exact conversation id is printed by `/quit`. |
 
 Startup trust dialog: first launch in a workspace asks "Do you trust the contents of this project?" with "Yes, I trust this folder" selected by default. Accept with Enter, then verify the brief starts processing.

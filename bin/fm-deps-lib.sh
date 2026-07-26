@@ -15,7 +15,7 @@
 #     kind       npm | binary | system
 #     purpose    one line
 #     relies-on  one line
-#     currency   npm:<pkg> | none: <reason>
+#     currency   npm:<pkg> | brew:<formula> | github:<owner/repo> | none: <reason>
 #     sibling    <dir under the home's projects/> (optional)
 #     contract   pinned | none: <reason>
 #     control     captain | third-party[:<who>] | vendor:<who> | system: <reason>
@@ -23,6 +23,9 @@
 #     fallback    direct|upstream-and-wait|own-build-of-fork|vendor|drop-and-degrade: <why>
 #     degrades-to one line: what breaks if this is wrong or absent
 #     provenance  published | local-build: <what we run instead, and why> (npm only)
+#     artifact-baseline <version> <file-count> <byte-total> <fingerprint>
+#                  required for local-build provenance; the expected installed
+#                  tree identity that makes a matching local build silent
 #     repo        <owner>/<name> (optional; what `fm-deps.sh access-check` queries)
 #   control/fallback/degrades-to/write-access are REQUIRED unless kind = system,
 #   because a dependency nobody can land a fix in is a different kind of risk
@@ -288,6 +291,17 @@ fm_deps_validate_inventory() {
       local-build | local-build:*) printf '%s: provenance local-build must say what is running instead and why\n' "$id" ;;
       *) printf '%s: unrecognized provenance %s\n' "$id" "$value" ;;
     esac
+    case "$value" in
+      local-build:*)
+        fm_deps_field_into value "$id" artifact-baseline || true
+        if [ -z "$value" ]; then
+          printf '%s: provenance local-build requires artifact-baseline\n' "$id"
+        elif ! printf '%s\n' "$value" |
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+ [0-9]+ [0-9]+ [0-9]+$'; then
+          printf '%s: artifact-baseline must be <version> <file-count> <byte-total> <fingerprint>\n' "$id"
+        fi
+        ;;
+    esac
     value=$kind
     case "$value" in
       npm | binary | system | '') ;;
@@ -295,7 +309,7 @@ fm_deps_validate_inventory() {
     esac
     fm_deps_field_into value "$id" currency || true
     case "$value" in
-      npm:?* | brew:?*) ;;
+      npm:?* | brew:?* | github:?*/?*) ;;
       none:*[![:space:]]*) ;;
       none | none:*) printf '%s: currency none must state a reason\n' "$id" ;;
       '') ;;
@@ -381,7 +395,7 @@ fm_deps_env_override() { # <prefix> <id> [suffix]
 # must keep those apart, because "cannot be established" and "could not reach
 # the registry today" are different facts about the world.
 fm_deps_lookup_latest() { # <id>
-  local id=${1:-} source pkg out status npm_cmd brew_cmd
+  local id=${1:-} source pkg out status npm_cmd brew_cmd gh_cmd repo
   source=$(fm_deps_field "$id" currency 2>/dev/null || true)
   case "$source" in
     npm:?*) pkg=${source#npm:} ;;
@@ -400,6 +414,23 @@ fm_deps_lookup_latest() { # <id>
       status=$?
       [ "$status" -eq 0 ] || return 2
       out=$(printf '%s' "$out" | jq -r '.formulae[0].versions.stable // empty' 2>/dev/null)
+      out=$(printf '%s\n' "$out" | fm_deps_extract_semver)
+      [ -n "$out" ] || return 2
+      printf '%s\n' "$out"
+      return 0
+      ;;
+    github:?*/?*)
+      # A component distributed outside a package registry can still have an
+      # authoritative release stream. Declare the repository explicitly and
+      # ask gh-axi for its newest non-draft, non-prerelease release instead of
+      # treating a visible release history as unknowable.
+      repo=${source#github:}
+      gh_cmd=${FM_DEPS_GH_AXI:-gh-axi}
+      command -v "$gh_cmd" >/dev/null 2>&1 || return 2
+      out=$(GH_REPO="$repo" fm_deps_run_bounded "$FM_DEPS_LOOKUP_TIMEOUT" \
+        "$gh_cmd" release list --exclude-drafts --exclude-pre-releases --limit 1 2>/dev/null)
+      status=$?
+      [ "$status" -eq 0 ] || return 2
       out=$(printf '%s\n' "$out" | fm_deps_extract_semver)
       [ -n "$out" ] || return 2
       printf '%s\n' "$out"
@@ -441,7 +472,7 @@ fm_deps_extract_semver_list() {
 # --- artifact identity ------------------------------------------------------
 #
 # A version number is not identity. The captain's machine currently runs a
-# quota-axi packed from his own fork, carrying an unmerged fix, reporting the
+# quota-axi packed from his maintained fork, carrying a local fix, reporting the
 # same `0.1.13` string as the published release while containing different code.
 # A currency check that compares version strings calls that install current and
 # identical to upstream, and is wrong about what is actually running. It is the
