@@ -88,3 +88,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-kuru-product-check.sh` | Verify KURU changes against repository and copied lived-home surfaces before reporting product green |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
 | `fm-cleanup-stale-test-roots.sh` | Guarded dry-run-first cleanup of leaked test fixture roots under TMPDIR (safety gates + manifest) |
+| `fm-fold-lib.sh`         | Shared manifest access for custody records under `vendor/<id>/fold.json`              |
+| `fm-fold.sh`             | Build, install, and digest-verify a custody artifact (docs/dependency-custody.md)     |
+| `fm-fold-divergence.sh`  | Regenerate the carried/declined/untriaged upstream divergence report from git history |
+| `fm-fold-sweep.sh`       | Enumerate every firstmate surface class that can reach a custody record's upstream name |

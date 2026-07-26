@@ -1,0 +1,128 @@
+{
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "providers": [
+    {
+      "provider": "claude",
+      "state": {
+        "status": "fresh"
+      },
+      "windows": [
+        {
+          "id": "five_hour",
+          "kind": "session",
+          "percentRemaining": 17,
+          "resetsAt": "2026-01-01T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "seven_day",
+          "kind": "weekly",
+          "percentRemaining": 24,
+          "resetsAt": "2026-01-02T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "model:fable",
+          "kind": "model",
+          "percentRemaining": 31,
+          "resetsAt": "2026-01-03T00:00:00+00:00",
+          "windowSeconds": null
+        }
+      ]
+    },
+    {
+      "provider": "codex",
+      "state": {
+        "status": "fresh"
+      },
+      "windows": [
+        {
+          "id": "weekly",
+          "kind": "weekly",
+          "percentRemaining": 34,
+          "resetsAt": "2026-01-01T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "model:codex_bengalfox:7d",
+          "kind": "model",
+          "percentRemaining": 41,
+          "resetsAt": "2026-01-02T00:00:00+00:00",
+          "windowSeconds": null
+        }
+      ]
+    },
+    {
+      "provider": "cursor",
+      "state": {
+        "status": "auth_required"
+      },
+      "windows": []
+    },
+    {
+      "provider": "copilot",
+      "state": {
+        "status": "auth_required"
+      },
+      "windows": []
+    },
+    {
+      "provider": "grok",
+      "state": {
+        "status": "fresh"
+      },
+      "windows": [
+        {
+          "id": "credits",
+          "kind": "credits",
+          "percentRemaining": 85,
+          "resetsAt": "2026-01-01T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "product:grok_build",
+          "kind": "credits",
+          "percentRemaining": 92,
+          "resetsAt": "2026-01-02T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "product:api",
+          "kind": "credits",
+          "percentRemaining": 99,
+          "resetsAt": "2026-01-03T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "product:imagine",
+          "kind": "credits",
+          "percentRemaining": 5,
+          "resetsAt": "2026-01-04T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "product:chat",
+          "kind": "credits",
+          "percentRemaining": 12,
+          "resetsAt": "2026-01-05T00:00:00+00:00",
+          "windowSeconds": null
+        },
+        {
+          "id": "product:voice",
+          "kind": "credits",
+          "percentRemaining": 19,
+          "resetsAt": "2026-01-06T00:00:00+00:00",
+          "windowSeconds": null
+        }
+      ]
+    },
+    {
+      "provider": "kimi",
+      "state": {
+        "status": "auth_required"
+      },
+      "windows": []
+    }
+  ],
+  "schemaVersion": 2
+}
