@@ -50,7 +50,7 @@
 #   A --secondmate spawn is exempt and resolves the SECONDMATE harness
 #   (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok|agy)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -104,6 +104,7 @@
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
+# agy uses a gitignored workspace `.agents/hooks.json` Stop hook.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
@@ -291,6 +292,7 @@ SPAWN_PI_EXT_CREATED=0
 SPAWN_GROK_POINTER_CREATED=0
 SPAWN_GROK_TOKEN_CREATED=0
 SPAWN_GROK_AUTH_TOKEN=
+SPAWN_AGY_HOOK_CREATED=0
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -425,6 +427,7 @@ spawn_abort_cleanup() {
     if [ "$SPAWN_CLAUDE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.claude/settings.local.json" 2>/dev/null || true; fi
     if [ "$SPAWN_OPENCODE_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.opencode/plugins/fm-turn-end.js" 2>/dev/null || true; fi
     if [ "$SPAWN_GROK_POINTER_CREATED" -eq 1 ]; then rm -f "$WT/.fm-grok-turnend" 2>/dev/null || true; fi
+    if [ "$SPAWN_AGY_HOOK_CREATED" -eq 1 ]; then rm -f "$WT/.agents/hooks.json" 2>/dev/null || true; fi
   fi
   if [ "$SPAWN_TASK_TMP_CREATED" -eq 1 ] && [ -n "${TASK_TMP:-}" ]; then rm -rf "$TASK_TMP" 2>/dev/null || true; fi
   if [ -n "${STATE:-}" ] && [ -n "${ID:-}" ]; then
@@ -556,7 +559,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|pi|grok|agy)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -775,6 +778,10 @@ launch_template() {
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
     grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    # agy (Google Antigravity CLI): --prompt-interactive starts the supervised
+    # TUI and --dangerously-skip-permissions auto-approves tool execution.
+    # Turn-end rides the workspace .agents/hooks.json Stop hook installed below.
+    agy) printf '%s' 'agy --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__--prompt-interactive "$(cat __BRIEF__)"' ;;
     *) return 1 ;;
   esac
 }
@@ -947,7 +954,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|grok)
+    claude|codex|opencode|pi|grok|agy)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -983,6 +990,18 @@ effort_flag_for_harness() {
       # omit max rather than passing a flag the installed CLI will reject as invalid.
       case "$effort" in
         low|medium|high|xhigh) printf -- '--thinking %s ' "$(shell_quote "$effort")" ;;
+      esac
+      ;;
+    agy)
+      # agy accepts --effort low|medium|high. Its catalog also has model ids
+      # that already bake effort into the model token (for example
+      # gemini-3.1-pro-low). When a model token ends in an effort suffix, omit a
+      # separate --effort so the model token remains the single source of truth.
+      case "${MODEL:-}" in
+        *-low|*-medium|*-high) return 0 ;;
+      esac
+      case "$effort" in
+        low|medium|high) printf -- '--effort %s ' "$(shell_quote "$effort")" ;;
       esac
       ;;
     # opencode's interactive `opencode --prompt` launch has a verified --model
@@ -1492,6 +1511,36 @@ spawn_send_key() {  # <target> <key>
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
 }
+agy_refuse_model_substitution() {  # <warning-line>
+  local warning_line=${1:-}
+  echo "error: agy model '${MODEL:-default}' was not honored; Antigravity reported it is no longer available and substituted another model" >&2
+  [ -z "$warning_line" ] || echo "error: agy warning: $warning_line" >&2
+  echo "error: refusing spawn to avoid a silent model downgrade; re-probe a live agy launch and update the dispatch profile" >&2
+  rm -f "$STATE/$ID.meta" 2>/dev/null || true
+  SPAWN_META_PUBLISHED=0
+  return 1
+}
+agy_check_model_substitution() {
+  local polls delay i cap warning_line
+  [ "$HARNESS" = agy ] || return 0
+  [ -n "${MODEL:-}" ] && [ "$MODEL" != default ] || return 0
+  polls=${FM_AGY_MODEL_WARNING_CHECK_POLLS:-8}
+  delay=${FM_AGY_MODEL_WARNING_CHECK_DELAY:-0.5}
+  case "$polls" in ''|*[!0-9]*) polls=8 ;; esac
+  i=0
+  while [ "$i" -lt "$polls" ]; do
+    cap=$(fm_backend_capture "$BACKEND" "$T" 80 "$W" 2>/dev/null || true)
+    if printf '%s\n' "$cap" | grep -F "$MODEL" >/dev/null 2>&1 \
+      && printf '%s\n' "$cap" | grep -F "no longer available" >/dev/null 2>&1; then
+      warning_line=$(printf '%s\n' "$cap" | grep -F "$MODEL" | grep -F "no longer available" | head -1 || true)
+      agy_refuse_model_substitution "$warning_line"
+      return 1
+    fi
+    i=$((i + 1))
+    [ "$i" -ge "$polls" ] || sleep "$delay"
+  done
+  return 0
+}
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   lease_path=
   lease_path_seen=
@@ -1669,6 +1718,18 @@ EOF
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
       exclude_path '.fm-grok-turnend'
       ;;
+    agy*)
+      # agy discovers workspace customizations from .agents/ at the repository
+      # root and fires Stop hooks at turn boundaries. Verified live on agy 1.1.7
+      # with .agents/hooks.json touching a marker after an idle turn.
+      mkdir -p "$WT/.agents"
+      [ ! -e "$WT/.agents/hooks.json" ] \
+        || { echo "error: refusing to replace existing Antigravity hook in $WT" >&2; exit 1; }
+      SPAWN_AGY_HOOK_CREATED=1
+      hook_command=$(json_escape "touch $(shell_quote "$TURNEND"); printf '{}'") || exit 1
+      printf '{"fm-turn-end":{"Stop":[{"type":"command","command":"%s","timeout":5}]}}\n' "$hook_command" > "$WT/.agents/hooks.json"
+      exclude_path '.agents/hooks.json'
+      ;;
   esac
 fi
 
@@ -1812,6 +1873,7 @@ sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
+agy_check_model_substitution || exit 1
 
 if [ -n "${FM_NM_GEN_BINARY:-}" ]; then
   echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT nm_generation=${FM_NM_GEN_ID:-}"

@@ -193,7 +193,7 @@ test_freeze_excluded_when_live_exists() {
 
 test_trust_and_antigravity_gate_provider_data() {
   local profiles scored_obs selection ag
-  profiles='[{"provider":"codex","harness":"codex"},{"provider":"grok","harness":"grok"},{"provider":"antigravity","harness":"pi"}]'
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"grok","harness":"grok"},{"provider":"antigravity","harness":"agy"}]'
 
   scored_obs=$(jq -cn \
     --argjson codex "$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 0)")" \
@@ -211,7 +211,7 @@ test_trust_and_antigravity_gate_provider_data() {
     ))
   ' <<< "$selection" >/dev/null || fail "trust multipliers must be static data and grok must stay ungated: $selection"
 
-  profiles='[{"provider":"codex","harness":"codex"},{"provider":"antigravity","harness":"pi"}]'
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"antigravity","harness":"agy"}]'
 
   # Healthy trusted headroom: codex H=(50-5)/(100-5)>0.35, so fallback weight is
   # exactly zero and antigravity is excluded, not ranked last.
@@ -277,7 +277,7 @@ test_trust_and_antigravity_gate_provider_data() {
     --argjson claude '{"provider":"claude","evidence":"unreadable","scorable":false,"posture":"unknown","target_percent":10}' \
     --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 3600 18000)")" \
     '[$codex,$claude,$ag]')
-  profiles='[{"provider":"codex","harness":"codex"},{"provider":"claude","harness":"claude"},{"provider":"antigravity","harness":"pi"}]'
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"claude","harness":"claude"},{"provider":"antigravity","harness":"agy"}]'
   selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
   jq -e '
     .profile.provider == "antigravity"

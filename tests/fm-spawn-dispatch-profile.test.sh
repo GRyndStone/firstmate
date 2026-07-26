@@ -26,6 +26,7 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
+  capture-pane) printf '%s\n' "${FM_FAKE_TMUX_CAPTURE:-}"; exit 0 ;;
   send-keys)
     for a in "$@"; do case "$a" in *"treehouse get --lease --lease-holder "*)
       fake_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -154,6 +155,59 @@ enable_dispatch_profile() {
     > "$home/config/crew-dispatch.json"
 }
 
+enable_antigravity_dispatch_profile() {
+  local home=$1
+  printf '%s\n' '{"rules":[],"default":{"select":"usage-burndown","use":[{"provider":"claude","harness":"claude","model":"claude-opus-5","effort":"xhigh"},{"provider":"codex","harness":"codex","model":"gpt-5.6-sol","effort":"xhigh"},{"provider":"grok","harness":"grok","model":"grok-4.5","effort":"high"},{"provider":"antigravity","harness":"agy","model":"gemini-3.1-pro-low"}]}}' \
+    > "$home/config/crew-dispatch.json"
+}
+
+antigravity_quota_json() {
+  cat <<'JSON'
+{
+  "groups": [
+    {
+      "displayName": "Gemini Models",
+      "buckets": [
+        {
+          "bucketId": "gemini-weekly",
+          "displayName": "Weekly Limit",
+          "remainingFraction": 1,
+          "resetTime": "2099-01-01T00:00:00Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "gemini-5h",
+          "displayName": "Five Hour Limit",
+          "remainingFraction": 1,
+          "resetTime": "2099-01-01T00:00:00Z",
+          "window": "5h"
+        }
+      ]
+    },
+    {
+      "displayName": "Claude and GPT models",
+      "buckets": [
+        {
+          "bucketId": "3p-weekly",
+          "displayName": "Weekly Limit",
+          "remainingFraction": 1,
+          "resetTime": "2099-01-01T00:00:00Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "3p-5h",
+          "displayName": "Five Hour Limit",
+          "remainingFraction": 1,
+          "resetTime": "2099-01-01T00:00:00Z",
+          "window": "5h"
+        }
+      ]
+    }
+  ]
+}
+JSON
+}
+
 make_seeded_secondmate_home() {
   local home=$1 id=$2
   mkdir -p "$home/bin" "$home/data"
@@ -181,6 +235,9 @@ run_spawn() {
     FM_FAKE_QUOTA_EXIT="${FM_FAKE_QUOTA_EXIT:-0}" \
     FM_FAKE_CODEX_RESET_UNREADABLE="${FM_FAKE_CODEX_RESET_UNREADABLE:-0}" \
     FM_FAKE_CODEX_RESET_COUNT="${FM_FAKE_CODEX_RESET_COUNT:-0}" \
+    FM_FAKE_TMUX_CAPTURE="${FM_FAKE_TMUX_CAPTURE:-}" \
+    FM_AGY_MODEL_WARNING_CHECK_POLLS="${FM_AGY_MODEL_WARNING_CHECK_POLLS:-1}" \
+    FM_USAGE_ANTIGRAVITY_QUOTA_JSON="${FM_USAGE_ANTIGRAVITY_QUOTA_JSON:-}" \
     FM_DISPATCH_QUOTA_AXI="$fakebin/quota-axi" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
@@ -564,6 +621,128 @@ test_pi_omits_invalid_max_effort() {
   pass "pi threads model and omits unsupported max effort"
 }
 
+test_agy_threads_model_and_baked_effort() {
+  local rec id out status launch hook
+  id=profile-agy-z31
+  rec=$(make_spawn_case profile-agy agy "$id")
+  read_case_record "$rec"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider antigravity --harness agy \
+    --model gemini-3.1-pro-low --effort high \
+    --override-reason "captain set best reachable antigravity profile")
+  status=$?
+  expect_code 0 "$status" "agy spawn should accept the best reachable antigravity profile"
+  assert_contains "$out" "spawned $id harness=agy" "spawn did not report agy harness"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" agy gemini-3.1-pro-low high
+  assert_grep "provider=antigravity" "$HOME_DIR/state/$id.meta" "meta missing antigravity provider pin"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-low' --prompt-interactive" \
+    "agy launch did not pass the model token or prompt-interactive path: $launch"
+  assert_not_contains "$launch" "--effort" \
+    "agy launch must omit --effort when the model token already carries low/medium/high: $launch"
+  hook="$WT_DIR/.agents/hooks.json"
+  assert_present "$hook" "agy Stop hook was not installed"
+  assert_contains "$(cat "$hook")" '"fm-turn-end"' "agy hook does not use the named hook format"
+  assert_contains "$(cat "$hook")" "$HOME_DIR/state/$id.turn-ended" "agy hook does not touch this task's turn-ended file"
+  pass "agy launch threads model-only baked effort and installs the documented Stop hook"
+}
+
+test_agy_effort_only_flag() {
+  local rec id out status launch
+  id=profile-agy-effort-z32
+  rec=$(make_spawn_case profile-agy-effort agy "$id")
+  read_case_record "$rec"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider antigravity --harness agy --effort low \
+    --override-reason "probe agy effort-only path")
+  status=$?
+  expect_code 0 "$status" "agy effort-only spawn should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "agy --dangerously-skip-permissions --effort 'low' --prompt-interactive" \
+    "agy effort-only launch did not pass --effort low: $launch"
+  pass "agy passes --effort only when no model token already encodes effort"
+}
+
+test_agy_existing_hook_is_refused() {
+  local rec id out status
+  id=profile-agy-existing-hook-z33
+  rec=$(make_spawn_case profile-agy-existing-hook agy "$id")
+  read_case_record "$rec"
+  mkdir -p "$WT_DIR/.agents"
+  printf '{}\n' > "$WT_DIR/.agents/hooks.json"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --provider antigravity --harness agy \
+    --override-reason "probe agy hook collision")
+  status=$?
+  expect_code 1 "$status" "agy spawn must refuse to replace an existing workspace hook"
+  assert_contains "$out" "refusing to replace existing Antigravity hook" \
+    "agy hook collision did not fail closed: $out"
+  assert_absent "$HOME_DIR/state/$id.meta" "failed agy hook collision must not publish meta"
+  pass "agy spawn refuses to replace a project-owned .agents/hooks.json"
+}
+
+test_agy_unavailable_model_warning_fails_spawn() {
+  local rec id out status
+  id=profile-agy-model-sub-z35
+  rec=$(make_spawn_case profile-agy-model-sub agy "$id")
+  read_case_record "$rec"
+
+  out=$(
+    FM_FAKE_TMUX_CAPTURE=$'Warning\n  "gemini-3.1-pro-high" is no longer available. Using "Gemini 3.6 Flash\n  (High)."' \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+        "$id" "$PROJ_DIR" --provider antigravity --harness agy \
+        --model gemini-3.1-pro-high --override-reason "probe agy stale catalog"
+  )
+  status=$?
+  expect_code 1 "$status" "agy unavailable model warning must fail spawn"
+  assert_contains "$out" "agy model 'gemini-3.1-pro-high' was not honored" \
+    "agy substitution warning did not become a loud spawn error: $out"
+  assert_contains "$out" "refusing spawn to avoid a silent model downgrade" \
+    "agy substitution refusal did not explain the downgrade risk: $out"
+  assert_not_contains "$out" "spawned $id" "agy substitution failure must not report a successful spawn"
+  assert_absent "$HOME_DIR/state/$id.meta" "agy substitution failure must remove published meta"
+  pass "agy pane warning for unavailable model fails spawn instead of silently downgrading"
+}
+
+test_antigravity_default_dispatch_selects_agy_when_gate_opens() {
+  local rec id out status meta launch candidates
+  id=profile-agy-dispatch-z34
+  rec=$(make_spawn_case profile-agy-dispatch claude "$id")
+  read_case_record "$rec"
+  enable_antigravity_dispatch_profile "$HOME_DIR"
+
+  out=$(
+    FM_FAKE_CLAUDE_REMAINING=10 \
+    FM_FAKE_CLAUDE_BUDGET_REMAINING=10 \
+    FM_FAKE_CODEX_REMAINING=5 \
+    FM_FAKE_CODEX_BUDGET_REMAINING=5 \
+    FM_FAKE_GROK_REMAINING=5 \
+    FM_USAGE_ANTIGRAVITY_QUOTA_JSON="$(antigravity_quota_json)" \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR"
+  )
+  status=$?
+  expect_code 0 "$status" "antigravity default profile should route when full-trust providers are at floor"
+  assert_contains "$out" "spawned $id harness=agy" "default dispatch did not select agy when its gate opened: $out"
+  meta="$HOME_DIR/state/$id.meta"
+  assert_meta_profile "$meta" agy gemini-3.1-pro-low default
+  assert_grep "provider=antigravity" "$meta" "meta missing antigravity provider"
+  assert_grep "dispatch_origin=algorithm" "$meta" "meta missing algorithm dispatch origin"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "agy --dangerously-skip-permissions --model 'gemini-3.1-pro-low' --prompt-interactive" \
+    "selected antigravity launch did not use the agy harness/model: $launch"
+  assert_not_contains "$launch" "--effort" "baked antigravity model must not also pass an effort flag: $launch"
+  candidates=$(sed -n 's/^dispatch_candidates_json=//p' "$meta")
+  jq -e '
+    length == 4
+    and (map(select(.provider == "antigravity" and .profile.harness == "agy" and .eligible == true and .gate_weight == 1)) | length) == 1
+    and (map(select(.provider == "claude" or .provider == "codex" or .provider == "grok") | select(.posture == "freeze")) | length) == 3
+  ' <<< "$candidates" >/dev/null || fail "antigravity default candidate evidence missing: $candidates"
+  pass "default dispatch can select the antigravity/agy profile when the fallback gate opens"
+}
+
 test_batch_forwards_shared_profile_flags() {
   local rec id1 id2 out status shelllog
   id1=profile-batch-a-z9
@@ -698,6 +877,11 @@ test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
 test_pi_omits_invalid_max_effort
+test_agy_threads_model_and_baked_effort
+test_agy_effort_only_flag
+test_agy_existing_hook_is_refused
+test_agy_unavailable_model_warning_fails_spawn
+test_antigravity_default_dispatch_selects_agy_when_gate_opens
 test_batch_forwards_shared_profile_flags
 test_concurrent_static_and_dispatch_assignments_do_not_cross_talk
 test_active_dispatch_profile_does_not_block_secondmate_launch
