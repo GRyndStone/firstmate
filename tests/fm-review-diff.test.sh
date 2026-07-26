@@ -8,6 +8,7 @@
 #   (b) pr= without pr_head= -> fetch refs/pull/<n>/head and diff that
 #   (c) pr= absent -> unchanged worktree-branch diff
 #   (d) pr= present but PR head unreachable -> fallback to local branch + warning
+#   (e) local-first -> local default base, never fetch the remote backup
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -141,7 +142,38 @@ test_unreachable_pr_head_falls_back_with_warning() {
   pass "fm-review-diff falls back to local branch with a warning when PR head is unreachable"
 }
 
+test_local_first_uses_local_default_without_fetching_backup() {
+  local case_dir out baseline tracked_before tracked_after advance
+  case_dir=$(make_case local-first-base)
+  baseline=$(git -C "$case_dir/project" rev-parse main)
+
+  printf 'local feature\n' > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add feature.txt
+  git -C "$case_dir/wt" commit -qm "local-first feature"
+  write_task_meta "$case_dir" "mode=local-first"
+
+  advance="$case_dir/_advance"
+  git clone -q "$case_dir/origin.git" "$advance"
+  printf 'remote backup drift\n' > "$advance/remote.txt"
+  git -C "$advance" add remote.txt
+  git -C "$advance" commit -qm "remote-only drift"
+  git -C "$advance" push -q origin main
+  rm -rf "$advance"
+  tracked_before=$(git -C "$case_dir/project" rev-parse refs/remotes/origin/main)
+  [ "$tracked_before" = "$baseline" ] || fail "local-first fixture unexpectedly refreshed origin/main"
+
+  out=$(run_review_diff "$case_dir" task-x1)
+  tracked_after=$(git -C "$case_dir/project" rev-parse refs/remotes/origin/main)
+
+  assert_contains "$out" "diff base: main" "local-first review did not use local main"
+  assert_not_contains "$out" "diff base: origin/main" "local-first review used its backup as truth"
+  [ "$tracked_after" = "$tracked_before" ] \
+    || fail "local-first review fetched the remote backup"
+  pass "fm-review-diff uses local product truth for local-first without fetching its backup"
+}
+
 test_pr_meta_uses_pr_head_not_stale_local
 test_pr_meta_fetches_pull_head_without_recorded_sha
 test_no_pr_meta_uses_local_branch
 test_unreachable_pr_head_falls_back_with_warning
+test_local_first_uses_local_default_without_fetching_backup

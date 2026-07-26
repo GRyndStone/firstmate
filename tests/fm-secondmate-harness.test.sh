@@ -660,6 +660,8 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   mkdir -p "$home/data/$id" "$home/projects" "$home/state"
   printf 'brief\n' > "$home/data/$id/brief.md"
   fm_write_criteria "$home/data" "$id"
+  printf -- '- %s [direct-PR] - explicit reference fixture\n' \
+    "$(basename "$proj")" > "$home/data/projects.md"
   : > "$launchlog"
   PATH="$fakebin:$BASE_PATH" TMUX="fake,1,0" CLAUDECODE=1 \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \

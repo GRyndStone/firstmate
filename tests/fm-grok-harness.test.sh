@@ -85,6 +85,8 @@ make_spawn_case() {
   printf 'brief\n' > "$home/data/$id/brief.md"
   fm_write_criteria "$home/data" "$id"
   fm_git_worktree "$proj" "$wt" "fm/$id"
+  printf -- '- %s [direct-PR] - explicit reference fixture\n' \
+    "$(basename "$proj")" > "$home/data/projects.md"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$grok_home|$id"
 }

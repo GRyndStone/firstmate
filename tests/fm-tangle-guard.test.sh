@@ -127,6 +127,7 @@ test_brief_assertion_precedes_branch() {
   local home brief iso br
   home="$TMP_ROOT/brief-home"
   mkdir -p "$home/data"
+  printf '%s\n' '- alpha [direct-PR] - explicit reference fixture (added 2026-07-26)' > "$home/data/projects.md"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" tangle-brief-cc3 alpha >/dev/null 2>&1
   brief="$home/data/tangle-brief-cc3/brief.md"
   assert_present "$brief" "brief was not scaffolded"
@@ -227,6 +228,7 @@ test_spawn_isolation_abort() {
   home="$TMP_ROOT/spawn-home"
   mkdir -p "$home/data"
   proj=$(make_repo "$TMP_ROOT/spawn-proj")
+  printf '%s\n' '- spawn-proj [direct-PR] - explicit reference fixture (added 2026-07-26)' > "$home/data/projects.md"
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake")
   # A genuine isolated linked worktree of the project, detached on the default.
   git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-wt" >/dev/null 2>&1
@@ -344,6 +346,7 @@ test_spawn_tmux_window_construction() {
   home="$TMP_ROOT/spawn-rec-home"
   mkdir -p "$home/data"
   proj=$(make_repo "$TMP_ROOT/spawn-rec-proj")
+  printf '%s\n' '- spawn-rec-proj [direct-PR] - explicit reference fixture (added 2026-07-26)' > "$home/data/projects.md"
   fakebin=$(make_spawn_record_fakebin "$TMP_ROOT/spawn-rec-fake")
   rec="$TMP_ROOT/spawn-rec.log"
   : > "$rec"

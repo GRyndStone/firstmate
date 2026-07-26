@@ -827,9 +827,15 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
   : > "$log"
   env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
+    FM_PROJECTS_OVERRIDE="$data/projects.md" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
     "$bin/bin/fm-spawn.sh" "$@"
+}
+
+register_spawn_project_mode() {  # <data-dir> <project-dir>
+  local data=$1 project=$2
+  printf -- '- %s [direct-PR] - explicit reference fixture\n' \
+    "$(basename "$project")" > "$data/projects.md"
 }
 
 # NOTE: the old-vs-new spawn command-log conformance test that used to live here
@@ -936,6 +942,7 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   mkdir -p "$data/$id"
   printf 'test brief content\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   state="$TMP_ROOT/symlink-state-$label"; config="$TMP_ROOT/symlink-config-$label"
   mkdir -p "$state" "$config"
   log="$TMP_ROOT/symlink-spawn-$label.log"
@@ -973,6 +980,7 @@ test_spawn_validation_failure_cleans_uncertain_treehouse_worktree() {
   mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
   printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   fb="$dir/fakebin"
   cat > "$fb/tmux" <<SH
 #!/usr/bin/env bash
@@ -1043,6 +1051,7 @@ test_spawn_retains_treehouse_ownership_when_endpoint_cleanup_is_unconfirmed() {
   mkdir -p "$invalid" "$data/$id" "$state" "$config" "$dir/fakebin"
   printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   fb="$dir/fakebin"
   cat > "$fb/tmux" <<SH
 #!/usr/bin/env bash
@@ -1215,12 +1224,13 @@ test_spawn_default_backend_writes_no_meta_field() {
   fb=$(make_spawn_fakebin "$TMP_ROOT/nobackend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   state="$TMP_ROOT/nobackend-state"; config="$TMP_ROOT/nobackend-config"
   mkdir -p "$state" "$config"
 
   out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
+    FM_PROJECTS_OVERRIDE="$data/projects.md" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_TMUX_LOG="$TMP_ROOT/nobackend.log" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
   expect_code 0 $? "explicit --backend tmux should spawn successfully"$'\n'"$out"
@@ -1238,6 +1248,7 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   fb=$(make_spawn_fakebin "$TMP_ROOT/explicit-backend-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   state="$TMP_ROOT/explicit-backend-state"; config="$TMP_ROOT/explicit-backend-config"
   mkdir -p "$state" "$config"
 
@@ -1245,7 +1256,7 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   # but an explicit --backend tmux flag must still win outright.
   out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
+    FM_PROJECTS_OVERRIDE="$data/projects.md" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/explicit-backend.log" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
   expect_code 0 $? "explicit --backend tmux should spawn successfully even with HERDR_ENV=1 set"$'\n'"$out"
@@ -1263,6 +1274,7 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   fb=$(make_spawn_fakebin "$TMP_ROOT/nest-fake" "$wt")
   mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   state="$TMP_ROOT/nest-state"; config="$TMP_ROOT/nest-config"
   mkdir -p "$state" "$config"
 
@@ -1273,7 +1285,7 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   # it (today's default path, byte-identical).
   out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
+    FM_PROJECTS_OVERRIDE="$data/projects.md" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/nest.log" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude 2>&1)
   expect_code 0 $? "fm-spawn.sh should auto-detect tmux and spawn successfully for nested tmux-in-herdr"$'\n'"$out"
@@ -1300,6 +1312,7 @@ test_spawn_failure_without_handles_retains_creation_claim() {
   mkdir -p "$data/$id" "$state" "$config" "$fake"
   printf 'brief\n' > "$data/$id/brief.md"
   fm_write_criteria "$data" "$id"
+  register_spawn_project_mode "$data" "$proj"
   cat > "$fake/tmux" <<'SH'
 #!/bin/sh
 case "${1:-}" in
@@ -1313,7 +1326,7 @@ SH
   fm_fake_exit0 "$fake" treehouse
   out=$(PATH="$fake:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
+    FM_PROJECTS_OVERRIDE="$data/projects.md" FM_SPAWN_NO_GUARD=1 TMUX='fake,1,0' \
     FM_TMUX_LOG="$log" "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "handle-less backend creation failure unexpectedly spawned"

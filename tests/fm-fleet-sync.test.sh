@@ -10,7 +10,8 @@
 #     quantified "STUCK: ... N commits behind ... - needs attention" warning
 #     instead of a quiet skip.
 # The pre-existing fast-forward / already-current / local-only / no-origin paths
-# must be unchanged, and bootstrap must relay the new outcomes as FLEET_SYNC lines.
+# must be unchanged. local-first must never sync from its backup, unresolved
+# delivery modes must fail closed, and bootstrap must relay actionable outcomes.
 #
 # It also pins the orphaned .git/packed-refs.lock recovery in the fetch step
 # (fetch_with_packed_refs_lock_guard, backed by bin/fm-lock-lib.sh's shared
@@ -42,6 +43,12 @@ new_home() {
   printf '%s\n' "$h"
 }
 
+register_project() {
+  local home=$1 name=$2 mode=${3:-direct-PR}
+  mkdir -p "$home/data"
+  printf -- '- %s [%s] - test project (added 2026-07-26)\n' "$name" "$mode" >> "$home/data/projects.md"
+}
+
 commit_file() {
   local dir=$1 file=$2 content=$3 msg=$4
   printf '%s\n' "$content" > "$dir/$file"
@@ -69,6 +76,7 @@ build_pair() {
   git -C "$work" push -q -u origin main
 
   git clone --quiet "file://$remote_abs" "$clone"
+  register_project "$home" "$name"
   printf '%s\n' "$clone"
 }
 
@@ -114,6 +122,7 @@ build_packed_prunable() {
   git -C "$work" push -q origin main:refs/heads/feature
 
   git clone --quiet "file://$remote_abs" "$clone"
+  register_project "$home" "$name"
   git -C "$clone" branch -q feature origin/feature
   commit_file "$work" file.txt v1 C1
   git -C "$work" push -q origin main
@@ -347,6 +356,7 @@ test_no_origin_skipped() {
   git init -q "$clone"
   git -C "$clone" symbolic-ref HEAD refs/heads/main
   commit_file "$clone" file.txt v0 C0
+  register_project "$home" theta
 
   out=$(run_sync "$home" "$clone")
 
@@ -368,6 +378,41 @@ test_local_only_skipped() {
   assert_contains "$out" "iota: skipped: local-only project" "local-only clone is skipped as before"
   assert_not_contains "$out" "STUCK" "local-only skip is not escalated to STUCK"
   pass "local-only clone is skipped (benign), not flagged STUCK"
+}
+
+test_local_first_skips_backup_without_fetching() {
+  local home clone out before
+  home=$(new_home)
+  clone=$(build_pair "$home" localfirst)
+  advance_origin "$home" localfirst REMOTE_ONLY
+  before=$(head_sha "$clone")
+  printf -- '- localfirst [local-first] - running local product (added 2026-07-26)\n' > "$home/data/projects.md"
+
+  out=$(run_sync "$home" "$clone")
+
+  assert_contains "$out" "localfirst: skipped: local-first project" \
+    "local-first clone did not skip its backup"
+  [ "$(head_sha "$clone")" = "$before" ] \
+    || fail "local-first clone synced remote backup down into the local product"
+  assert_not_contains "$out" "STUCK" "local-first skip is not a stuck clone"
+  pass "local-first clone never syncs its remote backup down"
+}
+
+test_unresolved_mode_skips_without_fetching() {
+  local home clone out before
+  home=$(new_home)
+  clone=$(build_pair "$home" unresolved)
+  advance_origin "$home" unresolved REMOTE_ONLY
+  before=$(head_sha "$clone")
+  printf -- '- unresolved - omitted mode fixture (added 2026-07-26)\n' > "$home/data/projects.md"
+
+  out=$(run_sync "$home" "$clone")
+
+  assert_contains "$out" "unresolved: skipped: delivery mode unresolved:" \
+    "fleet sync did not surface unresolved delivery mode"
+  [ "$(head_sha "$clone")" = "$before" ] \
+    || fail "unresolved project synced before its deliverable mode was chosen"
+  pass "fleet sync fails closed without mutating projects whose delivery mode is unresolved"
 }
 
 test_single_project_by_bare_name_resolves() {
@@ -613,6 +658,8 @@ test_on_default_clean_behind_fast_forwards
 test_already_current_unchanged
 test_no_origin_skipped
 test_local_only_skipped
+test_local_first_skips_backup_without_fetching
+test_unresolved_mode_skips_without_fetching
 test_single_project_by_bare_name_resolves
 test_single_project_by_bare_name_ignores_cwd_shadow
 test_single_project_by_projects_relative_name_resolves

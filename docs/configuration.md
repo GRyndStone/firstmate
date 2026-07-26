@@ -114,7 +114,7 @@ A project-less seed requires no existing project clones or `data/projects.md` en
 A preexisting project-bearing charter is also refused until it is re-scaffolded with `--no-projects` or removed.
 The lease is held under the secondmate id until explicit retirement or seed rollback returns it, so normal restarts do not free or recycle the home.
 Teardown of a leased home fails closed if `treehouse return` cannot release the lease; plain-clone homes with no treehouse pool slot are removed directly.
-Secondmate routes cover `no-mistakes` and `direct-PR` projects; `local-only` projects remain main-firstmate work.
+Secondmate routes cover `no-mistakes` and `direct-PR` projects; `local-first` and `local-only` projects remain main-firstmate work because a secondmate clone is not their running local product.
 For `no-mistakes` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
 After creating a secondmate, move existing main-backlog queued items that you have judged in-scope with `fm-backlog-handoff.sh <secondmate-id> <item-key>...`; it is idempotent and refuses In flight, Done, or non-secondmate homes.
 Set `FM_SECONDMATE_CHARTER` to seed from inline charter text when no filled charter brief exists; set `FM_SECONDMATE_SCOPE` when the routing scope should differ from the charter text.
@@ -162,12 +162,13 @@ The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, `conf
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
 For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
-## Delivery mode defaults (data/projects.md)
+## Delivery mode resolution (data/projects.md)
 
 [`bin/fm-project-mode.sh`](../bin/fm-project-mode.sh) is the single owner of delivery-mode resolution from `data/projects.md`.
-`direct-PR` is the default for omitted mode brackets, unknown modes, missing registry, and unknown projects.
-`no-mistakes` is explicit opt-in only (`[no-mistakes]` on the registry line).
-`AGENTS.md` section 6 keeps the operator-facing mode list and points here for the fallback rule.
+Every project must explicitly record `direct-PR`, `no-mistakes`, `local-first`, or `local-only`.
+Missing registry, unknown project, omitted brackets, and invalid modes fail closed with the deciding question: is the project deliverable a reference repository or a running local instance?
+Reference repositories choose `direct-PR` or `no-mistakes`; running local instances choose `local-first` when GitHub backs them up or `local-only` when no remote exists.
+`AGENTS.md` section 6 keeps the operator-facing mode list and makes the question part of project intake.
 
 Firstmate's own GitHub PR check for this repo is separate: [`.github/workflows/no-mistakes-required.yml`](../.github/workflows/no-mistakes-required.yml) runs [`bin/fm-pr-delivery-check.sh`](../bin/fm-pr-delivery-check.sh), which accepts direct-PR by default and fails closed only for explicit no-mistakes (label `no-mistakes` and/or body line `delivery: no-mistakes`) without the pipeline signature.
 `CONTRIBUTING.md` documents both human paths.
@@ -202,7 +203,7 @@ Forced continuations are recorded best-effort from the primary turn-end guard wh
 ## No-mistakes generation (config/no-mistakes-generation)
 
 `config/no-mistakes-generation` is an optional local, gitignored file that selects which no-mistakes runtime generation newly spawned **explicit `no-mistakes` ship** tasks use for validation.
-It is ignored for `direct-PR`, `local-only`, scout, and secondmate launches.
+It is ignored for `direct-PR`, `local-first`, `local-only`, scout, and secondmate launches.
 This section is the single owner of the operator-facing generation contract; script headers and [`docs/no-mistakes-agent-handoff.md`](no-mistakes-agent-handoff.md) point here instead of restating it.
 
 Format (key=value lines; comments and blanks ignored):
@@ -225,7 +226,7 @@ Resolution and pinning (ship + `mode=no-mistakes` only):
 4. Snapshot the pin into the new task's meta and export `NM_HOME` plus a `PATH` prefix for the binary's directory into that worker pane only.
 5. Absent file on an opted-in no-mistakes task: ambient PATH `no-mistakes` and default `NM_HOME`.
 6. Present but incomplete, invalid, or unhealthy on an opted-in no-mistakes task: fail closed at spawn with an actionable diagnostic; never silently route to the ambient/default installation.
-7. Non-no-mistakes tasks never read this file: a bad or absent generation config cannot break direct-PR or local-only launches.
+7. Non-no-mistakes tasks never read this file: a bad or absent generation config cannot break direct-PR, local-first, or local-only launches.
 
 A later edit to the config file affects only future spawns.
 It must not rewrite live task metadata or force-restart a process.
@@ -327,7 +328,7 @@ Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
-Normal completed runs keep local-only and no-origin skips silent.
+Normal completed runs keep local-first, local-only, and no-origin skips silent.
 If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.sh` output before the aggregate timeout skip so no finished result is lost.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.
 On that signature only, `fm-fleet-sync.sh` retries the fetch with a bounded wait for the lock to self-clear, then removes the lock and retries once more only when it can prove the lock stale, exactly like the `fm-teardown.sh` `index.lock` recovery.
