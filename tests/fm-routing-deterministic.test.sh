@@ -307,7 +307,7 @@ fixture_unavailable_evidence_refuses_loudly() {
 }
 
 fixture_total_tie_is_stable() {
-  local profiles codex_a codex_b quota selection providers run
+  local profiles codex_a quota selection providers run
   reset_history
   # Same provider twice with identical R/T so score, headroom, R, and T all match;
   # only profile index differs. Two different providers cannot fully tie under
