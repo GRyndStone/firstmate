@@ -11,12 +11,16 @@
 #   for provider=codex only:
 #     reset_factor = C^N where N = available rate-limit reset credits
 #     (C defaults to 1.5; compounding). Other providers use factor 1.
-#   score = score_base * base_pressure * reset_factor
+#   score = score_base * base_pressure * reset_factor * trust_multiplier * gate_weight
+#   trust_multiplier is static captain preference data. gate_weight defaults to 1
+#   and only applies to gated providers. Its H reference is max normalized
+#   headroom across ungated full-trust providers.
 #
 # Per-provider target floors live in bin/fm-usage-source-lib.sh's registry
 # (default 5 for known providers, 10 for claude). Freeze begins when R is at
 # or below that provider's target; those candidates are excluded when any live
-# candidate remains. Highest score wins.
+# candidate remains. Gated providers with weight 0 are excluded from the live
+# candidate set. Highest weighted score wins.
 #
 # Removed from the score path (do not reintroduce):
 #   - B*T burn-rate subtraction
@@ -244,7 +248,13 @@ fm_usage_burndown_resolve_target() { # <observation_json>
 }
 
 fm_usage_burndown_score_one() { # <observation_json>
-  local obs=$1 provider window_id reset_epoch reported_W period_json target
+  local obs=$1 provider window_id reset_epoch reported_W period_json target trust_policy
+  provider=$(printf '%s\n' "$obs" | jq -r '.provider // empty' 2>/dev/null) || provider=
+  if [ -n "$provider" ] && fm_usage_source_provider_known "$provider" 2>/dev/null; then
+    trust_policy=$(fm_usage_source_trust_policy "$provider")
+  else
+    trust_policy='{"trust_multiplier":1,"gated":false,"wake_below":1,"full_at":0}'
+  fi
   if ! printf '%s\n' "$obs" | jq -e '
     (.evidence == "fresh" or .evidence == "stale")
     and ((.binding.remaining? | type) == "number")
@@ -252,7 +262,7 @@ fm_usage_burndown_score_one() { # <observation_json>
     and ((.binding.resets_at_epoch? | type) == "number")
   ' >/dev/null 2>&1; then
     target=$(fm_usage_burndown_resolve_target "$obs")
-    printf '%s\n' "$obs" | jq -c --argjson target "$target" '. + {
+    printf '%s\n' "$obs" | jq -c --argjson target "$target" --argjson trust "$trust_policy" '. + {
       target_percent:$target,
       headroom:null,
       score_base:null,
@@ -276,14 +286,23 @@ fm_usage_burndown_score_one() { # <observation_json>
       scorable:false,
       W:null,
       W_source:"missing",
-      spend_floor:$target
+      spend_floor:$target,
+      trust_multiplier:($trust.trust_multiplier // 1),
+      gated:($trust.gated // false),
+      gate_wake_below:($trust.wake_below // 1),
+      gate_full_at:($trust.full_at // 0),
+      gate_weight:null,
+      gate_reference_headroom:null,
+      gate_reference_source:null,
+      raw_score:null,
+      score_after_reset:null,
+      score_after_trust:null
     }'
     return 0
   fi
   # Codex reset-count handling is part of scoring below. An unreadable count is
   # a loud, named diagnostic with neutral factor 1 - never a silent zero and
   # never a poison of otherwise-valid window evidence (AC-3).
-  provider=$(printf '%s\n' "$obs" | jq -r '.provider')
   window_id=$(printf '%s\n' "$obs" | jq -r '.binding.id')
   # R and T are read only inside the jq score expression below (from $obs.binding);
   # shell-side copies would be dead after the formula change that stopped passing
@@ -296,6 +315,7 @@ fm_usage_burndown_score_one() { # <observation_json>
     --argjson obs "$obs" \
     --argjson period "$period_json" \
     --argjson target "$target" \
+    --argjson trust "$trust_policy" \
     --argjson K "$FM_BURNDOWN_PRESSURE_K" \
     --argjson gate_floor "$FM_BURNDOWN_RATE_FLOOR" \
     --argjson reset_factor_base "$FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR" '
@@ -348,7 +368,8 @@ fm_usage_burndown_score_one() { # <observation_json>
     | $reset_state.factor as $reset_factor
     | $reset_state.n as $reset_n
     | ($base_pressure * $reset_factor) as $pressure
-    | ($score_base * $pressure) as $score
+    | ($score_base * $pressure) as $score_after_reset
+    | ($score_after_reset * ($trust.trust_multiplier // 1)) as $score_after_trust
     | (100 - $R) as $used
     | (($o.gate_windows // []) | all(.remaining > $gate_floor)) as $eligible
     | (
@@ -392,7 +413,7 @@ fm_usage_burndown_score_one() { # <observation_json>
         reset_pressure_source:$reset_state.source,
         reset_count_unreadable:$reset_state.unreadable,
         urgency:$urgency,
-        score:$score,
+        score:$score_after_trust,
         posture:$posture,
         percent_used:$used,
         eligible:$eligible,
@@ -402,6 +423,16 @@ fm_usage_burndown_score_one() { # <observation_json>
         W_source:$period.source,
         spend_floor:$target,
         rate_floor:$gate_floor,
+        trust_multiplier:($trust.trust_multiplier // 1),
+        gated:($trust.gated // false),
+        gate_wake_below:($trust.wake_below // 1),
+        gate_full_at:($trust.full_at // 0),
+        gate_weight:null,
+        gate_reference_headroom:null,
+        gate_reference_source:null,
+        raw_score:$score_base,
+        score_after_reset:$score_after_reset,
+        score_after_trust:$score_after_trust,
         diagnostics:(
           ($o.diagnostics // [])
           + (
@@ -480,6 +511,17 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
         reset_count_unreadable:($observation.reset_count_unreadable // false),
         urgency:($observation.urgency // null),
         score:($observation.score // null),
+        trust_multiplier:($observation.trust_multiplier // 1),
+        gated:($observation.gated // false),
+        gate_wake_below:($observation.gate_wake_below // 1),
+        gate_full_at:($observation.gate_full_at // 0),
+        gate_weight:($observation.gate_weight // null),
+        gate_reference_headroom:($observation.gate_reference_headroom // null),
+        gate_reference_source:($observation.gate_reference_source // null),
+        gate_excluded:($observation.gate_excluded // false),
+        raw_score:($observation.raw_score // null),
+        score_after_reset:($observation.score_after_reset // null),
+        score_after_trust:($observation.score_after_trust // $observation.score // null),
         posture:($observation.posture // "unknown"),
         percent_used:($observation.percent_used // null),
         spend_floor:($observation.spend_floor // $observation.target_percent // null),
@@ -499,6 +541,37 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
             }
         ]
       };
+    def normalized_full_trust_headroom:
+      if (.R | type) == "number"
+         and (.target_percent | type) == "number"
+         and .target_percent < 100 then
+        ([0, (.R - .target_percent)] | max) / (100 - .target_percent)
+      else null
+      end;
+    def gate_weight_for($H):
+      if .gated != true then 1
+      elif $H >= .gate_wake_below then 0
+      elif $H <= .gate_full_at then 1
+      elif (.gate_wake_below - .gate_full_at) <= 0 then 1
+      else (.gate_wake_below - $H) / (.gate_wake_below - .gate_full_at)
+      end;
+    def apply_gate_weight($gate_state):
+      (gate_weight_for($gate_state.H)) as $w
+      | .gate_weight = $w
+      | .gate_reference_headroom = $gate_state.H
+      | .gate_reference_source = (if .gated == true then $gate_state.source else "ungated" end)
+      | if .gated == true then
+          .score = (if (.score | type) == "number" then (.score * $w) else .score end)
+          | .gate_excluded = ($w == 0)
+          | if $w == 0 and .scorable == true then
+              .eligible = false
+              | .ineligible_reason = "gated-full-trust-headroom"
+              | .score = 0
+            else .
+            end
+        else
+          .gate_excluded = false
+        end;
     # Deterministic order: score desc, headroom (S) desc, R desc, T asc, index asc.
     def better($left; $right):
       if $left == null then $right
@@ -538,19 +611,42 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
                posture:"unknown"
              })
            )
-       ]) as $rows
+       ]) as $raw_rows
+    | ([ $raw_rows[] | select(.gated != true and .trust_multiplier == 1) ]) as $full_trust_rows
+    | ([
+        $full_trust_rows[]
+        | select(.scorable == true)
+        | normalized_full_trust_headroom
+        | select(type == "number")
+      ]) as $full_trust_headrooms
+    | (
+        if ($full_trust_headrooms | length) > 0 then
+          {H:($full_trust_headrooms | max), source:"ungated-full-trust-provider-headroom"}
+        elif ($full_trust_rows | length) > 0 then
+          {H:0, source:"full-trust-evidence-unreadable"}
+        else
+          {H:0, source:"no-ungated-full-trust-providers"}
+        end
+      ) as $gate_state
+    | ([ $raw_rows[] | apply_gate_weight($gate_state) ]) as $rows
     | if $mode == "admit" then
         $rows[0] as $chosen
         | if $chosen == null then
             {unavailable:true,frozen:false,profile:null,explain:"no profiles",candidates:[],strategy:"usage-burndown"}
           elif $chosen.eligible != true then
             (
-              "admit pin blocked by exhausted rate window; budget R=\($chosen.R) T=\($chosen.T)s"
+              if $chosen.ineligible_reason == "gated-full-trust-headroom" then
+                "admit pin excluded by gate ramp; H=\($chosen.gate_reference_headroom) "
+                + "source=\($chosen.gate_reference_source) "
+                + "wake_below=\($chosen.gate_wake_below) weight=\($chosen.gate_weight)"
+              else
+                "admit pin blocked by exhausted rate window; budget R=\($chosen.R) T=\($chosen.T)s"
+              end
             ) as $why
             | {
                 unavailable:false,
                 frozen:true,
-                block_reason:"rate-window-exhausted",
+                block_reason:($chosen.ineligible_reason // "ineligible"),
                 provider:$chosen.provider,
                 used:$chosen.percent_used,
                 min:$chosen.R,
@@ -559,7 +655,7 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
                   + {quota_posture:"unknown"}
                   + decision_fields($chosen;$rows;$why)
                 ),
-                explain:("admit pin provider \($chosen.provider) temporarily ineligible: exhausted rate window"),
+                explain:("admit pin provider \($chosen.provider) temporarily ineligible: \($chosen.ineligible_reason // "ineligible")"),
                 candidates:$rows,
                 strategy:"usage-burndown"
               }
@@ -642,11 +738,35 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
                 + "target=\($chosen.target_percent) headroom=\($chosen.headroom) "
                 + "score_base=\($chosen.score_base) urgency=\($chosen.urgency) "
                 + "base_pressure=\($chosen.base_pressure) "
+                + (
+                    if $chosen.gated == true then
+                      "trust=\($chosen.trust_multiplier) "
+                      + "gate_weight=\($chosen.gate_weight) "
+                      + "H=\($chosen.gate_reference_headroom)/\($chosen.gate_reference_source) "
+                    else
+                      "trust=\($chosen.trust_multiplier) "
+                    end
+                  )
+                + "raw_score=\($chosen.raw_score) "
+                + "score_after_reset=\($chosen.score_after_reset) "
+                + "score_after_trust=\($chosen.score_after_trust) "
                 + "score=((R-target)/T)*(1+K*urgency^2)"
                 + (
                     if $chosen.provider == "codex" then
                       " * reset_factor=\($chosen.reset_pressure_factor)"
                       + " (resets=\($chosen.reset_available_count)/\($chosen.reset_pressure_source))"
+                    else ""
+                    end
+                  )
+                + (
+                    if $chosen.trust_multiplier != 1 then
+                      " * trust=\($chosen.trust_multiplier)"
+                    else ""
+                    end
+                  )
+                + (
+                    if $chosen.gated == true then
+                      " * gate_weight=\($chosen.gate_weight)"
                     else ""
                     end
                   )
@@ -718,12 +838,12 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
           elif ($rate_limited | length) > 0 then
             (reduce $rate_limited[] as $candidate (null;better(.;$candidate))) as $chosen
             | (
-                "all scorable candidates have exhausted rate windows"
+                "all scorable candidates are ineligible"
               ) as $why
             | {
                 unavailable:false,
                 frozen:true,
-                block_reason:"rate-window-exhausted",
+                block_reason:($chosen.ineligible_reason // "ineligible"),
                 provider:$chosen.provider,
                 used:$chosen.percent_used,
                 min:$chosen.R,
@@ -769,6 +889,17 @@ fm_usage_burndown_format_explain() { # <selection_json>
         + "R=\(.R) T=\(.T) W=\(.W)/\(.W_source) target=\(.target_percent) headroom=\(.headroom) "
         + "score_base=\(.score_base) urgency=\(.urgency) "
         + "base_pressure=\(.base_pressure) pressure=\(.pressure)/\(.pressure_source) "
+        + "trust=\(.trust_multiplier) "
+        + "raw_score=\(.raw_score) score_after_reset=\(.score_after_reset) "
+        + "score_after_trust=\(.score_after_trust) "
+        + (
+            if .gated == true then
+              "gate_weight=\(.gate_weight) "
+              + "H=\(.gate_reference_headroom)/\(.gate_reference_source) "
+              + "gate_ramp=\(.gate_full_at)-\(.gate_wake_below) "
+            else ""
+            end
+          )
         + (
             if .provider == "codex" then
               "reset_factor=\(.reset_pressure_factor) "
@@ -779,6 +910,8 @@ fm_usage_burndown_format_explain() { # <selection_json>
         + "score=\(.score) "
         + "formula=((R-target)/T)*(1+K*urgency^2)"
         + (if .provider == "codex" then "*C^N" else "" end)
+        + (if .trust_multiplier != 1 then "*trust" else "" end)
+        + (if .gated == true then "*gate_weight" else "" end)
         + " "
         + "window_roles=\(.window_roles | tojson)")
   '

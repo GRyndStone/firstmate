@@ -87,7 +87,7 @@ So KURU's specification already draws the line this lane was trying to find:
 
 - **Routing on usage evidence is KURU-native and already built.** `tools/usage-burndown`
   is ~1,028 lines with no third-party imports, carrying registered adapters for
-  anthropic-class, openai-class, grok-class, gemini-class, and openrouter-class
+  anthropic-class, openai-class, grok-class, antigravity-class, gemini-class, and openrouter-class
   through one plug surface. Absorbing quota-axi's routing would be re-implementing
   something that already exists. (It is Python today and therefore a port item
   under the Bun/TypeScript decision — see the re-derivation below.)

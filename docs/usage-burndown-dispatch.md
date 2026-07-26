@@ -36,6 +36,7 @@ The per-provider target floor applies to this budget, not to the rate gate.
 | `claude` | `five_hour` | `seven_day` | **10** | none |
 | `codex` | `five_hour` | `weekly` | 5 | none |
 | `grok` | `grokbuild` or `product:grokbuild` when reported | `credits` | 5 | `api`, `grokimagine`, `chat`, `voice`, and their `product:` forms |
+| `antigravity` | `gemini-5h` | `gemini-weekly` | 5 | `3p-weekly`, `3p-5h` |
 | `gemini` | (unmetered) | — | 5 | — |
 | `openrouter` | (unmetered) | — | 5 | — |
 | `cursor` | (policy empty until wired) | — | 5 | — |
@@ -54,6 +55,46 @@ A new window not named by a configured provider policy is recorded as `unclassif
 A provider with exactly one usable non-model window and no configured role policy treats that window as both gate and budget.
 A provider with multiple unclassified windows degrades to `evidence=unknown` because choosing a durable budget would be a guess.
 Missing gate evidence cannot prove that a provider is rate-limited.
+
+## Trust and fallback gating
+
+Provider trust is static captain preference data in the same registry as target floors and window roles.
+It is separate from evidence-derived multipliers such as Codex reset credits and the near-expiry amplifier, and the decision record keeps those fields separately inspectable.
+
+| Provider | Trust multiplier | Gated? |
+| --- | ---: | --- |
+| `claude` | 1.0 | no |
+| `codex` | 1.0 | no |
+| `grok` | 0.75 | no |
+| `antigravity` | 0.40 | yes |
+
+Grok deliberately has a 0.75 trust multiplier with no fallback gate.
+Its credits expire weekly, so gating it behind full-trust provider drain would strand credits unspent in light weeks.
+Gating is for a provider the captain would rather never touch unless needed; trust is for a provider the captain does want used, ranked lower.
+
+Only Antigravity is a gated fallback today.
+For each ungated full-trust provider, the reference headroom calculation is:
+
+```text
+headroom(p) = max(0, R - F) / (100 - F)
+H = max(headroom(p)) across ungated full-trust providers only
+```
+
+At present, that means `claude` and `codex` drive `H`.
+Adding or removing a gated provider, or a lower-trust ungated provider such as `grok`, must not change `H`.
+
+Antigravity's gate opens on this ramp:
+
+```text
+gate_weight = 0                             when H >= 0.35
+gate_weight = 1                             when H <= 0.05
+gate_weight = (0.35 - H) / (0.35 - 0.05)   between those points
+effective_antigravity_weight = trust_multiplier * gate_weight
+```
+
+Because Antigravity's trust multiplier is `0.40`, its effective fallback weight is `0` while trusted providers are healthy, ramps linearly between `0` and `0.40`, and reaches `0.40` at or below the 5 percent headroom floor.
+`gate_weight=0` means **excluded from the candidate set**, not ranked last with a zero score.
+An unreadable full-trust fleet treats `H` as `0` and records `gate_reference_source=full-trust-evidence-unreadable`, so the fallback opens instead of stranding routing with no candidate.
 
 ## Objective
 
@@ -74,7 +115,9 @@ For each eligible provider, the budget window and registry supply:
 | `C` | Codex reset factor base (default 1.5) |
 | `reset_factor` | `C^N` for codex; `1` for every other provider |
 | `pressure` | `base_pressure * reset_factor` |
-| `score` | `score_base * pressure` |
+| `trust_multiplier` | Static captain preference multiplier from the provider registry |
+| `gate_weight` | Provider fallback gate multiplier; defaults to 1 for ungated providers |
+| `score` | `score_base * pressure * trust_multiplier * gate_weight` |
 
 The equations are:
 
@@ -87,7 +130,7 @@ base_pressure = 1                  otherwise
 reset_factor = C^N                 provider=codex only; N available rate-limit resets
 reset_factor = 1                   every other provider
 pressure = base_pressure * reset_factor
-score = score_base * pressure
+score = score_base * pressure * trust_multiplier * gate_weight
 ```
 
 Net change from the prior engine:
@@ -96,7 +139,8 @@ Net change from the prior engine:
 2. The `B*T` burn-rate subtraction is gone; the numerator is exactly `R - F`.
 3. The `1 + K*urgency^2` amplifier is **retained unchanged**.
 4. The codex `1.5^N` reset factor is retained unchanged.
-5. Highest score wins unless explicitly pinned.
+5. Static trust multipliers and provider-data fallback gates apply after evidence-derived pressure.
+6. Highest score wins unless explicitly pinned.
 
 **Removed from the score path** (do not reintroduce as a second opinion, tiebreak, or env-gated alternate mode):
 

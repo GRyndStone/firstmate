@@ -63,6 +63,7 @@ test_class_map() {
   [ "$(fm_usage_source_class claude)" = anthropic-class ] || fail "claude class"
   [ "$(fm_usage_source_class codex)" = openai-class ] || fail "codex class"
   [ "$(fm_usage_source_class grok)" = grok-class ] || fail "grok class"
+  [ "$(fm_usage_source_class antigravity)" = antigravity-class ] || fail "antigravity class"
   [ "$(fm_usage_source_class gemini)" = gemini-class ] || fail "gemini class"
   [ "$(fm_usage_source_class openrouter)" = openrouter-class ] || fail "openrouter class"
   pass "provider class map covers shipped adapter classes"
@@ -71,7 +72,7 @@ test_class_map() {
 test_provider_registry_distinguishes_unknown_tokens() {
   local ids class_out status
   ids=$(fm_usage_source_provider_ids)
-  [ "$ids" = $'claude\ncodex\ngrok\ngemini\nopenrouter\ncursor\ncopilot' ] \
+  [ "$ids" = $'claude\ncodex\ngrok\nantigravity\ngemini\nopenrouter\ncursor\ncopilot' ] \
     || fail "recognized provider registry changed: $ids"
   fm_usage_source_provider_known gemini \
     || fail "recognized unmetered provider must be accepted by the shared registry"
@@ -83,6 +84,87 @@ test_provider_registry_distinguishes_unknown_tokens() {
   expect_code 64 "$status" "unrecognized provider class lookup must refuse"
   [ -z "$class_out" ] || fail "unrecognized provider must not receive a generic class: $class_out"
   pass "shared provider registry distinguishes provider identities from unknown tokens"
+}
+
+test_antigravity_live_summary_adapter() {
+  local fixture obs broken
+  fixture="$TMP_ROOT/antigravity-summary.json"
+  cat > "$fixture" <<JSON
+{
+  "description": "Within each group, models share a weekly limit and a 5-hour limit. The 5-hour limit smooths out aggregate demand, while your weekly limit is tied directly to your individual tier.",
+  "groups": [
+    {
+      "displayName": "Gemini Models",
+      "description": "Models within this group: Gemini Flash, Gemini Pro",
+      "buckets": [
+        {
+          "bucketId": "gemini-weekly",
+          "displayName": "Weekly Limit",
+          "remainingFraction": 0.9899833,
+          "resetTime": "$(iso_at_epoch $((TEST_NOW + 604000)))",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "gemini-5h",
+          "displayName": "Five Hour Limit",
+          "remainingFraction": 0.9799,
+          "resetTime": "$(iso_at_epoch $((TEST_NOW + 13000)))",
+          "window": "5h"
+        }
+      ]
+    },
+    {
+      "displayName": "Claude and GPT models",
+      "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+      "buckets": [
+        {
+          "bucketId": "3p-weekly",
+          "displayName": "Weekly Limit",
+          "remainingFraction": 1,
+          "resetTime": "$(iso_at_epoch $((TEST_NOW + 604100)))",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "3p-5h",
+          "displayName": "Five Hour Limit",
+          "remainingFraction": 1,
+          "resetTime": "$(iso_at_epoch $((TEST_NOW + 13100)))",
+          "window": "5h"
+        }
+      ]
+    }
+  ]
+}
+JSON
+  obs=$(
+    FM_USAGE_ANTIGRAVITY_QUOTA_JSON="$(cat "$fixture")" \
+      fm_usage_source_observe antigravity '{}' "$TEST_NOW"
+  )
+  jq -e '
+    .class == "antigravity-class"
+    and .provider == "antigravity"
+    and .evidence == "fresh"
+    and .binding.id == "gemini-weekly"
+    and .binding.remaining == 98.99833
+    and .binding.window_seconds == 604800
+    and .binding.window_seconds_source == "meter-window-field"
+    and (.gate_windows | length) == 1
+    and .gate_windows[0].id == "gemini-5h"
+    and .gate_windows[0].remaining == 97.99
+    and ([.windows[].id] | index("3p-weekly") == null)
+    and ([.windows[].id] | index("3p-5h") == null)
+  ' <<< "$obs" >/dev/null || fail "antigravity adapter did not bind live summary roles: $obs"
+
+  broken=$(
+    FM_USAGE_ANTIGRAVITY_QUOTA_JSON='{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":"bogus","resetTime":"nope","window":"weekly"}]}]}' \
+      fm_usage_source_observe antigravity '{}' "$TEST_NOW"
+  )
+  jq -e '
+    .evidence == "unreadable"
+    and (.diagnostics | any(test("antigravity quota unreadable")))
+    and (.binding? == null)
+  ' <<< "$broken" >/dev/null || fail "broken antigravity quota must be loudly unreadable: $broken"
+  pass "antigravity adapter scores gemini weekly budget, gates on gemini 5h, ignores 3p buckets, and fails loud"
 }
 
 test_quota_backed_adapters() {
@@ -267,6 +349,7 @@ test_metered_predicate() {
   fm_usage_source_provider_is_metered claude || fail "claude must be metered"
   fm_usage_source_provider_is_metered codex || fail "codex must be metered"
   fm_usage_source_provider_is_metered grok || fail "grok must be metered"
+  fm_usage_source_provider_is_metered antigravity || fail "antigravity must be metered"
   if fm_usage_source_provider_is_metered gemini; then
     fail "gemini must not be treated as metered"
   fi
@@ -408,6 +491,7 @@ test_per_provider_target_floors() {
   [ "$(fm_usage_source_target_percent claude)" = 10 ] || fail "claude target must be 10"
   [ "$(fm_usage_source_target_percent codex)" = 5 ] || fail "codex target must be 5"
   [ "$(fm_usage_source_target_percent grok)" = 5 ] || fail "grok target must be 5"
+  [ "$(fm_usage_source_target_percent antigravity)" = 5 ] || fail "antigravity target must be 5"
   [ "$(fm_usage_source_target_percent gemini)" = 5 ] || fail "gemini target must be 5"
   [ "$(fm_usage_source_target_percent openrouter)" = 5 ] || fail "openrouter target must be 5"
   [ "$(fm_usage_source_target_percent cursor)" = 5 ] || fail "cursor target must be 5"
@@ -423,12 +507,29 @@ test_per_provider_target_floors() {
   obs=$(fm_usage_source_observe codex "$quota" "$TEST_NOW")
   jq -e '.target_percent == 5' <<< "$obs" >/dev/null \
     || fail "observe must carry codex registry target 5: $obs"
+  jq -e '.trust_multiplier == 1 and .gated == false' \
+    <<< "$(fm_usage_source_trust_policy claude)" >/dev/null \
+    || fail "claude trust must be full and ungated"
+  jq -e '.trust_multiplier == 1 and .gated == false' \
+    <<< "$(fm_usage_source_trust_policy codex)" >/dev/null \
+    || fail "codex trust must be full and ungated"
+  jq -e '.trust_multiplier == 0.75 and .gated == false' \
+    <<< "$(fm_usage_source_trust_policy grok)" >/dev/null \
+    || fail "grok trust must be 0.75 and not gated"
+  jq -e '
+    .trust_multiplier == 0.4
+    and .gated == true
+    and .wake_below == 0.35
+    and .full_at == 0.05
+  ' <<< "$(fm_usage_source_trust_policy antigravity)" >/dev/null \
+    || fail "antigravity trust/gate policy must be declared as provider data"
   pass "per-provider target floors are registry data and ride on observations"
 }
 
 test_class_map
 test_provider_registry_distinguishes_unknown_tokens
 test_per_provider_target_floors
+test_antigravity_live_summary_adapter
 test_quota_backed_adapters
 test_missing_window_period_is_not_fabricated
 test_unconfigured_role_fallback_is_bounded
