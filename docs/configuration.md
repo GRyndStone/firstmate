@@ -156,7 +156,7 @@ When the harness token is absent or `default`, secondmate launch falls back thro
 `fm-harness.sh secondmate-model` and `fm-harness.sh secondmate-effort` expose only the optional tokens from `config/secondmate-harness`; `config/crew-harness` remains a bare adapter-name file.
 An explicit harness argument to `fm-spawn.sh` still overrides either config file for that spawn only.
 An explicit `--model` or `--effort` overrides the matching token from `config/secondmate-harness`; an explicit harness or raw launch command starts with clean model and effort defaults unless those flags are also passed.
-When `config/crew-dispatch.json` exists, crewmate and scout spawns require an explicit resolved harness instead of automatically falling back to `config/crew-harness`.
+When `config/crew-dispatch.json` exists, ordinary crewmate and scout spawns self-route through its default candidate set; explicit routing axes are reserved for an override accompanied by `--override-reason`.
 The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, `config/backlog-backend`, and `config/no-mistakes-generation` into secondmate homes at secondmate spawn, during the locked session-start bootstrap secondmate sweep, and during explicit `bin/fm-config-push.sh` runs, so a secondmate's own crewmates, dispatch profiles, backlog backend, and no-mistakes generation selection use the primary values.
 `config/secondmate-harness` is not inherited because secondmates do not launch secondmates.
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
@@ -242,10 +242,11 @@ Bootstrap prints a detect-only `NM_GENERATION:` line when the file is present (a
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
-`config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
-The shell scripts do not match those rules; firstmate chooses the best matching source with judgment, passes it through `bin/fm-dispatch-select.sh --admit`, and passes the resulting concrete provider/profile and quota observation fields to `fm-spawn.sh`.
-When the file exists, `fm-spawn.sh` enforces that contract by refusing crewmate and scout spawns that lack an explicit provider and harness (`--harness`, a positional adapter, or a raw launch command), then re-admitting that exact profile and recording the current observation before any endpoint or worktree mutation.
-Batch spawns satisfy the same requirement with shared provider, harness, model, effort, and quota observation flags, and each task rechecks admission through the single-task path.
+`config/crew-dispatch.json` is an optional local, gitignored file containing a routine default candidate set and optional natural-language rules.
+The shell scripts do not match natural-language rules, but `fm-spawn.sh` owns routine default routing.
+When the file exists and a new crewmate or scout receives no routing axes, spawn runs `default` through `usage-burndown` and launches the returned provider, harness, model, and effort.
+Batch spawns re-enter that single-task path so each unpinned task obtains a fresh decision.
+An explicit provider, harness, model, or effort under active dispatch config requires `--override-reason`, and task metadata distinguishes that override from algorithm routing.
 Secondmate spawns are exempt and still resolve through `config/secondmate-harness` and its optional model and effort tokens.
 This section is the single owner of the canonical schema and its per-field semantics; `AGENTS.md` section 4 keeps only the dispatch procedure and points here.
 
@@ -261,7 +262,12 @@ This section is the single owner of the canonical schema and its per-field seman
       "why": "<optional rationale that helps firstmate choose>"
     }
   ],
-  "default": { "provider": "<optional quota provider>", "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>" }
+  "default": {
+    "use": [
+      { "provider": "<optional quota provider>", "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>" }
+    ],
+    "select": "usage-burndown"
+  }
 }
 ```
 
@@ -276,18 +282,19 @@ Admission emits exit 64 plus a machine-distinct error profile for an unrecognize
 Recognized providers declared `unmetered` in that registry remain admissible with `provider_recognition=recognized` and `quota_posture=unknown`.
 `select` is optional and supports `usage-burndown` (canonical) and the legacy alias `quota-balanced` (same engine).
 Absent `select` means use the first array element, or the only object in the single-object form; the first array element is the deterministic tie-break and the ultimate fallback when the engine has no scorable evidence.
-`default` is optional.
+`default` is optional and accepts either one profile or the same `use` plus `select` dispatch-object shape as a rule.
+The candidate-set form is recommended because it makes routine no-argument spawn mechanically route among eligible providers.
 An omitted model or effort means the selected harness uses its own default for that axis.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
-Natural-language rules choose the eligible profile set and preferences; multi-candidate routing is the usage-burndown optimizer in `bin/fm-dispatch-select.sh` (`bin/fm-usage-burndown-lib.sh`, `bin/fm-usage-source-lib.sh`).
-The full objective, modular source adapters, freeze/unknown degradation, captain-override precedence, and add-a-source recipe live in [`docs/usage-burndown-dispatch.md`](usage-burndown-dispatch.md).
+An intentionally selected natural-language rule supplies an override profile set and preferences; its multi-candidate choice still uses the usage-burndown optimizer in `bin/fm-dispatch-select.sh` (`bin/fm-usage-burndown-lib.sh`, `bin/fm-usage-source-lib.sh`).
+The full objective, window roles, counterfactual burn evidence, period learning, freeze and unknown degradation, automatic default route, and override record live in [`docs/usage-burndown-dispatch.md`](usage-burndown-dispatch.md).
 The dispatch-select header owns the CLI, admitted-profile wire fields, freeze exit code, and resume-meta pin contract.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 When the file exists, bootstrap validates it with `jq`.
 Valid files produce a `CREW_DISPATCH: active config/crew-dispatch.json` block that lists each rule and prints `default:` when present.
-Malformed JSON, an unverified harness, a malformed array profile, an unknown `select`, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
-If no dispatch rule fits, firstmate uses the dispatch profile `default` when present, then falls back to `config/crew-harness`.
-Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved provider and harness explicitly until the file is fixed or removed.
+Malformed JSON, an unverified harness, a malformed rule or default candidate set, an unknown `select`, or an effort value unsupported by that harness is reported as `CREW_DISPATCH: invalid config/crew-dispatch.json - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
+If no task-specific rule is intentionally selected, callers omit routing axes and let spawn use `default`.
+If `default` is absent or unreadable, spawn warns and routes the configured crew harness as its deterministic fail-safe profile.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
 ## Finite workflow bounds

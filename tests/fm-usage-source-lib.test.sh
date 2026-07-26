@@ -47,8 +47,11 @@ write_quota() {
       "provider": "grok",
       "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
       "windows": [
-        { "id": "credits", "kind": "credits", "percentRemaining": 13, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 86400 },
-        { "id": "product:api", "kind": "credits", "percentRemaining": 66, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 86400 }
+        { "id": "credits", "kind": "credits", "percentRemaining": 13, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 },
+        { "id": "product:grokbuild", "kind": "credits", "percentRemaining": 47, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 },
+        { "id": "product:api", "kind": "credits", "percentRemaining": 66, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 },
+        { "id": "product:chat", "kind": "credits", "percentRemaining": 88, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 },
+        { "id": "product:voice", "kind": "credits", "percentRemaining": 91, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 }
       ]
     }
   ]
@@ -92,6 +95,9 @@ test_quota_backed_adapters() {
     and .evidence == "fresh"
     and .binding.remaining == 50
     and .binding.id == "seven_day"
+    and .binding.role == "budget"
+    and (.gate_windows | length) == 1
+    and .gate_windows[0].id == "five_hour"
     and (.windows | length) == 2
   ' <<< "$obs" >/dev/null || fail "claude adapter binding wrong: $obs"
 
@@ -100,9 +106,93 @@ test_quota_backed_adapters() {
     <<< "$obs" >/dev/null || fail "codex adapter: $obs"
 
   obs=$(fm_usage_source_observe grok "$(cat "$quota")" "$TEST_NOW")
-  jq -e '.class == "grok-class" and .binding.remaining == 13 and .binding.id == "credits"' \
-    <<< "$obs" >/dev/null || fail "grok adapter should bind tightest non-model window: $obs"
-  pass "anthropic/openai/grok adapters expose window, remaining, and binding"
+  jq -e '
+    .class == "grok-class"
+    and .binding.remaining == 13
+    and .binding.id == "credits"
+    and .binding.window_seconds == 604800
+    and .binding.window_seconds_source == "meter"
+    and .gate_windows[0].id == "product:grokbuild"
+    and ([.windows[]
+          | select(.id == "product:api" or .id == "product:chat" or .id == "product:voice")]
+         | all(.role == "ignored"))
+  ' <<< "$obs" >/dev/null || fail "grok adapter should bind the reported weekly credits budget: $obs"
+  pass "anthropic/openai/grok adapters classify rate gates and durable budgets"
+}
+
+test_missing_window_period_is_not_fabricated() {
+  local reset quota obs null_quota null_obs
+  reset=$(iso_at_epoch $((TEST_NOW + 79678)))
+  quota=$(jq -cn \
+    --arg reset "$reset" '
+    {
+      providers:[{
+        provider:"grok",
+        state:{status:"fresh"},
+        windows:[{
+          id:"credits",
+          kind:"credits",
+          percentRemaining:11,
+          resetsAt:$reset
+        }]
+      }]
+    }')
+  obs=$(fm_usage_source_observe grok "$quota" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .binding.id == "credits"
+    and .binding.window_seconds == null
+    and .binding.window_seconds_source == "missing"
+  ' <<< "$obs" >/dev/null || fail "Grok adapter fabricated an unobserved period: $obs"
+  null_quota=$(jq '.providers[0].windows[0].windowSeconds = null' <<< "$quota")
+  null_obs=$(fm_usage_source_observe grok "$null_quota" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .binding.id == "credits"
+    and .binding.window_seconds == null
+    and .binding.window_seconds_source == "missing"
+  ' <<< "$null_obs" >/dev/null || fail "Grok adapter replaced an explicit unknown period: $null_obs"
+  pass "absent and explicitly null Grok periods remain missing evidence"
+}
+
+test_unconfigured_role_fallback_is_bounded() {
+  local reset quota obs
+  reset=$(iso_at_epoch $((TEST_NOW + 3600)))
+  quota=$(jq -cn \
+    --arg reset "$reset" '
+    {
+      providers:[{
+        provider:"cursor",
+        state:{status:"fresh"},
+        windows:[{
+          id:"requests",
+          kind:"credits",
+          percentRemaining:50,
+          resetsAt:$reset,
+          windowSeconds:604800
+        }]
+      }]
+    }')
+  obs=$(fm_usage_source_observe cursor "$quota" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .binding.role_source == "single-window-fallback"
+    and .gate_windows[0].id == "requests"
+  ' <<< "$obs" >/dev/null || fail "single unconfigured window did not become both gate and budget: $obs"
+
+  quota=$(jq -c '
+    .providers[0].windows += [{
+      id:"other",
+      kind:"credits",
+      percentRemaining:40,
+      resetsAt:.providers[0].windows[0].resetsAt,
+      windowSeconds:604800
+    }]
+  ' <<< "$quota")
+  obs=$(fm_usage_source_observe cursor "$quota" "$TEST_NOW")
+  jq -e '.evidence == "unknown" and (.binding? == null)' \
+    <<< "$obs" >/dev/null || fail "multiple unclassified windows should degrade unknown: $obs"
+  pass "single-window fallback is both roles while ambiguous multi-window shapes degrade unknown"
 }
 
 test_stubs_degrade_unknown() {
@@ -139,6 +229,8 @@ test_observe_profiles_dedupes() {
 test_class_map
 test_provider_registry_distinguishes_unknown_tokens
 test_quota_backed_adapters
+test_missing_window_period_is_not_fabricated
+test_unconfigured_role_fallback_is_bounded
 test_stubs_degrade_unknown
 test_absent_provider_unknown
 test_observe_profiles_dedupes

@@ -20,5 +20,12 @@
       "why": "Use a strong coding profile for broad design and implementation work. The usage-burndown engine picks among eligible providers by remaining usage per remaining window time; freeze never silently switches an explicit pin."
     }
   ],
-  "default": { "provider": "codex", "harness": "codex", "model": "gpt-5.5", "effort": "medium" }
+  "default": {
+    "use": [
+      { "provider": "claude", "harness": "claude", "model": "claude-sonnet-5", "effort": "high" },
+      { "provider": "codex", "harness": "codex", "model": "gpt-5.5", "effort": "high" },
+      { "provider": "grok", "harness": "grok", "model": "grok-4.5", "effort": "high" }
+    ],
+    "select": "usage-burndown"
+  }
 }

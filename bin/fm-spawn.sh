@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--provider <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--quota-posture <normal|conserve|protect|unknown>] [--quota-used <percent>] [--backend <name>] [--parent <task-id>] [--lane-kind <name>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--provider <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--override-reason <text>] [--quota-posture <normal|conserve|protect|unknown>] [--quota-used <percent>] [--backend <name>] [--parent <task-id>] [--lane-kind <name>] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
-#   --provider <name> is the quota provider identity selected at admission. It is
-#   distinct from --harness (the launch adapter) and is recorded with the concrete
-#   profile in task metadata. When omitted and no crew-dispatch profile is active,
-#   provider defaults to harness for pin continuity.
+#   With config/crew-dispatch.json active, a crewmate/scout spawn that supplies no
+#   routing axes reads the configured default candidate set, runs usage-burndown,
+#   and launches the selected provider/harness/model/effort itself.
+#   --provider/--harness/--model/--effort intentionally bypass that default only
+#   with a non-empty --override-reason. Metadata records dispatch_origin plus the
+#   reason and full candidate-number JSON, so algorithm and override are auditable.
+#   --provider is the quota identity and remains distinct from launch --harness.
 #   Explicit, dispatch-managed, and inherited provider pins must be recognized by
 #   bin/fm-usage-source-lib.sh or crewmate/scout launch refuses with exit 64.
 #   --parent <task-id> inherits the admitted provider/model/effort pin plus
@@ -16,11 +19,9 @@
 #   Parent depth 0 refuses the child. Root spawns without --parent get default
 #   budget fields from fm-workflow-bound.sh default-budget.
 #   --lane-kind <name> records lane_kind= on meta (e.g. analyst, gsd, impl).
-#   --quota-posture and --quota-used may carry the caller's selector observation;
-#   when config/crew-dispatch.json is active, spawn always re-admits the exact
-#   profile through bin/fm-dispatch-select.sh --admit and records that current
-#   result before any endpoint or worktree mutation. Freeze (exit 75) and an
-#   unrecognized provider (exit 64) block launch without substitution.
+#   --quota-posture and --quota-used are compatibility inputs only. Active
+#   dispatch always obtains fresh admission itself before endpoint or worktree
+#   mutation. Freeze (exit 75) and unrecognized provider (exit 64) block launch.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -45,10 +46,7 @@
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
 #   callers must surface it instead of silently retrying another backend.
-#   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
-#   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
-#   spawns require an explicit provider and harness so firstmate cannot silently
-#   skip dispatch consultation or admission, then re-admit that exact profile.
+#   With no dispatch config, a crewmate/scout still resolves config/crew-harness.
 #   A --secondmate spawn is exempt and resolves the SECONDMATE harness
 #   (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
@@ -80,8 +78,8 @@
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
 #   source of truth; shared profile and backend flags apply to every pair.
-#   If config/crew-dispatch.json exists, shared --provider and --harness are required
-#   for crewmate and scout batches. The loop lives here, in bash, so callers never
+#   With dispatch config, each unpinned pair routes independently through the
+#   default candidate set. The loop lives here, in bash, so callers never
 #   hand-write a multi-task shell loop (the tool shell is zsh, which does not
 #   word-split unquoted $vars and silently breaks ad-hoc `for ... in $pairs` loops).
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
@@ -152,6 +150,7 @@ EFFORT=
 PROVIDER=
 QUOTA_POSTURE=
 QUOTA_USED=
+OVERRIDE_REASON=
 BACKEND_ARG=
 PARENT_ID=
 LANE_KIND=
@@ -165,6 +164,7 @@ EFFORT_SET=0
 PROVIDER_SET=0
 QUOTA_POSTURE_SET=0
 QUOTA_USED_SET=0
+OVERRIDE_REASON_SET=0
 BACKEND_SET=0
 PARENT_SET=0
 LANE_KIND_SET=0
@@ -182,6 +182,7 @@ for a in "$@"; do
       effort) EFFORT=$a; EFFORT_SET=1 ;;
       quota-posture) QUOTA_POSTURE=$a; QUOTA_POSTURE_SET=1 ;;
       quota-used) QUOTA_USED=$a; QUOTA_USED_SET=1 ;;
+      override-reason) OVERRIDE_REASON=$a; OVERRIDE_REASON_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       parent) PARENT_ID=$a; PARENT_SET=1 ;;
       lane-kind) LANE_KIND=$a; LANE_KIND_SET=1 ;;
@@ -205,6 +206,8 @@ for a in "$@"; do
     --quota-posture=*) QUOTA_POSTURE=${a#--quota-posture=}; QUOTA_POSTURE_SET=1 ;;
     --quota-used) want_value=quota-used ;;
     --quota-used=*) QUOTA_USED=${a#--quota-used=}; QUOTA_USED_SET=1 ;;
+    --override-reason) want_value=override-reason ;;
+    --override-reason=*) OVERRIDE_REASON=${a#--override-reason=}; OVERRIDE_REASON_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --parent) want_value=parent ;;
@@ -221,9 +224,13 @@ done
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$QUOTA_POSTURE_SET" -eq 0 ] || [ -n "$QUOTA_POSTURE" ] || { echo "error: --quota-posture requires a non-empty value" >&2; exit 1; }
 [ "$QUOTA_USED_SET" -eq 0 ] || [ -n "$QUOTA_USED" ] || { echo "error: --quota-used requires a non-empty value" >&2; exit 1; }
+[ "$OVERRIDE_REASON_SET" -eq 0 ] || [ -n "$OVERRIDE_REASON" ] || { echo "error: --override-reason requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$PARENT_SET" -eq 0 ] || [ -n "$PARENT_ID" ] || { echo "error: --parent requires a non-empty value" >&2; exit 1; }
 [ "$LANE_KIND_SET" -eq 0 ] || [ -n "$LANE_KIND" ] || { echo "error: --lane-kind requires a non-empty value" >&2; exit 1; }
+case "$OVERRIDE_REASON" in
+  *$'\n'*|*$'\r'*) echo "error: --override-reason must be one line" >&2; exit 1 ;;
+esac
 if [ "$PARENT_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
   echo "error: --parent cannot be combined with --secondmate" >&2
   exit 1
@@ -242,13 +249,6 @@ if [ -n "$QUOTA_USED" ] && ! awk -v value="$QUOTA_USED" \
   echo "error: --quota-used must be a number from 0 through 100" >&2
   exit 1
 fi
-# Provider presence under crew-dispatch is re-checked after --parent budget
-# inheritance may fill the pin from the admitted parent.
-if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ] && [ -z "$PROVIDER" ] && [ -z "$PARENT_ID" ]; then
-  echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
-  exit 1
-fi
-
 # Backend selection (data/fm-backend-design-d7): explicit --backend, else
 # FM_BACKEND env, else config/backend, else runtime auto-detection, else
 # default tmux (fm_backend_name). fm_backend_validate_spawn refuses unknown or
@@ -510,10 +510,6 @@ parse_partial_create_result() {
 idpart=${POS[0]:-}
 idpart=${idpart%%=*}
 if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in */*) false ;; *) true ;; esac; then
-  if [ "$KIND" != secondmate ] && { [ -z "$HARNESS_ARG" ] || [ -z "$PROVIDER" ]; } && [ -f "$CONFIG/crew-dispatch.json" ]; then
-    echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
-    exit 1
-  fi
   rc=0
   shared_args=()
   [ -z "$PROVIDER" ] || shared_args+=(--provider "$PROVIDER")
@@ -522,6 +518,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$QUOTA_POSTURE" ] || shared_args+=(--quota-posture "$QUOTA_POSTURE")
   [ -z "$QUOTA_USED" ] || shared_args+=(--quota-used "$QUOTA_USED")
+  [ -z "$OVERRIDE_REASON" ] || shared_args+=(--override-reason "$OVERRIDE_REASON")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   [ -z "$PARENT_ID" ] || shared_args+=(--parent "$PARENT_ID")
   [ -z "$LANE_KIND" ] || shared_args+=(--lane-kind "$LANE_KIND")
@@ -578,6 +575,28 @@ else
   ARG3=${POS[2]:-}
 fi
 [ -z "$HARNESS_ARG" ] || ARG3=$HARNESS_ARG
+ROUTING_OVERRIDE_REQUESTED=0
+if [ "$PROVIDER_SET" -eq 1 ] || [ "$HARNESS_SET" -eq 1 ] \
+  || [ "$MODEL_SET" -eq 1 ] || [ "$EFFORT_SET" -eq 1 ] || [ -n "$ARG3" ]; then
+  ROUTING_OVERRIDE_REQUESTED=1
+fi
+if [ "$OVERRIDE_REASON_SET" -eq 1 ] && [ "$ROUTING_OVERRIDE_REQUESTED" -eq 0 ]; then
+  echo "error: --override-reason requires an explicit provider, harness, model, or effort override" >&2
+  exit 1
+fi
+
+DISPATCH_ORIGIN=static
+DISPATCH_PROFILE_JSON=
+DISPATCH_STRATEGY=
+DISPATCH_EXPLAIN=
+DISPATCH_CANDIDATES_JSON=
+DISPATCH_SELECTED_INDEX=
+DISPATCH_TIE_BREAK=
+DISPATCH_ORDER=
+
+spawn_meta_value() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
+}
 
 # Finite-workflow budget: inherit from an admitted parent (GSD children, etc.)
 # or stamp root defaults. bin/fm-workflow-bound.sh owns the field contract.
@@ -645,10 +664,72 @@ if [ "$KIND" != secondmate ]; then
         ;;
     esac
   done <<< "$budget_blob"
-  if [ -f "$CONFIG/crew-dispatch.json" ] && { [ -z "$PROVIDER" ] || [ -z "${HARNESS_ARG:-$ARG3}" ]; }; then
-    echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (or inherit both from --parent); the consultation backstop refuses launch without them." >&2
-    exit 1
+fi
+
+# Mechanical default routing. No caller-selected profile is required or
+# accepted as an implicit pin: an unpinned new task runs the configured default
+# candidate set through usage-burndown. Existing task pins and parent inheritance
+# remain stable. A new explicit pin requires a recorded reason.
+if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
+  command -v jq >/dev/null 2>&1 || { echo "error: jq is required for dispatch routing" >&2; exit 1; }
+  existing_meta="$STATE/$ID.meta"
+  if [ -f "$existing_meta" ]; then
+    pinned_provider=$(spawn_meta_value "$existing_meta" provider)
+    pinned_harness=$(spawn_meta_value "$existing_meta" harness)
+    pinned_model=$(spawn_meta_value "$existing_meta" model)
+    pinned_effort=$(spawn_meta_value "$existing_meta" effort)
+    [ -n "$pinned_provider" ] || pinned_provider=$pinned_harness
+    if [ "$ROUTING_OVERRIDE_REQUESTED" -eq 0 ]; then
+      PROVIDER=$pinned_provider
+      HARNESS_ARG=$pinned_harness
+      ARG3=$pinned_harness
+      MODEL=${pinned_model:-default}
+      EFFORT=${pinned_effort:-default}
+    fi
+    DISPATCH_ORIGIN=$(spawn_meta_value "$existing_meta" dispatch_origin)
+    [ -n "$DISPATCH_ORIGIN" ] || DISPATCH_ORIGIN=resume
+  elif [ "$ROUTING_OVERRIDE_REQUESTED" -eq 1 ]; then
+    [ "$OVERRIDE_REASON_SET" -eq 1 ] || {
+      echo "error: explicit routing with config/crew-dispatch.json requires --override-reason so the pin is distinguishable from algorithm routing" >&2
+      exit 2
+    }
+    [ -n "$PROVIDER" ] && [ -n "${HARNESS_ARG:-$ARG3}" ] || {
+      echo "error: an explicit routing override requires both --provider and --harness (or positional harness)" >&2
+      exit 2
+    }
+    DISPATCH_ORIGIN=override
+  elif [ -n "$PARENT_ID" ]; then
+    DISPATCH_ORIGIN=inherited
+  else
+    if ! default_spec=$(jq -ec '
+        .default
+        | select(type == "object")
+      ' "$CONFIG/crew-dispatch.json" 2>/dev/null); then
+      fallback_harness=$("$FM_ROOT/bin/fm-harness.sh" crew)
+      default_spec=$(jq -cn \
+        --arg provider "$fallback_harness" \
+        --arg harness "$fallback_harness" \
+        '{provider:$provider,harness:$harness}')
+      echo "warning: dispatch config has no usable default candidate set; routing the configured crew harness as the deterministic fallback" >&2
+    fi
+    routing_status=0
+    routing_json=$("$SCRIPT_DIR/fm-dispatch-select.sh" \
+      --select usage-burndown "$default_spec") || routing_status=$?
+    [ "$routing_status" -eq 0 ] || exit "$routing_status"
+    PROVIDER=$(jq -er '.provider | select(type == "string" and length > 0)' <<< "$routing_json") || exit 1
+    HARNESS_ARG=$(jq -er '.harness | select(type == "string" and length > 0)' <<< "$routing_json") || exit 1
+    MODEL=$(jq -er '(.model // "default") | select(type == "string" and length > 0)' <<< "$routing_json") || exit 1
+    EFFORT=$(jq -er '(.effort // "default") | select(type == "string" and length > 0)' <<< "$routing_json") || exit 1
+    QUOTA_POSTURE=$(jq -er '.quota_posture | select(type == "string" and length > 0)' <<< "$routing_json") || exit 1
+    QUOTA_USED=$(jq -r 'if (.quota_percent_used? | type) == "number" then (.quota_percent_used | tostring) else "" end' <<< "$routing_json") || exit 1
+    ARG3=$HARNESS_ARG
+    DISPATCH_PROFILE_JSON=$routing_json
+    DISPATCH_ORIGIN=algorithm
   fi
+  [ -n "$PROVIDER" ] && [ -n "${HARNESS_ARG:-$ARG3}" ] || {
+    echo "error: dispatch routing did not resolve both provider and harness" >&2
+    exit 1
+  }
 fi
 
 # The verified launch command per adapter. The knowledge half of each adapter
@@ -716,7 +797,7 @@ case "$ARG3" in
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
     else
       if [ -f "$CONFIG/crew-dispatch.json" ]; then
-        echo "error: config/crew-dispatch.json is active - pass the explicit provider and harness returned by dispatch admission (the consultation backstop, so quota governance is never silently skipped)." >&2
+        echo "error: automatic dispatch did not resolve a harness from config/crew-dispatch.json" >&2
         exit 1
       fi
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" crew)
@@ -775,10 +856,6 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
   fi
 fi
 
-spawn_meta_value() {
-  sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1
-}
-
 # Pinned profile is immutable once recorded. Recovery may re-launch the same
 # provider/harness/model/effort; a different profile must never silently replace it.
 if [ "$KIND" != secondmate ] && [ -f "$STATE/$ID.meta" ]; then
@@ -797,20 +874,24 @@ if [ "$KIND" != secondmate ] && [ -f "$STATE/$ID.meta" ]; then
   fi
 fi
 
-# When crew-dispatch is active, re-admit the exact selected profile before any
-# endpoint or worktree mutation. bin/fm-dispatch-select.sh owns freeze and
-# posture boundaries; spawn never substitutes another provider/harness.
+# Algorithm routing already returns an admitted profile. Explicit, inherited,
+# and resumed pins take the single-profile admission path here. Both paths
+# converge on the same machine-readable decision record before resource mutation.
 if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
   command -v jq >/dev/null 2>&1 || { echo "error: jq is required for dispatch admission" >&2; exit 1; }
-  admission_spec=$(jq -cn \
-    --arg provider "$PROVIDER" \
-    --arg harness "$HARNESS" \
-    --arg model "${MODEL:-default}" \
-    --arg effort "${EFFORT:-default}" \
-    '{provider:$provider,harness:$harness,model:$model,effort:$effort}') || exit 1
-  admission_status=0
-  admission_json=$("$SCRIPT_DIR/fm-dispatch-select.sh" --admit "$admission_spec") || admission_status=$?
-  [ "$admission_status" -eq 0 ] || exit "$admission_status"
+  if [ -z "$DISPATCH_PROFILE_JSON" ]; then
+    admission_spec=$(jq -cn \
+      --arg provider "$PROVIDER" \
+      --arg harness "$HARNESS" \
+      --arg model "${MODEL:-default}" \
+      --arg effort "${EFFORT:-default}" \
+      '{provider:$provider,harness:$harness,model:$model,effort:$effort}') || exit 1
+    admission_status=0
+    DISPATCH_PROFILE_JSON=$("$SCRIPT_DIR/fm-dispatch-select.sh" \
+      --admit "$admission_spec") || admission_status=$?
+    [ "$admission_status" -eq 0 ] || exit "$admission_status"
+  fi
+  admission_json=$DISPATCH_PROFILE_JSON
   admitted_provider=$(jq -er '.provider | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
   admitted_harness=$(jq -er '.harness | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
   admitted_model=$(jq -er '(.model // "default") | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
@@ -822,6 +903,12 @@ if [ "$KIND" != secondmate ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
   fi
   QUOTA_POSTURE=$(jq -er '.quota_posture | select(type == "string" and length > 0)' <<< "$admission_json") || exit 1
   QUOTA_USED=$(jq -r 'if (.quota_percent_used? | type) == "number" then (.quota_percent_used | tostring) else "" end' <<< "$admission_json") || exit 1
+  DISPATCH_STRATEGY=$(jq -r '.dispatch_strategy // "usage-burndown"' <<< "$admission_json") || exit 1
+  DISPATCH_EXPLAIN=$(jq -r '.dispatch_explain // "" | gsub("[\\r\\n]+"; " ")' <<< "$admission_json") || exit 1
+  DISPATCH_CANDIDATES_JSON=$(jq -c '.dispatch_candidates // []' <<< "$admission_json") || exit 1
+  DISPATCH_SELECTED_INDEX=$(jq -r '.dispatch_selected_index // 0' <<< "$admission_json") || exit 1
+  DISPATCH_TIE_BREAK=$(jq -r '.dispatch_tie_break // "profile-order"' <<< "$admission_json") || exit 1
+  DISPATCH_ORDER=$(jq -r '.dispatch_order // "score-desc,S-desc,R-desc,T-asc,index-asc"' <<< "$admission_json") || exit 1
 fi
 
 secondmate_registry_value() {
@@ -1620,6 +1707,16 @@ META_TMP="$STATE/$ID.meta.tmp.${BASHPID:-$$}"
   echo "effort=${EFFORT:-default}"
   [ -z "$QUOTA_POSTURE" ] || echo "quota_posture=$QUOTA_POSTURE"
   [ -z "$QUOTA_USED" ] || echo "quota_percent_used=$QUOTA_USED"
+  if [ -n "$DISPATCH_PROFILE_JSON" ]; then
+    echo "dispatch_origin=$DISPATCH_ORIGIN"
+    [ "$DISPATCH_ORIGIN" != override ] || echo "dispatch_override_reason=$OVERRIDE_REASON"
+    echo "dispatch_strategy=$DISPATCH_STRATEGY"
+    echo "dispatch_explain=$DISPATCH_EXPLAIN"
+    echo "dispatch_candidates_json=$DISPATCH_CANDIDATES_JSON"
+    echo "dispatch_selected_index=$DISPATCH_SELECTED_INDEX"
+    echo "dispatch_tie_break=$DISPATCH_TIE_BREAK"
+    echo "dispatch_order=$DISPATCH_ORDER"
+  fi
   # Finite-workflow budget fields (bin/fm-workflow-bound.sh). Secondmates are
   # persistent supervisors and do not carry a child budget pin.
   if [ "$KIND" != secondmate ]; then

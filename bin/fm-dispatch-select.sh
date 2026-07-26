@@ -19,15 +19,14 @@
 #     A profile may state both; provider defaults to harness for compatibility.
 #   - Multi-candidate selection strategy: `usage-burndown` (canonical).
 #     Legacy alias: `quota-balanced` (same engine; existing configs keep working).
-#   - Per source, adapters expose remaining usage R, time-to-reset T, and
-#     feasible burn B (learned from history, never a static table). Projected
-#     expiry surplus S = max(0, R - B*T); score = S * pressure, with pressure
-#     rising as T shrinks while S > 0. Highest score wins; freeze-level sources
-#     are skipped when any non-freeze known source exists.
-#   - Observational postures from percent used: below 60% normal, at 60%
-#     conserve, at 80% protect, at 90% freeze (inclusive). Posture does not rank
-#     multi-candidate winners; freeze still refuses an explicit pin in place
-#     (exit 75) and never substitutes another provider for that pin.
+#   - Short rate windows are eligibility gates only. The provider's durable
+#     budget window supplies remaining R, time-to-reset T, learned
+#     counterfactual burn B, and an observed or reset-history-derived period W.
+#     Spendable expiry surplus S = max(0, R - spend_floor - B*T);
+#     score = (S/T) * pressure. Highest score wins.
+#   - Observational postures remain normal/conserve/protect. Freeze begins when
+#     budget remaining reaches FM_BURNDOWN_SPEND_FLOOR (default 5%). An
+#     exhausted rate gate or a frozen explicit pin exits 75 without substitution.
 #   - Stale-but-current general-window numbers remain usable under adapter rules
 #     (refreshedAt/resetsAt prove the window is still current).
 #   - Recognized providers with missing, failed, or unusable usage evidence stay
@@ -47,7 +46,10 @@
 #
 # usage-burndown and --admit use quota-axi --json unless --quota-json supplies
 # a fixture. FM_DISPATCH_QUOTA_AXI overrides the quota command.
+# FM_DISPATCH_NOW_EPOCH overrides the clock for frozen fixtures.
 # FM_BURNDOWN_PRESSURE_K overrides the expiry-pressure coefficient (default 4).
+# FM_BURNDOWN_SPEND_FLOOR overrides the budget remaining floor (default 5).
+# FM_BURNDOWN_RATE_FLOOR overrides the gate exhaustion boundary (default 0).
 # FM_USAGE_BURN_HISTORY overrides the burn-sample history path.
 set -u
 
@@ -55,7 +57,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=bin/fm-usage-burndown-lib.sh
 . "$SCRIPT_DIR/fm-usage-burndown-lib.sh"
 
-NOW_EPOCH=$(date +%s)
+NOW_EPOCH=${FM_DISPATCH_NOW_EPOCH:-$(date +%s)}
+case "$NOW_EPOCH" in
+  ''|*[!0-9]*) echo "error: FM_DISPATCH_NOW_EPOCH must be an integer epoch" >&2; exit 2 ;;
+esac
 SELECT_OVERRIDE=
 QUOTA_JSON_FILE=
 ADMIT=0
@@ -266,19 +271,50 @@ fi
 
 quota_unavailable() {
   log "$1; retaining selected provider with quota posture unknown"
-  # When multi was requested but evidence is wholly unusable, still emit first
-  # profile with unknown posture (never silent freeze, never fabricated numbers).
   printf '%s\n' "$profiles_json" | jq -c '
     def clean($p):
       {provider: ($p.provider // $p.harness), harness: $p.harness}
       + (if ($p.model? | type) == "string" then {model: $p.model} else {} end)
       + (if ($p.effort? | type) == "string" then {effort: $p.effort} else {} end);
-    clean(.[0]) + {
-      provider_recognition:"recognized",
-      quota_posture:"unknown",
-      dispatch_strategy:"usage-burndown",
-      dispatch_explain:"usage evidence unavailable; retained first profile"
-    }
+    ([to_entries[]
+      | {
+          index:.key,
+          provider:(.value.provider // .value.harness),
+          harness:.value.harness,
+          profile:clean(.value),
+          evidence:"unknown",
+          scorable:false,
+          eligible:true,
+          ineligible_reason:null,
+          R:null,
+          T:null,
+          W:null,
+          W_source:"missing",
+          B:null,
+          B_source:"none",
+          S:null,
+          spendable_surplus:null,
+          required_rate:null,
+          pressure:null,
+          urgency:null,
+          score:null,
+          posture:"unknown",
+          percent_used:null,
+          window_id:null,
+          binding_reason:null,
+          window_roles:[]
+        }
+    ]) as $rows
+    | clean(.[0]) + {
+        provider_recognition:"recognized",
+        quota_posture:"unknown",
+        dispatch_strategy:"usage-burndown",
+        dispatch_explain:"usage evidence unavailable; retained first profile",
+        dispatch_candidates:$rows,
+        dispatch_selected_index:0,
+        dispatch_tie_break:"profile-order",
+        dispatch_order:"score-desc,S-desc,R-desc,T-asc,index-asc"
+      }
   '
   exit 0
 }
@@ -333,7 +369,12 @@ if [ "$(printf '%s\n' "$selection" | jq -r '.frozen')" = true ]; then
   frozen_provider=$(printf '%s\n' "$selection" | jq -r '.provider')
   frozen_used=$(printf '%s\n' "$selection" | jq -r '.used')
   frozen_remaining=$(printf '%s\n' "$selection" | jq -r '.min')
-  log "admission refused: provider '$frozen_provider' is freeze at ${frozen_used}% used (general-window minimum ${frozen_remaining}% remaining); keep the selected task/profile and retry after quota clears"
+  block_reason=$(printf '%s\n' "$selection" | jq -r '.block_reason // "budget-spend-floor"')
+  if [ "$block_reason" = rate-window-exhausted ]; then
+    log "admission refused: provider '$frozen_provider' has no rate-window capacity; keep the selected task/profile and retry after the rate window clears"
+  else
+    log "admission refused: provider '$frozen_provider' reached the ${FM_BURNDOWN_SPEND_FLOOR}% budget spend floor (${frozen_used}% used, ${frozen_remaining}% remaining); keep the selected task/profile and retry after quota clears"
+  fi
   exit 75
 fi
 

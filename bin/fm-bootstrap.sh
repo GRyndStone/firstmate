@@ -582,9 +582,22 @@ crew_dispatch_validate() {
       elif ($u | type) == "object" then [$u]
       else []
       end;
+    def default_profiles($d):
+      if ($d | type) != "object" then []
+      elif $d | has("use") then use_profiles($d.use)
+      else [$d]
+      end;
+    def all_profiles:
+      ([(.rules // [])[]? | use_profiles(.use?)[]?]
+        + default_profiles(.default?));
+    def all_selects:
+      ([(.rules // [])[]? | .select? // empty]
+        + [if (.default? | type) == "object" and (.default | has("use"))
+           then .default.select? // empty
+           else empty
+           end]);
     def bad_efforts:
-      ([(.rules // [])[]? | use_profiles(.use?)[]? | {h: .harness, e: .effort}]
-        + (if (.default? | type) == "object" then [{h: .default.harness, e: .default.effort}] else [] end))
+      ([all_profiles[] | {h:.harness,e:.effort}])
       | map(select(.e != null))
       | map(select((.h | type) == "string" and verified(.h)))
       | map(select(. as $p | effort_ok($p.h; $p.e) | not))
@@ -599,12 +612,16 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select(type != "object")] | length > 0 then "each use profile must be an object"
     elif [(.rules // [])[]? | use_profiles(.use?)[]? | select((.harness? | type) != "string" or (.harness | length) == 0)] | length > 0 then "each use profile needs harness"
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
-    elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced" and . != "usage-burndown")] | length > 0 then
-      "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced" and . != "usage-burndown") ] | unique | join(", "))
+    elif [all_selects[] | select(type != "string" or length == 0)] | length > 0 then "select must be a non-empty string"
+    elif [all_selects[] | select(. != "quota-balanced" and . != "usage-burndown")] | length > 0 then
+      "unknown select: " + ([all_selects[] | select(. != "quota-balanced" and . != "usage-burndown")] | unique | join(", "))
     elif has("default") and (.default | type) != "object" then "default must be an object"
-    elif has("default") and ((.default.harness? | type) != "string" or (.default.harness | length) == 0) then "default needs harness when present"
+    elif has("default") and (.default | has("use")) and ((.default.use | type) != "object" and (.default.use | type) != "array") then "default use must be an object or array"
+    elif has("default") and (.default | has("use")) and ((.default.use | type) == "array" and (.default.use | length) == 0) then "default needs at least one use profile"
+    elif [default_profiles(.default?)[]? | select(type != "object")] | length > 0 then "each default use profile must be an object"
+    elif [default_profiles(.default?)[]? | select((.harness? | type) != "string" or (.harness | length) == 0)] | length > 0 then "each default use profile needs harness"
     else
-      ([(.rules // [])[]? | use_profiles(.use?)[]?.harness] + [.default?.harness?]
+      ([all_profiles[]?.harness]
         | map(select(. != null))
         | map(select(. as $h | verified($h) | not))
         | unique) as $bad_harnesses
@@ -631,9 +648,11 @@ crew_dispatch_validate() {
           + "[" + ([$r.use[] | profile(.)] | join(", ")) + "]")
       else profile($r.use)
       end;
+    def default_label($d):
+      if $d | has("use") then use_label($d) else profile($d) end;
     (["CREW_DISPATCH: active config/crew-dispatch.json"]
       + [(.rules // [])[]? | "  rule: " + (.when | tostring) + " -> " + use_label(.)]
-      + (if (.default? | type) == "object" then ["  default: " + profile(.default)] else [] end))
+      + (if (.default? | type) == "object" then ["  default: " + default_label(.default)] else [] end))
     | .[]
   ' "$file"
 }

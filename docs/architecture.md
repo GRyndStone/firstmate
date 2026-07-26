@@ -122,10 +122,11 @@ A GSD-driving brief variant (`fm-brief.sh --gsd`) rides the scout shape at runti
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.
-The dispatch file is intentionally judgment-based: firstmate reads the natural-language rules at intake, chooses the best matching rule (eligible set and preferences), resolves multi-candidate choice through the usage-burndown engine in `fm-dispatch-select.sh` (including `--admit`), and passes concrete provider/harness/model/effort plus quota observation fields to `fm-spawn.sh`.
-The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns usage-burndown selection and fail-closed provider admission (`docs/usage-burndown-dispatch.md`), but they do not parse task intent or match the natural-language rules.
+With a valid dispatch file, an ordinary spawn supplies no routing axes: `fm-spawn.sh` reads the configured default candidate set, calls the usage-burndown engine, and launches the provider, harness, model, and effort it selects.
+Natural-language rules remain available for deliberate task-specific overrides, but invoking one requires concrete axes plus `--override-reason`, so task judgment cannot silently replace the routine mechanism.
+The shell scripts validate the JSON shape and verified harness/effort combinations, and `fm-dispatch-select.sh` owns usage-burndown selection and fail-safe provider admission (`docs/usage-burndown-dispatch.md`).
 The session-start bootstrap step surfaces either the active rule block or a concise invalid-config line at startup.
-When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit provider and harness, re-admits that exact profile before creating resources, and pins the admitted profile in task meta so later failure cannot silently substitute another harness or model.
+When the file exists, `fm-spawn.sh` distinguishes `dispatch_origin=algorithm` from `dispatch_origin=override`, records the full candidate explanation for algorithm decisions, and records the override reason for explicit routing.
 Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
 Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
@@ -159,7 +160,7 @@ When the harness token is unset or `default`, launch falls back to `config/crew-
 Those optional tokens are re-read on every secondmate spawn or respawn and are overridden by explicit per-spawn `--model` or `--effort` flags.
 An explicit per-spawn harness or raw launch command does not inherit model or effort tokens from `config/secondmate-harness`.
 `config/crew-harness` remains the crewmate harness and is inherited into secondmate homes.
-`config/crew-dispatch.json` is inherited too; secondmates use the same natural-language dispatch profiles when spawning their own crewmates.
+`config/crew-dispatch.json` is inherited too; secondmates use the same routine default candidate set and optional override profiles when spawning their own crewmates.
 `config/backlog-backend` is inherited too; absent or `tasks-axi` selects the default tasks-axi backlog backend, while `manual` forces routine backlog updates to hand-editing across the fleet without disabling validated handoff delegation.
 `config/no-mistakes-generation` is inherited too so secondmate-spawned crewmates pin the same no-mistakes runtime generation (`docs/configuration.md` "No-mistakes generation").
 

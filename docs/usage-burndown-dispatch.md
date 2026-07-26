@@ -1,194 +1,185 @@
 # Usage-burndown dispatch engine
 
 Design note for the routine agent-routing decision path.
-This document is the full statement of the policy; script headers own flags and wire shapes; `AGENTS.md` section 4 keeps only the intake trigger and a pointer here.
+This document is the full statement of the policy.
+Script headers own flags and wire shapes.
+`AGENTS.md` section 4 keeps only the operating trigger and a pointer here.
 
 Date: 2026-07-25.
-Captain commission: route agents by remaining usage per remaining window time, with a modifier that prefers burning capacity that would otherwise expire unused at reset; modular across providers; supersede the prior selection layer.
+Captain commission: route agents by remaining durable budget per remaining reset time, preferentially burn capacity that would otherwise expire unused, and make the mechanism run without an agent remembering to invoke it.
 
-## Why this replaces the prior layer
+## Two window roles
 
-The prior selector (`quota-balanced` in `bin/fm-dispatch-select.sh`) ranked candidates by maximum general-window `percentRemaining` and attached a 60/80/90 posture band for admission.
-That is a static ordering on a single snapshot ratio.
-It does not ask whether a source can actually consume its remaining budget before the window resets, so a source with high remaining and low feasible burn near expiry looks "healthy" and is under-used while the unused slice expires.
+A short rate window and a durable budget window are not interchangeable.
+A short window is an eligibility gate only.
+When a short window has no meaningful capacity, the provider cannot accept work now and is removed from the candidate set.
+When the gate has capacity, its remaining amount and reset time have no effect on score.
 
-The burndown engine scores each eligible source from fresh observations at decision time using remaining usage, time to reset, and a learned feasible burn rate.
-It chooses so that usage projected to expire unused is minimized, with pressure that grows as a window nears reset while surplus remains.
-Posture bands remain observational admission signals (including freeze refusal for an explicit pin); they no longer decide multi-candidate routing.
+The durable budget window is the only scored window.
+Its remaining capacity is genuinely lost at reset, and spending from a short window also consumes this longer budget.
+The spend floor applies to this budget, not to the rate gate.
 
-## Objective (single owner: `bin/fm-usage-burndown-lib.sh`)
+`bin/fm-usage-source-lib.sh` stores role classification as provider-registry data:
 
-For each eligible source at decision time, from adapter evidence:
+| Provider | Gate windows | Scored budget | Ignored windows |
+| --- | --- | --- | --- |
+| `claude` | `five_hour` | `seven_day` | none |
+| `codex` | `five_hour` | `weekly` | none |
+| `grok` | `grokbuild` or `product:grokbuild` when reported | `credits` | `api`, `grokimagine`, `chat`, `voice`, and their `product:` forms |
+
+The Grok `credits` pool is weekly, and the meter contract reports its true `windowSeconds` as `604800`.
+Older observations that omit the field and observations that report explicit `null` remain unknown rather than inheriting that number from provider identity.
+The engine learns an unknown period only after distinct observed `resetsAt` values establish it.
+The Grok Build product pool gates whether the Grok coding harness can accept work, while API, image, chat, and voice product pools are irrelevant to that harness and are ignored.
+A new window not named by a configured provider policy is recorded as `unclassified` rather than silently treated as ignored.
+
+A provider with exactly one usable non-model window and no configured role policy treats that window as both gate and budget.
+A provider with multiple unclassified windows degrades to `evidence=unknown` because choosing a durable budget would be a guess.
+Missing gate evidence cannot prove that a provider is rate-limited.
+
+## Objective
+
+For each eligible provider, the budget window supplies:
 
 | Symbol | Meaning |
 | --- | --- |
-| `R` | Remaining usage of the binding window (percent of that window, 0-100) |
-| `T` | Seconds until that window resets |
-| `W` | Nominal window length in seconds |
-| `B` | Feasible burn rate in percent-per-second (learned; never a static table of providers) |
-| `S` | Projected expiry surplus: `max(0, R - B*T)` |
+| `R` | Budget percent remaining |
+| `T` | Seconds until the budget resets |
+| `W` | Observed or reset-history-derived budget period in seconds |
+| `B` | Counterfactual non-preferential burn rate in percent per second |
+| `F` | Protected budget floor in percent remaining |
+| `S` | Spendable capacity projected to expire without preferential routing |
 
-`S` is the slice of remaining usage the source is not expected to consume before reset if burn continues only at rate `B`.
-A single dispatch choice cannot zero every source's surplus; it assigns the next unit of work to the source whose weighted surplus most justifies preferential consumption.
+The equations are:
 
-**Score** (higher wins among multi-candidate selects):
-
-```
-urgency = clamp(1 - T/W, 0, 1)
-pressure = 1 + K * urgency^2    when S > 0
-pressure = 1                    when S == 0
-score = S * pressure
-```
-
-`K` defaults to 4 (`FM_BURNDOWN_PRESSURE_K`).
-As `T` shrinks while `S > 0`, pressure rises and the engine prefers that source even if another has slightly higher raw `R`.
-When every known source has `S = 0` (feasible burn covers remaining), fall back to higher `R`, then lower profile index (deterministic).
-
-Freeze (`percent used >= 90` on the binding general windows) is admission, not score:
-- Multi-candidate select excludes freeze-level sources when any non-freeze known source exists, so work still ships on capacity that is not frozen.
-- If every known candidate is freeze, admission refuses (exit 75) with an actionable reason, same as an explicit pin.
-- An explicit single-profile `--admit` or `--resume-meta` pin still freezes in place and never substitutes another provider.
-
-Unknown or unusable evidence for a recognized provider never fabricates `R`/`T`/`B`.
-That source stays selectable with `provider_recognition=recognized` and `quota_posture=unknown`, scores as non-competing for surplus minimization, and wins only when no known competitor remains (stable first-index tie-break among unknowns).
-Missing `quota-axi` or malformed JSON cannot prove freeze for a recognized provider.
-An unrecognized provider token is caller input failure rather than evidence absence.
-It emits a machine-distinct profile with `provider_recognition=unrecognized` and `dispatch_error=unrecognized-provider`, names the bad token and recognized set on stderr, and exits 64.
-
-## Feasible burn rate `B` (dynamic, not assumed)
-
-`B` is never a hard-coded per-provider constant.
-
-1. **History** (preferred): `data/usage-burn-history.json` under the active home (override with `FM_USAGE_BURN_HISTORY`).
-   Each successful scored decision appends a sample `{provider, window_id, remaining, at}`.
-   For the same provider+window, the latest pair with decreasing remaining yields `B = (R_prev - R_now) / (t_now - t_prev)`.
-   Multiple recent positive samples average (bounded window).
-2. **Prior from this snapshot**: if the window reports elapsed time and percent already used, `B_prior = percentUsed / max(elapsed, 1)`.
-3. **Zero prior**: no history and no usable elapsed → `B = 0`, so `S = R` (honest "all remaining is at-risk until we learn burn").
-
-Projections therefore move after every dispatch that records a sample.
-There is no static ranking table and no single fixed remaining/time ratio used as the only score.
-
-## Modular source adapters (single owner: `bin/fm-usage-source-lib.sh`)
-
-Every usage source implements one plug surface.
-Adapters emit a uniform observation JSON; the optimizer never parses provider-specific quota shapes.
-
-### Plug surface (observation object)
-
-```json
-{
-  "source_id": "claude",
-  "class": "anthropic-class",
-  "provider": "claude",
-  "evidence": "fresh|stale|unknown",
-  "unit": "percent",
-  "windows": [
-    {
-      "id": "five_hour",
-      "kind": "session",
-      "remaining": 66.0,
-      "resets_at_epoch": 1710000000,
-      "window_seconds": 18000
-    }
-  ],
-  "binding": {
-    "id": "five_hour",
-    "remaining": 66.0,
-    "T": 3600,
-    "window_seconds": 18000
-  },
-  "diagnostics": []
-}
+```text
+spendable = max(0, R - F)
+S = max(0, spendable - B*T)
+required_rate = S/T
+urgency = clamp(1 - T/W, 0, 1)       when W is known
+pressure = 1 + K*urgency^2            when S > 0 and W is known
+pressure = 1                          otherwise
+score = required_rate * pressure
 ```
 
-`binding` is the tightest general window (minimum remaining; soonest reset on ties).
-`evidence=unknown` means the adapter could not produce a usable binding; `windows` may be empty.
+`required_rate` implements "most remaining usage per remaining time."
+`pressure` is a modifier that makes a nearly ended budget window more urgent when its true period is known.
+`K` defaults to 4 and is configurable with `FM_BURNDOWN_PRESSURE_K`.
+`F` defaults to 5 and is configurable with `FM_BURNDOWN_SPEND_FLOOR`.
+The rate-gate boundary defaults to 0 and is configurable with `FM_BURNDOWN_RATE_FLOOR`.
 
-### Provider registry
+Higher score wins.
+The complete deterministic order is score descending, `S` descending, `R` descending, `T` ascending, then configured profile index ascending.
+The last step is a total tie-break because every candidate has one unique index.
 
-`fm_usage_source_registry` is the single owner of recognized provider identities, adapter classes, and meter kinds.
-Both `fm-dispatch-select.sh` and `fm-spawn.sh` ask this registry whether a provider token is recognized.
-Each row declares the quota identity, adapter class, and either `quota-axi` or `unmetered` as its meter kind.
-The executable registry is the only current recognized-provider list.
-An `unmetered` row always emits honest `evidence=unknown` until its meter kind and observation path are wired.
+Posture remains observational.
+Budget usage at 60 percent is `conserve`, usage at 80 percent is `protect`, and budget remaining at or below `F` is `freeze`.
+Multi-candidate routing excludes a frozen budget when any live candidate exists.
+An explicit pin at the floor refuses in place with exit 75 and never substitutes another provider.
+An exhausted rate gate also refuses an explicit pin in place with exit 75.
 
-Provider is the quota identity; harness remains the launch adapter (`provider` may differ from `harness`, e.g. Claude via opencode).
-Adapter class tokens such as `openai` are not provider aliases.
-The selector refuses them instead of mapping them because a convenience mapping would hide a caller bug and could route against the wrong quota identity.
+## What `B` means
 
-### Recipe: add a new agentic source
+`B` means how much budget is expected to be consumed before reset if the next dispatch does not preferentially route to this provider.
+It is a counterfactual baseline, not an extrapolation of consumption that routing itself caused.
 
-1. Choose a stable `provider` string (quota identity) and a `class` name (`*-class`).
-2. Add one row to `fm_usage_source_registry` with meter kind `unmetered` until evidence is wired.
-3. Implement a branch in `fm_usage_source_observe` (or a sourced sibling) that, given raw quota JSON or another meter, fills the plug surface.
-   Prefer real remaining + `resetsAt` + window length; never invent numbers when the meter is missing.
-4. Change that same registry row to the wired meter kind.
-5. If the source is not in `quota-axi`, document the external meter command and wire it behind the same observation shape (optional env override for the command).
-6. Add a unit test that fixtures the meter output and asserts binding + unknown degradation.
-7. Optionally add a crew-dispatch example profile using the new `provider` with a verified harness.
+The previous implementation used `percentUsed / elapsed`.
+That snapshot prior was circular because a routed burst increased projected future burn, collapsed that provider's surplus to zero, and caused routing to stop using the budget that needed burn-down.
+The same problem affected history because only selected-provider samples were recorded.
 
-No optimizer change is required when the plug surface is honored.
-No selector or spawn refusal-path change is required when the registry row is added.
+Every scored decision now records a sample for every candidate with an explicit `selected` boolean.
+For one provider and reset window, `B` divides total positive depletion by total time across intervals whose opening decision did not select that provider.
+Qualifying zero-depletion intervals count as zero background demand rather than disappearing from the estimate.
+Intervals opened by selecting the provider and legacy samples without `selected` are ignored.
+If no qualifying interval exists, `B=0` with source `counterfactual-zero`.
 
-## Supersession and `config/crew-dispatch.json`
+The available evidence cannot identify a perfect causal counterfactual.
+An already-running task can continue consuming after a later decision routes elsewhere, and unrelated clients can consume the same quota.
+The estimate assumes consumption observed after a non-selection decision is the best available proxy for background demand that does not require the next preferential route.
+This is deliberately conservative: when that evidence is absent, all spendable budget is treated as at risk.
 
-### What the engine owns
+History lives at `data/usage-burn-history.json` under the active home.
+`FM_USAGE_BURN_HISTORY` overrides the path for fixtures.
 
-`bin/fm-dispatch-select.sh` is the routine decision path for multi-candidate selection and for admission observation.
-Strategy name: `usage-burndown`.
-Legacy alias: `quota-balanced` (same engine; kept so existing local configs and tests keep working without a forced rewrite).
+## What `W` means
 
-Stdout remains one compact profile JSON for `fm-spawn.sh`:
-`provider`, `harness`, `model`, `effort`, `provider_recognition`, `quota_posture`, optional `quota_percent_used`, plus `dispatch_strategy` and `dispatch_explain` for inspectability.
-Stderr carries human-readable decision logs (inputs, per-candidate scores, chosen source, why).
-An unrecognized-token error profile additionally carries `dispatch_error`, `unrecognized_providers`, and `recognized_providers`.
+`W` is accepted from a meter only when the meter actually reports a positive `windowSeconds`; the updated `quota-axi` contract reports Grok's real weekly value as `604800`.
+An explicit `null` is unknown, and an absent field from an older meter is also unknown.
+There are no provider or window-id duration constants.
+In particular, `credits` never implies 24 hours.
 
-### What natural-language rules become
+When the meter omits `W`, the engine compares distinct recorded `resetsAt` values for the same provider and window id.
+A positive change supplies `W` with source `history-reset-period`.
+This assumes the two recorded reset boundaries are successive; a missed whole period can make the learned period too large, and the explanation exposes the source so that assumption is auditable.
+Until a period is observed, `W` and urgency remain null and pressure stays neutral at 1.
+The provider may still compete on the directly observed `R`, `T`, and counterfactual `B`; the engine never fabricates urgency.
 
-`config/crew-dispatch.json` is no longer a rival numeric selector.
-Firstmate still uses judgment to pick the best-fit rule (`when` / `why`).
-That rule supplies:
+## Missing evidence and fail-safe dispatch
 
-- the **eligible set** (`use` profiles: harness/model/effort/provider constraints and preferences);
-- optional `select: "usage-burndown"` (or the legacy alias) when multiple profiles may run;
-- single-object `use` or array-without-select as an explicit preference order (first profile), still admitted through the same observation path.
+Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `W`, `B`, freeze, or rate exhaustion.
+A known candidate outranks an unknown candidate during normal scoring.
+When no known live candidate remains, the first unknown candidate is retained with `quota_posture=unknown`.
+Missing `quota-axi`, malformed JSON, an unwired recognized provider, and an unclassifiable window shape therefore do not refuse routine work.
+The emitted profile still carries one unknown row for every configured candidate.
 
-So rules are optional constraints and preferences consumed by the engine, not a second optimizer.
-Captain per-task instructions still outrank everything (precedence in `AGENTS.md` section 4): when firstmate pins one profile from a captain instruction, that pin is admitted in place (`dispatch_explain` records `captain-or-explicit-pin`); the engine does not re-open multi-source selection.
+An unrecognized provider token is caller input failure rather than missing evidence.
+It emits `provider_recognition=unrecognized`, `dispatch_error=unrecognized-provider`, the bad and recognized provider sets, and exits 64.
 
-### Freeze and posture
+## Self-routing spawn and overrides
 
-Posture thresholds remain observational (normal / conserve / protect / freeze at 60 / 80 / 90 percent used inclusive).
-They annotate the admitted profile for fleet visibility and still gate freeze refusal for pins.
-They do not rank multi-candidate winners.
+`bin/fm-spawn.sh` is the routine mechanism.
+When `config/crew-dispatch.json` exists and a new crewmate or scout receives no routing axes, spawn reads the configured `default`, invokes `usage-burndown`, and launches the returned provider, harness, model, and effort.
+The default may be one profile or a dispatch object with `use` candidates and `select:"usage-burndown"`.
+The documented example uses a candidate set.
+Batch spawns re-enter the same single-task path, so every unpinned task obtains its own deterministic decision.
 
-## Compatibility
+Caller-supplied provider, harness, model, or effort is an intentional override.
+A new override under active dispatch config requires `--override-reason` and a concrete provider plus harness.
+The exact profile is admitted in place and never reopened as a multi-provider choice.
+Existing task pins and bounded child inheritance remain stable without being mislabeled as a new human override.
 
-- `fm-spawn.sh` flags `--provider`, `--harness`, `--model`, `--effort`, `--quota-posture`, `--quota-used` keep working; spawn still re-admits through `fm-dispatch-select.sh --admit`.
-- Missing/stale quota evidence for recognized providers: unknown posture, no silent freeze, no silent provider switch on explicit pins.
-- Unrecognized provider token: distinct error profile and exit 64 before quota observation.
-- Crewmate and scout spawn: explicit, dispatch-managed, and inherited provider pins are checked against the same usage-source registry before launch.
-- Tests: colocated `tests/fm-usage-burndown-lib.test.sh`, `tests/fm-usage-source-lib.test.sh`, and updated `tests/fm-dispatch-select.test.sh`.
-- Bootstrap accepts `usage-burndown` and the `quota-balanced` alias for `select`.
+Task metadata distinguishes the paths:
+
+```text
+dispatch_origin=algorithm|override|inherited|resume
+dispatch_override_reason=<one line, override only>
+dispatch_strategy=usage-burndown
+dispatch_explain=<chosen calculation>
+dispatch_candidates_json=<compact array of every candidate and every score input>
+dispatch_selected_index=<configured candidate index>
+dispatch_tie_break=profile-order
+dispatch_order=score-desc,S-desc,R-desc,T-asc,index-asc
+```
+
+`dispatch_candidates_json` includes evidence, eligibility, window roles, binding reason, `R`, `T`, `W` and its source, `B` and its source, `S`, required rate, urgency, pressure, score, posture, and floors.
+This record makes "the algorithm chose this" distinguishable from "a human overrode it for this reason" without reconstructing logs.
+
+## Configuration and compatibility
+
+`config/crew-dispatch.json` remains local and human-editable.
+Natural-language rules can still constrain unusual task classes, but routine no-argument spawn does not require an agent to choose a provider or remember to invoke the selector.
+`docs/examples/crew-dispatch.json` is the starting point.
+
+Strategy name is `usage-burndown`.
+The legacy alias `quota-balanced` invokes the same engine.
+`--admit` and `--resume-meta` remain single-profile paths.
+Recognized providers without a meter remain admissible with unknown posture.
+Bootstrap validates both rule candidate sets and default candidate sets.
 
 ## Inspectability
 
-Every multi-candidate decision logs:
-
-1. candidate index, provider, harness, R, T, B, S, pressure, score, evidence, posture;
-2. chosen index and one-line why (e.g. `highest expiry-weighted surplus`);
-3. strategy name and whether history or prior supplied `B`.
-
-Single-profile admit logs observation-only posture without claiming a multi-source optimization.
+Every decision prints one stderr line per candidate.
+Each line includes provider, harness, evidence, gate eligibility, posture, budget id and binding reason, window roles, `R`, `T`, `W` and source, `B` and source, `S`, required rate, urgency, pressure, and score.
+The selected profile carries the same candidate array in `dispatch_candidates`.
+Spawn persists that array in task metadata.
 
 ## Module map
 
 | Path | Role |
 | --- | --- |
-| `bin/fm-usage-source-lib.sh` | Adapter plug surface + shipped classes |
-| `bin/fm-usage-burndown-lib.sh` | Objective, scoring, history, explanation builder |
-| `bin/fm-dispatch-select.sh` | CLI: resolve rule/profiles, call engine, admit, freeze |
-| `docs/usage-burndown-dispatch.md` | This design note (policy owner for rationale) |
-| `docs/configuration.md` | Schema pointer + short semantics |
-| `AGENTS.md` §4 | Intake trigger + pointer only |
+| `bin/fm-usage-source-lib.sh` | Provider registry, role classification, and observation adapter |
+| `bin/fm-usage-burndown-lib.sh` | Counterfactual history, period learning, scoring, selection, and explanation |
+| `bin/fm-dispatch-select.sh` | Selector and admission CLI |
+| `bin/fm-spawn.sh` | Automatic default routing, explicit override boundary, and metadata record |
+| `docs/configuration.md` | Config schema and operational flags |
+| `docs/examples/crew-dispatch.json` | Default candidate-set example |

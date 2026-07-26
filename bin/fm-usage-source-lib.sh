@@ -1,36 +1,38 @@
 #!/usr/bin/env bash
 # Modular usage-source adapters for the usage-burndown dispatch engine.
 #
-# This library owns the plug surface every provider class must emit and the
-# shipped adapters that fill it from quota-axi (or honest stubs).
-# Scoring and selection live in bin/fm-usage-burndown-lib.sh.
-# Policy rationale: docs/usage-burndown-dispatch.md.
+# This library owns provider recognition and the role of each reported usage
+# window. A gate window can only make a provider temporarily ineligible. A
+# budget window alone supplies optimizer inputs. Unknown window periods stay
+# null; the optimizer may derive them from reset history, but this adapter never
+# invents a duration.
 #
 # Plug surface (one JSON object per source observation):
 #   source_id, class, provider, evidence (fresh|stale|unknown), unit,
-#   windows[{id,kind,remaining,resets_at_epoch,window_seconds}],
-#   binding{id,remaining,T,window_seconds} when evidence is usable,
-#   diagnostics[] optional human strings.
+#   windows[{id,kind,role,remaining,resets_at_epoch,window_seconds,
+#            window_seconds_source}],
+#   gate_windows[], binding{...budget window...}, binding_reason, diagnostics[].
 #
-# The registry below is the single owner of recognized provider identities,
-# their adapter classes, and whether a meter is wired.
-# Recipe for new sources: docs/usage-burndown-dispatch.md.
-#
+# The registry is the single owner of provider identities, adapter classes,
+# meter kinds, and provider-specific window-role policy.
 # Sourced only; not executed as a main program.
 
 _FM_USAGE_SOURCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_USAGE_SOURCE_LIB_DIR="."
 
-# Registry rows are provider identity, adapter class, and meter kind.
-# Adding a recognized provider without a meter needs only one unmetered row.
+# Registry columns:
+#   provider, adapter class, meter kind, compact window-role policy JSON.
+# A provider with no role policy uses the single-window fallback: exactly one
+# usable non-model window is both gate and budget. Multiple unclassified windows
+# degrade to unknown rather than guessing which pool is durable.
 fm_usage_source_registry() {
-  printf '%s\t%s\t%s\n' \
-    claude anthropic-class quota-axi \
-    codex openai-class quota-axi \
-    grok grok-class quota-axi \
-    gemini gemini-class unmetered \
-    openrouter openrouter-class unmetered \
-    cursor cursor-class quota-axi \
-    copilot copilot-class quota-axi
+  printf '%s\t%s\t%s\t%s\n' \
+    claude anthropic-class quota-axi '{"budget":["seven_day"],"gate":["five_hour"],"ignore":[]}' \
+    codex openai-class quota-axi '{"budget":["weekly"],"gate":["five_hour"],"ignore":[]}' \
+    grok grok-class quota-axi '{"budget":["credits"],"gate":["grokbuild","product:grokbuild"],"ignore":["api","product:api","grokimagine","product:grokimagine","chat","product:chat","voice","product:voice"]}' \
+    gemini gemini-class unmetered '{"budget":[],"gate":[],"ignore":[]}' \
+    openrouter openrouter-class unmetered '{"budget":[],"gate":[],"ignore":[]}' \
+    cursor cursor-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' \
+    copilot copilot-class quota-axi '{"budget":[],"gate":[],"ignore":[]}'
 }
 
 _fm_usage_source_registry_field() { # <provider> <field-number>
@@ -43,7 +45,7 @@ _fm_usage_source_registry_field() { # <provider> <field-number>
 }
 
 fm_usage_source_provider_ids() {
-  fm_usage_source_registry | awk -F '\t' 'NF >= 3 { print $1 }'
+  fm_usage_source_registry | awk -F '\t' 'NF >= 4 { print $1 }'
 }
 
 fm_usage_source_provider_ids_csv() {
@@ -58,7 +60,6 @@ fm_usage_source_provider_known() { # <provider>
   _fm_usage_source_registry_field "${1:-}" 1 >/dev/null
 }
 
-# Map a recognized quota provider id to its adapter class name.
 fm_usage_source_class() { # <provider>
   local provider=${1:-}
   if ! _fm_usage_source_registry_field "$provider" 2; then
@@ -75,45 +76,27 @@ fm_usage_source_meter_kind() { # <provider>
   fi
 }
 
-# General (non-model) window id list for a provider class / id.
-# Empty list means "all non-model windows with percentRemaining".
-fm_usage_source_general_ids_json() { # <provider>
-  case "${1:-}" in
-    claude) printf '%s\n' '["five_hour","seven_day"]' ;;
-    codex) printf '%s\n' '["five_hour","weekly"]' ;;
-    grok) printf '%s\n' '[]' ;; # all non-model
-    gemini|openrouter) printf '%s\n' '[]' ;;
-    cursor|copilot) printf '%s\n' '[]' ;;
-    *) printf '%s\n' '[]' ;;
-  esac
-}
-
-# Nominal seconds for a known window id when the meter omits windowSeconds.
-fm_usage_source_default_window_seconds() { # <provider> <window_id>
-  local id=$2
-  case "$id" in
-    five_hour) printf '%s\n' 18000 ;;
-    seven_day|weekly) printf '%s\n' 604800 ;;
-    credits) printf '%s\n' 86400 ;;
-    *) printf '%s\n' 0 ;;
-  esac
+fm_usage_source_window_policy() { # <provider>
+  local provider=${1:-}
+  if ! _fm_usage_source_registry_field "$provider" 4; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
 }
 
 # Build one observation object for provider from a full quota-axi JSON blob.
 # now_epoch is required for T and stale-window currentness.
-# Emits a single-line JSON object on stdout.
 fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   local provider=$1 quota_json=$2 now_epoch=$3
-  local class general_ids meter_kind
+  local class meter_kind role_policy
   if ! fm_usage_source_provider_known "$provider"; then
     printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
     return 64
   fi
   class=$(fm_usage_source_class "$provider") || return $?
   meter_kind=$(fm_usage_source_meter_kind "$provider") || return $?
-  general_ids=$(fm_usage_source_general_ids_json "$provider")
+  role_policy=$(fm_usage_source_window_policy "$provider") || return $?
 
-  # Recognized providers with no meter path always degrade honestly to unknown.
   case "$meter_kind" in
     unmetered)
       jq -cn \
@@ -127,6 +110,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           evidence:"unknown",
           unit:"percent",
           windows:[],
+          gate_windows:[],
           diagnostics:["no usage meter wired for this recognized provider yet; see docs/usage-burndown-dispatch.md"]
         }'
       return 0
@@ -141,45 +125,44 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   printf '%s\n' "$quota_json" | jq -ec \
     --arg provider "$provider" \
     --arg class "$class" \
-    --argjson general_ids "$general_ids" \
+    --argjson policy "$role_policy" \
     --argjson now "$now_epoch" '
     def iso_epoch:
       if type != "string" then null
       else try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null
       end;
-    def default_secs($id):
-      if $id == "five_hour" then 18000
-      elif ($id == "seven_day" or $id == "weekly") then 604800
-      elif $id == "credits" then 86400
-      else 0
-      end;
-    def general_window_ok($p; $window):
-      (($window.kind? // "") != "model")
-      and (($window.percentRemaining? | type) == "number")
-      and ($window.percentRemaining >= 0)
-      and ($window.percentRemaining <= 100)
-      and (
-        ($general_ids | length) == 0
-        or (($general_ids | index($window.id)) != null)
-      );
-    def stale_window_is_current($refreshed; $window):
-      ($window.resetsAt | iso_epoch) as $reset
-      | (
-          if ($window.windowSeconds? | type) == "number" and $window.windowSeconds > 0
-          then $window.windowSeconds
-          else default_secs($window.id)
-          end
-        ) as $duration
+    def general_window_ok:
+      ((.kind? // "") != "model")
+      and ((.percentRemaining? | type) == "number")
+      and (.percentRemaining >= 0)
+      and (.percentRemaining <= 100);
+    def stale_window_is_current($refreshed):
+      (.resetsAt | iso_epoch) as $reset
+      | (.windowSeconds? // null) as $duration
       | ($refreshed != null)
         and ($refreshed <= $now)
         and ($reset != null)
         and ($reset > $now)
         and ($reset > $refreshed)
-        and ($duration != null)
+        and (($duration | type) == "number")
         and ($duration > 0)
         and (($reset - $refreshed) <= $duration);
-    . as $root
-    | ([.providers[]? | select(.provider == $provider)][0]) as $p
+    def configured_roles:
+      (($policy.budget // []) + ($policy.gate // []) + ($policy.ignore // []));
+    def role_for($id; $count):
+      if (($policy.budget // []) | index($id)) != null then "budget"
+      elif (($policy.gate // []) | index($id)) != null then "gate"
+      elif (($policy.ignore // []) | index($id)) != null then "ignored"
+      elif (configured_roles | length) > 0 then "unclassified"
+      elif $count == 1 then "both"
+      else "unclassified"
+      end;
+    def role_source_for($id; $count):
+      if (configured_roles | length) > 0 then "provider-policy"
+      elif $count == 1 then "single-window-fallback"
+      else "unclassified"
+      end;
+    ([.providers[]? | select(.provider == $provider)][0]) as $p
     | if $p == null then
         {
           source_id:$provider,
@@ -188,76 +171,102 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           evidence:"unknown",
           unit:"percent",
           windows:[],
+          gate_windows:[],
           diagnostics:["provider absent from quota evidence"]
         }
       else
         (($p.state.status? // "unknown") as $status
         | ($p.state.refreshedAt? | iso_epoch) as $refreshed
         | ([($p.windows // [])[]
-            | select(general_window_ok($p; .))
+            | select(general_window_ok)
             | select(
                 $status == "fresh"
-                or ($status == "stale" and stale_window_is_current($refreshed; .))
+                or ($status == "stale" and stale_window_is_current($refreshed))
               )
             | . as $w
-            | (
-                if ($w.windowSeconds? | type) == "number" and $w.windowSeconds > 0
-                then $w.windowSeconds
-                else default_secs($w.id)
-                end
-              ) as $ws
-            | ($w.resetsAt | iso_epoch) as $reset_raw
-            # Fresh meters may omit resetsAt (fixtures and partial APIs). Keep the
-            # remaining percent honest; assume a full window ahead for T so we do
-            # not invent a near-expiry pressure spike.
-            | (if $reset_raw != null and $reset_raw > $now then $reset_raw
-               elif $status == "fresh" and $ws > 0 then ($now + $ws)
-               else null
-               end) as $reset
-            | select($reset != null and $ws > 0)
+            | ($w.resetsAt | iso_epoch) as $reset
+            | select($reset != null and $reset > $now)
             | {
                 id: $w.id,
+                label: ($w.label // null),
                 kind: ($w.kind // "session"),
                 remaining: $w.percentRemaining,
                 resets_at_epoch: $reset,
-                window_seconds: $ws,
+                window_seconds: (
+                  if ($w.windowSeconds? | type) == "number" and $w.windowSeconds > 0
+                  then $w.windowSeconds
+                  else null
+                  end
+                ),
+                window_seconds_source: (
+                  if ($w.windowSeconds? | type) == "number" and $w.windowSeconds > 0
+                  then "meter"
+                  else "missing"
+                  end
+                ),
                 T: ($reset - $now)
               }
-          ]) as $usable
-        | if ($usable | length) == 0 then
+          ]) as $raw
+        | ($raw | length) as $raw_count
+        | ($raw | map(
+            . + {
+              role: role_for(.id; $raw_count),
+              role_source: role_source_for(.id; $raw_count)
+            }
+          )) as $classified
+        | ([$classified[] | select(.role == "budget" or .role == "both")]) as $budgets
+        | ([$classified[] | select(.role == "gate" or .role == "both")]) as $gates
+        | if ($budgets | length) != 1 then
             {
               source_id:$provider,
               class:$class,
               provider:$provider,
               evidence:"unknown",
               unit:"percent",
-              windows:[],
+              windows:$classified,
+              gate_windows:$gates,
               diagnostics:(
-                ["no usable general windows"]
+                if ($raw | length) == 0 then
+                  ["no usable non-model windows"]
+                elif ($budgets | length) == 0 then
+                  ["no budget window can be classified without guessing"]
+                else
+                  ["multiple budget windows classified; refusing to guess which one binds"]
+                end
                 + (if $status != "fresh" then ["quota status is \($status)"] else [] end)
               )
             }
           else
-            # Binding = minimum remaining; soonest reset on ties.
-            (
-              $usable
-              | sort_by(.remaining, .T)
-              | .[0]
-            ) as $bind
+            ($budgets[0]) as $budget
             | {
                 source_id:$provider,
                 class:$class,
                 provider:$provider,
                 evidence:(if $status == "fresh" then "fresh" else "stale" end),
                 unit:"percent",
-                windows: $usable,
+                windows:$classified,
+                gate_windows:$gates,
                 binding: {
-                  id: $bind.id,
-                  remaining: $bind.remaining,
-                  T: $bind.T,
-                  window_seconds: $bind.window_seconds
+                  id:$budget.id,
+                  role:"budget",
+                  role_source:$budget.role_source,
+                  remaining:$budget.remaining,
+                  resets_at_epoch:$budget.resets_at_epoch,
+                  T:$budget.T,
+                  window_seconds:$budget.window_seconds,
+                  window_seconds_source:$budget.window_seconds_source
                 },
-                diagnostics: []
+                binding_reason:(
+                  if $budget.role_source == "single-window-fallback"
+                  then "only usable window acts as both eligibility gate and scored budget"
+                  else "provider policy marks this as the durable budget; gate windows never affect score"
+                  end
+                ),
+                diagnostics:(
+                  [$classified[]
+                    | select(.role == "unclassified")
+                    | "unclassified window \(.id) was not used"]
+                )
               }
           end
         )
@@ -266,8 +275,6 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
 }
 
 # Observe every distinct provider listed in a profiles JSON array.
-# profiles_json: [{provider?,harness,...}, ...]
-# Prints a JSON array of observation objects (one per distinct provider id).
 fm_usage_source_observe_profiles() { # <profiles_json> <quota_json> <now_epoch>
   local profiles_json=$1 quota_json=$2 now_epoch=$3
   local providers p obs out class
@@ -287,7 +294,7 @@ fm_usage_source_observe_profiles() { # <profiles_json> <quota_json> <now_epoch>
       obs=$(jq -cn \
         --arg provider "$p" \
         --arg class "$class" \
-        '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],diagnostics:["adapter failed"]}')
+        '{source_id:$provider,class:$class,provider:$provider,evidence:"unknown",unit:"percent",windows:[],gate_windows:[],diagnostics:["adapter failed"]}')
     fi
     out=$(jq -cn --argjson acc "$out" --argjson o "$obs" '$acc + [$o]')
   done <<< "$providers"
