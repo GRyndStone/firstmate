@@ -25,7 +25,9 @@
 # Usage:
 #   fm-fold-sweep.sh                 sweep every declared fold
 #   fm-fold-sweep.sh <fold>...       sweep only the named folds
-#   fm-fold-sweep.sh --strict        exit 1 if any un-allowlisted invocation remains
+#   fm-fold-sweep.sh --strict        exit 1 if any un-allowlisted reach site remains
+#   fm-fold-sweep.sh --coverage      exit 1 if any tracked file is neither swept
+#                                    nor declared excluded (enumeration completeness)
 #
 # Exit status is 0 unless --strict is set and an un-allowlisted invocation was
 # found, so the sweep is readable during a migration and enforceable after it.
@@ -37,11 +39,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 STRICT=0
+COVERAGE=0
 FOLDS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --strict) STRICT=1; shift ;;
-    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --coverage) COVERAGE=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) printf 'fm-fold-sweep: unknown flag %s\n' "$1" >&2; exit 2 ;;
     *) FOLDS+=("$1"); shift ;;
   esac
@@ -54,7 +58,10 @@ ALLOW_FILE="$ROOT/vendor/sweep-allow.txt"
 
 # The enumerated surface classes, each tagged with how an upstream name there
 # reaches the tool. Adding a new kind of surface to the repo means adding a row
-# here; tests/fm-fold-sweep.test.sh asserts the list covers the repo.
+# here, and tests/fm-fold-sweep.test.sh fails if the list stops covering every
+# tracked file. That test was written only after this comment was found claiming
+# a coverage guarantee that did not exist while five hook directories and the
+# public skills/ tree went unswept.
 #
 #   exec      - firstmate executes it. ANY occurrence of the bare upstream name
 #               counts as reach, because the classifier cannot prove which code
@@ -67,29 +74,81 @@ ALLOW_FILE="$ROOT/vendor/sweep-allow.txt"
 #               here is legitimate and required; counted, never failed.
 surface_classes() {
   printf '%s\t%s\t%s\n' \
-    instructions directive 'AGENTS.md' \
+    instructions directive 'AGENTS.md CLAUDE.md' \
     scripts exec 'bin' \
-    hooks exec 'bin/backends' \
+    backends exec 'bin/backends' \
+    hooks exec '.claude .codex .grok .opencode .pi' \
     briefs directive 'bin/fm-brief.sh' \
     skills directive '.agents/skills' \
-    ci exec '.github/workflows' \
-    config exec '.tasks.toml .no-mistakes.yaml' \
+    public-skills directive 'skills' \
+    ci exec '.github' \
+    config exec '.tasks.toml .no-mistakes.yaml .gitignore' \
     docs prose 'docs README.md CONTRIBUTING.md' \
     tests prose 'tests' \
-    vendor prose 'vendor'
+    vendor prose 'vendor absorb'
 }
 
-# Files in a surface class that exist and are tracked.
-class_files() { # <paths...>
+# Tracked paths deliberately NOT swept, each with a reason. The amended AC-2
+# requires naming exclusions rather than letting them vanish, so this list is
+# printed by --coverage and asserted by tests/fm-fold-sweep.test.sh.
+surface_exclusions() {
+  printf '%s\t%s\n' \
+    'LICENSE' 'legal text; cannot contain a tool invocation' \
+    'assets/banner.png' 'binary image; not text-searchable'
+}
+
+# Files in a surface class. Symlinks are included deliberately: CLAUDE.md and
+# .claude/skills are tracked symlinks, and `find -type f` skips them, which would
+# silently drop two directive surfaces from the enumeration.
+class_files() { # <space-separated paths>
   local p
+  # shellcheck disable=SC2086 # deliberate word-split: the field holds several paths
   for p in $1; do
-    [ -e "$p" ] || continue
-    if [ -d "$p" ]; then
-      find "$p" -type f ! -path '*/.git/*' 2>/dev/null
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    if [ -d "$p" ] && [ ! -L "$p" ]; then
+      find "$p" \( -type f -o -type l \) ! -path '*/.git/*' 2>/dev/null
     else
       printf '%s\n' "$p"
     fi
   done
+}
+
+# Every tracked file reached by some declared surface class, normalised.
+covered_tracked_files() {
+  local class kind paths
+  while IFS=$'\t' read -r class kind paths; do
+    [ -n "$class" ] || continue
+    class_files "$paths"
+  done < <(surface_classes) | sed 's|^\./||' | sort -u
+}
+
+# Completeness gate. The amended AC-2 makes an under-counting sweep an outright
+# failure, so completeness must be verifiable rather than asserted in a comment.
+# Prints any tracked file that no surface class reaches and that is not named in
+# surface_exclusions; exits 1 when any exist.
+cmd_coverage() {
+  local tracked covered excluded unexplained
+  tracked=$(git ls-files | sort)
+  covered=$(covered_tracked_files)
+  excluded=$(surface_exclusions | cut -f1 | sort)
+
+  printf 'tracked files:   %s\n' "$(printf '%s\n' "$tracked" | grep -c .)"
+  printf 'reached by class: %s\n' "$(comm -12 <(printf '%s\n' "$tracked") <(printf '%s\n' "$covered") | grep -c .)"
+  printf 'declared exclusions:\n'
+  surface_exclusions | while IFS=$'\t' read -r path why; do
+    printf '  %-20s %s\n' "$path" "$why"
+  done
+
+  unexplained=$(comm -23 <(printf '%s\n' "$tracked") <(printf '%s\n' "$covered") |
+    comm -23 - <(printf '%s\n' "$excluded"))
+  if [ -n "$unexplained" ]; then
+    printf '\nUNCOVERED tracked files (neither swept nor declared excluded):\n'
+    printf '%s\n' "$unexplained" | sed 's/^/  /'
+    printf 'fm-fold-sweep: enumeration is incomplete; add a surface class or an exclusion\n' >&2
+    return 1
+  fi
+  printf '\nenumeration complete: every tracked file is swept or explicitly excluded\n'
+  return 0
 }
 
 allow_reason_text() { # <path>
@@ -111,6 +170,11 @@ allow_reason() { # <path>
 bare_name_re() { # <name>
   printf '(^|[^-._[:alnum:]/])%s([^-._[:alnum:]]|$)' "$1"
 }
+
+if [ "$COVERAGE" -eq 1 ]; then
+  cmd_coverage
+  exit $?
+fi
 
 total_reach=0
 total_allowed=0

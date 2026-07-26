@@ -1,16 +1,51 @@
-# Surfaces allowed to name an upstream command in an executable or directive
-# context, one "<path>  <reason>" per line.
+# Accounted-for reach sites: firstmate surfaces that legitimately name an
+# upstream tool, one "<path>  <reason>" per line.
 #
-# bin/fm-fold-sweep.sh reports an allowlisted site as ALLOWED rather than hiding
-# it, so a permitted dependency stays visible instead of disappearing.
+# bin/fm-fold-sweep.sh reports these as ALLOWED rather than hiding them, so an
+# accounted dependency stays visible in the enumeration instead of disappearing.
 #
-# This file is deliberately near-empty. Per docs/capability-map.md, firstmate is
-# transitional and its tools are NOT being renamed, so today every upstream name
-# in bin/ is a legitimate live dependency rather than a migration leftover. The
-# sweep is run to SEE that surface (8 sites for the quota record, 31 across both),
-# not to enforce zero. Enforcement (--strict) becomes meaningful only if a
-# custody artifact is ever actually adopted, which the capability map recommends
-# against for these tools.
+# WHY EVERY CURRENT SITE IS LISTED, AND WHAT THAT BUYS
+# Per docs/capability-map.md firstmate is terminal and its tools are NOT being
+# renamed, so every entry below is a live dependency rather than a migration
+# leftover. Accounting for them makes `--strict` a RATCHET: the known surface is
+# green, and a NEW reach site appearing anywhere in the repo fails the gate until
+# someone writes it down here with a reason. That is the property the enumeration
+# has to keep true through retirement - the knowledge of every dependency site,
+# with a gate that stops it silently growing.
+#
+# Adding a line is cheap and deliberate. Not noticing a new dependency is the
+# failure this prevents.
 
+# --- instructions: name the tools agents must use ---
+AGENTS.md  mandates the toolchain by name; the instruction surface is the dependency
+CLAUDE.md  symlink to AGENTS.md; tracked separately so it is enumerated separately
+
+# --- agent skills: direct an agent to run the tool ---
+.agents/skills/bootstrap-diagnostics/SKILL.md  handling playbook for MISSING:/tool diagnostics
+.agents/skills/harness-adapters/SKILL.md  spawn/recovery reference naming the worktree pool
+.agents/skills/secondmate-provisioning/SKILL.md  secondmate homes are leased from the pool
+.agents/skills/updatefirstmate/SKILL.md  self-update walks secondmate homes in the pool
+
+# --- live call sites: firstmate executes these ---
+bin/fm-spawn.sh  leases a task worktree (treehouse get --lease)
+bin/fm-teardown.sh  returns the worktree and its lease (treehouse return)
+bin/fm-backend.sh  reads pool state (treehouse status) for endpoint reconciliation
+bin/fm-home-seed.sh  leases and rolls back a secondmate home
+bin/fm-bootstrap.sh  required-tool detection and the install hint
+bin/fm-session-start.sh  relays the bootstrap toolchain report
+bin/fm-update.sh  fast-forwards homes that live in the pool
+bin/fm-worktree-ownership-lib.sh  reports lease-holder mismatches by name
+bin/fm-dispatch-select.sh  the quota meter call, via ${FM_DISPATCH_QUOTA_AXI:-quota-axi}
+bin/fm-usage-source-lib.sh  registry of which providers the quota meter covers
+bin/fm-brief.sh  brief text tells a crewmate its worktree is a pool path
+
+# --- backend adapters: resolve worktrees per runtime backend ---
+bin/backends/tmux.sh  worktree/pool handling for the tmux backend
+bin/backends/herdr.sh  worktree/pool handling for the herdr backend
+bin/backends/zellij.sh  worktree/pool handling for the zellij backend
+bin/backends/cmux.sh  worktree/pool handling for the cmux backend
+
+# --- the custody machinery itself ---
 bin/fm-fold-sweep.sh  the sweep names every upstream command by definition
-bin/fm-fold-lib.sh    manifest access reads upstreamCommand from fold.json
+bin/fm-fold-lib.sh  manifest access reads upstreamCommand from fold.json
+bin/fm-fold.sh  builds and verifies artifacts declared against an upstream name
