@@ -4,24 +4,29 @@
 # Only a provider's durable budget window is scored. Short rate windows are
 # eligibility gates and never contribute R, T, or score.
 #
-# Captain formula (verbatim 2026-07-26):
-#   score = (remaining_usage_percent - target_percent) / remaining_time
+# Captain formula (2026-07-26, amended to keep near-expiry amplifier):
+#   score_base = (remaining_usage_percent - target_percent) / remaining_time
+#   urgency = clamp(1 - T/W, 0, 1) when W is known
+#   base_pressure = 1 + K*urgency^2 when headroom > 0 and W known, else 1
 #   for provider=codex only:
-#     score *= C^N where N = available rate-limit reset credits
+#     reset_factor = C^N where N = available rate-limit reset credits
 #     (C defaults to 1.5; compounding). Other providers use factor 1.
+#   score = score_base * base_pressure * reset_factor
 #
 # Per-provider target floors live in bin/fm-usage-source-lib.sh's registry
 # (default 5 for known providers, 10 for claude). Freeze begins when R is at
 # or below that provider's target; those candidates are excluded when any live
 # candidate remains. Highest score wins.
 #
-# Removed from the score path entirely (do not reintroduce):
+# Removed from the score path (do not reintroduce):
 #   - B*T burn-rate subtraction
-#   - urgency = 1 - T/W and the squared amplifier 1 + K*urgency^2
+#
+# Retained exactly as today: the squared-urgency near-expiry amplifier
+# (1 + K*urgency^2, K defaults to 4). W is resolved from the meter or reset
+# history for that amplifier; when W is missing, pressure stays neutral at 1.
 #
 # Burn-history recording still exists so later analysis can inspect non-selected
-# intervals, but B never multiplies or subtracts on the score path. W may still
-# be resolved for the decision record; it does not amplify score.
+# intervals, but B never multiplies or subtracts on the score path.
 #
 # Codex N is a real observation of rateLimitResetCredits; unreadable N is an
 # error with neutral factor 1, never a silent zero. Full rationale:
@@ -36,6 +41,8 @@ _FM_USAGE_BURNDOWN_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/
 
 FM_BURNDOWN_HISTORY_MAX=${FM_BURNDOWN_HISTORY_MAX:-200}
 FM_BURNDOWN_RATE_FLOOR=${FM_BURNDOWN_RATE_FLOOR:-0}
+# Squared-urgency near-expiry amplifier coefficient (retained from prior engine).
+FM_BURNDOWN_PRESSURE_K=${FM_BURNDOWN_PRESSURE_K:-4}
 # Compounding per-available-reset multiplier for provider=codex only.
 FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR=${FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR:-1.5}
 # Fallback only when an observation lacks target_percent (unit fixtures, etc.).
@@ -58,6 +65,7 @@ fm_usage_burndown_numeric_or_default() { # <value> <default> <min> <max>
 
 FM_BURNDOWN_HISTORY_MAX=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_HISTORY_MAX" 200 1 10000)
 FM_BURNDOWN_RATE_FLOOR=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_RATE_FLOOR" 0 0 100)
+FM_BURNDOWN_PRESSURE_K=$(fm_usage_burndown_numeric_or_default "$FM_BURNDOWN_PRESSURE_K" 4 0 100)
 FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR=$(fm_usage_burndown_numeric_or_default \
   "$FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR" 1.5 1 10)
 FM_BURNDOWN_DEFAULT_TARGET=$(fm_usage_burndown_numeric_or_default \
@@ -129,8 +137,8 @@ fm_usage_burn_history_record() {
 }
 
 # Resolve W from the meter first, then from distinct resets observed for the
-# same provider and window. A missing period remains null. W is recorded for
-# audit only; it does not amplify score under the captain formula.
+# same provider and window. A missing period remains null. W feeds the retained
+# squared-urgency amplifier (1 + K*urgency^2); when missing, pressure is neutral.
 fm_usage_window_period() { # <provider> <window_id> <current_reset_epoch> <reported_W_or_null>
   local provider=$1 window_id=$2 current_reset=$3 reported_W=${4:-null}
   local samples
@@ -287,6 +295,7 @@ fm_usage_burndown_score_one() { # <observation_json>
     --argjson obs "$obs" \
     --argjson period "$period_json" \
     --argjson target "$target" \
+    --argjson K "$FM_BURNDOWN_PRESSURE_K" \
     --argjson gate_floor "$FM_BURNDOWN_RATE_FLOOR" \
     --argjson reset_factor_base "$FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR" '
     $obs as $o
@@ -294,10 +303,23 @@ fm_usage_burndown_score_one() { # <observation_json>
     | $o.binding.T as $T
     | (if $T < 0 then 0 else $T end) as $Tpos
     | $target as $target
-    # Captain formula: headroom = remaining - target; score_base = headroom / T.
+    # Captain formula numerator: headroom = R - target (no B*T subtraction).
     # max(0, ...) keeps at-or-below-target providers at score 0 (also freeze).
     | ([0, $R - $target] | max) as $headroom
     | (if $Tpos > 0 then ($headroom / $Tpos) else 0 end) as $score_base
+    # Retained near-expiry amplifier: urgency = clamp(1 - T/W, 0, 1).
+    | (
+        if ($period.W | type) == "number" and $period.W > 0 then
+          [0, ([1, 1 - ($Tpos / $period.W)] | min)] | max
+        else null
+        end
+      ) as $urgency
+    | (
+        if $headroom > 0 and ($urgency | type) == "number" then
+          1 + ($K * ($urgency * $urgency))
+        else 1
+        end
+      ) as $base_pressure
     | (($o.rate_limit_reset_credits // {}) ) as $reset
     | ($reset.evidence // "fresh") as $reset_evidence
     | (
@@ -324,7 +346,8 @@ fm_usage_burndown_score_one() { # <observation_json>
       ) as $reset_state
     | $reset_state.factor as $reset_factor
     | $reset_state.n as $reset_n
-    | ($score_base * $reset_factor) as $score
+    | ($base_pressure * $reset_factor) as $pressure
+    | ($score_base * $pressure) as $score
     | (100 - $R) as $used
     | (($o.gate_windows // []) | all(.remaining > $gate_floor)) as $eligible
     | (
@@ -336,39 +359,38 @@ fm_usage_burndown_score_one() { # <observation_json>
         end
       ) as $posture
     | (
+        if ($urgency | type) == "number" then "window-urgency" else "neutral-missing-window-period" end
+      ) as $base_source
+    | (
         if $o.provider != "codex" then
-          "target-rate"
+          $base_source
         elif $reset_state.unreadable then
-          "target-rate+codex-reset-unreadable"
+          $base_source + "+codex-reset-unreadable"
         elif ($reset_factor != 1) then
-          "target-rate+codex-reset-" + ($reset_factor_base | tostring) + "^" + (($reset_n | floor) | tostring)
+          $base_source + "+codex-reset-" + ($reset_factor_base | tostring) + "^" + (($reset_n | floor) | tostring)
         else
-          "target-rate+codex-reset-1"
+          $base_source + "+codex-reset-1"
         end
       ) as $pressure_source
     | $o + {
         target_percent:$target,
         headroom:$headroom,
         score_base:$score_base,
-        # B is observational only; never an input to score under the captain formula.
+        # B is observational only; never an input to score (B*T removed).
         B:null,
         B_source:"not-used-in-score",
-        # Alias fields kept for decision-record continuity: S/required_rate map
-        # to headroom/score_base so a reader reconstructs score without the
-        # superseded B*T or urgency terms.
+        # Alias fields: S/required_rate map to headroom/score_base for continuity.
         S:$headroom,
         spendable_surplus:$headroom,
         required_rate:$score_base,
-        base_pressure:1,
-        pressure:$reset_factor,
+        base_pressure:$base_pressure,
+        pressure:$pressure,
         pressure_source:$pressure_source,
         reset_available_count:$reset_n,
         reset_pressure_factor:$reset_factor,
         reset_pressure_source:$reset_state.source,
         reset_count_unreadable:$reset_state.unreadable,
-        # Urgency amplifier removed from score path; field is null so it cannot
-        # be mistaken for a live multiplier.
-        urgency:null,
+        urgency:$urgency,
         score:$score,
         posture:$posture,
         percent_used:$used,
@@ -583,7 +605,8 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
             (
               "admit pin; budget=\($chosen.window_id) R=\($chosen.R) T=\($chosen.T)s "
               + "target=\($chosen.target_percent) headroom=\($chosen.headroom) "
-              + "score_base=\($chosen.score_base) "
+              + "score_base=\($chosen.score_base) urgency=\($chosen.urgency) "
+              + "base_pressure=\($chosen.base_pressure) "
               + "reset_factor=\($chosen.reset_pressure_factor) score=\($chosen.score)"
             ) as $why
             | {
@@ -614,9 +637,11 @@ fm_usage_burndown_select() { # <profiles_json> <scored_observations_json> <multi
             (reduce $live[] as $candidate (null; better(.;$candidate))) as $chosen
             | (
                 "highest target-rate score; budget=\($chosen.window_id) "
-                + "R=\($chosen.R) T=\($chosen.T)s target=\($chosen.target_percent) "
-                + "headroom=\($chosen.headroom) score_base=\($chosen.score_base) "
-                + "score=(R-target)/T"
+                + "R=\($chosen.R) T=\($chosen.T)s W=\($chosen.W)/\($chosen.W_source) "
+                + "target=\($chosen.target_percent) headroom=\($chosen.headroom) "
+                + "score_base=\($chosen.score_base) urgency=\($chosen.urgency) "
+                + "base_pressure=\($chosen.base_pressure) "
+                + "score=((R-target)/T)*(1+K*urgency^2)"
                 + (
                     if $chosen.provider == "codex" then
                       " * reset_factor=\($chosen.reset_pressure_factor)"
@@ -740,8 +765,9 @@ fm_usage_burndown_format_explain() { # <selection_json>
       | "  candidate[\(.index)] provider=\(.provider) harness=\(.harness) "
         + "evidence=\(.evidence) eligible=\(.eligible) ineligible_reason=\(.ineligible_reason) "
         + "posture=\(.posture) budget=\(.window_id) binding_reason=\(.binding_reason) "
-        + "R=\(.R) T=\(.T) target=\(.target_percent) headroom=\(.headroom) "
-        + "score_base=\(.score_base) "
+        + "R=\(.R) T=\(.T) W=\(.W)/\(.W_source) target=\(.target_percent) headroom=\(.headroom) "
+        + "score_base=\(.score_base) urgency=\(.urgency) "
+        + "base_pressure=\(.base_pressure) pressure=\(.pressure)/\(.pressure_source) "
         + (
             if .provider == "codex" then
               "reset_factor=\(.reset_pressure_factor) "
@@ -750,7 +776,7 @@ fm_usage_burndown_format_explain() { # <selection_json>
             end
           )
         + "score=\(.score) "
-        + "formula=(R-target)/T"
+        + "formula=((R-target)/T)*(1+K*urgency^2)"
         + (if .provider == "codex" then "*C^N" else "" end)
         + " "
         + "window_roles=\(.window_roles | tojson)")

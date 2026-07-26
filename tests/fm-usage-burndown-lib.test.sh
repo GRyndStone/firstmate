@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for the usage-burndown optimizer core (bin/fm-usage-burndown-lib.sh).
-# Formula under test: score = (R - target) / T * (1.5^N for codex only).
+# Formula under test:
+#   score = ((R - target) / T) * (1 + K*urgency^2) * (1.5^N for codex only)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -12,6 +13,7 @@ set -u
 fm_test_tmproot TMP_ROOT fm-usage-burndown-lib-tests
 mkdir -p "$TMP_ROOT"
 export FM_USAGE_BURN_HISTORY="$TMP_ROOT/burn-history.json"
+export FM_BURNDOWN_PRESSURE_K=4
 
 obs_scorable() {
   local provider=$1 R=$2 T=$3 W=$4
@@ -57,37 +59,44 @@ obs_scorable() {
 }
 
 test_target_rate_score_formula() {
-  local near far near_score far_score near_base far_base
+  local near far near_score far_score near_p far_p
   printf '%s\n' '{"samples":[]}' > "$FM_USAGE_BURN_HISTORY"
-  # Claude target=10: R=100 => headroom=90. Near T=600 vs far T=17000.
+  # Claude target=10: R=100 => headroom=90. Near T=600 vs far T=17000, W=18000.
   near=$(fm_usage_burndown_score_one "$(obs_scorable claude 100 600 18000)")
   far=$(fm_usage_burndown_score_one "$(obs_scorable claude 100 17000 18000)")
   jq -e '
     .target_percent == 10
     and .headroom == 90
     and .scorable == true
-    and .urgency == null
     and .B_source == "not-used-in-score"
+    and .B == null
     and (.score_base - 0.15 | fabs) < 0.0001
+    and .urgency != null
+    and .base_pressure > 1
   ' <<< "$near" >/dev/null || fail "near-expiry target-rate score inputs wrong: $near"
   jq -e '
     .target_percent == 10
     and .headroom == 90
-    and .urgency == null
     and (.score_base - (90/17000) | fabs) < 1e-9
+    and .urgency != null
   ' <<< "$far" >/dev/null || fail "far-from-expiry still scores headroom/T: $far"
   near_score=$(jq -r '.score' <<< "$near")
   far_score=$(jq -r '.score' <<< "$far")
+  near_p=$(jq -r '.base_pressure' <<< "$near")
+  far_p=$(jq -r '.base_pressure' <<< "$far")
+  awk -v n="$near_p" -v f="$far_p" 'BEGIN { exit !(n > f) }' \
+    || fail "near-expiry base_pressure ($near_p) should exceed far ($far_p)"
   awk -v n="$near_score" -v f="$far_score" 'BEGIN { exit !(n > f) }' \
     || fail "near-expiry score ($near_score) should exceed far ($far_score)"
-  # Hand-check: score equals score_base when not codex.
-  near_base=$(jq -r '.score_base' <<< "$near")
-  far_base=$(jq -r '.score_base' <<< "$far")
-  awk -v s="$near_score" -v b="$near_base" 'BEGIN { exit !(s == b) }' \
-    || fail "non-codex score must equal score_base: near score=$near_score base=$near_base"
-  awk -v s="$far_score" -v b="$far_base" 'BEGIN { exit !(s == b) }' \
-    || fail "non-codex score must equal score_base: far score=$far_score base=$far_base"
-  pass "score is exactly (R-target)/T with urgency amplifier and B*T gone"
+  # Hand-check: score = score_base * base_pressure * reset_factor (reset=1 for claude).
+  jq -e '
+    (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
+    and .reset_pressure_factor == 1
+  ' <<< "$near" >/dev/null || fail "score must be score_base*base_pressure*reset: $near"
+  jq -e '
+    (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
+  ' <<< "$far" >/dev/null || fail "score must be score_base*base_pressure*reset: $far"
+  pass "score is ((R-target)/T)*(1+K*urgency^2)*reset; B*T gone; urgency kept"
 }
 
 test_per_provider_targets_are_distinct() {
@@ -126,21 +135,20 @@ test_unknown_evidence_not_scorable() {
 }
 
 test_history_does_not_reduce_score() {
-  local obs scored expected
+  local obs scored
   # Three unselected samples that would have driven old B*T to cover headroom.
   fm_usage_burn_history_record claude w 80 1000 false 2000000000 18000
   fm_usage_burn_history_record claude w 60 1100 false 2000000000 18000
   fm_usage_burn_history_record claude w 60 1200 false 2000000000 18000
   obs=$(obs_scorable claude 60 5000 18000)
   scored=$(fm_usage_burndown_score_one "$obs")
-  # New formula: headroom = 60-10 = 50; score = 50/5000 = 0.01. B must not zero it.
-  expected=0.01
-  jq -e --argjson expected "$expected" '
+  # headroom = 60-10 = 50; score_base = 50/5000 = 0.01; B must not zero headroom.
+  jq -e '
     .headroom == 50
     and .B_source == "not-used-in-score"
     and .B == null
-    and (.score - $expected | fabs) < 1e-12
-    and .urgency == null
+    and (.score_base - 0.01 | fabs) < 1e-12
+    and (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
   ' <<< "$scored" >/dev/null \
     || fail "burn history must not subtract from score under captain formula: $scored"
   pass "observational burn history never reduces the captain score"
@@ -240,9 +248,9 @@ test_posture_boundaries() {
 }
 
 test_codex_reset_multiplier_compounds() {
-  local n0 n1 n2 n3 p0 p1 p2 p3 f0 f1 f2 f3 claude_p s0 s1 s2 s3
+  local n0 n1 n2 n3 f0 f1 f2 f3 claude_p s0 s1 s2 s3
   printf '%s\n' '{"samples":[]}' > "$FM_USAGE_BURN_HISTORY"
-  # Identical R/T so score_base matches; only N varies.
+  # Identical R/T/W so score_base and base_pressure match; only N varies.
   n0=$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 0)")
   n1=$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 1)")
   n2=$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 2)")
@@ -259,26 +267,28 @@ test_codex_reset_multiplier_compounds() {
   awk -v f="$f1" 'BEGIN { exit !(f == 1.5) }' || fail "N=1 factor must be 1.5: $n1"
   awk -v f="$f2" 'BEGIN { exit !(f == 2.25) }' || fail "N=2 factor must be 2.25: $n2"
   awk -v f="$f3" 'BEGIN { exit !(f == 3.375) }' || fail "N=3 factor must be 3.375: $n3"
-  # score_base = (80-5)/3600; score = score_base * factor
-  awk -v s="$s0" -v b="$(jq -r '.score_base' <<< "$n0")" 'BEGIN { exit !(s == b) }' \
-    || fail "N=0 score must equal score_base"
+  # score = score_base * base_pressure * reset_factor
+  jq -e '(.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12' \
+    <<< "$n0" >/dev/null || fail "N=0 score reconstruction failed: $n0"
+  jq -e '(.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12' \
+    <<< "$n1" >/dev/null || fail "N=1 score reconstruction failed: $n1"
   awk -v a="$s0" -v b="$s1" 'BEGIN { exit !(b > a) }' || fail "N=1 score must exceed N=0"
   awk -v a="$s1" -v b="$s2" 'BEGIN { exit !(b > a) }' || fail "N=2 score must exceed N=1"
   awk -v a="$s2" -v b="$s3" 'BEGIN { exit !(b > a) }' || fail "N=3 score must exceed N=2"
-  awk -v s="$s1" -v b="$(jq -r '.score_base' <<< "$n1")" \
-    'BEGIN { exit !((s - b*1.5)^2 < 1e-18) }' \
-    || fail "N=1 score must be score_base * 1.5"
   jq -e '.pressure_source | test("codex-reset")' <<< "$n1" >/dev/null \
     || fail "pressure_source must surface the codex reset factor: $n1"
-  # Claude with the same R/T must not gain a reset factor.
+  # Claude with the same R/T/W must not gain a reset factor.
   claude_p=$(fm_usage_burndown_score_one "$(obs_scorable claude 80 3600 18000)")
   jq -e '.reset_pressure_factor == 1 and .reset_available_count == null' \
     <<< "$claude_p" >/dev/null \
     || fail "non-codex provider must not take the reset multiplier: $claude_p"
-  # Hand-check claude score is (80-10)/3600 only — multiplier never applied.
-  awk -v s="$(jq -r '.score' <<< "$claude_p")" \
-    'BEGIN { exit !((s - (70/3600))^2 < 1e-18) }' \
-    || fail "claude score must be pure (R-target)/T without reset multiplier"
+  # Claude still has urgency amplifier, but reset factor stays 1.
+  jq -e '
+    .reset_pressure_factor == 1
+    and (.score - (.score_base * .base_pressure) | fabs) < 1e-12
+    and .base_pressure > 1
+  ' <<< "$claude_p" >/dev/null \
+    || fail "claude score must use urgency amplifier without reset multiplier: $claude_p"
   pass "codex reset multiplies score as 1.5^N and leaves other providers alone"
 }
 
@@ -312,11 +322,12 @@ test_codex_unreadable_reset_is_loud_error() {
     | any(test("unreadable"; "i"))
   ' <<< "$scored" >/dev/null \
     || fail "unreadable path must name the cause in diagnostics: $scored"
-  # Score under unreadable equals score_base (neutral 1), not fabricated N=0 silence without flag.
-  awk -v s="$(jq -r '.score' <<< "$scored")" \
-      -v b="$(jq -r '.score_base' <<< "$scored")" \
-    'BEGIN { exit !(s == b) }' \
-    || fail "unreadable reset must use factor 1 (score == score_base), not invent N"
+  # Score under unreadable uses reset factor 1 (not silent N=0 without flag).
+  jq -e '
+    .reset_pressure_factor == 1
+    and (.score - (.score_base * .base_pressure * 1) | fabs) < 1e-12
+  ' <<< "$scored" >/dev/null \
+    || fail "unreadable reset must use factor 1, not invent N: $scored"
   # Genuine zero is not an error and is distinct from unreadable.
   zero=$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 0)")
   jq -e '

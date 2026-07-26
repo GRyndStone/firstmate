@@ -8,12 +8,15 @@ Script headers own flags and wire shapes.
 Date: 2026-07-26 (formula revision).
 Captain commission: route agents by remaining durable budget per remaining reset time, preferentially burn capacity that would otherwise expire unused, and make the mechanism run without an agent remembering to invoke it.
 
-Captain formula (verbatim, 2026-07-26):
+Captain formula (2026-07-26, amended to keep the near-expiry amplifier):
 
 1. Default target for known providers is 5 percent remaining (safe minimum); claude is 10 percent.
 2. Score each provider as `(remaining usage % - target %) / remaining time`.
 3. Codex gets a 1.5x multiplier per available rate-limit reset, compounding.
 4. Highest result is the routing target unless manually specified.
+5. **Amendment:** retain the squared-urgency near-expiry amplifier exactly as today
+   (`1 + K*urgency^2`, `K=4`, `urgency=clamp(1-T/W,0,1)`). Only the `B*T` burn-rate
+   subtraction is removed.
 
 ## Two window roles
 
@@ -60,35 +63,48 @@ For each eligible provider, the budget window and registry supply:
 | --- | --- |
 | `R` | Budget percent remaining |
 | `T` | Seconds until the budget resets |
+| `W` | Observed or reset-history-derived budget period in seconds |
 | `F` | Per-provider target floor (percent remaining) |
 | `H` | Headroom above target: `max(0, R - F)` |
 | `score_base` | `H / T` when `T > 0`, else 0 |
+| `urgency` | `clamp(1 - T/W, 0, 1)` when `W` is known, else null |
+| `K` | Urgency amplifier coefficient (default 4) |
+| `base_pressure` | `1 + K*urgency^2` when `H > 0` and `W` known, else 1 |
 | `N` | Available Codex rate-limit resets (codex only) |
 | `C` | Codex reset factor base (default 1.5) |
 | `reset_factor` | `C^N` for codex; `1` for every other provider |
-| `score` | `score_base * reset_factor` |
+| `pressure` | `base_pressure * reset_factor` |
+| `score` | `score_base * pressure` |
 
 The equations are:
 
 ```text
 H = max(0, R - F)
 score_base = H / T                 when T > 0, else 0
+urgency = clamp(1 - T/W, 0, 1)     when W is known
+base_pressure = 1 + K*urgency^2    when H > 0 and W is known
+base_pressure = 1                  otherwise
 reset_factor = C^N                 provider=codex only; N available rate-limit resets
 reset_factor = 1                   every other provider
-score = score_base * reset_factor
+pressure = base_pressure * reset_factor
+score = score_base * pressure
 ```
 
-This is exactly the captain's formula: `(remaining_usage_percent - target_percent) / remaining_time`, times the codex reset multiplier.
-Dividing by remaining time already carries urgency linearly.
+Net change from the prior engine:
+
+1. Per-provider target floors replace the single global floor (`F`).
+2. The `B*T` burn-rate subtraction is gone; the numerator is exactly `R - F`.
+3. The `1 + K*urgency^2` amplifier is **retained unchanged**.
+4. The codex `1.5^N` reset factor is retained unchanged.
+5. Highest score wins unless explicitly pinned.
 
 **Removed from the score path** (do not reintroduce as a second opinion, tiebreak, or env-gated alternate mode):
 
 - `B*T` counterfactual burn-rate subtraction
-- `urgency = 1 - T/W` and the squared amplifier `1 + K*urgency^2`
 
 Burn-history samples may still be recorded for observational analysis; they never multiply or subtract on the score path.
-`W` (window period) may still be resolved for the decision record; it does not amplify score.
 
+`K` defaults to 4 and is configurable with `FM_BURNDOWN_PRESSURE_K`.
 `C` defaults to 1.5 and is configurable with `FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR`.
 The rate-gate boundary defaults to 0 and is configurable with `FM_BURNDOWN_RATE_FLOOR`.
 Only the registry provider id `codex` receives the reset factor (not class tokens such as `openai`).
@@ -103,7 +119,7 @@ Multi-candidate routing excludes a frozen budget when any live candidate exists.
 An explicit pin at the floor refuses in place with exit 75 and never substitutes another provider.
 An exhausted rate gate also refuses an explicit pin in place with exit 75.
 
-## What `W` means (record only)
+## What `W` means
 
 `W` is accepted from a meter only when the meter actually reports a positive `windowSeconds`; the updated `quota-axi` contract reports Grok's real weekly value as `604800`.
 An explicit `null` is unknown, and an absent field from an older meter is also unknown.
@@ -112,8 +128,8 @@ In particular, `credits` never implies 24 hours.
 
 When the meter omits `W`, the engine compares distinct recorded `resetsAt` values for the same provider and window id.
 A positive change supplies `W` with source `history-reset-period`.
-Until a period is observed, `W` remains null.
-Under the captain formula, missing `W` does not change score; the provider competes on the directly observed `R`, `T`, and `F`.
+Until a period is observed, `W` and urgency remain null and `base_pressure` stays neutral at 1.
+The provider may still compete on the directly observed `R`, `T`, and `F`; the engine never fabricates urgency.
 
 ## Codex rate-limit reset multiplier
 
@@ -162,16 +178,16 @@ Window-level unreadable usage (missing meters, exhausted evidence) is unchanged 
 
 ### Worked example
 
-Two live candidates, same `T`, `C=1.5`:
+Two live candidates, same `T` and `W`, `K=4`, `C=1.5` (identical base pressure):
 
-| Provider | `R` | `F` | headroom | `score_base` | `N` | `reset_factor` | `score` | wins? |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| claude | 90 | 10 | 80 | 80/T | n/a | 1 | 80/T | no |
-| codex | 60 | 5 | 55 | 55/T | 2 | 2.25 | 123.75/T | **yes** |
+| Provider | `R` | `F` | headroom | `score_base` | base pressure | `N` | `reset_factor` | pressure | wins? |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| claude | 90 | 10 | 80 | 80/T | ~1.64 | n/a | 1 | ~1.64 | no |
+| codex | 60 | 5 | 55 | 55/T | ~1.64 | 2 | 2.25 | ~3.69 | **yes** |
 
-Without the reset rule, claude's higher headroom would win on `score_base`.
-With two available Codex resets, codex score is multiplied by `1.5^2 = 2.25`, so the decision prefers burning Codex while the wasting resets still exist.
-The selection explanation and each candidate line surface `target`, `headroom`, `score_base`, `reset_factor`, `resets=N/source`, and `score` so a surprising ranking is auditable six months later.
+Without the reset rule, claude's higher headroom would win on `score_base * base_pressure`.
+With two available Codex resets, codex pressure is multiplied by `1.5^2 = 2.25`, so the decision prefers burning Codex while the wasting resets still exist.
+The selection explanation and each candidate line surface `target`, `headroom`, `score_base`, `urgency`, `base_pressure`, `reset_factor`, `resets=N/source`, and `score` so a surprising ranking is auditable six months later.
 
 ## Missing evidence and loud errors
 
@@ -230,8 +246,8 @@ dispatch_tie_break=profile-order
 dispatch_order=score-desc,S-desc,R-desc,T-asc,index-asc
 ```
 
-`dispatch_candidates_json` includes evidence, eligibility, window roles, binding reason, `R`, `T`, `target_percent`, `headroom`, `score_base`, `reset_pressure_factor`, `reset_available_count`, score, posture, and floors.
-A reader can reconstruct `score = (R - target_percent) / T * reset_pressure_factor` from those fields alone.
+`dispatch_candidates_json` includes evidence, eligibility, window roles, binding reason, `R`, `T`, `W` and its source, `target_percent`, `headroom`, `score_base`, urgency, base_pressure, `reset_pressure_factor`, `reset_available_count`, score, posture, and floors.
+A reader can reconstruct `score = ((R - target_percent) / T) * base_pressure * reset_pressure_factor` from those fields alone.
 This record makes "the algorithm chose this" distinguishable from "a human overrode it for this reason" without reconstructing logs.
 
 ## Configuration and compatibility
@@ -249,7 +265,7 @@ Bootstrap validates both rule candidate sets and default candidate sets.
 ## Inspectability
 
 Every decision prints one stderr line per candidate.
-Each line includes provider, harness, evidence, gate eligibility, posture, budget id and binding reason, window roles, `R`, `T`, target, headroom, score_base, codex reset factor when applicable, score, and the formula label `(R-target)/T` (plus `*C^N` for codex).
+Each line includes provider, harness, evidence, gate eligibility, posture, budget id and binding reason, window roles, `R`, `T`, `W`, target, headroom, score_base, urgency, base_pressure, pressure, codex reset factor when applicable, score, and the formula label `((R-target)/T)*(1+K*urgency^2)` (plus `*C^N` for codex).
 The selected profile carries the same candidate array in `dispatch_candidates`.
 Spawn persists that array in task metadata.
 

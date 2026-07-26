@@ -103,7 +103,7 @@ test_usage_burndown_multiple_candidates() {
   jq -e '.provider == "codex" and .harness == "codex" and .model == "gpt-5.5" and .quota_posture == "normal" and .dispatch_strategy == "usage-burndown"' \
     <<< "$out" >/dev/null || fail "higher headroom provider should win, got: $out"
   assert_contains "$err" "highest target-rate score" "stderr must explain the choice"
-  assert_contains "$err" "(R-target)/T" "stderr must state the captain formula"
+  assert_contains "$err" "((R-target)/T)*(1+K*urgency^2)" "stderr must state the captain formula with urgency amp"
 
   # Exact equal headroom and T: claude H=40 (R=50, target 10), codex H=40 (R=45, target 5).
   # Profile order puts claude first → stable first-index win.

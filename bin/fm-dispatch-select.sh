@@ -20,11 +20,13 @@
 #   - Multi-candidate selection strategy: `usage-burndown` (canonical).
 #     Legacy alias: `quota-balanced` (same engine; existing configs keep working).
 #   - Short rate windows are eligibility gates only. The provider's durable
-#     budget window supplies remaining R and time-to-reset T. Per-provider
-#     target floors live in bin/fm-usage-source-lib.sh (default 5%, claude 10%).
-#     Captain formula: score = (R - target) / T, times C^N for codex only
-#     (C defaults to 1.5). Highest score wins. B*T burn-rate subtraction and the
-#     squared urgency amplifier are not part of the score path.
+#     budget window supplies remaining R, time-to-reset T, and period W.
+#     Per-provider target floors live in bin/fm-usage-source-lib.sh (default 5%,
+#     claude 10%). Captain formula:
+#       score = ((R - target) / T) * (1 + K*urgency^2) * reset_factor
+#     with urgency = clamp(1 - T/W, 0, 1), K default 4, and reset_factor = C^N
+#     for codex only (C defaults to 1.5). Highest score wins. B*T burn-rate
+#     subtraction is not part of the score path; the urgency amplifier is.
 #   - Observational postures remain normal/conserve/protect. Freeze begins when
 #     budget remaining reaches that provider's target floor. An exhausted rate
 #     gate or a frozen explicit pin exits 75 without substitution.
@@ -59,9 +61,10 @@
 # unless --quota-json supplies a fixture. FM_DISPATCH_QUOTA_AXI overrides the
 # quota command. The keychain flag is always passed so macOS Claude reads succeed;
 # on non-macOS it is a no-op. FM_DISPATCH_NOW_EPOCH overrides the clock for frozen
-# fixtures. FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR overrides the codex per-reset
-# multiplier C (default 1.5). FM_BURNDOWN_RATE_FLOOR overrides the gate
-# exhaustion boundary (default 0). FM_USAGE_BURN_HISTORY overrides the
+# fixtures. FM_BURNDOWN_PRESSURE_K overrides the near-expiry urgency coefficient
+# (default 4). FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR overrides the codex
+# per-reset multiplier C (default 1.5). FM_BURNDOWN_RATE_FLOOR overrides the
+# gate exhaustion boundary (default 0). FM_USAGE_BURN_HISTORY overrides the
 # observational burn-sample history path (not a score input). Per-provider
 # target floors are registry data in fm-usage-source-lib.sh, not a global env.
 set -u

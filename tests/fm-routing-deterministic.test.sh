@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Frozen-fixture acceptance suite for deterministic self-routing policy.
-# Formula: score = (R - target) / T * (1.5^N for codex only); targets per registry.
+# Formula: score = ((R - target) / T) * (1 + K*urgency^2) * (1.5^N for codex);
+# targets per registry.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -119,8 +120,9 @@ fixture_nearly_exhausted_budget_soon() {
     [.candidates[] | select(.provider == "claude")][0]
     | .R == 15 and .T == 60 and .target_percent == 10 and .headroom == 5
       and .score_base > 0.0833 and .score_base < 0.0834
-      and .urgency == null
-  ' "claude target 10 leaves exactly 5% headroom at the computed score_base"
+      and .urgency != null
+      and .base_pressure > 1
+  ' "claude target 10 leaves exactly 5% headroom; near-expiry urgency amplifies"
 }
 
 fixture_equal_remaining_different_horizons() {
@@ -232,16 +234,18 @@ fixture_grok_period_is_observed_not_fabricated() {
     [.candidates[] | select(.provider == "grok")][0]
     | .W == 604800
       and .W_source == "history-reset-period"
-      and .urgency == null
+      and .urgency > 0.86
+      and .urgency < 0.88
       and .target_percent == 5
       and .headroom == 6
-  ' "a Grok reset period is learned as weekly; W does not amplify score"
+  ' "a Grok reset period is learned as weekly and produces high near-reset urgency"
   check_jq "$selection" '
     [.candidates[] | select(.provider == "grok")][0]
     | .W != 86400
       and .B_source == "not-used-in-score"
       and (.score_base - (6/79678) | fabs) < 1e-12
-  ' "missing Grok window length never fabricates a 24-hour denominator; score is (R-target)/T"
+      and (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
+  ' "missing Grok window length never fabricates a 24-hour denominator; score uses retained urgency amp"
 }
 
 fixture_above_target_is_selectable() {
