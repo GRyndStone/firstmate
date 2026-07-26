@@ -102,8 +102,12 @@ test_quota_backed_adapters() {
   ' <<< "$obs" >/dev/null || fail "claude adapter binding wrong: $obs"
 
   obs=$(fm_usage_source_observe codex "$(cat "$quota")" "$TEST_NOW")
-  jq -e '.class == "openai-class" and .binding.remaining == 60' \
-    <<< "$obs" >/dev/null || fail "codex adapter: $obs"
+  jq -e '
+    .class == "openai-class"
+    and .binding.remaining == 60
+    and .rate_limit_reset_credits.evidence == "fresh"
+    and .rate_limit_reset_credits.available_count == 0
+  ' <<< "$obs" >/dev/null || fail "codex adapter: $obs"
 
   obs=$(fm_usage_source_observe grok "$(cat "$quota")" "$TEST_NOW")
   jq -e '
@@ -280,6 +284,123 @@ test_observe_profiles_dedupes() {
   pass "observe_profiles emits one observation per distinct provider"
 }
 
+test_codex_reset_credits_parse_shapes() {
+  local parsed expired_at future_at
+  future_at=$((TEST_NOW + 86400))
+  expired_at=$((TEST_NOW - 60))
+
+  parsed=$(fm_usage_source_parse_codex_rate_limit_reset_credits 'null' "$TEST_NOW")
+  jq -e '.evidence == "fresh" and .available_count == 0 and .source == "absent-as-zero"' \
+    <<< "$parsed" >/dev/null || fail "null raw must be genuine zero: $parsed"
+
+  parsed=$(fm_usage_source_parse_codex_rate_limit_reset_credits \
+    "{\"availableCount\":2}" "$TEST_NOW")
+  jq -e '.evidence == "fresh" and .available_count == 2 and .source == "available-count-field"' \
+    <<< "$parsed" >/dev/null || fail "availableCount-only shape: $parsed"
+
+  parsed=$(fm_usage_source_parse_codex_rate_limit_reset_credits \
+    '{"available_count":"nope"}' "$TEST_NOW")
+  jq -e '.evidence == "unreadable" and .available_count == null' \
+    <<< "$parsed" >/dev/null || fail "string available_count must be unreadable: $parsed"
+
+  parsed=$(fm_usage_source_parse_codex_rate_limit_reset_credits \
+    "$(jq -cn --argjson now "$TEST_NOW" --argjson fut "$future_at" --argjson exp "$expired_at" '
+      {
+        availableCount: 99,
+        credits: [
+          {status:"available", expiresAt:$fut, resetType:"codexRateLimits"},
+          {status:"available", expiresAt:$exp, resetType:"codexRateLimits"},
+          {status:"consumed", expiresAt:$fut, resetType:"codexRateLimits"},
+          {status:"available", expiresAt:$fut, resetType:"codexRateLimits"}
+        ]
+      }
+    ')" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .available_count == 2
+    and .source == "credits-array-filtered"
+    and .all_expired == false
+  ' <<< "$parsed" >/dev/null || fail "mixed credits must count only available unexpired: $parsed"
+
+  parsed=$(fm_usage_source_parse_codex_rate_limit_reset_credits \
+    "$(jq -cn --argjson exp "$expired_at" '
+      {
+        availableCount: 1,
+        credits: [
+          {status:"available", expiresAt:$exp, resetType:"codexRateLimits"}
+        ]
+      }
+    ')" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .available_count == 0
+    and .source == "credits-array-all-expired"
+    and .all_expired == true
+  ' <<< "$parsed" >/dev/null || fail "all-expired set must be zero and marked: $parsed"
+
+  pass "codex rateLimitResetCredits shapes parse with loud unreadable and availability filter"
+}
+
+test_codex_observe_attaches_reset_credits() {
+  local quota obs
+  quota="$TMP_ROOT/quota-codex-resets.json"
+  cat > "$quota" <<JSON
+{
+  "providers": [
+    {
+      "provider": "codex",
+      "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 70, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 18000 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 60, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 }
+      ],
+      "rateLimitResetCredits": {
+        "availableCount": 1,
+        "credits": [
+          {
+            "status": "available",
+            "resetType": "codexRateLimits",
+            "expiresAt": $((TEST_NOW + 100000))
+          }
+        ]
+      }
+    }
+  ]
+}
+JSON
+  obs=$(fm_usage_source_observe codex "$(cat "$quota")" "$TEST_NOW")
+  jq -e '
+    .evidence == "fresh"
+    and .rate_limit_reset_credits.available_count == 1
+    and .rate_limit_reset_credits.evidence == "fresh"
+    and .rate_limit_reset_credits.source == "credits-array-filtered"
+  ' <<< "$obs" >/dev/null || fail "observe must attach filtered reset count: $obs"
+
+  # Unreadable count demotes evidence so dispatch treats it as a loud error.
+  cat > "$quota" <<JSON
+{
+  "providers": [
+    {
+      "provider": "codex",
+      "state": { "status": "fresh", "refreshedAt": "$VALID_REFRESHED_AT" },
+      "windows": [
+        { "id": "five_hour", "kind": "session", "percentRemaining": 70, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 18000 },
+        { "id": "weekly", "kind": "weekly", "percentRemaining": 60, "resetsAt": "$VALID_RESET_AT", "windowSeconds": 604800 }
+      ],
+      "rateLimitResetCredits": { "availableCount": "bogus" }
+    }
+  ]
+}
+JSON
+  obs=$(fm_usage_source_observe codex "$(cat "$quota")" "$TEST_NOW")
+  jq -e '
+    .evidence == "unknown"
+    and .rate_limit_reset_credits.evidence == "unreadable"
+    and (.diagnostics | any(test("unreadable"; "i")))
+  ' <<< "$obs" >/dev/null || fail "unreadable reset credits must demote evidence: $obs"
+  pass "codex observe attaches reset credits and demotes unreadable counts"
+}
+
 test_class_map
 test_provider_registry_distinguishes_unknown_tokens
 test_quota_backed_adapters
@@ -290,5 +411,7 @@ test_absent_provider_unknown
 test_offset_and_fractional_timestamps_parse
 test_metered_predicate
 test_observe_profiles_dedupes
+test_codex_reset_credits_parse_shapes
+test_codex_observe_attaches_reset_credits
 
 echo "# all fm-usage-source-lib tests passed"

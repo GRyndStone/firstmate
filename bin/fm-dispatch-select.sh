@@ -349,6 +349,15 @@ else
   fi
   [ "$quota_status" -eq 0 ] \
     || usage_evidence_error "quota-axi exited $quota_status while reading live usage"
+  # Live meter path: quota-axi drops rateLimitResetCredits. When codex is a
+  # candidate, observe it read-only via the app-server and attach it before
+  # scoring (never redeem/consume a reset).
+  if printf '%s\n' "$profiles_json" | jq -e '
+    [.[] | (.provider // .harness // empty)] | index("codex")
+  ' >/dev/null 2>&1; then
+    quota_json=$(fm_usage_source_enrich_codex_reset_credits "$quota_json" "$NOW_EPOCH") \
+      || usage_evidence_error "failed to observe codex rate-limit reset credits"
+  fi
 fi
 
 printf '%s\n' "$quota_json" | jq -e 'type == "object" and (.providers | type) == "array"' >/dev/null 2>&1 \

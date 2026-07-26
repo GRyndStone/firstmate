@@ -11,10 +11,16 @@
 #   source_id, class, provider, evidence (fresh|stale|unknown), unit,
 #   windows[{id,kind,role,remaining,resets_at_epoch,window_seconds,
 #            window_seconds_source}],
-#   gate_windows[], binding{...budget window...}, binding_reason, diagnostics[].
+#   gate_windows[], binding{...budget window...}, binding_reason, diagnostics[],
+#   optional rate_limit_reset_credits{evidence,available_count,source,error,items[]}
+#   for provider=codex only (openai-class rate-limit reset credits).
 #
 # The registry is the single owner of provider identities, adapter classes,
 # meter kinds, and provider-specific window-role policy.
+# Codex rate-limit reset credits are observed separately from quota-axi windows:
+# quota-axi's normalizeCredits keeps only balance/unlimited and drops
+# rateLimitResetCredits (cli-rpc) / rate_limit_reset_credits (HTTP). See
+# docs/usage-burndown-dispatch.md "Codex rate-limit reset pressure".
 # Sourced only; not executed as a main program.
 
 _FM_USAGE_SOURCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_USAGE_SOURCE_LIB_DIR="."
@@ -101,6 +107,351 @@ fm_usage_source_fetch_quota_json() {
   "$cmd" --allow-keychain-prompt --json
 }
 
+# Parse a raw rateLimitResetCredits / rate_limit_reset_credits object into the
+# observation fragment used by the burndown engine.
+# Only status=="available" items whose expiresAt (epoch seconds) is absent or
+# strictly greater than now_epoch count. availableCount alone is used only when
+# no credits array is present (HTTP shape). Unreadable shapes are loud errors
+# (evidence=unreadable), never a silent zero.
+# Args: <raw_json_or_null> <now_epoch>
+fm_usage_source_parse_codex_rate_limit_reset_credits() {
+  local raw=${1:-null} now_epoch=${2:-0}
+  if [ -z "$raw" ]; then
+    raw=null
+  fi
+  # jq -e exits non-zero for JSON null/false; use `empty` for a pure parse check.
+  if ! printf '%s\n' "$raw" | jq empty >/dev/null 2>&1; then
+    jq -cn '{
+      evidence:"unreadable",
+      available_count:null,
+      source:"parse-error",
+      error:"rateLimitResetCredits payload is not valid JSON",
+      items:[]
+    }'
+    return 0
+  fi
+  jq -cn --argjson raw "$raw" --argjson now "$now_epoch" '
+    def nonneg_int:
+      (type == "number") and (. == floor) and (. >= 0);
+    def item_expiry:
+      .expiresAt // .expires_at // null;
+    def item_status:
+      (.status // "") | ascii_downcase;
+    def available_item:
+      (item_status == "available")
+      and (
+        (item_expiry | type) != "number"
+        or item_expiry > $now
+      );
+    if $raw == null then
+      {
+        evidence:"fresh",
+        available_count:0,
+        source:"absent-as-zero",
+        error:null,
+        all_expired:false,
+        items:[]
+      }
+    elif ($raw | type) != "object" then
+      {
+        evidence:"unreadable",
+        available_count:null,
+        source:"type-error",
+        error:"rateLimitResetCredits is not an object",
+        all_expired:false,
+        items:[]
+      }
+    elif ($raw._fm_error | type) == "string" and ($raw._fm_error | length) > 0 then
+      {
+        evidence:"unreadable",
+        available_count:null,
+        source:"probe-error",
+        error:$raw._fm_error,
+        all_expired:false,
+        items:[]
+      }
+    elif (($raw.credits // $raw.Credits // null) | type) == "array" then
+      ($raw.credits // $raw.Credits) as $credits
+      | ([
+          $credits[]?
+          | select(type == "object")
+          | {
+              status:(.status // null),
+              reset_type:(.resetType // .reset_type // null),
+              expires_at_epoch:(item_expiry),
+              granted_at_epoch:(.grantedAt // .granted_at // null)
+            }
+        ]) as $items
+      | ([ $items[] | select(
+            ((.status // "") | ascii_downcase) == "available"
+            and (
+              (.expires_at_epoch | type) != "number"
+              or .expires_at_epoch > $now
+            )
+          ) ]) as $avail
+      | ($items | length) as $total
+      | ($avail | length) as $n
+      | {
+          evidence:"fresh",
+          available_count:$n,
+          source:(
+            if $total == 0 then "credits-array-empty"
+            elif $n == 0 and ($items | any(
+              ((.status // "") | ascii_downcase) == "available"
+              and (.expires_at_epoch | type) == "number"
+              and .expires_at_epoch <= $now
+            )) then "credits-array-all-expired"
+            elif $n == 0 then "credits-array-none-available"
+            else "credits-array-filtered"
+            end
+          ),
+          error:null,
+          all_expired:(
+            $total > 0 and $n == 0 and ($items | any(
+              ((.status // "") | ascii_downcase) == "available"
+              and (.expires_at_epoch | type) == "number"
+              and .expires_at_epoch <= $now
+            ))
+          ),
+          items:$items
+        }
+    else
+      ($raw.availableCount // $raw.available_count // null) as $ac
+      | if $ac == null then
+          {
+            evidence:"fresh",
+            available_count:0,
+            source:"absent-count-as-zero",
+            error:null,
+            all_expired:false,
+            items:[]
+          }
+        elif ($ac | nonneg_int) then
+          {
+            evidence:"fresh",
+            available_count:($ac | floor),
+            source:"available-count-field",
+            error:null,
+            all_expired:false,
+            items:[]
+          }
+        else
+          {
+            evidence:"unreadable",
+            available_count:null,
+            source:"available-count-unreadable",
+            error:("availableCount is not a non-negative integer (got "
+              + ($ac | type) + ")"),
+            all_expired:false,
+            items:[]
+          }
+        end
+    end
+  '
+}
+
+# Live, read-only observation of Codex rateLimitResetCredits via app-server RPC
+# account/rateLimits/read. Observe only: never redeem or consume a reset.
+# Never prints credentials, tokens, account ids, or credit ids.
+# Optional override: FM_USAGE_CODEX_RESET_CREDITS_JSON (raw object or full RPC
+# result) for fixtures. Optional binary: FM_USAGE_CODEX_BINARY or CODEX_BINARY
+# or `codex` on PATH.
+# Prints the raw rateLimitResetCredits object (or {_fm_error:...}) on stdout.
+fm_usage_source_fetch_codex_rate_limit_reset_credits_raw() {
+  local override=${FM_USAGE_CODEX_RESET_CREDITS_JSON:-}
+  local binary
+  if [ -n "$override" ]; then
+    if ! printf '%s\n' "$override" | jq -e . >/dev/null 2>&1; then
+      jq -cn '{_fm_error:"FM_USAGE_CODEX_RESET_CREDITS_JSON is not valid JSON"}'
+      return 0
+    fi
+    printf '%s\n' "$override" | jq -c '
+      if type == "object" and (has("rateLimitResetCredits") or has("rate_limit_reset_credits")) then
+        .rateLimitResetCredits // .rate_limit_reset_credits
+      elif type == "object" and (has("availableCount") or has("available_count") or has("credits") or has("_fm_error")) then
+        .
+      else
+        {_fm_error:"FM_USAGE_CODEX_RESET_CREDITS_JSON has no rateLimitResetCredits object"}
+      end
+    '
+    return 0
+  fi
+  binary=${FM_USAGE_CODEX_BINARY:-${CODEX_BINARY:-}}
+  if [ -z "$binary" ]; then
+    binary=$(command -v codex 2>/dev/null || true)
+  fi
+  if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+    jq -cn '{_fm_error:"codex binary unavailable for rateLimitResetCredits probe"}'
+    return 0
+  fi
+  # Python owns the JSON-RPC session; bash only supplies the binary path.
+  # stdout is the raw rateLimitResetCredits object or {_fm_error}.
+  FM_USAGE_CODEX_BINARY_PATH="$binary" python3 - <<'PY'
+import json, os, subprocess, sys, time
+
+binary = os.environ["FM_USAGE_CODEX_BINARY_PATH"]
+proc = subprocess.Popen(
+    [binary, "-s", "read-only", "-a", "untrusted", "app-server"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+)
+responses = {}
+
+def fail(msg: str) -> None:
+    print(json.dumps({"_fm_error": msg}))
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    sys.exit(0)
+
+def wait_for(req_id: int, timeout: float = 12.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if req_id in responses:
+            return responses.pop(req_id)
+        if proc.stdout is None:
+            break
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.05)
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(msg, dict) and isinstance(msg.get("id"), int):
+            if "error" in msg and msg["error"] is not None:
+                responses[msg["id"]] = {"_rpc_error": msg["error"]}
+            else:
+                responses[msg["id"]] = msg.get("result", msg.get("params"))
+    fail("timed out waiting for codex app-server rateLimits/read")
+
+def send(req_id: int, method: str, params=None) -> None:
+    if proc.stdin is None:
+        fail("codex app-server stdin closed")
+    proc.stdin.write(json.dumps({"id": req_id, "method": method, "params": params or {}}) + "\n")
+    proc.stdin.flush()
+
+try:
+    send(1, "initialize", {"clientInfo": {"name": "firstmate-usage", "version": "1"}})
+    init = wait_for(1, 15)
+    if isinstance(init, dict) and "_rpc_error" in init:
+        fail("codex app-server initialize failed")
+    send(2, "account/rateLimits/read")
+    limits = wait_for(2, 10)
+    if isinstance(limits, dict) and "_rpc_error" in limits:
+        fail("account/rateLimits/read returned an RPC error")
+    if not isinstance(limits, dict):
+        fail("account/rateLimits/read returned a non-object")
+    raw = limits.get("rateLimitResetCredits")
+    if raw is None:
+        raw = limits.get("rate_limit_reset_credits")
+    if raw is None:
+        # Successful read with no reset-credits section: genuine zero.
+        print(json.dumps(None))
+    else:
+        # Drop credit ids from the live probe so logs never carry account-bound ids.
+        if isinstance(raw, dict) and isinstance(raw.get("credits"), list):
+            scrubbed = dict(raw)
+            items = []
+            for item in raw["credits"]:
+                if not isinstance(item, dict):
+                    continue
+                items.append({
+                    k: item[k]
+                    for k in (
+                        "resetType", "reset_type", "status",
+                        "grantedAt", "granted_at", "expiresAt", "expires_at",
+                        "title", "description",
+                    )
+                    if k in item
+                })
+            scrubbed["credits"] = items
+            # Prefer camelCase count when present; keep both shapes if supplied.
+            print(json.dumps(scrubbed))
+        else:
+            print(json.dumps(raw))
+except Exception as exc:
+    fail(f"codex rateLimitResetCredits probe failed: {type(exc).__name__}")
+finally:
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+PY
+}
+
+# Inject codex rateLimitResetCredits into a quota-axi JSON blob for provider=codex.
+# Live path uses the app-server probe (observe only). Fixture path may already
+# carry the field; it is left alone. Always returns a full quota JSON object.
+# Args: <quota_json> <now_epoch>
+fm_usage_source_enrich_codex_reset_credits() {
+  local quota_json=$1 now_epoch=${2:-0}
+  local has_codex raw_reset
+  has_codex=$(printf '%s\n' "$quota_json" | jq -r '
+    [.providers[]? | select(.provider == "codex")] | length
+  ' 2>/dev/null || printf '0')
+  if [ "$has_codex" = 0 ]; then
+    printf '%s\n' "$quota_json"
+    return 0
+  fi
+  # If the meter (or fixture) already carried the field, keep it.
+  if printf '%s\n' "$quota_json" | jq -e '
+    [.providers[]? | select(.provider == "codex")
+     | select(has("rateLimitResetCredits") or has("rate_limit_reset_credits")
+              or has("rate_limit_reset_credits_error"))] | length > 0
+  ' >/dev/null 2>&1; then
+    printf '%s\n' "$quota_json"
+    return 0
+  fi
+  raw_reset=$(fm_usage_source_fetch_codex_rate_limit_reset_credits_raw) \
+    || raw_reset='{"_fm_error":"codex rateLimitResetCredits probe failed"}'
+  if ! printf '%s\n' "$raw_reset" | jq -e . >/dev/null 2>&1; then
+    raw_reset='{"_fm_error":"codex rateLimitResetCredits probe returned non-JSON"}'
+  fi
+  jq -cn --argjson quota "$quota_json" --argjson raw "$raw_reset" '
+    $quota
+    | .providers |= map(
+        if .provider == "codex" then
+          . + {rateLimitResetCredits: $raw}
+        else .
+        end
+      )
+  '
+}
+
+# Extract and normalize codex reset-credits from a provider object inside
+# quota-axi JSON. Missing field => genuine zero (fixture / no grants).
+# Args: <quota_json> <now_epoch>
+fm_usage_source_codex_reset_credits_from_quota_json() {
+  local quota_json=$1 now_epoch=${2:-0}
+  local raw
+  raw=$(printf '%s\n' "$quota_json" | jq -c '
+    ([.providers[]? | select(.provider == "codex")][0]) as $p
+    | if $p == null then null
+      elif ($p.rateLimitResetCredits? != null) then $p.rateLimitResetCredits
+      elif ($p.rate_limit_reset_credits? != null) then $p.rate_limit_reset_credits
+      else null
+      end
+  ' 2>/dev/null || printf 'null')
+  fm_usage_source_parse_codex_rate_limit_reset_credits "$raw" "$now_epoch"
+}
+
 # True when the provider is expected to yield scorable meter evidence.
 # Unmetered recognized providers (no adapter wired yet) may honestly report
 # evidence=unknown without it being a read failure.
@@ -114,7 +465,7 @@ fm_usage_source_provider_is_metered() { # <provider>
 # now_epoch is required for T and stale-window currentness.
 fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   local provider=$1 quota_json=$2 now_epoch=$3
-  local class meter_kind role_policy
+  local class meter_kind role_policy obs reset_credits
   if ! fm_usage_source_provider_known "$provider"; then
     printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
     return 64
@@ -148,7 +499,7 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
       ;;
   esac
 
-  printf '%s\n' "$quota_json" | jq -ec \
+  obs=$(printf '%s\n' "$quota_json" | jq -ec \
     --arg provider "$provider" \
     --arg class "$class" \
     --argjson policy "$role_policy" \
@@ -311,7 +662,36 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
           end
         )
       end
-    '
+    ') || return $?
+
+  # Codex alone carries rate-limit reset credits. Attach a real observation;
+  # unreadable counts demote evidence to unknown so dispatch treats them as
+  # loud errors rather than a silent N=0 (see docs/usage-burndown-dispatch.md).
+  if [ "$provider" = codex ]; then
+    reset_credits=$(fm_usage_source_codex_reset_credits_from_quota_json \
+      "$quota_json" "$now_epoch")
+    obs=$(jq -cn --argjson o "$obs" --argjson r "$reset_credits" '
+      $o as $base
+      | ($base + {
+          rate_limit_reset_credits:$r,
+          diagnostics:(
+            ($base.diagnostics // [])
+            + (
+                if $r.evidence == "unreadable" then
+                  ["codex rate-limit reset credits unreadable: "
+                    + ($r.error // "unknown cause")]
+                else []
+                end
+              )
+          )
+        })
+      | if $r.evidence == "unreadable" then
+          . + {evidence:"unknown"}
+        else .
+        end
+    ')
+  fi
+  printf '%s\n' "$obs"
 }
 
 # Observe every distinct provider listed in a profiles JSON array.

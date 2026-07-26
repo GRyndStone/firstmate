@@ -57,16 +57,21 @@ spendable = max(0, R - F)
 S = max(0, spendable - B*T)
 required_rate = S/T
 urgency = clamp(1 - T/W, 0, 1)       when W is known
-pressure = 1 + K*urgency^2            when S > 0 and W is known
-pressure = 1                          otherwise
+base_pressure = 1 + K*urgency^2      when S > 0 and W is known
+base_pressure = 1                    otherwise
+reset_factor = C^N                   provider=codex only; N available rate-limit resets
+reset_factor = 1                     every other provider
+pressure = base_pressure * reset_factor
 score = required_rate * pressure
 ```
 
 `required_rate` implements "most remaining usage per remaining time."
-`pressure` is a modifier that makes a nearly ended budget window more urgent when its true period is known.
+`base_pressure` is a modifier that makes a nearly ended budget window more urgent when its true period is known.
 `K` defaults to 4 and is configurable with `FM_BURNDOWN_PRESSURE_K`.
 `F` defaults to 5 and is configurable with `FM_BURNDOWN_SPEND_FLOOR`.
 The rate-gate boundary defaults to 0 and is configurable with `FM_BURNDOWN_RATE_FLOOR`.
+`C` defaults to 1.5 and is configurable with `FM_BURNDOWN_CODEX_RESET_PRESSURE_FACTOR`.
+Only the registry provider id `codex` receives the reset factor (not class tokens such as `openai`).
 
 Higher score wins.
 The complete deterministic order is score descending, `S` descending, `R` descending, `T` ascending, then configured profile index ascending.
@@ -114,9 +119,65 @@ This assumes the two recorded reset boundaries are successive; a missed whole pe
 Until a period is observed, `W` and urgency remain null and pressure stays neutral at 1.
 The provider may still compete on the directly observed `R`, `T`, and counterfactual `B`; the engine never fabricates urgency.
 
+## Codex rate-limit reset pressure
+
+ChatGPT/Codex accounts can hold **rate-limit reset credits**: free one-shot grants that fully refill Codex rate limits.
+They are a wasting asset: each credit expires if the account never burns enough Codex usage to need it.
+The captain's rule therefore multiplies **codex pressure only** by `C^N` for each genuinely available reset (`C=1.5` by default, compounding).
+
+### Observed source shape (live)
+
+`quota-axi` does **not** surface this field today.
+Its Codex normalizer keeps only `credits.balance` / `credits.unlimited` and discards every other credits-adjacent field, including the reset grant list.
+The raw Codex app-server RPC `account/rateLimits/read` (cli-rpc) does carry it:
+
+```text
+rateLimitResetCredits: {
+  availableCount: <int>,
+  credits: [
+    {
+      resetType: "codexRateLimits",
+      status: "available" | ...,
+      grantedAt: <epoch seconds>,
+      expiresAt: <epoch seconds>,
+      title: ...,
+      description: ...
+    }
+  ]
+}
+```
+
+The OAuth HTTP usage endpoint exposes a thinner shape under `rate_limit_reset_credits` with `available_count` / `applicable_available_count` and no per-credit expiry list.
+Firstmate's live path observes the app-server object read-only (never redeems or consumes a reset), attaches it onto the codex provider blob before scoring, and never prints credentials, tokens, account ids, or credit ids.
+
+### Counting rules
+
+| Observation | `N` | Factor | Notes |
+| --- | --- | --- | --- |
+| credits array present | count of items with `status=available` and (`expiresAt` absent or `expiresAt > now`) | `C^N` | per-item filter is authoritative over `availableCount` |
+| only `availableCount` / `available_count` present | that non-negative integer | `C^N` | HTTP shape; no per-item expiry filter possible |
+| successful read, section absent | `0` | `1` | genuine zero |
+| all credits expired or consumed | `0` | `1` | source `credits-array-all-expired` is distinct from absent |
+| malformed count / probe failure | unreadable | n/a | ERROR: demotes codex evidence to unknown; never silent zero |
+
+Unreadable reset evidence for `codex` is the same class of error as unreadable usage: stderr names the provider and cause, the candidate is not scorable, and the selector continues among remaining live candidates or refuses with exit 70 when none remain.
+
+### Worked example
+
+Two live candidates, same `T` and `W`, counterfactual `B=0`, spend floor 5%, `K=4`, `C=1.5`:
+
+| Provider | `R` | base pressure | `N` | `reset_factor` | pressure | wins? |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| claude | 90 | ~1.64 | n/a | 1 | ~1.64 | no |
+| codex | 60 | ~1.64 | 2 | 2.25 | ~3.69 | **yes** |
+
+Without the reset rule, claude's higher remaining budget would win on `required_rate`.
+With two available Codex resets, codex pressure is multiplied by `1.5^2 = 2.25`, so the decision prefers burning Codex while the wasting resets still exist.
+The selection explanation and each candidate line surface `reset_factor`, `resets=N/source`, and `pressure_source` so a surprising ranking is auditable six months later.
+
 ## Missing evidence and loud errors
 
-Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `W`, `B`, freeze, or rate exhaustion.
+Unknown or unusable evidence for a recognized provider never fabricates `R`, `T`, `W`, `B`, freeze, rate exhaustion, or a Codex reset count.
 A known scorable candidate outranks an unknown candidate during normal scoring.
 
 Metered providers (adapter meter kind `quota-axi`) must yield readable usage.
