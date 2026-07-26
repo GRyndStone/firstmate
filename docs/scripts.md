@@ -34,7 +34,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-task-identity-lib.sh` | Refuse existing task-id reuse across unrelated repositories at the spawn lifecycle boundary |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile; owns usage-burndown multi-candidate selection and fail-closed provider admission (`--admit`, `--resume-meta`); see `docs/usage-burndown-dispatch.md` |
 | `fm-usage-burndown-lib.sh` | Usage-burndown optimizer core (surplus S, pressure, learned burn B, explain) |
-| `fm-usage-source-lib.sh` | Modular usage-source adapters (anthropic/openai/grok/gemini/openrouter classes) |
+| `fm-usage-source-lib.sh` | Modular usage-source adapters (anthropic/openai/grok/antigravity/gemini/openrouter classes) |
 | `fm-workflow-bound.sh`   | Finite workflow bounds: budget inheritance, two-attempt obstacle caps, deterministic auth preflight, analyst checkpoint/idle, and no-analyst-dependency asserts |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |

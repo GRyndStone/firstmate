@@ -410,7 +410,7 @@ test_spawn_refuses_unrecognized_provider_without_selector_backstop() {
     expect_code 64 "$status" "$kind spawn with an unrecognized provider must refuse"
     assert_contains "$out" "unrecognized provider token 'typo-provider'" \
       "$kind refusal did not name the bad provider token"
-    assert_contains "$out" "recognized providers: claude, codex, grok, gemini, openrouter, cursor, copilot" \
+    assert_contains "$out" "recognized providers: claude, codex, grok, antigravity, gemini, openrouter, cursor, copilot" \
       "$kind refusal did not name the shared recognized set"
     assert_absent "$HOME_DIR/state/$id.meta" "$kind refusal should happen before meta is written"
     [ ! -s "$LAUNCH_LOG" ] || fail "$kind refusal reached harness launch: $(cat "$LAUNCH_LOG")"

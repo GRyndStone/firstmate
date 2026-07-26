@@ -28,21 +28,27 @@ _FM_USAGE_SOURCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/nu
 # Registry columns:
 #   provider, adapter class, meter kind, compact window-role policy JSON,
 #   target_percent (safe budget floor for scoring; default known-provider floor 5,
-#   claude 10 so that provider keeps a larger buffer).
+#   claude 10 so that provider keeps a larger buffer), compact trust policy JSON
+#   ({trust_multiplier,gated,wake_below,full_at}; defaults full-trust ungated).
 # A provider with no role policy uses the single-window fallback: exactly one
 # usable non-model window is both gate and budget. Multiple unclassified windows
 # degrade to unknown rather than guessing which pool is durable.
 # Per-provider target floors sit here next to window-role policy so they are
 # registry data, not a special-case branch inside the scoring expression.
+# Grok intentionally has trust_multiplier=0.75 with no gate: its credits expire
+# weekly, so gating it behind full-trust provider drain would strand credits on
+# light weeks. Antigravity is gated because the captain would rather avoid it
+# entirely while full-trust providers have meaningful headroom.
 fm_usage_source_registry() {
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    claude anthropic-class quota-axi '{"budget":["seven_day"],"gate":["five_hour"],"ignore":[]}' 10 \
-    codex openai-class quota-axi '{"budget":["weekly"],"gate":["five_hour"],"ignore":[]}' 5 \
-    grok grok-class quota-axi '{"budget":["credits"],"gate":["grokbuild","product:grokbuild"],"ignore":["api","product:api","grokimagine","product:grokimagine","chat","product:chat","voice","product:voice"]}' 5 \
-    gemini gemini-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 \
-    openrouter openrouter-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 \
-    cursor cursor-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5 \
-    copilot copilot-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    claude anthropic-class quota-axi '{"budget":["seven_day"],"gate":["five_hour"],"ignore":[]}' 10 '{"trust_multiplier":1.0}' \
+    codex openai-class quota-axi '{"budget":["weekly"],"gate":["five_hour"],"ignore":[]}' 5 '{"trust_multiplier":1.0}' \
+    grok grok-class quota-axi '{"budget":["credits"],"gate":["grokbuild","product:grokbuild"],"ignore":["api","product:api","grokimagine","product:grokimagine","chat","product:chat","voice","product:voice"]}' 5 '{"trust_multiplier":0.75}' \
+    antigravity antigravity-class antigravity '{"budget":["gemini-weekly"],"gate":["gemini-5h"],"ignore":["3p-weekly","3p-5h"]}' 5 '{"trust_multiplier":0.40,"gated":true,"wake_below":0.35,"full_at":0.05}' \
+    gemini gemini-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 '{}' \
+    openrouter openrouter-class unmetered '{"budget":[],"gate":[],"ignore":[]}' 5 '{}' \
+    cursor cursor-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5 '{}' \
+    copilot copilot-class quota-axi '{"budget":[],"gate":[],"ignore":[]}' 5 '{}'
 }
 
 # Known-provider default when a registry row omits an explicit target (must stay 5,
@@ -81,6 +87,39 @@ fm_usage_source_target_percent() { # <provider>
     return 0
   fi
   printf '%s\n' "$FM_USAGE_SOURCE_DEFAULT_TARGET_PERCENT"
+}
+
+fm_usage_source_trust_policy() { # <provider>
+  local provider=${1:-} value
+  if ! fm_usage_source_provider_known "$provider"; then
+    printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
+    return 64
+  fi
+  value=$(_fm_usage_source_registry_field "$provider" 6 2>/dev/null) || value='{}'
+  [ -n "$value" ] || value='{}'
+  python3 -c '
+import json, math, sys
+try:
+    raw = json.loads(sys.argv[1])
+except Exception:
+    raw = {}
+if not isinstance(raw, dict):
+    raw = {}
+def number(name, default):
+    value = raw.get(name, default)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)) and 0 <= float(value) <= 1:
+        return float(value)
+    return float(default)
+policy = {
+    "trust_multiplier": number("trust_multiplier", 1),
+    "gated": raw.get("gated") is True,
+    "wake_below": number("wake_below", 1),
+    "full_at": number("full_at", 0),
+}
+if policy["wake_below"] < policy["full_at"]:
+    policy["wake_below"] = policy["full_at"]
+print(json.dumps(policy, separators=(",", ":")))
+' "$value" 2>/dev/null || jq -cn '{trust_multiplier:1,gated:false,wake_below:1,full_at:0}'
 }
 
 fm_usage_source_provider_ids_csv() {
@@ -487,14 +526,293 @@ fm_usage_source_codex_reset_credits_from_quota_json() {
 fm_usage_source_provider_is_metered() { # <provider>
   local kind
   kind=$(fm_usage_source_meter_kind "${1:-}" 2>/dev/null) || return 1
-  [ "$kind" = quota-axi ]
+  [ "$kind" = quota-axi ] || [ "$kind" = antigravity ]
+}
+
+# Read Antigravity's own quota summary endpoint through the already-authenticated
+# local keyring token. Prints the raw RetrieveUserQuotaSummaryResponse object, or
+# {_fm_error: "..."} on unreadable evidence. Never prints credential values.
+# Optional fixture override: FM_USAGE_ANTIGRAVITY_QUOTA_JSON.
+fm_usage_source_fetch_antigravity_quota_summary_raw() {
+  local override=${FM_USAGE_ANTIGRAVITY_QUOTA_JSON:-}
+  if [ -n "$override" ]; then
+    if ! printf '%s\n' "$override" | jq -e . >/dev/null 2>&1; then
+      jq -cn '{_fm_error:"FM_USAGE_ANTIGRAVITY_QUOTA_JSON is not valid JSON"}'
+      return 0
+    fi
+    printf '%s\n' "$override"
+    return 0
+  fi
+  python3 - <<'PY'
+import base64
+import json
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+def emit_error(message: str) -> None:
+    print(json.dumps({"_fm_error": message}))
+    sys.exit(0)
+
+
+try:
+    proc = subprocess.run(
+        ["security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+    )
+except Exception as exc:
+    emit_error(f"antigravity keyring read failed: {type(exc).__name__}")
+
+if proc.returncode != 0:
+    emit_error("antigravity keyring credential not found")
+
+secret = proc.stdout.strip()
+if not secret.startswith("go-keyring-base64:"):
+    emit_error("antigravity keyring credential has unexpected envelope")
+
+try:
+    raw = base64.b64decode(secret.split(":", 1)[1])
+    keyring = json.loads(raw.decode("utf-8"))
+except Exception as exc:
+    emit_error(f"antigravity keyring credential decode failed: {type(exc).__name__}")
+
+token = keyring.get("token")
+if not isinstance(token, dict):
+    emit_error("antigravity keyring credential has no token object")
+access = token.get("access_token") or token.get("accessToken") or token.get("AccessToken")
+if not isinstance(access, str) or not access:
+    emit_error("antigravity keyring credential has no access token field")
+
+request = urllib.request.Request(
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    data=b"{}",
+    method="POST",
+    headers={
+        "Authorization": "Bearer " + access,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "firstmate-usage-antigravity/1",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        body = response.read()
+except urllib.error.HTTPError as exc:
+    emit_error(f"antigravity quota endpoint returned HTTP {exc.code}")
+except Exception as exc:
+    emit_error(f"antigravity quota endpoint failed: {type(exc).__name__}")
+
+try:
+    parsed = json.loads(body.decode("utf-8"))
+except Exception as exc:
+    emit_error(f"antigravity quota response is not JSON: {type(exc).__name__}")
+
+print(json.dumps(parsed, separators=(",", ":")))
+PY
+}
+
+fm_usage_source_antigravity_window_seconds() { # <window>
+  case "${1:-}" in
+    weekly) printf '%s\n' 604800 ;;
+    5h) printf '%s\n' 18000 ;;
+    *) printf '%s\n' null ;;
+  esac
+}
+
+fm_usage_source_antigravity_unreadable_observation() { # <class> <provider> <target_percent> <reason>
+  jq -cn \
+    --arg class "$1" \
+    --arg provider "$2" \
+    --argjson target_percent "$3" \
+    --arg reason "$4" \
+    '{
+      source_id:$provider,
+      class:$class,
+      provider:$provider,
+      evidence:"unreadable",
+      unit:"percent",
+      windows:[],
+      gate_windows:[],
+      target_percent:$target_percent,
+      diagnostics:["antigravity quota unreadable: " + $reason]
+    }'
+}
+
+fm_usage_source_normalize_antigravity_summary() { # <raw_summary_json> <provider> <class> <target_percent> <now_epoch>
+  local raw=$1 provider=$2 class=$3 target_percent=$4 now_epoch=$5 role_policy
+  role_policy=$(fm_usage_source_window_policy "$provider") || return $?
+  printf '%s\n' "$raw" | jq -ec \
+    --arg provider "$provider" \
+    --arg class "$class" \
+    --argjson policy "$role_policy" \
+    --argjson target_percent "$target_percent" \
+    --argjson now "$now_epoch" '
+    def iso_epoch:
+      if type != "string" then null
+      else
+        try (
+          sub("\\.[0-9]+"; "") as $s
+          | if ($s | test("Z$")) then
+              $s | fromdateiso8601
+            elif ($s | test("[+-][0-9]{2}:?[0-9]{2}$")) then
+              ($s | capture("(?<base>.*)(?<sign>[+-])(?<hh>[0-9]{2}):?(?<mm>[0-9]{2})$")) as $m
+              | (($m.base + "Z") | fromdateiso8601) as $naive
+              | ((($m.hh | tonumber) * 3600) + (($m.mm | tonumber) * 60)) as $off
+              | if $m.sign == "+" then $naive - $off else $naive + $off end
+            else null
+            end
+        ) catch null
+      end;
+    def period_for($window):
+      if $window == "weekly" then 604800
+      elif $window == "5h" then 18000
+      else null
+      end;
+    def role_for($id):
+      if (($policy.budget // []) | index($id)) != null then "budget"
+      elif (($policy.gate // []) | index($id)) != null then "gate"
+      elif (($policy.ignore // []) | index($id)) != null then "ignored"
+      else "unclassified"
+      end;
+    if (. | type) != "object" then
+      {
+        source_id:$provider,
+        class:$class,
+        provider:$provider,
+        evidence:"unreadable",
+        unit:"percent",
+        windows:[],
+        gate_windows:[],
+        target_percent:$target_percent,
+        diagnostics:["antigravity quota unreadable: response is not an object"]
+      }
+    elif (._fm_error | type) == "string" and (._fm_error | length) > 0 then
+      {
+        source_id:$provider,
+        class:$class,
+        provider:$provider,
+        evidence:"unreadable",
+        unit:"percent",
+        windows:[],
+        gate_windows:[],
+        target_percent:$target_percent,
+        diagnostics:["antigravity quota unreadable: " + ._fm_error]
+      }
+    else
+      ([.groups[]? | .buckets[]?] | length) as $total
+      | ([.groups[]? as $group
+          | ($group.displayName // null) as $group_name
+          | $group.buckets[]?
+          | select(type == "object")
+          | (.bucketId // "") as $id
+          | (.window // "") as $window
+          | (.resetTime | iso_epoch) as $reset
+          | (.remainingFraction // null) as $fraction
+          | select($id != "")
+          | {
+              id:$id,
+              label:(.displayName // $id),
+              kind:$window,
+              group:$group_name,
+              remaining:(
+                if ($fraction | type) == "number" and $fraction >= 0 and $fraction <= 1
+                then ($fraction * 100)
+                else null
+                end
+              ),
+              resets_at_epoch:$reset,
+              window_seconds:period_for($window),
+              window_seconds_source:(
+                if period_for($window) == null then "unreadable-window-field"
+                else "meter-window-field"
+                end
+              ),
+              T:(if $reset == null then null else ($reset - $now) end),
+              role:role_for($id),
+              role_source:"provider-policy"
+            }
+          | select(.role != "ignored")
+        ]) as $classified
+      | ([$classified[] | select(
+            (.remaining | type) == "number"
+            and (.resets_at_epoch | type) == "number"
+            and .resets_at_epoch > $now
+          )]) as $usable
+      | ([$usable[] | select(.role == "budget")]) as $budgets
+      | ([$usable[] | select(.role == "gate")]) as $gates
+      | if $total == 0 then
+          {
+            source_id:$provider,
+            class:$class,
+            provider:$provider,
+            evidence:"unreadable",
+            unit:"percent",
+            windows:[],
+            gate_windows:[],
+            target_percent:$target_percent,
+            diagnostics:["antigravity quota unreadable: response has no groups[].buckets[]"]
+          }
+        elif ($budgets | length) != 1 then
+          {
+            source_id:$provider,
+            class:$class,
+            provider:$provider,
+            evidence:"unreadable",
+            unit:"percent",
+            windows:$classified,
+            gate_windows:$gates,
+            target_percent:$target_percent,
+            diagnostics:[
+              if ($budgets | length) == 0 then
+                "antigravity quota unreadable: no usable configured budget bucket"
+              else
+                "antigravity quota unreadable: multiple configured budget buckets"
+              end
+            ]
+          }
+        else
+          ($budgets[0]) as $budget
+          | {
+              source_id:$provider,
+              class:$class,
+              provider:$provider,
+              evidence:"fresh",
+              unit:"percent",
+              windows:$classified,
+              gate_windows:$gates,
+              target_percent:$target_percent,
+              binding:{
+                id:$budget.id,
+                role:"budget",
+                role_source:$budget.role_source,
+                remaining:$budget.remaining,
+                resets_at_epoch:$budget.resets_at_epoch,
+                T:$budget.T,
+                window_seconds:$budget.window_seconds,
+                window_seconds_source:$budget.window_seconds_source
+              },
+              binding_reason:"live Antigravity summary marks weekly as the durable tier budget; 5h gates eligibility; 3p Claude/GPT buckets are ignored for the default Gemini Antigravity provider",
+              diagnostics:(
+                [$classified[]
+                  | select(.role == "unclassified")
+                  | "unclassified antigravity bucket \(.id) was not used"]
+              )
+            }
+        end
+    end
+  '
 }
 
 # Build one observation object for provider from a full quota-axi JSON blob.
 # now_epoch is required for T and stale-window currentness.
 fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
   local provider=$1 quota_json=$2 now_epoch=$3
-  local class meter_kind role_policy obs reset_credits
+  local class meter_kind role_policy target_percent obs reset_credits
   if ! fm_usage_source_provider_known "$provider"; then
     printf "fm-usage-source: unrecognized provider token '%s'\n" "$provider" >&2
     return 64
@@ -525,6 +843,19 @@ fm_usage_source_observe() { # <provider> <quota_json> <now_epoch>
       return 0
       ;;
     quota-axi) ;;
+    antigravity)
+      local raw_antigravity
+      raw_antigravity=$(fm_usage_source_fetch_antigravity_quota_summary_raw) \
+        || raw_antigravity='{"_fm_error":"antigravity quota probe failed"}'
+      if ! printf '%s\n' "$raw_antigravity" | jq -e . >/dev/null 2>&1; then
+        fm_usage_source_antigravity_unreadable_observation \
+          "$class" "$provider" "$target_percent" "quota probe returned non-JSON"
+        return 0
+      fi
+      fm_usage_source_normalize_antigravity_summary \
+        "$raw_antigravity" "$provider" "$class" "$target_percent" "$now_epoch"
+      return 0
+      ;;
     *)
       printf "fm-usage-source: provider '%s' has unsupported meter kind '%s'\n" "$provider" "$meter_kind" >&2
       return 70

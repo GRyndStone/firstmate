@@ -238,13 +238,15 @@ fixture_grok_period_is_observed_not_fabricated() {
       and .urgency < 0.88
       and .target_percent == 5
       and .headroom == 6
+      and .trust_multiplier == 0.75
   ' "a Grok reset period is learned as weekly and produces high near-reset urgency"
   check_jq "$selection" '
     [.candidates[] | select(.provider == "grok")][0]
     | .W != 86400
       and .B_source == "not-used-in-score"
       and (.score_base - (6/79678) | fabs) < 1e-12
-      and (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
+      and (.score_after_reset - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
+      and (.score - (.score_after_reset * .trust_multiplier) | fabs) < 1e-12
   ' "missing Grok window length never fabricates a 24-hour denominator; score uses retained urgency amp"
 }
 

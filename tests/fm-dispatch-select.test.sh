@@ -394,7 +394,7 @@ test_unrecognized_provider_is_a_distinct_machine_error() {
     ' <<< "$out" >/dev/null || fail "unrecognized provider profile was not machine-distinct: $out"
     assert_contains "$err" "unrecognized provider token '$token'" \
       "unrecognized refusal did not name the bad token"
-    assert_contains "$err" "recognized providers: claude, codex, grok, gemini, openrouter, cursor, copilot" \
+    assert_contains "$err" "recognized providers: claude, codex, grok, antigravity, gemini, openrouter, cursor, copilot" \
       "unrecognized refusal did not name the shared recognized set"
     assert_not_contains "$err" "no usable usage evidence" \
       "unrecognized provider was mislabeled as honest absence"

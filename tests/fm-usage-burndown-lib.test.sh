@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unit tests for the usage-burndown optimizer core (bin/fm-usage-burndown-lib.sh).
 # Formula under test:
-#   score = ((R - target) / T) * (1 + K*urgency^2) * (1.5^N for codex only)
+#   score = ((R - target) / T) * (1 + K*urgency^2)
+#           * (1.5^N for codex only) * trust * gate_weight
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -68,6 +69,8 @@ test_target_rate_score_formula() {
     .target_percent == 10
     and .headroom == 90
     and .scorable == true
+    and .trust_multiplier == 1
+    and .gate_weight == null
     and .B_source == "not-used-in-score"
     and .B == null
     and (.score_base - 0.15 | fabs) < 0.0001
@@ -96,7 +99,7 @@ test_target_rate_score_formula() {
   jq -e '
     (.score - (.score_base * .base_pressure * .reset_pressure_factor) | fabs) < 1e-12
   ' <<< "$far" >/dev/null || fail "score must be score_base*base_pressure*reset: $far"
-  pass "score is ((R-target)/T)*(1+K*urgency^2)*reset; B*T gone; urgency kept"
+  pass "score is ((R-target)/T)*(1+K*urgency^2)*reset*trust*gate; B*T gone; urgency kept"
 }
 
 test_per_provider_targets_are_distinct() {
@@ -186,6 +189,106 @@ test_freeze_excluded_when_live_exists() {
   jq -e '.profile.provider == "codex" and .frozen == false' \
     <<< "$selection" >/dev/null || fail "should skip freeze when live capacity exists: $selection"
   pass "freeze-level sources are skipped when a non-freeze known source exists"
+}
+
+test_trust_and_antigravity_gate_provider_data() {
+  local profiles scored_obs selection ag
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"grok","harness":"grok"},{"provider":"antigravity","harness":"pi"}]'
+
+  scored_obs=$(jq -cn \
+    --argjson codex "$(fm_usage_burndown_score_one "$(obs_scorable codex 80 3600 18000 0)")" \
+    --argjson grok "$(fm_usage_burndown_score_one "$(obs_scorable grok 80 3600 18000)")" \
+    --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 60 18000)")" \
+    '[$codex,$grok,$ag]')
+  selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
+  jq -e '
+    ([.candidates[] | select(.provider == "codex")][0] | .trust_multiplier == 1 and .gate_weight == 1)
+    and ([.candidates[] | select(.provider == "grok")][0] | (
+      .trust_multiplier == 0.75
+      and .gated == false
+      and .gate_weight == 1
+      and (.score - (.score_after_reset * 0.75) | fabs) < 1e-12
+    ))
+  ' <<< "$selection" >/dev/null || fail "trust multipliers must be static data and grok must stay ungated: $selection"
+
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"antigravity","harness":"pi"}]'
+
+  # Healthy trusted headroom: codex H=(50-5)/(100-5)>0.35, so fallback weight is
+  # exactly zero and antigravity is excluded, not ranked last.
+  scored_obs=$(jq -cn \
+    --argjson codex "$(fm_usage_burndown_score_one "$(obs_scorable codex 50 3600 18000 0)")" \
+    --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 60 18000)")" \
+    '[$codex,$ag]')
+  selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
+  jq -e '
+    .profile.provider == "codex"
+    and ([.candidates[] | select(.provider == "antigravity")][0] | (
+      .trust_multiplier == 0.4
+      and .gated == true
+      and .gate_weight == 0
+      and .gate_reference_headroom > 0.35
+      and .gate_reference_source == "ungated-full-trust-provider-headroom"
+      and .eligible == false
+      and .ineligible_reason == "gated-full-trust-headroom"
+      and .score == 0
+      and (.score_after_trust | type) == "number"
+    ))
+  ' <<< "$selection" >/dev/null || fail "healthy trusted headroom must exclude antigravity: $selection"
+
+  # Drained trusted headroom: codex H=(24-5)/(100-5)=0.2, so the gate is half
+  # open; antigravity remains separately trust-weighted at 0.40.
+  scored_obs=$(jq -cn \
+    --argjson codex "$(fm_usage_burndown_score_one "$(obs_scorable codex 24 3600 18000 0)")" \
+    --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 3600 18000)")" \
+    '[$codex,$ag]')
+  selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
+  ag=$(jq -c '[.candidates[] | select(.provider == "antigravity")][0]' <<< "$selection")
+  jq -e '
+    .gated == true
+    and .eligible == true
+    and (.gate_reference_headroom - 0.2 | fabs) < 1e-12
+    and (.gate_weight - 0.5 | fabs) < 1e-12
+    and .trust_multiplier == 0.4
+    and (.score - (.score_after_trust * .gate_weight) | fabs) < 1e-12
+  ' <<< "$ag" >/dev/null || fail "drained trusted headroom must ramp antigravity in weakly: $selection"
+
+  # Floor-level trusted headroom: H=0 gives full gate strength, with the static
+  # trust multiplier still visible at 0.40.
+  scored_obs=$(jq -cn \
+    --argjson codex "$(fm_usage_burndown_score_one "$(obs_scorable codex 5 3600 18000 0)")" \
+    --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 3600 18000)")" \
+    '[$codex,$ag]')
+  selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
+  jq -e '
+    .profile.provider == "antigravity"
+    and ([.candidates[] | select(.provider == "antigravity")][0] | (
+      .gated == true
+      and .gate_reference_headroom == 0
+      and .gate_weight == 1
+      and .trust_multiplier == 0.4
+      and (.score - (.score_after_reset * 0.4) | fabs) < 1e-12
+    ))
+  ' <<< "$selection" >/dev/null || fail "floor trusted headroom must give antigravity full fallback weight: $selection"
+
+  # If every full-trust provider is unreadable, H is deliberately treated as 0
+  # so the gated fallback opens instead of stranding the fleet with nowhere to route.
+  scored_obs=$(jq -cn \
+    --argjson codex '{"provider":"codex","evidence":"unreadable","scorable":false,"posture":"unknown","target_percent":5}' \
+    --argjson claude '{"provider":"claude","evidence":"unreadable","scorable":false,"posture":"unknown","target_percent":10}' \
+    --argjson ag "$(fm_usage_burndown_score_one "$(obs_scorable antigravity 100 3600 18000)")" \
+    '[$codex,$claude,$ag]')
+  profiles='[{"provider":"codex","harness":"codex"},{"provider":"claude","harness":"claude"},{"provider":"antigravity","harness":"pi"}]'
+  selection=$(fm_usage_burndown_select "$profiles" "$scored_obs" multi)
+  jq -e '
+    .profile.provider == "antigravity"
+    and ([.candidates[] | select(.provider == "antigravity")][0] | (
+      .gate_reference_headroom == 0
+      and .gate_reference_source == "full-trust-evidence-unreadable"
+      and .gate_weight == 1
+      and .eligible == true
+    ))
+  ' <<< "$selection" >/dev/null || fail "unreadable full-trust fleet must open antigravity gate with branch recorded: $selection"
+  pass "trust multipliers are separate from Antigravity's deterministic full-trust-headroom gate"
 }
 
 test_at_or_below_target_is_excluded() {
@@ -384,6 +487,7 @@ test_unknown_evidence_not_scorable
 test_history_does_not_reduce_score
 test_multi_select_prefers_expiring_headroom
 test_freeze_excluded_when_live_exists
+test_trust_and_antigravity_gate_provider_data
 test_at_or_below_target_is_excluded
 test_admit_pin_freezes_in_place
 test_posture_boundaries
