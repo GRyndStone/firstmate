@@ -83,6 +83,7 @@ surface_classes() {
     public-skills directive 'skills' \
     ci exec '.github' \
     config exec '.tasks.toml .no-mistakes.yaml .gitignore' \
+    deps exec 'deps' \
     docs prose 'docs README.md CONTRIBUTING.md' \
     tests prose 'tests' \
     vendor prose 'vendor absorb'
