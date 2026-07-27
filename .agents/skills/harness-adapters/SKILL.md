@@ -131,6 +131,11 @@ A plain `tmux capture-pane` cannot tell that ghost text apart from typed text.
 Firstmate launches every claude crewmate and secondmate with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, scoped to firstmate-launched agents through `bin/fm-spawn.sh`, so it never touches the captain's global config.
 The CLI's `--prompt-suggestions` flag is print/SDK-mode only and does not suppress the interactive composer ghost text, verified empirically on v2.1.186.
 As defense in depth for any pane that flag cannot reach, including the captain's own firstmate composer that away-mode reads, the shared `fm_composer_strip_ghost` extractor in `bin/fm-composer-lib.sh` removes dim/faint SGR 2 ghost runs before pending-input classification on both ANSI-capable readers (tmux and herdr).
+
+Firstmate also launches every claude crewmate and secondmate through `env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION`.
+A pane inherits the launching agent's process environment, and a claude that sees those two variables set believes it is a child session and silently disables transcript saving, printing `⚠ Transcript saving is off — inherited CLAUDE_CODE_…` and leaving the crewmate's whole run unrecoverable.
+Verified 2026-07-26 on Claude Code 2.1.220 by launching in an already-trusted directory with exactly those two unset: the warning disappears, and `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`, and `CLAUDECODE` are not implicated.
+The scrub is a per-launch prefix on the crewmate command only; it never touches the launching session.
 Its broader dark-TRUECOLOR placeholder handling and dark-theme tradeoff are documented in `docs/herdr-backend.md`'s 2026-07-10 incident record.
 That styled capture is internal to the boolean detector only.
 `fm-peek` and every other human or LLM-facing capture path stays plain `tmux capture-pane` with no escape codes.

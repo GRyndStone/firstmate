@@ -755,7 +755,15 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    #
+    # env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION drops the launching
+    # agent's own session identity, which a pane would otherwise inherit through the
+    # process environment. A claude that sees those set believes it is a child session
+    # and silently turns transcript saving off ("Transcript saving is off - inherited
+    # CLAUDE_CODE_..."), so the crewmate's whole run leaves no transcript to recover.
+    # Verified 2026-07-26 on Claude Code 2.1.220: unsetting exactly these two clears the
+    # warning; CLAUDE_CODE_ENTRYPOINT/EXECPATH/CLAUDECODE are not implicated.
+    claude) printf '%s' 'env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
