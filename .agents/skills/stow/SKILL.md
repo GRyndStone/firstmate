@@ -6,6 +6,15 @@ metadata:
   internal: true
 ---
 
+## Starting mandate: zero assumptions
+
+Every claim, question, and action must cite the captain's words, thoughts, opinions, determinations, or decisions, or reality: what code actually does or tests directly prove, never an abstraction, plausible reading, or guess.
+Read documentation when it has the answer; when research, another document, or a test can find it, go find it; when first principles can derive it, derive it.
+Ask only when the answer exists only in the captain's head.
+Do exactly what the captain told you to do.
+Act only with evidenced, explicitly given authority; infer no standing authorization from context or convenience.
+Never discard or condense this mandate or replace it with a reference.
+
 <!-- maintainers: this is the firstmate-internal skill. The public, installer-facing counterpart lives at skills/stow/SKILL.md - deliberately a separate file with no shared code or environment branching. Keep them independent. -->
 
 # stow

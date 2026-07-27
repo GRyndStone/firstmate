@@ -103,14 +103,33 @@ if [ "$X_MODE" -eq 0 ] && [ -f "$x_mode_env" ]; then
 fi
 
 render_snippet() {
-  local line
+  local line reached_mode=0
   while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$reached_mode" -eq 0 ]; then
+      case "$line" in
+        Mode:*) reached_mode=1 ;;
+        *) continue ;;
+      esac
+    fi
     line=${line//__FM_PI_EXT__/$pi_ext}
     line=${line//__FM_PI_TURNEND_EXT__/$pi_turnend_ext}
     line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
     line=${line//__FM_X_MODE_ENV__/$x_mode_env}
     printf '%s\n' "$line"
   done < "$SNIPPET"
+}
+
+print_starting_mandate() {
+  cat <<'EOF'
+## Starting mandate: zero assumptions
+
+Every claim, question, and action must cite the captain's words, thoughts, opinions, determinations, or decisions, or reality: what code actually does or tests directly prove, never an abstraction, plausible reading, or guess.
+Read documentation when it has the answer; when research, another document, or a test can find it, go find it; when first principles can derive it, derive it.
+Ask only when the answer exists only in the captain's head.
+Do exactly what the captain told you to do.
+Act only with evidenced, explicitly given authority; infer no standing authorization from context or convenience.
+Never discard or condense this mandate or replace it with a reference.
+EOF
 }
 
 repair_line() {
@@ -162,6 +181,8 @@ RULE='==========================================================================
 printf '%s\n' "$RULE"
 printf 'SUPERVISION OPERATING INSTRUCTIONS - primary harness: %s\n' "$HARNESS"
 printf '%s\n' "$RULE"
+print_starting_mandate
+printf '\n'
 printf 'Current state:\n'
 if [ "$READ_ONLY" -eq 1 ]; then
   printf '%s\n' '- Lock: read-only; do not drain, arm, spawn, steer, merge, or repair fleet state here.'
