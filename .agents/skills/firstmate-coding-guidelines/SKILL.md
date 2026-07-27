@@ -9,6 +9,15 @@ metadata:
   internal: true
 ---
 
+## Starting mandate: zero assumptions
+
+Every claim, question, and action must cite the captain's words, thoughts, opinions, determinations, or decisions, or reality: what code actually does or tests directly prove, never an abstraction, plausible reading, or guess.
+Read documentation when it has the answer; when research, another document, or a test can find it, go find it; when first principles can derive it, derive it.
+Ask only when the answer exists only in the captain's head.
+Do exactly what the captain told you to do.
+Act only with evidenced, explicitly given authority; infer no standing authorization from context or convenience.
+Never discard or condense this mandate or replace it with a reference.
+
 # firstmate-coding-guidelines
 
 Load this before changing firstmate's shared, tracked material, as defined by `AGENTS.md` section 1.
@@ -34,7 +43,9 @@ Do not place a fact at a more convenient tier than the one this tree gives you.
 ## One-owner rule
 
 Every contract - a data format, a state machine, a decision procedure - is stated in full exactly once.
-Every other mention of it is a one-line cross-reference, never a restatement.
+The zero-assumptions starting mandate is the explicit exception because the captain required full repetition at every agent instruction surface.
+Never deduplicate that mandate or replace any copy with a reference.
+Apart from that exception, every other mention of a contract is a one-line cross-reference, never a restatement.
 A single deliberate one-line reinforcement at a genuine risk point is allowed, for example a "don't forget X" placed exactly where forgetting X is costly.
 Restating the contract's substance a second time is not allowed: the two copies will drift the moment only one is edited.
 When you touch a contract, grep the repo for its other mentions and update the cross-references, not duplicate the change into a second full copy.
